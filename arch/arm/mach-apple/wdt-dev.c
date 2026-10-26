@@ -77,6 +77,15 @@ static int __init apple_wdt_dev_init(void)
 	watchdog_set_nowayout(&apple_wdd, WATCHDOG_NOWAYOUT);
 	watchdog_stop_on_reboot(&apple_wdd);
 
+	/*
+	 * The pre-kernel entry stub arms the hardware watchdog before
+	 * jumping into Linux. Rebase to the default 60s timeout now and
+	 * mark WDOG_HW_RUNNING so the watchdog core feeds it via its
+	 * boot-enabled keepalive worker until userspace opens /dev/watchdog.
+	 */
+	apple_wdt_start(&apple_wdd);
+	set_bit(WDOG_HW_RUNNING, &apple_wdd.status);
+
 	ret = watchdog_register_device(&apple_wdd);
 	if (ret) {
 		pr_err("could not register /dev/watchdog: %d\n", ret);

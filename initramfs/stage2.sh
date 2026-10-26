@@ -14,6 +14,13 @@ log_msg() {
 }
 
 log_msg "stage2 starting on $(uname -sr)"
+hostname -F /etc/hostname 2>/dev/null || hostname velliangiri 2>/dev/null || true
+
+# Start hardware watchdog supervision (/dev/watchdog) first so nothing can delay it
+if [ -c /dev/watchdog ]; then
+	watchdog -T 60 -t 15 /dev/watchdog
+	log_msg "hardware watchdog daemon active (60s bite, 15s feed)"
+fi
 
 # Bring up USB CDC-ECM + CDC-ACM gadget if UDC is active
 if [ -d /sys/class/net/usb0 ] || ip link show usb0 >/dev/null 2>&1; then
@@ -22,40 +29,31 @@ if [ -d /sys/class/net/usb0 ] || ip link show usb0 >/dev/null 2>&1; then
 	log_msg "usb0 configured at 10.55.0.2/24"
 fi
 
+# Spawn interactive getty/shell on USB CDC-ACM (/dev/ttyGS0)
+(
+	while true; do
+		if [ -c /dev/ttyGS0 ]; then
+			/sbin/getty -i -n -l /bin/sh 115200 ttyGS0 2>/dev/null || sleep 1
+		else
+			sleep 1
+		fi
+	done
+) &
+log_msg "CDC-ACM console getty active on /dev/ttyGS0"
+
+# Start Dropbear SSH server on port 22 in background
+mkdir -p /etc/dropbear
+if [ -x /usr/sbin/dropbear ]; then
+	/usr/sbin/dropbear -R -E -p 22 2>/dev/kmsg &
+	log_msg "dropbear SSH daemon listening on port 22 (root login permitted)"
+fi
+
 # Bring up Fast Ethernet (eth0) via DHCP in background
 if [ -d /sys/class/net/eth0 ] || ip link show eth0 >/dev/null 2>&1; then
 	ip link set eth0 up 2>/dev/null || true
 	udhcpc -i eth0 -b -s /etc/udhcpc/default.script -p /run/udhcpc.eth0.pid >/dev/null 2>&1 &
 	log_msg "eth0 link up; udhcpc started in background"
 fi
-
-# Start Dropbear SSH server on port 22
-mkdir -p /etc/dropbear
-if [ -x /usr/sbin/dropbear ]; then
-	/usr/sbin/dropbear -R -B -E -p 22 2>/dev/kmsg || true
-	log_msg "dropbear SSH daemon listening on port 22 (root login permitted)"
-fi
-
-# Start hardware watchdog supervision (/dev/watchdog) after services are up
-if [ -c /dev/watchdog ]; then
-	watchdog -T 60 -t 15 /dev/watchdog 2>/dev/null || true
-	log_msg "hardware watchdog daemon active (60s bite, 15s feed)"
-fi
-
-# Spawn interactive getty/shell on USB CDC-ACM (/dev/ttyGS0)
-(
-	while true; do
-		if [ -c /dev/ttyGS0 ]; then
-			if command -v getty >/dev/null 2>&1; then
-				getty -i -n -l /bin/sh 115200 ttyGS0 2>/dev/null || sleep 1
-			else
-				setsid /bin/sh </dev/ttyGS0 >/dev/ttyGS0 2>&1 || sleep 1
-			fi
-		else
-			sleep 1
-		fi
-	done
-) &
 
 log_msg "system ready"
 

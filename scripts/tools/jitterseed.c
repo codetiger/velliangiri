@@ -2,77 +2,93 @@
 /*
  * Clocksource jitter entropy seeder for S5L8947X early initramfs
  *
- * Samples clock_gettime(CLOCK_MONOTONIC) deltas across short busy-wait loops
- * and credits 512 bits of entropy to /dev/urandom via RNDADDENTROPY so
- * Dropbear SSH starts immediately without blocking on CRNG initialization.
+ * Samples CLOCK_MONOTONIC_RAW (the 24 MHz hardware watchdog counter, 41 ns per
+ * tick) across a cache/memory-walking loop of 16,384 iterations and credits
+ * 256 bits of entropy to /dev/urandom via RNDADDENTROPY so the kernel CRNG
+ * initializes in ~70 ms during early boot.
  */
 
+#include <errno.h>
 #include <fcntl.h>
 #include <linux/random.h>
 #include <stdint.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <sys/ioctl.h>
 #include <time.h>
 #include <unistd.h>
 
-#define ENTROPY_WORDS	16	/* 64 bytes = 512 bits */
-#define ROUNDS_PER_WORD	64
+#define SAMPLES	16384
+#define CREDIT	256	/* bits */
+#define WALK	4096	/* bytes of scratch buffer walked per sample */
 
-static uint32_t sample_word(void)
+static uint64_t now_ns(void)
 {
 	struct timespec ts;
-	uint32_t acc = 0x9e3779b9U;
-	int r, k;
 
-	for (r = 0; r < ROUNDS_PER_WORD; r++) {
-		volatile int spin;
-
-		clock_gettime(CLOCK_MONOTONIC, &ts);
-		acc ^= (uint32_t)ts.tv_nsec;
-		acc = (acc << 7) | (acc >> 25);
-		acc += 0x85ebca6bU;
-
-		spin = (int)((acc & 0x3fU) + 17U);
-		while (spin-- > 0)
-			__asm__ volatile("" ::: "memory");
-	}
-	for (k = 0; k < 4; k++) {
-		clock_gettime(CLOCK_MONOTONIC, &ts);
-		acc ^= (uint32_t)ts.tv_nsec * 0xc2b2ae35U;
-		acc = (acc << 13) | (acc >> 19);
-	}
-	return acc;
+	clock_gettime(CLOCK_MONOTONIC_RAW, &ts);
+	return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
 }
 
 int main(void)
 {
+	static unsigned char scratch[WALK];
 	struct {
-		int entropy_count;
-		int buf_size;
-		uint32_t buf[ENTROPY_WORDS];
-	} req;
-	int fd, i;
+		struct rand_pool_info info;
+		uint32_t buf[SAMPLES / 4];
+	} e;
+	uint64_t t0, t1, start = now_ns();
+	uint32_t acc = 0x9e3779b9U, idx = 0;
+	unsigned int distinct[256] = { 0 };
+	int fd, i, n = 0;
 
-	req.entropy_count = ENTROPY_WORDS * 32;
-	req.buf_size = sizeof(req.buf);
-	for (i = 0; i < ENTROPY_WORDS; i++)
-		req.buf[i] = sample_word();
+	memset(&e, 0, sizeof(e));
+	for (i = 0; i < SAMPLES; i++) {
+		int k, steps = 64 + (int)(acc & 63U);
+		unsigned char *p = (unsigned char *)e.buf;
 
-	fd = open("/dev/urandom", O_WRONLY);
-	if (fd < 0)
-		fd = open("/dev/random", O_WRONLY);
-	if (fd < 0) {
-		perror("jitterseed: open /dev/urandom");
+		t0 = now_ns();
+		for (k = 0; k < steps; k++) {
+			idx = (idx * 1103515245U + 12345U + acc) & (WALK - 1);
+			scratch[idx] += (unsigned char)(acc >> 7);
+			acc ^= scratch[(idx + (uint32_t)k) & (WALK - 1)];
+			acc = (acc << 5) | (acc >> 27);
+		}
+		t1 = now_ns();
+		acc += (uint32_t)(t1 - t0);
+		p[i] = (unsigned char)(t1 - t0) ^ (unsigned char)((t1 - t0) >> 8);
+		distinct[p[i]]++;
+	}
+
+	for (i = 0; i < 256; i++) {
+		if (distinct[i])
+			n++;
+	}
+
+	if (n < 16) {
+		printf("jitterseed: only %d distinct delta values in %d samples -- not credited\n",
+		       n, SAMPLES);
 		return 1;
 	}
 
-	if (ioctl(fd, RNDADDENTROPY, &req) < 0) {
-		perror("jitterseed: RNDADDENTROPY");
+	fd = open("/dev/urandom", O_RDWR);
+	if (fd < 0) {
+		printf("jitterseed: /dev/urandom: %s\n", strerror(errno));
+		return 1;
+	}
+
+	e.info.entropy_count = CREDIT;
+	e.info.buf_size = SAMPLES;
+	if (ioctl(fd, RNDADDENTROPY, &e) < 0) {
+		printf("jitterseed: RNDADDENTROPY: %s\n", strerror(errno));
 		close(fd);
 		return 1;
 	}
 
 	close(fd);
+	printf("jitterseed: %d samples, %d distinct delta values, %d bits credited in %llu ms\n",
+	       SAMPLES, n, CREDIT,
+	       (unsigned long long)((now_ns() - start) / 1000000ULL));
 	return 0;
 }

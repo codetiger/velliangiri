@@ -81,6 +81,15 @@ fi
 python3 "${ROOT}/scripts/dropbear-hostkey.py" \
 	"${STAGE_DIR}/etc/dropbear/dropbear_ed25519_host_key"
 
+# Seed static /dev console and null nodes so console_on_rootfs() succeeds before /init
+mkdir -p "${STAGE_DIR}/dev"
+mknod -m 600 "${STAGE_DIR}/dev/console" c 5 1 2>/dev/null || true
+mknod -m 666 "${STAGE_DIR}/dev/tty"     c 5 0 2>/dev/null || true
+mknod -m 620 "${STAGE_DIR}/dev/tty0"    c 4 0 2>/dev/null || true
+mknod -m 620 "${STAGE_DIR}/dev/tty1"    c 4 1 2>/dev/null || true
+mknod -m 666 "${STAGE_DIR}/dev/null"    c 1 3 2>/dev/null || true
+mknod -m 666 "${STAGE_DIR}/dev/zero"    c 1 5 2>/dev/null || true
+
 # Install optional SSH public key if provided via SSH_PUBKEY env var
 if [ -n "${SSH_PUBKEY:-}" ] && [ -f "${SSH_PUBKEY}" ]; then
 	cp "${SSH_PUBKEY}" "${STAGE_DIR}/root/.ssh/authorized_keys"

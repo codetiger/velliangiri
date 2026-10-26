@@ -3,8 +3,8 @@
  * Userspace MMIO diagnostic utility (/bin/peek) with SIGBUS/SIGSEGV recovery
  *
  * Usage:
- *   peek <phys_addr> [count_words]
- *   peek -w <phys_addr> <hex_val>
+ *   peek [r] <phys_addr> [count_words]
+ *   peek -w|w <phys_addr> <hex_val>
  */
 
 #include <errno.h>
@@ -27,11 +27,24 @@ static void fault_handler(int sig)
 	siglongjmp(fault_env, 1);
 }
 
+static int parse_ul(const char *s, int base, unsigned long *out)
+{
+	char *end = NULL;
+
+	if (!s || !*s)
+		return -1;
+	errno = 0;
+	*out = strtoul(s, &end, base);
+	if (errno != 0 || !end || *end != '\0')
+		return -1;
+	return 0;
+}
+
 int main(int argc, char **argv)
 {
 	struct sigaction sa;
 	int do_write = 0;
-	unsigned long phys;
+	unsigned long phys = 0;
 	volatile unsigned long count = 1, write_val = 0;
 	unsigned long page_base, page_off, map_len;
 	int fd;
@@ -39,27 +52,42 @@ int main(int argc, char **argv)
 	volatile uint32_t *p;
 
 	if (argc < 2) {
-		fprintf(stderr, "Usage: %s [-w] <phys_addr> [count_or_val]\n", argv[0]);
+		fprintf(stderr, "Usage: %s [r|-w|w] <phys_addr> [count_or_val]\n", argv[0]);
 		return 1;
 	}
 
-	if (strcmp(argv[1], "-w") == 0) {
-		if (argc < 4) {
-			fprintf(stderr, "Usage: %s -w <phys_addr> <hex_val>\n", argv[0]);
+	if (strcmp(argv[1], "-w") == 0 || strcmp(argv[1], "w") == 0) {
+		if (argc < 4 ||
+		    parse_ul(argv[2], 16, &phys) < 0 ||
+		    parse_ul(argv[3], 16, (unsigned long *)&write_val) < 0) {
+			fprintf(stderr, "Usage: %s -w <phys_addr_hex> <hex_val>\n", argv[0]);
 			return 1;
 		}
 		do_write = 1;
-		phys = strtoul(argv[2], NULL, 0);
-		write_val = strtoul(argv[3], NULL, 0);
+	} else if (strcmp(argv[1], "r") == 0) {
+		if (argc < 3 || parse_ul(argv[2], 16, &phys) < 0) {
+			fprintf(stderr, "Usage: %s r <phys_addr_hex> [count]\n", argv[0]);
+			return 1;
+		}
+		if (argc >= 4 && parse_ul(argv[3], 0, (unsigned long *)&count) < 0) {
+			fprintf(stderr, "Invalid count: %s\n", argv[3]);
+			return 1;
+		}
 	} else {
-		phys = strtoul(argv[1], NULL, 0);
-		if (argc >= 3)
-			count = strtoul(argv[2], NULL, 0);
-		if (count == 0)
-			count = 1;
-		if (count > 4096)
-			count = 4096;
+		if (parse_ul(argv[1], 16, &phys) < 0) {
+			fprintf(stderr, "Invalid physical address: %s\n", argv[1]);
+			return 1;
+		}
+		if (argc >= 3 && parse_ul(argv[2], 0, (unsigned long *)&count) < 0) {
+			fprintf(stderr, "Invalid count: %s\n", argv[2]);
+			return 1;
+		}
 	}
+
+	if (count == 0)
+		count = 1;
+	if (count > 4096)
+		count = 4096;
 
 	memset(&sa, 0, sizeof(sa));
 	sa.sa_handler = fault_handler;
