@@ -1,0 +1,23 @@
+name: Source Tree Check
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+permissions:
+  contents: read
+
+jobs:
+  check-source:
+    name: Verify Source Tree Hygiene
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Run source tree check
+        run: ./scripts/check-no-proprietary.sh --all
