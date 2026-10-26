@@ -59,6 +59,7 @@ echo "[kernel] Verifying required S5L8947X config symbols ..."
 awk -f "${ROOT}/scripts/check-config-fragment.awk" "${CONFIG_BASE}" "${TREE}/.config"
 
 echo "[kernel] Compiling zImage and s5l8947x-j33iap.dtb (-j${JOBS}) ..."
+rm -f "${TREE}/arch/arm/boot/dts/apple/s5l8947x-j33iap.dtb"
 make -C "${TREE}" -j"${JOBS}" zImage dtbs
 
 cp "${TREE}/arch/arm/boot/zImage" "${OUT}/zImage"

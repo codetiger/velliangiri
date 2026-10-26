@@ -96,3 +96,29 @@
 		};
 	};
 };
+
+/* 1. On-Board IR / System Management MCU (TI MSP430 on UART1 @ 250000 baud) */
+&mcu0 {
+	status = "okay";
+};
+
+/* 2. Wireless Combo Core (BCM4334 Wi-Fi HSIC + Bluetooth 4.0 on UART2) */
+&wireless0 {
+	status = "okay";
+	wlan-supply = <&wlan_reg_on>;
+};
+
+/* 3. Display Pipe (rgbout + out + HDMI + M2M Scaler) */
+&display_pipe {
+	status = "okay";
+};
+
+/* 4. Audio Engine (AE2 + I2S0 HDMI + S/PDIF Optical TOSLINK) */
+&audio0 {
+	status = "okay";
+};
+
+/* 5. PowerVR SGX543 GPU */
+&sgx0 {
+	status = "okay";
+};

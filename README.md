@@ -15,15 +15,23 @@ Mainline **Linux 6.12** kernel port and open-source (`GPL-2.0-only`) hardware dr
 - **Networking (`drivers/net/ethernet/apple/s5l_fe.c`)**:
   - 10/100 Fast Ethernet MAC (`0x3b000000`, IRQ 27) with NAPI descriptor rings, MDIO bus, SMSC LAN8742 PHY, DHCP (`udhcpc`), Dropbear SSH, and UDP `netconsole`.
 - **USB 2.0 OTG & Host PHY (`drivers/phy/phy-apple-s5l-usb.c`)**:
-  - Synopsys `dwc2` USB 2.0 OTG peripheral (`0x36100000`, IRQ 11) with CDC-ECM (`usb0` at `10.55.0.2/24`) and CDC-ACM (`ttyGS0`) composite gadget, plus EHCI/HSIC host PHY support.
-- **Display (`scripts/boot/hdmi-720p.h`, `arch/arm/boot/dts/apple/s5l8947x-j33iap.dts`)**:
-  - Pre-kernel 720p@60Hz HDMI transmitter/PHY (`0x39700000`) and `rgbout` display pipe (`0x3a200000`) scanning out reserved DRAM at `0x9ec00000` (`simple-framebuffer` / `fbcon`).
+  - Synopsys `dwc2` USB 2.0 OTG peripheral (`0x36100000`, IRQ 11) with CDC-ECM (`usb0` at `10.55.0.2/24`) and CDC-ACM (`ttyGS0`) composite gadget, plus EHCI/HSIC host PHY support (`0x36400000`, IRQ 12).
+- **On-Board IR & System Management MCU (`drivers/input/misc/s5l8947x-mcu.c`)**:
+  - Direct MMIO UART1 driver (`0x32600000`, IRQ 22, PMGR gate 61, 250000 baud 8N1) with 80 ms UART BREAK wake synchronization, CRC-16/CCITT-FALSE `"St"` packet framing, `S5L8947X IR Remote` input device (`/dev/input/event0`), and `j33iap:white:status` front-panel LED controller.
+- **Wireless Combo Core (`BCM4334` Wi-Fi + Bluetooth 4.0, `drivers/input/misc/s5l8947x-mcu.c`)**:
+  - Broadcom `BCM4334` 802.11a/b/g/n Wi-Fi HSIC clock/power domain manager (`wlan_reg_on@57` PMU regulator, PMGR gates 32/78) and Bluetooth 4.0 H4 HCI controller over `uart2` (`0x32700000`, IRQ 23, PMGR gate 62, 115200 baud 8N1).
+- **Display Pipe, HDMI 1.4 & M2M Scaler (`scripts/boot/hdmi-720p.h`, `drivers/video/fbdev/s5l8947x-display.c`)**:
+  - Pre-kernel 720p@60Hz HDMI transmitter/PHY (`0x39700000`), `rgbout` display pipe (`0x3a200000`) scanning out reserved DRAM at `0x9ec00000` (`simple-framebuffer` / `fbcon`), runtime Plane 0 DMA page-flipping, 10-bit 3x256 hardware Gamma LUT scaling (`0x39600000`), HDMI Audio InfoFrame/ACR bridge, and M2M hardware scaler (`0x39200000`, PMGR gate 26).
+- **Audio Engine (`drivers/video/fbdev/s5l8947x-audio.c`)**:
+  - ALSA PCM and mixer driver (`S5L8947X HDMI/SPDIF`) driving the `ae2` digital audio complex (`0x34000000`, PMGR gate 37), `i2s0` HDMI audio (`0x34190000`), and `spdif` optical TOSLINK transmitter (`0x34194000`).
+- **PowerVR SGX543 GPU (`drivers/video/fbdev/s5l8947x-sgx.c`)**:
+  - PMGR clock/power domain controller (PMGR gates 7/8/9) and core telemetry driver (`/dev/sgx0`, `core_id=0x0c3fd6a7`) for the `sgx` GPU at `0x38000000` (IRQ 49).
 
 ## Repository Layout
 
 - `arch/arm/boot/dts/apple/` — `s5l8947x.dtsi` SoC include and `s5l8947x-j33iap.dts` board device tree
 - `arch/arm/mach-apple/` — `S5L8947X` machine descriptor, `PMCCNTR` calibration, 24 MHz WDT clocksource, and `/dev/watchdog`
-- `drivers/` — Clean-room `S5L8947X` kernel drivers (`irqchip`, `clk`, `pinctrl`, `i2c`, `mfd`, `regulator`, `phy`, `net/ethernet/apple`)
+- `drivers/` — Clean-room `S5L8947X` kernel drivers (`irqchip`, `clk`, `cpufreq`, `pinctrl`, `i2c`, `mfd`, `regulator`, `phy`, `net/ethernet/apple`, `input/misc`, `video/fbdev`)
 - `config/` — Linux 6.12 configuration fragments (`s5l8947x.config`, `s5l8947x-trim.config`) and initramfs prune list
 - `initramfs/` — Early boot (`/init`), Stage 2 service bring-up, and `udhcpc` scripts
 - `scripts/` — Dockerized cross-build environment, kernel fetch/patch/build scripts, pre-kernel loader (`scripts/boot/`), and userspace diagnostic tools (`scripts/tools/`)

@@ -135,6 +135,30 @@ diff --git a/drivers/i2c/busses/Makefile b/drivers/i2c/busses/Makefile
  
  ccflags-$(CONFIG_I2C_DEBUG_BUS) := -DDEBUG
 +obj-$(CONFIG_I2C_S5L8940X)	+= i2c-s5l8940x.o
+diff --git a/drivers/input/misc/Kconfig b/drivers/input/misc/Kconfig
+--- a/drivers/input/misc/Kconfig
++++ b/drivers/input/misc/Kconfig
+@@ -942,4 +942,12 @@ config INPUT_STPMIC1_ONKEY
+ 	  To compile this driver as a module, choose M here: the
+ 	  module will be called stpmic1_onkey.
+ 
++config INPUT_S5L8947X_MCU
++	tristate "S5L8947X On-Board IR/System MCU and BCM4334 Wireless Combo support"
++	depends on NEW_LEDS
++	select LEDS_CLASS
++	default ARCH_APPLE_S5L
++	help
++	  Support for the S5L8947X on-board IR/system MCU on UART1 and BCM4334 combo core.
++
+ endif
+diff --git a/drivers/input/misc/Makefile b/drivers/input/misc/Makefile
+--- a/drivers/input/misc/Makefile
++++ b/drivers/input/misc/Makefile
+@@ -90,3 +90,4 @@ obj-$(CONFIG_INPUT_WM831X_ON)		+= wm831x-on.o
+ obj-$(CONFIG_INPUT_XEN_KBDDEV_FRONTEND)	+= xen-kbdfront.o
+ obj-$(CONFIG_INPUT_YEALINK)		+= yealink.o
+ obj-$(CONFIG_INPUT_IDEAPAD_SLIDEBAR)	+= ideapad_slidebar.o
++obj-$(CONFIG_INPUT_S5L8947X_MCU)	+= s5l8947x-mcu.o
 diff --git a/drivers/irqchip/Kconfig b/drivers/irqchip/Kconfig
 --- a/drivers/irqchip/Kconfig
 +++ b/drivers/irqchip/Kconfig
@@ -331,6 +355,50 @@ diff --git a/drivers/usb/dwc2/core.c b/drivers/usb/dwc2/core.c
  	}
  }
  
+diff --git a/drivers/video/fbdev/Kconfig b/drivers/video/fbdev/Kconfig
+--- a/drivers/video/fbdev/Kconfig
++++ b/drivers/video/fbdev/Kconfig
+@@ -1910,3 +1910,29 @@ source "drivers/video/fbdev/omap2/Kconfig"
+ source "drivers/video/fbdev/mmp/Kconfig"
+ 
+ source "drivers/video/fbdev/core/Kconfig"
++
++config FB_S5L8947X_DISPLAY
++	tristate "S5L8947X Display Pipe (rgbout), HDMI 1.4, and M2M Scaler support"
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
++	depends on OF
++	default ARCH_APPLE_S5L
++	help
++	  Support for the S5L8947X rgbout display pipe, 10-bit gamma stage,
++	  HDMI 1.4 transmitter, and M2M hardware scaler.
++
++config SND_S5L8947X_AUDIO
++	tristate "S5L8947X Audio Engine (AE2 / I2S0 / SPDIF) ALSA support"
++	depends on (ARCH_APPLE_S5L || COMPILE_TEST) && SND
++	select SND_PCM
++	select SND_TIMER
++	default ARCH_APPLE_S5L
++	help
++	  ALSA PCM and mixer support for the S5L8947X AE2 digital audio complex,
++	  I2S0 HDMI audio, and S/PDIF optical TOSLINK output.
++
++config APPLE_S5L8947X_SGX
++	tristate "S5L8947X PowerVR SGX543 GPU power/clock and telemetry support"
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
++	default ARCH_APPLE_S5L
++	help
++	  Power/clock domain and core telemetry driver for the S5L8947X SGX543 GPU.
+diff --git a/drivers/video/fbdev/Makefile b/drivers/video/fbdev/Makefile
+--- a/drivers/video/fbdev/Makefile
++++ b/drivers/video/fbdev/Makefile
+@@ -119,4 +119,7 @@ obj-$(CONFIG_FB_SSD1307)	  += ssd1307fb.o
+ obj-$(CONFIG_FB_SIMPLE)           += simplefb.o
+ 
+ # the test framebuffer is last
+ obj-$(CONFIG_FB_VIRTUAL)          += vfb.o
++obj-$(CONFIG_FB_S5L8947X_DISPLAY) += s5l8947x-display.o
++obj-$(CONFIG_SND_S5L8947X_AUDIO)  += s5l8947x-audio.o
++obj-$(CONFIG_APPLE_S5L8947X_SGX)  += s5l8947x-sgx.o
 diff --git a/init/main.c b/init/main.c
 --- a/init/main.c
 +++ b/init/main.c
