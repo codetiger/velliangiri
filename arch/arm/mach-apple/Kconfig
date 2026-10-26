@@ -1,0 +1,35 @@
+# SPDX-License-Identifier: GPL-2.0-only
+menuconfig ARCH_APPLE_S5L
+	bool "S5L8940X / S5L8947X Cortex-A9 SoCs"
+	depends on ARCH_MULTI_V7
+	select ARM_ERRATA_754322
+	select ARM_ERRATA_764369 if SMP
+	select ARM_ERRATA_775420
+	select GENERIC_IRQ_CHIP
+	select GPIOLIB
+	select PINCTRL
+	help
+	  Support for 32-bit ARMv7 S5L8940X and S5L8947X SoC platforms
+	  based on the ARM Cortex-A9 processor core.
+
+if ARCH_APPLE_S5L
+
+config APPLE_S5L_WDT_CLKEVT
+	bool "S5L8947X 24 MHz watchdog clocksource and restart handler"
+	default y
+	help
+	  Uses the S5L8947X hardware watchdog 24 MHz counter at 0x3f103020
+	  as a continuous clocksource and sched_clock that runs across WFI,
+	  calibrates the Cortex-A9 PMCCNTR delay timer, and registers a
+	  platform restart handler.
+
+config APPLE_S5L_WATCHDOG
+	bool "S5L8947X /dev/watchdog character device"
+	depends on APPLE_S5L_WDT_CLKEVT
+	default y
+	help
+	  Exposes /dev/watchdog (misc minor 130) backed by the S5L8947X
+	  hardware watchdog timer at 0x3f103020 so userspace watchdog
+	  daemons can supervise system health after boot.
+
+endif

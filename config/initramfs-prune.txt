@@ -1,0 +1,38 @@
+# SPDX-License-Identifier: GPL-2.0-only
+# Initramfs prune list for compact S5L8947X single-stream XZ bundle.
+# Applied to a staging copy of the Alpine rootfs before cpio packing.
+
+sbin/apk
+usr/lib/libapk*
+usr/lib/libssl*
+usr/lib/libcrypto*
+usr/lib/engines-3
+usr/lib/ossl-modules
+usr/bin/ssl_client
+etc/apk
+usr/sbin/rpc.*
+usr/sbin/nfsdcld
+usr/sbin/nfsdcltrack
+usr/sbin/blkmapd
+usr/sbin/fsidd
+usr/sbin/nfsrahead
+usr/sbin/exportfs
+usr/sbin/nfsstat
+usr/sbin/showmount
+usr/sbin/sm-notify
+usr/sbin/nfsconf
+usr/sbin/nfsiostat
+usr/sbin/mountstats
+usr/sbin/start-statd
+usr/lib/libsqlite3*
+usr/lib/libevent*
+usr/lib/libdevmapper*
+usr/lib/libnfsidmap*
+usr/lib/libverto*
+usr/lib/libkadm5*
+usr/lib/libkdb5*
+usr/lib/libkrad*
+usr/lib/libgssrpc*
+usr/lib/krb5
+usr/libexec
+bin/busybox.dynamic-removed
