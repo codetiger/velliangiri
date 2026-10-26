@@ -44,7 +44,7 @@ if [ -x /bin/jitterseed ]; then
 fi
 
 # Log early kernel subsystem verdicts to kmsg / HDMI console
-dmesg 2>/dev/null | grep -E "AIC-TIMER|apple-wdt|s5l-fe|dwc2" | while read -r line; do
+dmesg 2>/dev/null | grep -E "AIC-TIMER|apple-wdt|s5l8947x-cpufreq|s5l-fe|dwc2" | while read -r line; do
 	msg "verdict: $line"
 done
 

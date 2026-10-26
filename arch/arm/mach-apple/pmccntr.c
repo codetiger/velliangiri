@@ -90,5 +90,6 @@ void __init apple_s5l_pmccntr_init(unsigned long rate)
 		rate ? "measured against 24 MHz watchdog counter" : "fallback");
 
 	clocksource_register_hz(&apple_pmccntr_cs, apple_pmccntr_rate);
-	register_current_timer_delay(&apple_pmccntr_delay);
+	if (!apple_s5l_wdt_available())
+		register_current_timer_delay(&apple_pmccntr_delay);
 }

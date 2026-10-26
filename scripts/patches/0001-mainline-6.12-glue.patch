@@ -92,6 +92,29 @@ diff --git a/drivers/clk/Makefile b/drivers/clk/Makefile
  obj-$(CONFIG_ARCH_ZYNQ)			+= zynq/
  obj-$(CONFIG_COMMON_CLK_ZYNQMP)         += zynqmp/
 +obj-$(CONFIG_S5L8940X_PMGR_CLK)		+= clk-s5l8940x-pmgr.o
+diff --git a/drivers/cpufreq/Kconfig.arm b/drivers/cpufreq/Kconfig.arm
+--- a/drivers/cpufreq/Kconfig.arm
++++ b/drivers/cpufreq/Kconfig.arm
+@@ -395,3 +395,11 @@ config ARM_PXA2xx_CPUFREQ
+ 	  This add the CPUFreq driver support for Intel PXA2xx SOCs.
+ 
+ 	  If in doubt, say N.
++
++config ARM_S5L8947X_CPUFREQ
++	bool "S5L8940X / S5L8947X PMGR CPUFreq driver"
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
++	default ARCH_APPLE_S5L
++	help
++	  PMGR hardware performance-state CPU frequency scaling driver for
++	  S5L8940X and S5L8947X SoCs (212.5 MHz, 425.0 MHz, and 850.0 MHz).
+diff --git a/drivers/cpufreq/Makefile b/drivers/cpufreq/Makefile
+--- a/drivers/cpufreq/Makefile
++++ b/drivers/cpufreq/Makefile
+@@ -122,3 +122,4 @@ obj-$(CONFIG_LOONGSON3_CPUFREQ)		+= loongson3_cpufreq.o
+ obj-$(CONFIG_SH_CPU_FREQ)		+= sh-cpufreq.o
+ obj-$(CONFIG_SPARC_US2E_CPUFREQ)	+= sparc-us2e-cpufreq.o
+ obj-$(CONFIG_SPARC_US3_CPUFREQ)		+= sparc-us3-cpufreq.o
++obj-$(CONFIG_ARM_S5L8947X_CPUFREQ)	+= s5l8947x-cpufreq.o
 diff --git a/drivers/i2c/busses/Kconfig b/drivers/i2c/busses/Kconfig
 --- a/drivers/i2c/busses/Kconfig
 +++ b/drivers/i2c/busses/Kconfig
