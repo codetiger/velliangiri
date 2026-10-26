@@ -248,6 +248,7 @@ static unsigned int aic1_event_hwirq(struct apple_aic1 *aic, u32 event)
 	return aic->nr_irq;
 }
 
+void apple_aic1_rearm(void);
 void apple_aic1_rearm(void)
 {
 	struct apple_aic1 *aic = apple_aic1;

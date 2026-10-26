@@ -14,12 +14,12 @@ URL="${ALPINE_MIRROR}/alpine/v${ALPINE_BRANCH}/releases/${ALPINE_ARCH}/${TARBALL
 REPO_MAIN="${ALPINE_MIRROR}/alpine/v${ALPINE_BRANCH}/main/${ALPINE_ARCH}"
 
 DL_DIR="${ROOT}/build/dl"
-STAGE_DIR="${ROOT}/build/rootfs-stage"
-APK_WORK="${ROOT}/build/apk-unpack"
+STAGE_DIR="/tmp/velliangiri-rootfs-stage"
+APK_WORK="/tmp/velliangiri-apk-unpack"
 OUT_CPIO="${ROOT}/build/initramfs-s5l8947x.cpio"
 CROSS_CC="${CROSS_COMPILE:-arm-linux-gnueabihf-}gcc"
 
-mkdir -p "${DL_DIR}" "${ROOT}/out"
+mkdir -p "${DL_DIR}" "${ROOT}/build" "${ROOT}/out"
 
 if [ ! -f "${DL_DIR}/${TARBALL}" ]; then
 	echo "[rootfs] Downloading ${URL} ..."
@@ -30,7 +30,7 @@ fi
 echo "[rootfs] Extracting ${TARBALL} -> ${STAGE_DIR} ..."
 rm -rf "${STAGE_DIR}"
 mkdir -p "${STAGE_DIR}"
-tar -xzf "${DL_DIR}/${TARBALL}" -C "${STAGE_DIR}"
+tar --no-same-owner --no-same-permissions -xzf "${DL_DIR}/${TARBALL}" -C "${STAGE_DIR}"
 
 # Install APK packages (dropbear, nfs-utils, busybox-static) via pure-Python resolver
 echo "[rootfs] Resolving and unpacking Alpine armhf packages ..."

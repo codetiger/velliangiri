@@ -660,10 +660,16 @@ static int s5l_fe_open(struct net_device *ndev)
 					PHY_INTERFACE_MODE_RMII);
 		of_node_put(phy_node);
 	}
-	if (!phydev)
-		phydev = phy_connect_direct(ndev, phy_find_first(priv->mii_bus),
-					    s5l_fe_adjust_link,
-					    PHY_INTERFACE_MODE_RMII);
+	if (!phydev) {
+		phydev = phy_find_first(priv->mii_bus);
+		if (phydev) {
+			ret = phy_connect_direct(ndev, phydev,
+						 s5l_fe_adjust_link,
+						 PHY_INTERFACE_MODE_RMII);
+			if (ret)
+				phydev = ERR_PTR(ret);
+		}
+	}
 	if (IS_ERR_OR_NULL(phydev)) {
 		dev_err(priv->dev, "failed to connect to Ethernet PHY\n");
 		s5l_fe_free_rings(priv);

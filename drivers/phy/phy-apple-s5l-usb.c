@@ -85,11 +85,11 @@ static int s5l_usb_phy_power_on(struct phy *phy)
 	udelay(20);
 
 	writel_relaxed(0, b + ORSTCON);
-	udelay(1000);
+	mdelay(1);
 
 	writel_relaxed(0x600, b + OPHYUNK2);
 	writel_relaxed(readl_relaxed(b + OPHYUNK1) | BIT(1), b + OPHYUNK1);
-	udelay(2500);
+	mdelay(3);
 
 	dev_info(uphy->dev, "OTG PHY powered on (PWR=%#x CLK=%#x TUNE1=%#x TUNE2=%#x)\n",
 		 readl_relaxed(b + OPHYPWR), readl_relaxed(b + OPHYCLK),

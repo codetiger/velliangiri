@@ -31,7 +31,8 @@ int main(int argc, char **argv)
 {
 	struct sigaction sa;
 	int do_write = 0;
-	unsigned long phys, count = 1, write_val = 0;
+	unsigned long phys;
+	volatile unsigned long count = 1, write_val = 0;
 	unsigned long page_base, page_off, map_len;
 	int fd;
 	void *map;
@@ -102,7 +103,7 @@ int main(int argc, char **argv)
 			       phys, (int)fault_sig);
 		}
 	} else {
-		unsigned long i;
+		volatile unsigned long i;
 
 		for (i = 0; i < count; i++) {
 			unsigned long cur = phys + i * 4;

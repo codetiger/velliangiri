@@ -32,6 +32,8 @@ run_in_container() {
 		ensure_image
 		docker run --rm -i \
 			-v "${ROOT}:/workspace" \
+			-v velliangiri-kbuild:/kbuild \
+			-e KERNEL_TREE=/kbuild/linux \
 			-w /workspace \
 			"${IMAGE}" "$@"
 	fi

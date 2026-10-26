@@ -13,6 +13,8 @@
 #include <asm/mach/map.h>
 #include <asm/system_misc.h>
 
+#include "s5l8947x.h"
+
 /*
  * Static early mappings:
  *  - UART0 at 0x32500000 -> 0xfee00000

@@ -9,6 +9,7 @@
 #include <linux/of.h>
 #include <linux/of_address.h>
 #include <linux/platform_device.h>
+#include <linux/slab.h>
 
 struct s5l8940x_pmgr_gate {
 	struct clk_hw hw;

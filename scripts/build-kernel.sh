@@ -5,7 +5,7 @@
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-TREE="${ROOT}/build/linux"
+TREE="${KERNEL_TREE:-${ROOT}/build/linux}"
 OUT="${ROOT}/out"
 CONFIG_BASE="${ROOT}/config/s5l8947x.config"
 CONFIG_TRIM="${ROOT}/config/s5l8947x-trim.config"

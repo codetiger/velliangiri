@@ -13,12 +13,11 @@
 #include <linux/uaccess.h>
 #include <linux/watchdog.h>
 
+#include "s5l8947x.h"
+
 #define S5L_WDT_DEFAULT_TIMEOUT	60U
 #define S5L_WDT_MIN_TIMEOUT	5U
 #define S5L_WDT_MAX_TIMEOUT	170U
-
-extern void apple_s5l_wdt_takeover(u32 timeout_seconds);
-extern void apple_s5l_wdt_feed(void);
 
 static unsigned int wdt_timeout = S5L_WDT_DEFAULT_TIMEOUT;
 static unsigned long wdt_is_open;
@@ -97,7 +96,7 @@ static long s5l_wdt_ioctl(struct file *file, unsigned int cmd,
 
 static const struct file_operations s5l_wdt_fops = {
 	.owner		= THIS_MODULE,
-	.llseek		= no_llseek,
+	.llseek		= noop_llseek,
 	.write		= s5l_wdt_write,
 	.unlocked_ioctl	= s5l_wdt_ioctl,
 	.compat_ioctl	= compat_ptr_ioctl,

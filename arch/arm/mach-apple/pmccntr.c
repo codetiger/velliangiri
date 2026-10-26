@@ -15,10 +15,9 @@
 #include <linux/kernel.h>
 #include <linux/timex.h>
 
-#define S5L_CPU_FREQ_DEFAULT_HZ	800000000UL
+#include "s5l8947x.h"
 
-extern void apple_s5l_early_puts(const char *s);
-extern void apple_s5l_early_puthex(u32 v);
+#define S5L_CPU_FREQ_DEFAULT_HZ	800000000UL
 
 static inline u32 read_pmccntr(void)
 {

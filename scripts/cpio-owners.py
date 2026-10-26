@@ -40,13 +40,17 @@ def process_cpio(data: bytes) -> bytes:
         next_pos = align4(data_end)
 
         raw_name = data[name_start : name_end - 1].lstrip(b"./")
-        if raw_name != b"TRAILER!!!":
-            # Force root ownership (uid=0, grp=0)
-            hdr[22:30] = b"00000000"
-            hdr[30:38] = b"00000000"
-            if raw_name in SETUID_PATHS:
-                c_mode |= 0o4000
-                hdr[14:22] = f"{c_mode:08X}".encode("ascii")
+        if raw_name == b"TRAILER!!!":
+            out.extend(hdr)
+            out.extend(data[name_start:])
+            break
+
+        # Force root ownership (uid=0, grp=0)
+        hdr[22:30] = b"00000000"
+        hdr[30:38] = b"00000000"
+        if raw_name in SETUID_PATHS:
+            c_mode |= 0o4000
+            hdr[14:22] = f"{c_mode:08X}".encode("ascii")
 
         out.extend(hdr)
         out.extend(data[name_start:next_pos])

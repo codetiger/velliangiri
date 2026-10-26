@@ -25,12 +25,10 @@ OBJCOPY="${CROSS}objcopy"
 mkdir -p "${BOOT_BUILD}" "${OUT}"
 
 echo "[bundle] Compiling pre-kernel loader (0x80000000, PMGR + 720p HDMI) ..."
-"${CC}" -march=armv7-a -marm -ffreestanding -fno-builtin -fno-stack-protector \
-	-O2 -Wall -Wextra -c "${BOOT_SRC}/boot-start.S" -o "${BOOT_BUILD}/boot-start.o"
-"${CC}" -march=armv7-a -marm -ffreestanding -fno-builtin -fno-stack-protector \
-	-O2 -Wall -Wextra -c "${BOOT_SRC}/boot-loader.c" -o "${BOOT_BUILD}/boot-loader.o"
-"${CC}" -march=armv7-a -marm -ffreestanding -fno-builtin -fno-stack-protector \
-	-O2 -Wall -Wextra -c "${BOOT_SRC}/pmgr-init.c" -o "${BOOT_BUILD}/pmgr-init.o"
+CFLAGS_BOOT=(-march=armv7-a -marm -mfloat-abi=soft -ffreestanding -fno-builtin -fno-stack-protector -O2 -Wall -Wextra)
+"${CC}" "${CFLAGS_BOOT[@]}" -c "${BOOT_SRC}/boot-start.S" -o "${BOOT_BUILD}/boot-start.o"
+"${CC}" "${CFLAGS_BOOT[@]}" -c "${BOOT_SRC}/boot-loader.c" -o "${BOOT_BUILD}/boot-loader.o"
+"${CC}" "${CFLAGS_BOOT[@]}" -c "${BOOT_SRC}/pmgr-init.c" -o "${BOOT_BUILD}/pmgr-init.o"
 
 "${LD}" -T "${BOOT_SRC}/boot-loader.ld" \
 	"${BOOT_BUILD}/boot-start.o" \
@@ -55,9 +53,9 @@ fi
 echo "[bundle] Packing inner payload (boot-loader + zImage @ +0x8000 + DTB @ +0x2000000) ..."
 INNER="${BOOT_BUILD}/inner-bundle.bin"
 rm -f "${INNER}"
-dd if=/dev/zero bs=1 count=0 seek="${DTB_OFFSET}" of="${INNER}" 2>/dev/null
-dd if="${BOOT_BUILD}/boot-loader.bin" of="${INNER}" bs=1 conv=notrunc 2>/dev/null
-dd if="${ZIMAGE}" of="${INNER}" bs=1 seek=$((0x8000)) conv=notrunc 2>/dev/null
+truncate -s "${DTB_OFFSET}" "${INNER}"
+dd if="${BOOT_BUILD}/boot-loader.bin" of="${INNER}" bs=4096 conv=notrunc 2>/dev/null
+dd if="${ZIMAGE}" of="${INNER}" bs=32768 seek=1 conv=notrunc 2>/dev/null
 cat "${DTB}" >> "${INNER}"
 
 # Pad inner bundle to a 32-byte boundary for entry-stub ldmia/stmia copy loop
@@ -69,7 +67,7 @@ fi
 INNER_SIZE=$(wc -c < "${INNER}" | tr -d ' ')
 
 echo "[bundle] Compiling position-independent entry stub (BUNDLE_SIZE=${INNER_SIZE}) ..."
-"${CC}" -march=armv7-a -marm -ffreestanding -fno-builtin \
+"${CC}" "${CFLAGS_BOOT[@]}" \
 	-DBUNDLE_SIZE="${INNER_SIZE}" \
 	-c "${BOOT_SRC}/entry-stub.S" -o "${BOOT_BUILD}/entry-stub.o"
 "${LD}" -T "${BOOT_SRC}/entry-stub.ld" "${BOOT_BUILD}/entry-stub.o" -o "${BOOT_BUILD}/entry-stub.elf"

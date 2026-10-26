@@ -221,7 +221,7 @@ diff --git a/drivers/phy/Makefile b/drivers/phy/Makefile
 diff --git a/drivers/pinctrl/Kconfig b/drivers/pinctrl/Kconfig
 --- a/drivers/pinctrl/Kconfig
 +++ b/drivers/pinctrl/Kconfig
-@@ -618,4 +618,11 @@ source "drivers/pinctrl/uniphier/Kconfig"
+@@ -618,4 +618,13 @@ source "drivers/pinctrl/uniphier/Kconfig"
  source "drivers/pinctrl/visconti/Kconfig"
  source "drivers/pinctrl/vt8500/Kconfig"
  
@@ -231,6 +231,8 @@ diff --git a/drivers/pinctrl/Kconfig b/drivers/pinctrl/Kconfig
 +	select PINMUX
 +	select PINCONF
 +	select GENERIC_PINCONF
++	select GENERIC_PINCTRL_GROUPS
++	select GENERIC_PINMUX_FUNCTIONS
 +	default y
  endif
 diff --git a/drivers/pinctrl/Makefile b/drivers/pinctrl/Makefile

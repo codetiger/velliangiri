@@ -11,9 +11,9 @@ TARBALL="linux-${KERNEL_VERSION}.tar.xz"
 URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/${TARBALL}"
 
 DL_DIR="${ROOT}/build/dl"
-TREE_DIR="${ROOT}/build/linux"
+TREE_DIR="${KERNEL_TREE:-${ROOT}/build/linux}"
 
-mkdir -p "${DL_DIR}"
+mkdir -p "${DL_DIR}" "$(dirname "${TREE_DIR}")"
 
 if [ -f "${TREE_DIR}/Makefile" ]; then
 	echo "[fetch-kernel] Kernel tree already present at ${TREE_DIR}"
@@ -29,6 +29,6 @@ fi
 echo "[fetch-kernel] Extracting ${TARBALL} -> ${TREE_DIR} ..."
 rm -rf "${TREE_DIR}.tmp"
 mkdir -p "${TREE_DIR}.tmp"
-tar -xf "${DL_DIR}/${TARBALL}" --strip-components=1 -C "${TREE_DIR}.tmp"
+tar --no-same-owner --no-same-permissions -xf "${DL_DIR}/${TARBALL}" --strip-components=1 -C "${TREE_DIR}.tmp"
 mv "${TREE_DIR}.tmp" "${TREE_DIR}"
 echo "[fetch-kernel] Linux ${KERNEL_VERSION} ready at ${TREE_DIR}"

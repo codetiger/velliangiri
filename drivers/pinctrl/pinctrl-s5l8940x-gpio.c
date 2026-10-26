@@ -27,6 +27,7 @@
 
 #include "core.h"
 #include "pinconf.h"
+#include "pinmux.h"
 #include "pinctrl-utils.h"
 
 struct s5l8940x_gpio_pinctrl {
@@ -216,7 +217,7 @@ static int s5l8940x_pinconf_get(struct pinctrl_dev *pctldev, unsigned int pin,
 	u32 cfg = s5l8940x_get_bits(agp, pin);
 	u32 arg = 0;
 
-	switch (param) {
+	switch ((u32)param) {
 	case PIN_CONFIG_BIAS_DISABLE:
 		if ((cfg & REG_PIN_PULL_MASK) != REG_PIN_PULL_DISABLE)
 			return -EINVAL;
@@ -256,7 +257,7 @@ static int s5l8940x_pinconf_get(struct pinctrl_dev *pctldev, unsigned int pin,
 	case PIN_CONFIG_SLEW_RATE:
 		arg = (cfg & REG_PIN_SLEW_MASK) >> REG_PIN_SLEW_SHIFT;
 		break;
-	case (enum pin_config_param)PIN_CONFIG_PERIPH:
+	case PIN_CONFIG_PERIPH:
 		if ((cfg & REG_PIN_MODE_MASK) != REG_PIN_MODE_OUTPUT_1 &&
 		    (cfg & REG_PIN_MODE_MASK) != REG_PIN_MODE_INPUT)
 			return -EINVAL;
@@ -283,7 +284,7 @@ static int s5l8940x_pinconf_set(struct pinctrl_dev *pctldev, unsigned int pin,
 		param = pinconf_to_config_param(configs[i]);
 		arg = pinconf_to_config_argument(configs[i]);
 
-		switch (param) {
+		switch ((u32)param) {
 		case PIN_CONFIG_BIAS_DISABLE:
 			mask |= REG_PIN_PULL_MASK;
 			val = (val & ~REG_PIN_PULL_MASK) | REG_PIN_PULL_DISABLE;
@@ -337,7 +338,7 @@ static int s5l8940x_pinconf_set(struct pinctrl_dev *pctldev, unsigned int pin,
 			val = (val & ~REG_PIN_SLEW_MASK) |
 			      ((arg << REG_PIN_SLEW_SHIFT) & REG_PIN_SLEW_MASK);
 			break;
-		case (enum pin_config_param)PIN_CONFIG_PERIPH:
+		case PIN_CONFIG_PERIPH:
 			mask |= REG_PIN_MODE_MASK | REG_PIN_PERIPH_MASK;
 			val = (val & ~(REG_PIN_MODE_MASK | REG_PIN_PERIPH_MASK)) |
 			      (((arg >> 1) << REG_PIN_PERIPH_SHIFT) & REG_PIN_PERIPH_MASK) |

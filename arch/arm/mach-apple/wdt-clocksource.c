@@ -28,6 +28,8 @@
 #include <linux/seqlock.h>
 #include <linux/spinlock.h>
 
+#include "s5l8947x.h"
+
 #define S5L_WDT_VIRT_BASE	0xfee01020UL
 #define WDT_CUR_TIME		0x00
 #define WDT_BITE_TIME		0x04
@@ -41,17 +43,13 @@
 #define WDT_BOOT_BITE_SECONDS	600U
 #define WDT_BOOT_BITE_TICKS	(WDT_BOOT_BITE_SECONDS * WDT_RATE_HZ)
 
-extern void apple_s5l_early_puts(const char *s);
-extern void apple_s5l_early_puthex(u32 v);
-extern void __init apple_s5l_pmccntr_set_freq(unsigned long hz);
-
 static inline void __iomem *wdt_base(void)
 {
 	return (void __iomem *)S5L_WDT_VIRT_BASE;
 }
 
 static DEFINE_RAW_SPINLOCK(wdt_lock);
-static seqcount_raw_spinlock_t wdt_seq = SEQCNT_RAW_SPINLOCK_INITIALIZER(wdt_seq, &wdt_lock);
+static seqcount_raw_spinlock_t wdt_seq = SEQCNT_RAW_SPINLOCK_ZERO(wdt_seq, &wdt_lock);
 static u64 wdt_offset;
 static u32 wdt_bite_ticks = WDT_BOOT_BITE_TICKS;
 static bool wdt_userspace_active;
