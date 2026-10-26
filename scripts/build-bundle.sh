@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
 # Assemble the self-relocating S5L8947X (j33iap) boot bundle:
-#   [entry-stub] + [boot-loader @ +0x0000] + [zImage @ +0x8000] + [DTB @ +0x2000000]
+#   [entry-stub] + [boot-loader @ +0x0000 (padded to 0x8000)] + [zImage @ +0x8000] + [DTB]
 
 set -euo pipefail
 
@@ -24,10 +24,13 @@ OBJCOPY="${CROSS}objcopy"
 
 mkdir -p "${BOOT_BUILD}" "${OUT}"
 
-echo "[bundle] Compiling pre-kernel loader (0x80000000, PMGR + 720p HDMI) ..."
+ZIMAGE_SIZE=$(wc -c < "${ZIMAGE}" | tr -d ' ')
+DTB_PHYS=$(printf "0x%08xU" $((0x80008000 + ZIMAGE_SIZE)))
+
+echo "[bundle] Compiling pre-kernel loader (0x80000000, PMGR + 720p HDMI, DTB_PHYS=${DTB_PHYS}) ..."
 CFLAGS_BOOT=(-march=armv7-a -marm -mfloat-abi=soft -ffreestanding -fno-builtin -fno-stack-protector -O2 -Wall -Wextra)
 "${CC}" "${CFLAGS_BOOT[@]}" -c "${BOOT_SRC}/boot-start.S" -o "${BOOT_BUILD}/boot-start.o"
-"${CC}" "${CFLAGS_BOOT[@]}" -c "${BOOT_SRC}/boot-loader.c" -o "${BOOT_BUILD}/boot-loader.o"
+"${CC}" "${CFLAGS_BOOT[@]}" -DDTB_PHYS="${DTB_PHYS}" -c "${BOOT_SRC}/boot-loader.c" -o "${BOOT_BUILD}/boot-loader.o"
 "${CC}" "${CFLAGS_BOOT[@]}" -c "${BOOT_SRC}/pmgr-init.c" -o "${BOOT_BUILD}/pmgr-init.o"
 
 "${LD}" -T "${BOOT_SRC}/boot-loader.ld" \
@@ -43,20 +46,12 @@ if [ "${LOADER_SIZE}" -gt 32768 ]; then
 	exit 1
 fi
 
-ZIMAGE_SIZE=$(wc -c < "${ZIMAGE}" | tr -d ' ')
-DTB_OFFSET=$((0x2000000))
-if [ $((0x8000 + ZIMAGE_SIZE)) -gt "${DTB_OFFSET}" ]; then
-	echo "[bundle] ERROR: zImage (${ZIMAGE_SIZE} bytes) overlaps DTB slot at +0x2000000" >&2
-	exit 1
-fi
-
-echo "[bundle] Packing inner payload (boot-loader + zImage @ +0x8000 + DTB @ +0x2000000) ..."
+echo "[bundle] Packing inner payload (boot-loader + zImage @ +0x8000 + appended DTB) ..."
 INNER="${BOOT_BUILD}/inner-bundle.bin"
 rm -f "${INNER}"
-truncate -s "${DTB_OFFSET}" "${INNER}"
+truncate -s 32768 "${INNER}"
 dd if="${BOOT_BUILD}/boot-loader.bin" of="${INNER}" bs=4096 conv=notrunc 2>/dev/null
-dd if="${ZIMAGE}" of="${INNER}" bs=32768 seek=1 conv=notrunc 2>/dev/null
-cat "${DTB}" >> "${INNER}"
+cat "${ZIMAGE}" "${DTB}" >> "${INNER}"
 
 # Pad inner bundle to a 32-byte boundary for entry-stub ldmia/stmia copy loop
 INNER_RAW=$(wc -c < "${INNER}" | tr -d ' ')
@@ -68,12 +63,11 @@ INNER_SIZE=$(wc -c < "${INNER}" | tr -d ' ')
 
 echo "[bundle] Compiling position-independent entry stub (BUNDLE_SIZE=${INNER_SIZE}) ..."
 "${CC}" "${CFLAGS_BOOT[@]}" \
+	-DPAYLOAD_PATH="\"${INNER}\"" \
 	-DBUNDLE_SIZE="${INNER_SIZE}" \
 	-c "${BOOT_SRC}/entry-stub.S" -o "${BOOT_BUILD}/entry-stub.o"
 "${LD}" -T "${BOOT_SRC}/entry-stub.ld" "${BOOT_BUILD}/entry-stub.o" -o "${BOOT_BUILD}/entry-stub.elf"
-"${OBJCOPY}" -O binary "${BOOT_BUILD}/entry-stub.elf" "${BOOT_BUILD}/entry-stub.bin"
-
-cat "${BOOT_BUILD}/entry-stub.bin" "${INNER}" > "${BUNDLE_OUT}"
+"${OBJCOPY}" -O binary "${BOOT_BUILD}/entry-stub.elf" "${BUNDLE_OUT}"
 cp "${BOOT_BUILD}/boot-loader.bin" "${OUT}/boot-loader.bin"
 
 echo "[bundle] Created self-relocating boot bundle:"

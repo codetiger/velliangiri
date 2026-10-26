@@ -5,194 +5,143 @@
 
 #include <dt-bindings/gpio/gpio.h>
 #include <dt-bindings/interrupt-controller/irq.h>
-#include <dt-bindings/pinctrl/apple.h>
 
 / {
 	#address-cells = <1>;
 	#size-cells = <1>;
-	compatible = "apple,s5l8947x", "apple,s5l8940x", "apple,s5l89xx";
+	interrupt-parent = <&aic>;
+	compatible = "apple,s5l8947x", "apple,s5l8940x", "apple,arm";
 
 	cpus {
 		#address-cells = <1>;
 		#size-cells = <0>;
 
-		cpu@0 {
+		cpu0: cpu@0 {
 			device_type = "cpu";
 			compatible = "arm,cortex-a9";
 			reg = <0>;
 		};
 	};
 
-	clocks {
-		osc24m: clock-osc24m {
-			compatible = "fixed-clock";
-			#clock-cells = <0>;
-			clock-frequency = <24000000>;
-			clock-output-names = "osc24m";
-		};
-
-		clk_100m: clock-100m {
-			compatible = "fixed-clock";
-			#clock-cells = <0>;
-			clock-frequency = <100000000>;
-			clock-output-names = "clk_100m";
-		};
+	l2: cache-controller@3e000000 {
+		compatible = "arm,pl310-cache";
+		reg = <0x3e000000 0x1000>;
+		cache-unified;
+		cache-level = <2>;
+		status = "disabled";
 	};
 
-	soc {
+	osc24m: clock-24000000 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <24000000>;
+		clock-output-names = "osc24m";
+	};
+
+	soc: soc@30000000 {
 		compatible = "simple-bus";
 		#address-cells = <1>;
 		#size-cells = <1>;
-		ranges;
+		ranges = <0x0 0x30000000 0x10000000>;
 
-		aic: interrupt-controller@3f200000 {
-			compatible = "apple,s5l8947x-aic", "apple,s5l8940x-aic", "apple,aic";
+		aic: interrupt-controller@f200000 {
+			compatible = "aic,1", "apple,aic1";
+			reg = <0xf200000 0x10000>;
+			interrupt-controller;
 			#interrupt-cells = <1>;
-			interrupt-controller;
-			reg = <0x3f200000 0x8000>;
+			#address-cells = <0>;
+			apple,main-cpus = <1>;
 		};
 
-		wdt: watchdog@3f103020 {
-			compatible = "apple,s5l8947x-wdt", "apple,s5l8940x-wdt";
-			reg = <0x3f103020 0x20>;
-			interrupt-parent = <&aic>;
-			interrupts = <0>;
-			clocks = <&osc24m>;
-		};
-
-		pmgr: clock-controller@3f100000 {
-			compatible = "apple,s5l8947x-pmgr-clocks", "apple,s5l8940x-pmgr-clocks";
-			#clock-cells = <1>;
-			reg = <0x3f100000 0x1000>;
-			clocks = <&osc24m>;
-			clock-indices = <
-				112 113 114 115 116 117 118
-				119 120 121 122 123
-				126 127 128 129 130 131 132 133 134 135 136 137 138
-				139 140 141 142 143 144 145
-				162 164 166
-				173 174 176 177 178 179 180 181 182 183 184 185 186 187 188 189
-				191
-			>;
-			clock-output-names =
-				"mcu0", "mcu1", "disp0", "disp-fe", "rgbout", "disp-be", "venet",
-				"edp", "vdec", "scaler", "venc", "isp",
-				"usb-complex", "usb-otg", "usb-ehci", "usb-ohci", "usb-ohci1",
-				"usb11phy", "usb20phy", "audio", "hpark", "sata", "adbe0", "adbe1", "dwi",
-				"gpio", "pke", "aes", "fmi0", "fmi0bch", "fmi1", "fmi1bch",
-				"spi0", "spi2", "spi4",
-				"uart0", "uart1", "uart3", "uart4", "uart5", "uart6",
-				"i2c0", "i2c1", "i2c2", "mca0", "mca1", "mca2", "mca3", "mca4", "pwm0", "eth",
-				"hsic0phy";
-		};
-
-		pinctrl: pinctrl@3f000000 {
-			compatible = "apple,s5l8947x-gpio", "apple,s5l8940x-gpio";
-			reg = <0x3f000000 0x1000>;
-			clocks = <&pmgr 25>;
-			apple,npins = <224>;
-			apple,nirqs = <224>;
-			gpio-controller;
-			#gpio-cells = <2>;
-			interrupt-controller;
-			#interrupt-cells = <2>;
-			interrupt-parent = <&aic>;
-			interrupts = <28>, <29>, <30>, <31>, <32>, <33>, <34>;
-		};
-
-		uart0: serial@32500000 {
-			compatible = "apple,s5l-uart";
-			reg = <0x32500000 0x1000>;
-			interrupt-parent = <&aic>;
-			interrupts = <12>;
+		uart0: serial@2500000 {
+			compatible = "apple,s5l-uart", "samsung,s3c6400-uart";
+			reg = <0x2500000 0x1000>;
+			interrupts = <21>;
 			clocks = <&osc24m>, <&osc24m>;
 			clock-names = "uart", "clk_uart_baud0";
+			status = "disabled";
 		};
 
-		i2c0: i2c@33200000 {
-			compatible = "apple,s5l8947x-i2c", "apple,s5l8940x-i2c", "apple,i2c";
-			reg = <0x33200000 0x1000>;
-			interrupt-parent = <&aic>;
+		wdt: timer@f103020 {
+			compatible = "apple,s5l8947x-wdt", "apple,s5l8940x-wdt-timer";
+			reg = <0xf103020 0x10>;
+			interrupts = <4>;
+			clock-frequency = <24000000>;
+			status = "okay";
+		};
+
+		pmgr: power-management@f100000 {
+			compatible = "apple,s5l8940x-pmgr", "syscon";
+			reg = <0xf100000 0x7000>;
+			status = "disabled";
+		};
+
+		i2c0: i2c@3200000 {
+			compatible = "apple,s5l8947x-i2c", "apple,s5l8940x-i2c";
+			reg = <0x3200000 0x1000>;
 			interrupts = <18>;
-			clocks = <&pmgr 41>;
 			clock-frequency = <100000>;
+			clocks = <&osc24m>;
+			clock-names = "i2c";
 			#address-cells = <1>;
 			#size-cells = <0>;
 			status = "disabled";
 		};
 
-		i2c1: i2c@33300000 {
-			compatible = "apple,s5l8947x-i2c", "apple,s5l8940x-i2c", "apple,i2c";
-			reg = <0x33300000 0x1000>;
-			interrupt-parent = <&aic>;
+		i2c1: i2c@3300000 {
+			compatible = "apple,s5l8947x-i2c", "apple,s5l8940x-i2c";
+			reg = <0x3300000 0x1000>;
 			interrupts = <19>;
-			clocks = <&pmgr 42>;
 			clock-frequency = <100000>;
+			clocks = <&osc24m>;
+			clock-names = "i2c";
 			#address-cells = <1>;
 			#size-cells = <0>;
 			status = "disabled";
 		};
 
-		i2c2: i2c@33400000 {
-			compatible = "apple,s5l8947x-i2c", "apple,s5l8940x-i2c", "apple,i2c";
-			reg = <0x33400000 0x1000>;
-			interrupt-parent = <&aic>;
+		i2c2: i2c@3400000 {
+			compatible = "apple,s5l8947x-i2c", "apple,s5l8940x-i2c";
+			reg = <0x3400000 0x1000>;
 			interrupts = <20>;
-			clocks = <&pmgr 43>;
 			clock-frequency = <100000>;
+			clocks = <&osc24m>;
+			clock-names = "i2c";
 			#address-cells = <1>;
 			#size-cells = <0>;
 			status = "disabled";
 		};
 
-		usb_phy: usb-phy@36000000 {
-			compatible = "apple,s5l8947x-usb-phy", "apple,s5l-usb-phy";
-			reg = <0x36000000 0x100>;
+		usb_phy: phy@6000000 {
+			compatible = "apple,s5l8947x-otgphy", "apple,s5l-usb-phy";
+			reg = <0x6000000 0x1000>,
+			      <0xf108000 0x1000>,
+			      <0x6100e00 0x4>;
 			#phy-cells = <1>;
-			apple,phy-clk-sel = <0x0>;
-			apple,phy-tune1 = <0x349>;
-			apple,phy-tune2 = <0x6ff3>;
+			apple,clock-gates = <30 31 36>;
+			apple,uotgtune1-device = <0x349>;
+			apple,uotgtune2-device = <0x6ff3>;
+			status = "okay";
 		};
 
-		usb0: usb@36100000 {
-			compatible = "snps,dwc2";
-			reg = <0x36100000 0x100000>;
-			interrupt-parent = <&aic>;
+		usb0: usb@6100000 {
+			compatible = "apple,s5l8940x-dwc2", "snps,dwc2";
+			reg = <0x6100000 0x10000>;
 			interrupts = <11>;
-			clocks = <&pmgr 13>;
-			clock-names = "otg";
 			phys = <&usb_phy 0>;
 			phy-names = "usb2-phy";
 			dr_mode = "peripheral";
-			g-rx-fifo-size = <544>;
-			g-np-tx-fifo-size = <32>;
-			g-tx-fifo-size = <128 128 64 64 64 64>;
+			g-rx-fifo-size = <512>;
+			g-np-tx-fifo-size = <128>;
+			g-tx-fifo-size = <128 128 128 128 128 128 128 128>;
+			status = "okay";
 		};
 
-		ehci0: usb@37000000 {
-			compatible = "generic-ehci";
-			reg = <0x37000000 0x1000>;
-			interrupt-parent = <&aic>;
-			interrupts = <9>;
-			clocks = <&pmgr 14>, <&pmgr 12>, <&pmgr 51>;
-			phys = <&usb_phy 1>;
-			phy-names = "usb";
-		};
-
-		ohci0: usb@37100000 {
-			compatible = "generic-ohci";
-			reg = <0x37100000 0x1000>;
-			interrupt-parent = <&aic>;
-			interrupts = <10>;
-			clocks = <&pmgr 15>, <&pmgr 12>;
-		};
-
-		eth0: ethernet@3b000000 {
-			compatible = "apple,s5l8947x-ethernet", "apple,s5l-fe";
-			reg = <0x3b000000 0x1000>;
-			interrupt-parent = <&aic>;
+		eth0: ethernet@b000000 {
+			compatible = "apple,s5l8947x-ethernet";
+			reg = <0xb000000 0x10000>;
 			interrupts = <27>;
-			clocks = <&pmgr 50>;
+			apple,clock-gate = <79>;
 			status = "disabled";
 		};
 	};

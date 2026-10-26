@@ -5,16 +5,13 @@
 #include <linux/init.h>
 #include <linux/types.h>
 
-void apple_s5l_early_putc(char c);
-void apple_s5l_early_puts(const char *s);
-void apple_s5l_early_puthex(u32 v);
-void apple_s5l_wdt_crumb(u32 val);
-void apple_s5l_wdt_kick(u32 seconds);
+void __init apple_s5l_pmccntr_enable_counter(void);
+void __init apple_s5l_pmccntr_init(unsigned long rate);
+unsigned long __init apple_s5l_calibrate_cpu_hz(void);
+void __init apple_s5l_wdt_clocksource_init(void);
 
-void __init apple_s5l_pmccntr_init(void);
-void __init apple_s5l_pmccntr_set_freq(unsigned long hz);
-
-void apple_s5l_wdt_takeover(u32 timeout_seconds);
-void apple_s5l_wdt_feed(void);
+bool apple_s5l_wdt_available(void);
+void apple_s5l_wdt_rebase_and_arm(u32 bite_ticks);
+void apple_s5l_wdt_reset_enable(bool on);
 
 #endif /* __ARCH_ARM_MACH_APPLE_S5L8947X_H */

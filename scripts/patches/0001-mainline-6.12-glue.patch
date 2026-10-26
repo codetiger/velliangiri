@@ -311,14 +311,18 @@ diff --git a/drivers/usb/dwc2/core.c b/drivers/usb/dwc2/core.c
 diff --git a/init/main.c b/init/main.c
 --- a/init/main.c
 +++ b/init/main.c
-@@ -1466,6 +1466,12 @@ static int __ref kernel_init(void *unused)
+@@ -1466,6 +1466,16 @@ static int __ref kernel_init(void *unused)
  	 */
  	wait_for_completion(&kthreadd_done);
  
 +#ifdef CONFIG_ARCH_APPLE_S5L
 +	{
++		void apple_aic1_quiesce(void);
 +		void apple_aic1_rearm(void);
++		apple_aic1_quiesce();
 +		apple_aic1_rearm();
++		early_boot_irqs_disabled = false;
++		local_irq_enable();
 +	}
 +#endif
  	kernel_init_freeable();

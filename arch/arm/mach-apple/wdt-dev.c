@@ -1,124 +1,90 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * S5L8947X /dev/watchdog character device driver.
- *
- * Exposes standard Linux /dev/watchdog (misc minor 130) backed by the
- * hardware watchdog rebase helpers in wdt-clocksource.c.
+ * /dev/watchdog driver for S5L8940X / S5L8947X hardware watchdog timer.
  */
 
-#include <linux/fs.h>
+#define pr_fmt(fmt) "apple-wdt: " fmt
+
 #include <linux/init.h>
 #include <linux/kernel.h>
-#include <linux/miscdevice.h>
-#include <linux/uaccess.h>
+#include <linux/module.h>
+#include <linux/types.h>
 #include <linux/watchdog.h>
 
 #include "s5l8947x.h"
 
-#define S5L_WDT_DEFAULT_TIMEOUT	60U
-#define S5L_WDT_MIN_TIMEOUT	5U
-#define S5L_WDT_MAX_TIMEOUT	170U
+#define APPLE_WDT_HZ		24000000U
+#define APPLE_WDT_MAX_SECS	170U
+#define APPLE_WDT_DEFAULT_SECS	60U
 
-static unsigned int wdt_timeout = S5L_WDT_DEFAULT_TIMEOUT;
-static unsigned long wdt_is_open;
-
-static int s5l_wdt_open(struct inode *inode, struct file *file)
+static int apple_wdt_ping(struct watchdog_device *wdd)
 {
-	if (test_and_set_bit(0, &wdt_is_open))
-		return -EBUSY;
-
-	apple_s5l_wdt_takeover(wdt_timeout);
-	pr_info("s5l8947x-wdt: /dev/watchdog opened, hardware bite set to %u s\n",
-		wdt_timeout);
-	return stream_open(inode, file);
-}
-
-static int s5l_wdt_release(struct inode *inode, struct file *file)
-{
-	/*
-	 * Intentionally keep the hardware watchdog armed on close (nowayout)
-	 * so a crashed watchdog daemon triggers a clean hardware reset.
-	 */
-	apple_s5l_wdt_feed();
-	clear_bit(0, &wdt_is_open);
-	pr_warn("s5l8947x-wdt: /dev/watchdog closed; hardware timer remains armed (%u s)\n",
-		wdt_timeout);
+	apple_s5l_wdt_rebase_and_arm(wdd->timeout * APPLE_WDT_HZ);
 	return 0;
 }
 
-static ssize_t s5l_wdt_write(struct file *file, const char __user *data,
-			     size_t len, loff_t *ppos)
+static int apple_wdt_start(struct watchdog_device *wdd)
 {
-	if (len)
-		apple_s5l_wdt_feed();
-	return len;
+	apple_wdt_ping(wdd);
+	apple_s5l_wdt_reset_enable(true);
+	return 0;
 }
 
-static const struct watchdog_info s5l_wdt_ident = {
-	.options		= WDIOF_SETTIMEOUT | WDIOF_KEEPALIVEPING,
-	.firmware_version	= 1,
-	.identity		= "s5l8947x-wdt",
+static int apple_wdt_stop(struct watchdog_device *wdd)
+{
+	apple_s5l_wdt_reset_enable(false);
+	return 0;
+}
+
+static int apple_wdt_set_timeout(struct watchdog_device *wdd, unsigned int secs)
+{
+	wdd->timeout = secs;
+	if (watchdog_active(wdd))
+		apple_wdt_ping(wdd);
+	return 0;
+}
+
+static const struct watchdog_info apple_wdt_info = {
+	.identity	= "S5L8947X Watchdog",
+	.options	= WDIOF_SETTIMEOUT | WDIOF_KEEPALIVEPING | WDIOF_MAGICCLOSE,
 };
 
-static long s5l_wdt_ioctl(struct file *file, unsigned int cmd,
-			  unsigned long arg)
-{
-	void __user *argp = (void __user *)arg;
-	int __user *p = argp;
-	int new_timeout;
-
-	switch (cmd) {
-	case WDIOC_GETSUPPORT:
-		return copy_to_user(argp, &s5l_wdt_ident,
-				    sizeof(s5l_wdt_ident)) ? -EFAULT : 0;
-	case WDIOC_GETSTATUS:
-	case WDIOC_GETBOOTSTATUS:
-		return put_user(0, p);
-	case WDIOC_KEEPALIVE:
-		apple_s5l_wdt_feed();
-		return 0;
-	case WDIOC_SETTIMEOUT:
-		if (get_user(new_timeout, p))
-			return -EFAULT;
-		if (new_timeout < (int)S5L_WDT_MIN_TIMEOUT)
-			new_timeout = S5L_WDT_MIN_TIMEOUT;
-		if (new_timeout > (int)S5L_WDT_MAX_TIMEOUT)
-			new_timeout = S5L_WDT_MAX_TIMEOUT;
-		wdt_timeout = (unsigned int)new_timeout;
-		apple_s5l_wdt_takeover(wdt_timeout);
-		return put_user((int)wdt_timeout, p);
-	case WDIOC_GETTIMEOUT:
-		return put_user((int)wdt_timeout, p);
-	default:
-		return -ENOTTY;
-	}
-}
-
-static const struct file_operations s5l_wdt_fops = {
+static const struct watchdog_ops apple_wdt_ops = {
 	.owner		= THIS_MODULE,
-	.llseek		= noop_llseek,
-	.write		= s5l_wdt_write,
-	.unlocked_ioctl	= s5l_wdt_ioctl,
-	.compat_ioctl	= compat_ptr_ioctl,
-	.open		= s5l_wdt_open,
-	.release	= s5l_wdt_release,
+	.start		= apple_wdt_start,
+	.stop		= apple_wdt_stop,
+	.ping		= apple_wdt_ping,
+	.set_timeout	= apple_wdt_set_timeout,
 };
 
-static struct miscdevice s5l_wdt_miscdev = {
-	.minor	= WATCHDOG_MINOR,
-	.name	= "watchdog",
-	.fops	= &s5l_wdt_fops,
+static struct watchdog_device apple_wdd = {
+	.info		= &apple_wdt_info,
+	.ops		= &apple_wdt_ops,
+	.min_timeout	= 1,
+	.max_timeout	= APPLE_WDT_MAX_SECS,
+	.timeout	= APPLE_WDT_DEFAULT_SECS,
 };
 
-static int __init s5l_wdt_dev_init(void)
+static int __init apple_wdt_dev_init(void)
 {
-	int ret = misc_register(&s5l_wdt_miscdev);
+	int ret;
 
-	if (ret)
-		pr_err("s5l8947x-wdt: failed to register /dev/watchdog: %d\n", ret);
-	else
-		pr_info("s5l8947x-wdt: /dev/watchdog registered (default %u s)\n",
-			wdt_timeout);
-	return ret;
+	if (!apple_s5l_wdt_available()) {
+		pr_err("no counter mapping, skipping /dev/watchdog\n");
+		return -ENODEV;
+	}
+
+	watchdog_set_nowayout(&apple_wdd, WATCHDOG_NOWAYOUT);
+	watchdog_stop_on_reboot(&apple_wdd);
+
+	ret = watchdog_register_device(&apple_wdd);
+	if (ret) {
+		pr_err("could not register /dev/watchdog: %d\n", ret);
+		return ret;
+	}
+
+	pr_info("/dev/watchdog registered (timeout %u s, max %u s)\n",
+		apple_wdd.timeout, apple_wdd.max_timeout);
+	return 0;
 }
-device_initcall(s5l_wdt_dev_init);
+late_initcall(apple_wdt_dev_init);

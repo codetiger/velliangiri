@@ -1,93 +1,94 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Cortex-A9 PMCCNTR cycle counter enablement and delay_timer registration
- * for S5L8940X / S5L8947X.
- *
- * Provides a hardware-backed delay_timer (udelay/mdelay) calibrated against
- * the 24 MHz watchdog counter in wdt-clocksource.c. Note that Cortex-A9
- * stops PMCCNTR during WFI, so timekeeping and sched_clock are provided by
- * the 24 MHz watchdog counter instead.
+ * Cortex-A9 PMCCNTR cycle counter enablement, fallback clocksource, and
+ * delay_timer registration for S5L8940X / S5L8947X.
  */
 
 #include <linux/clocksource.h>
-#include <linux/delay.h>
 #include <linux/init.h>
 #include <linux/kernel.h>
-#include <linux/timex.h>
+#include <linux/sched_clock.h>
+
+#include <asm/delay.h>
 
 #include "s5l8947x.h"
 
-#define S5L_CPU_FREQ_DEFAULT_HZ	800000000UL
+#define PMCCNTR_RATE_FALLBACK	1000000000UL
 
-static inline u32 read_pmccntr(void)
+static unsigned long apple_pmccntr_rate = PMCCNTR_RATE_FALLBACK;
+
+static u64 notrace apple_pmccntr_read(void)
 {
-	u32 val;
+	u32 cyc;
 
-	asm volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(val));
-	return val;
+	asm volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(cyc));
+	return cyc;
 }
 
-static inline void enable_pmccntr(void)
+static u64 apple_pmccntr_cs_read(struct clocksource *cs)
 {
-	u32 val;
+	return apple_pmccntr_read();
+}
 
-	/* PMUSERENR = 1 (allow userspace read) */
-	val = 1;
-	asm volatile("mcr p15, 0, %0, c9, c14, 0" : : "r"(val));
+static struct clocksource apple_pmccntr_cs = {
+	.name	= "pmccntr",
+	/* Below the 24 MHz watchdog counter (350): PMCCNTR stops in WFI. */
+	.rating	= 250,
+	.read	= apple_pmccntr_cs_read,
+	.mask	= CLOCKSOURCE_MASK(32),
+	.flags	= CLOCK_SOURCE_IS_CONTINUOUS,
+};
 
-	/* PMCR: E=1 (enable), P=1 (reset event counters), C=1 (reset CCNT), D=0 (/1) */
-	asm volatile("mrc p15, 0, %0, c9, c12, 0" : "=r"(val));
-	val |= (1 << 0) | (1 << 1) | (1 << 2);
-	val &= ~(1 << 3);
-	asm volatile("mcr p15, 0, %0, c9, c12, 0" : : "r"(val));
+static unsigned long apple_pmccntr_read_long(void)
+{
+	return (unsigned long)apple_pmccntr_read();
+}
+
+static struct delay_timer apple_pmccntr_delay = {
+	.read_current_timer	= apple_pmccntr_read_long,
+	.freq			= PMCCNTR_RATE_FALLBACK,
+};
+
+static void __init apple_pmccntr_enable(void)
+{
+	u32 v;
+
+	/* PMUSERENR: allow user + privileged access to PMU */
+	v = 1u | (1u << 2);
+	asm volatile("mcr p15, 0, %0, c9, c14, 0" :: "r"(v));
+
+	/* PMCNTENCLR: clear enable bits before programming */
+	v = 0x80000000u;
+	asm volatile("mcr p15, 0, %0, c9, c12, 2" :: "r"(v));
+
+	/* PMCR: E | P | C then leave E set */
+	v = (1u << 0) | (1u << 1) | (1u << 2);
+	asm volatile("mcr p15, 0, %0, c9, c12, 0" :: "r"(v));
 
 	/* PMCNTENSET: enable cycle counter (bit 31) */
-	val = (1U << 31);
-	asm volatile("mcr p15, 0, %0, c9, c12, 1" : : "r"(val));
+	v = 0x80000000u;
+	asm volatile("mcr p15, 0, %0, c9, c12, 1" :: "r"(v));
 
-	/* PMOVSR: clear overflow flags */
-	val = 0xffffffffU;
-	asm volatile("mcr p15, 0, %0, c9, c12, 3" : : "r"(val));
+	v = 1u;
+	asm volatile("mcr p15, 0, %0, c9, c12, 0" :: "r"(v));
+
 	isb();
 }
 
-static unsigned long pmccntr_read_delay(void)
+void __init apple_s5l_pmccntr_enable_counter(void)
 {
-	return read_pmccntr();
+	apple_pmccntr_enable();
 }
 
-static struct delay_timer pmccntr_delay_timer = {
-	.read_current_timer	= pmccntr_read_delay,
-	.freq			= S5L_CPU_FREQ_DEFAULT_HZ,
-};
-
-void __init apple_s5l_pmccntr_set_freq(unsigned long hz)
+void __init apple_s5l_pmccntr_init(unsigned long rate)
 {
-	if (!hz)
-		return;
-	pmccntr_delay_timer.freq = hz;
-	/* Re-run registration so loops_per_jiffy and timer_conversion_shift update */
-	register_current_timer_delay(&pmccntr_delay_timer);
-}
+	if (rate)
+		apple_pmccntr_rate = rate;
+	apple_pmccntr_delay.freq = apple_pmccntr_rate;
 
-void __init apple_s5l_pmccntr_init(void)
-{
-	u32 c0, c1;
+	pr_info("pmccntr: clocksource at %lu Hz (%s)\n", apple_pmccntr_rate,
+		rate ? "measured against 24 MHz watchdog counter" : "fallback");
 
-	enable_pmccntr();
-	c0 = read_pmccntr();
-	asm volatile("nop; nop; nop; nop; nop; nop; nop; nop");
-	c1 = read_pmccntr();
-
-	apple_s5l_early_puts("[s5l8947x] PMCCNTR delta=");
-	apple_s5l_early_puthex(c1 - c0);
-	apple_s5l_early_puts("\n");
-
-	if (c1 == c0) {
-		apple_s5l_early_puts("[s5l8947x] WARNING: PMCCNTR did not advance\n");
-		return;
-	}
-
-	register_current_timer_delay(&pmccntr_delay_timer);
-	apple_s5l_early_puts("[s5l8947x] PMCCNTR delay_timer registered\n");
+	clocksource_register_hz(&apple_pmccntr_cs, apple_pmccntr_rate);
+	register_current_timer_delay(&apple_pmccntr_delay);
 }

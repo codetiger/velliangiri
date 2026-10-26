@@ -9,16 +9,20 @@
 
 / {
 	model = "S5L8947X j33iap";
-	compatible = "apple,j33iap", "apple,s5l8947x", "apple,s5l8940x", "apple,s5l89xx";
+	compatible = "apple,j33iap", "apple,s5l8947x", "apple,s5l8940x", "apple,arm";
 
 	aliases {
 		serial0 = &uart0;
 		ethernet0 = &eth0;
 	};
 
+	chosen {
+		bootargs = "earlycon=s3c6400,0x32500000 keep_bootcon console=tty0 lpj=5000000 root=/dev/ram0 rw rootwait panic=10 loglevel=8 ignore_loglevel g_cdc.host_addr=02:10:5a:33:00:01 g_cdc.dev_addr=02:10:5a:33:00:02 netconsole=6666@10.55.0.2/eth0,6666@255.255.255.255/ff:ff:ff:ff:ff:ff rdinit=/init";
+	};
+
 	memory@80000000 {
 		device_type = "memory";
-		reg = <0x80000000 0x20000000>;
+		reg = <0x80000000 0x1f000000>;
 	};
 
 	reserved-memory {
@@ -26,33 +30,21 @@
 		#size-cells = <1>;
 		ranges;
 
-		/*
-		 * 20 MB carveout at top of 512 MB DRAM (0x9ec00000..0xa0000000).
-		 * Pre-kernel loader initializes 720p60 HDMI scanout at 0x9ec00000
-		 * (1280x720x4 = 0x384000 bytes).
-		 */
-		ramoops_and_fb: framebuffer@9ec00000 {
-			reg = <0x9ec00000 0x01400000>;
+		fb_region: framebuffer@9ec00000 {
+			reg = <0x9ec00000 0x400000>;
 			no-map;
 		};
 	};
 
-	chosen {
-		stdout-path = "serial0:115200n8";
-		bootargs = "console=tty0 console=ttySAC0,115200 console=ttyGS0,115200 earlycon=s5l,0x32500000 panic=15 loglevel=7 rdinit=/init";
-		#address-cells = <1>;
-		#size-cells = <1>;
-		ranges;
-
-		framebuffer@9ec00000 {
-			compatible = "simple-framebuffer";
-			reg = <0x9ec00000 (1280 * 720 * 4)>;
-			width = <1280>;
-			height = <720>;
-			stride = <(1280 * 4)>;
-			format = "a8r8g8b8";
-			status = "okay";
-		};
+	framebuffer0: framebuffer@9ec00000 {
+		compatible = "simple-framebuffer";
+		reg = <0x9ec00000 0x384000>;
+		width = <1280>;
+		height = <720>;
+		stride = <5120>;
+		format = "a8r8g8b8";
+		memory-region = <&fb_region>;
+		status = "okay";
 	};
 };
 
@@ -60,37 +52,25 @@
 	status = "okay";
 
 	pmu: pmu@74 {
-		compatible = "apple,d1815-pmu", "apple,pmu-i2c";
+		compatible = "apple,pmu-d1815", "apple,d1815-pmu", "apple,pmu-i2c";
 		reg = <0x74>;
 		#address-cells = <1>;
 		#size-cells = <0>;
 
-		/*
-		 * D1815 GPIO 7 (reg 0x57): BCM4334 Wi-Fi REG_ON
-		 */
-		wifi_reg_on: regulator@57 {
-			compatible = "apple,pmu-power-switch";
-			reg = <0x57>;
-			mask = <0xff>;
-			apple,active-val = <0x18>;
-			apple,inactive-val = <0x1a>;
-			regulator-name = "wifi-reg-on";
-			regulator-always-on;
-			regulator-boot-on;
+		/* D1815 GPIO 8 (reg 0x58, bit 1): SMSC LAN8742 Ethernet PHY nRST */
+		eth_phy_reset: eth_phy_reset@58 {
+			compatible = "apple,pmu-pwrsw", "apple,pmu-power-switch";
+			reg = <0x58>;
+			mask = <0x02>;
+			enable = <0x02>;
 		};
 
-		/*
-		 * D1815 GPIO 8 (reg 0x58): SMSC LAN8742 Ethernet PHY nRST
-		 */
-		eth_phy_reset: regulator@58 {
-			compatible = "apple,pmu-power-switch";
-			reg = <0x58>;
-			mask = <0xff>;
-			apple,active-val = <0x18>;
-			apple,inactive-val = <0x1a>;
-			regulator-name = "eth-phy-reset";
-			regulator-always-on;
-			regulator-boot-on;
+		/* D1815 GPIO 7 (reg 0x57, bit 1): BCM4334 Wi-Fi REG_ON */
+		wlan_reg_on: wlan_reg_on@57 {
+			compatible = "apple,pmu-pwrsw", "apple,pmu-power-switch";
+			reg = <0x57>;
+			mask = <0x02>;
+			enable = <0x02>;
 		};
 	};
 };
@@ -101,15 +81,17 @@
 
 &eth0 {
 	status = "okay";
-	phy-mode = "rmii";
-	phy-handle = <&eth_phy0>;
+	local-mac-address = [02 10 5a 33 00 ee];
+	phy-mode = "mii";
+	phy-handle = <&ethphy0>;
 	phy-supply = <&eth_phy_reset>;
 
 	mdio {
 		#address-cells = <1>;
 		#size-cells = <0>;
 
-		eth_phy0: ethernet-phy@0 {
+		ethphy0: ethernet-phy@0 {
+			compatible = "ethernet-phy-ieee802.3-c22";
 			reg = <0>;
 		};
 	};
