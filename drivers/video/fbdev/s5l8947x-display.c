@@ -53,24 +53,50 @@
 #define OUT_GAMMA_IDX		0x0054
 #define OUT_GAMMA_VAL		0x0058
 
-/* HDMI controller registers (0x39700000) */
+/* HDMI 1.4 controller registers (0x39700000) */
 #define HDMI_HPD_STATUS		0x0000c
 #define HDMI_PHY_STATUS_0	0x00020
+#define HDMI_AUDIO_CLKSEL	0x00070
 #define HDMI_CON_0		0x10000
+#define HDMI_CON_1		0x10004
+#define HDMI_CON_2		0x10008
 #define HDMI_MODE_SEL		0x10040
-#define HDMI_ASP_CON		0x10160
-#define HDMI_ASP_SP_FLAT	0x10164
-#define HDMI_ASP_CHCFG0		0x10170
-#define HDMI_ACR_CON		0x10180
-#define HDMI_ACR_MCTS0		0x10184
-#define HDMI_ACR_CTS0		0x10190
-#define HDMI_ACR_N0		0x1019c
+#define HDMI_GCP_CON		0x10200
+#define HDMI_ASP_CON		0x10300
+#define HDMI_ASP_SP_FLAT	0x10304
+#define HDMI_ASP_CHCFG0		0x10310
+#define HDMI_ASP_CHCFG1		0x10314
+#define HDMI_ASP_CHCFG2		0x10318
+#define HDMI_ASP_CHCFG3		0x1031c
+#define HDMI_ACR_CON		0x10400
+#define HDMI_ACR_MCTS0		0x10410
+#define HDMI_ACR_CTS0		0x10420
+#define HDMI_ACR_N0		0x10430
 #define HDMI_AUI_CON		0x10800
 #define HDMI_AUI_HEADER0	0x10810
 #define HDMI_AUI_HEADER1	0x10814
 #define HDMI_AUI_HEADER2	0x10818
 #define HDMI_AUI_CHECK_SUM	0x1081c
 #define HDMI_AUI_BYTE1		0x10820
+
+/* HDMI internal I2S receiver & subpacket mux (0x39740000) */
+#define HDMI_I2S_CLK_CON	0x40000
+#define HDMI_I2S_CON_1		0x40004
+#define HDMI_I2S_CON_2		0x40008
+#define HDMI_I2S_PIN_SEL_0	0x4000c
+#define HDMI_I2S_PIN_SEL_1	0x40010
+#define HDMI_I2S_PIN_SEL_2	0x40014
+#define HDMI_I2S_PIN_SEL_3	0x40018
+#define HDMI_I2S_DSD_CON	0x4001c
+#define HDMI_I2S_MUX_CON	0x40020
+#define HDMI_I2S_CH_ST_CON	0x40024
+#define HDMI_I2S_CH_ST_0	0x40028
+#define HDMI_I2S_CH_ST_1	0x4002c
+#define HDMI_I2S_CH_ST_2	0x40030
+#define HDMI_I2S_CH_ST_3	0x40034
+#define HDMI_I2S_CH_ST_4	0x40038
+#define HDMI_I2S_MUX_CH		0x40054
+#define HDMI_I2S_MUX_CUV	0x40058
 
 #define S5L_FB_BASE_MIN		0x9ec00000U
 #define S5L_FB_BASE_MAX		0x9f000000U
@@ -193,16 +219,44 @@ int s5l8947x_hdmi_audio_configure(unsigned int sample_rate, bool enable)
 		return 0;
 	}
 
-	/* Program Audio Clock Regeneration (ACR) N and CTS for 74.25 MHz TMDS */
+	/* Ensure HDMI mode (not DVI) and guard-band/preamble are enabled for data islands */
+	writel(0x02, d->hdmi + HDMI_MODE_SEL);
+	writel(0x00, d->hdmi + HDMI_CON_2);
+	writel(0x00, d->hdmi + HDMI_AUDIO_CLKSEL);
+
+	/* Program HDMI 1.4 Audio Clock Regeneration (ACR) N and CTS for 74.25 MHz TMDS */
 	s5l8947x_hdmi_write_bytes(d->hdmi, HDMI_ACR_N0, n_val, 3);
 	s5l8947x_hdmi_write_bytes(d->hdmi, HDMI_ACR_MCTS0, cts_val, 3);
 	s5l8947x_hdmi_write_bytes(d->hdmi, HDMI_ACR_CTS0, cts_val, 3);
 	writel(0x04, d->hdmi + HDMI_ACR_CON);
 
-	/* Enable 2-channel LPCM Audio Sample Packet (ASP) */
+	/* Enable 2-channel LPCM Audio Sample Packet (ASP) at HDMI 1.4 offset 0x10300 */
 	writel(0x00, d->hdmi + HDMI_ASP_SP_FLAT);
 	writel(0x08, d->hdmi + HDMI_ASP_CHCFG0);
-	writel(0x01, d->hdmi + HDMI_ASP_CON);
+	writel(0x1a, d->hdmi + HDMI_ASP_CHCFG1);
+	writel(0x2c, d->hdmi + HDMI_ASP_CHCFG2);
+	writel(0x3e, d->hdmi + HDMI_ASP_CHCFG3);
+	writel(0x00, d->hdmi + HDMI_ASP_CON);
+
+	/* Enable HDMI 1.4 internal I2S receiver and subpacket mux (0x39740000) */
+	writel(0x00, d->hdmi + HDMI_I2S_CLK_CON);
+	writel(0x01, d->hdmi + HDMI_I2S_CLK_CON);
+	writel(readl(d->hdmi + HDMI_I2S_DSD_CON) | 0x01U, d->hdmi + HDMI_I2S_DSD_CON);
+	writel(0x56, d->hdmi + HDMI_I2S_PIN_SEL_0); /* SCLK=5, LRCK=6 */
+	writel(0x34, d->hdmi + HDMI_I2S_PIN_SEL_1); /* SDATA1=3, SDATA0=4 */
+	writel(0x12, d->hdmi + HDMI_I2S_PIN_SEL_2); /* SDATA3=1, SDATA2=2 */
+	writel(0x00, d->hdmi + HDMI_I2S_PIN_SEL_3); /* DSD=0 */
+	writel(0x00, d->hdmi + HDMI_I2S_CON_1);     /* Falling edge SCLK, low=L */
+	writel(0x04, d->hdmi + HDMI_I2S_CON_2);     /* MSB first, 32fs, 16-bit, basic I2S */
+	writel(0x00, d->hdmi + HDMI_I2S_CH_ST_0);   /* Consumer LPCM */
+	writel(0x00, d->hdmi + HDMI_I2S_CH_ST_1);
+	writel(0x00, d->hdmi + HDMI_I2S_CH_ST_2);
+	writel((sample_rate == 44100) ? 0x00 : 0x02, d->hdmi + HDMI_I2S_CH_ST_3);
+	writel(0x02, d->hdmi + HDMI_I2S_CH_ST_4);   /* 16-bit word length */
+	writel(0x01, d->hdmi + HDMI_I2S_CH_ST_CON); /* Reload channel status */
+	writel(0xff, d->hdmi + HDMI_I2S_MUX_CH);    /* Enable all channels */
+	writel(0x03, d->hdmi + HDMI_I2S_MUX_CUV);   /* Enable L+R CUV */
+	writel(0x07, d->hdmi + HDMI_I2S_MUX_CON);   /* IN_ENABLE | AUD_I2S | CUV_I2S | MUX_EN */
 
 	/* Program CEA-861 Audio InfoFrame (0x84, ver 0x01, len 0x0a) */
 	writel(0x84, d->hdmi + HDMI_AUI_HEADER0);

@@ -28,7 +28,8 @@
 
 #define PMGR_PHYS_BASE		0x3f100000UL
 #define PMGR_GATE_OFFSET(n)	(0x1008U + (n) * 4U)
-#define PMGR_GATE_AUDIO		37
+#define PMGR_GATE_AUDIO_FIRST	37
+#define PMGR_GATE_AUDIO_LAST	42
 
 /* I2S0 controller registers (0x34190000) */
 #define I2S_CON			0x00
@@ -37,8 +38,12 @@
 #define I2S_PSR			0x0c
 #define I2S_TXD			0x10
 
+#define I2S_CON_RSTCLR		BIT(31)
+#define I2S_CON_TXDMA_ACTIVE	BIT(2)
 #define I2S_CON_ACTIVE		BIT(0)
+#define I2S_MOD_OPCLK_PCLK	(3U << 30)
 #define I2S_FIC_TXFLUSH		BIT(15)
+#define I2S_PSR_PSREN		BIT(15)
 
 /* S/PDIF TOSLINK transmitter registers (0x34194000) */
 #define SPDIF_CLKCON		0x00
@@ -48,11 +53,11 @@
 #define SPDIF_DAT		0x10
 #define SPDIF_CNT		0x14
 
-#define SPDIF_CLKCON_ON		0x02U
-#define SPDIF_CON_SW_RESET	BIT(0)
-#define SPDIF_CON_PCM_16BIT	0x00000020U
-#define SPDIF_CSTAS_48KHZ	0x02000000U
-#define SPDIF_CSTAS_44KHZ	0x00000000U
+#define SPDIF_CLKCON_ON		0x01U
+#define SPDIF_CON_SW_RESET	BIT(5)
+#define SPDIF_CON_PCM_16BIT	0x00381001U
+#define SPDIF_CSTAS_48KHZ	0x02000104U
+#define SPDIF_CSTAS_44KHZ	0x00000104U
 
 struct s5l8947x_audio {
 	struct device *dev;
@@ -96,33 +101,54 @@ static const struct snd_pcm_hardware s5l8947x_pcm_hw = {
 
 static int s5l8947x_audio_gate_enable(struct s5l8947x_audio *aud)
 {
-	u32 off = PMGR_GATE_OFFSET(PMGR_GATE_AUDIO);
-	u32 v;
+	unsigned int g;
 	int i;
 
 	if (!aud->pmgr)
 		return -ENODEV;
 
-	v = readl(aud->pmgr + off);
-	if (!v)
-		return -ENODEV;
-	writel((v & ~0x10fU) | 0x0fU, aud->pmgr + off);
-	for (i = 0; i < 10000; i++) {
-		v = readl(aud->pmgr + off);
-		if (!((v ^ (v >> 4)) & 0x0fU)) {
-			aud->hw_clocked = true;
-			return 0;
+	for (g = PMGR_GATE_AUDIO_FIRST; g <= PMGR_GATE_AUDIO_LAST; g++) {
+		u32 off = PMGR_GATE_OFFSET(g);
+		u32 v = readl(aud->pmgr + off);
+
+		if (!v)
+			continue;
+		writel((v & ~0x10fU) | 0x0fU, aud->pmgr + off);
+		for (i = 0; i < 10000; i++) {
+			v = readl(aud->pmgr + off);
+			if (!((v ^ (v >> 4)) & 0x0fU))
+				break;
+			udelay(1);
 		}
-		udelay(1);
 	}
-	return -ETIMEDOUT;
+	aud->hw_clocked = true;
+	return 0;
 }
 
 static void s5l8947x_audio_hw_prepare(struct s5l8947x_audio *aud,
 				      unsigned int rate)
 {
-	if (!aud->hw_clocked)
-		(void)s5l8947x_audio_gate_enable(aud);
+	u32 cstas = (rate == 44100) ? SPDIF_CSTAS_44KHZ : SPDIF_CSTAS_48KHZ;
+
+	(void)s5l8947x_audio_gate_enable(aud);
+
+	if (aud->i2s0 && aud->hw_clocked) {
+		writel_relaxed(I2S_CON_RSTCLR, aud->i2s0 + I2S_CON);
+		writel_relaxed(I2S_FIC_TXFLUSH, aud->i2s0 + I2S_FIC);
+		writel_relaxed(0, aud->i2s0 + I2S_FIC);
+		writel_relaxed(I2S_MOD_OPCLK_PCLK, aud->i2s0 + I2S_MOD);
+		writel_relaxed(I2S_PSR_PSREN | (1U << 8), aud->i2s0 + I2S_PSR);
+		writel_relaxed(I2S_CON_RSTCLR | I2S_CON_TXDMA_ACTIVE |
+			       I2S_CON_ACTIVE, aud->i2s0 + I2S_CON);
+	}
+
+	if (aud->spdif && aud->hw_clocked && aud->spdif_enable) {
+		writel_relaxed(SPDIF_CON_SW_RESET, aud->spdif + SPDIF_CON);
+		writel_relaxed(SPDIF_CON_PCM_16BIT, aud->spdif + SPDIF_CON);
+		writel_relaxed(cstas, aud->spdif + SPDIF_CSTAS);
+		writel_relaxed(SPDIF_CLKCON_ON, aud->spdif + SPDIF_CLKCON);
+	}
+
 	if (aud->hdmi_enable)
 		(void)s5l8947x_hdmi_audio_configure(rate, true);
 }
@@ -130,8 +156,12 @@ static void s5l8947x_audio_hw_prepare(struct s5l8947x_audio *aud,
 static void s5l8947x_audio_feed_fifo_sample(struct s5l8947x_audio *aud,
 					    u32 sample_pair)
 {
-	(void)aud;
-	(void)sample_pair;
+	if (!aud->hw_clocked)
+		return;
+	if (aud->i2s0 && aud->hdmi_enable)
+		writel_relaxed(sample_pair, aud->i2s0 + I2S_TXD);
+	if (aud->spdif && aud->spdif_enable)
+		writel_relaxed(sample_pair, aud->spdif + SPDIF_DAT);
 }
 
 static enum hrtimer_restart s5l8947x_audio_timer_cb(struct hrtimer *timer)
@@ -344,9 +374,8 @@ static int s5l8947x_audio_probe(struct platform_device *pdev)
 		aud->spdif = NULL;
 
 	aud->pmgr = devm_ioremap(&pdev->dev, PMGR_PHYS_BASE, 0x2000);
-	if (aud->pmgr &&
-	    (readl(aud->pmgr + PMGR_GATE_OFFSET(PMGR_GATE_AUDIO)) & 0xffU) == 0xffU)
-		aud->hw_clocked = true;
+	if (aud->pmgr)
+		(void)s5l8947x_audio_gate_enable(aud);
 
 	strscpy(card->driver, "s5l8947x-audio", sizeof(card->driver));
 	strscpy(card->shortname, "S5L8947X HDMI/SPDIF", sizeof(card->shortname));

@@ -48,15 +48,17 @@ python3 "${ROOT}/scripts/apk-unpack.py" \
 	done
 )
 
-# Cross-compile early entropy seeder and MMIO/I2C diagnostic utilities
-echo "[rootfs] Cross-compiling jitterseed, peek, and i2cpoke ..."
+# Cross-compile early entropy seeder and MMIO/I2C/subsystem diagnostic utilities
+echo "[rootfs] Cross-compiling jitterseed, peek, i2cpoke, and hwtest ..."
 "${CROSS_CC}" -O2 -Wall -Wextra -static \
 	-o "${STAGE_DIR}/bin/jitterseed" "${ROOT}/scripts/tools/jitterseed.c"
 "${CROSS_CC}" -O2 -Wall -Wextra -static \
 	-o "${STAGE_DIR}/bin/peek" "${ROOT}/scripts/tools/mmio-peek.c"
 "${CROSS_CC}" -O2 -Wall -Wextra -static \
 	-o "${STAGE_DIR}/bin/i2cpoke" "${ROOT}/scripts/tools/i2c-poke.c"
-chmod 755 "${STAGE_DIR}/bin/jitterseed" "${STAGE_DIR}/bin/peek" "${STAGE_DIR}/bin/i2cpoke"
+"${CROSS_CC}" -O2 -Wall -Wextra -static \
+	-o "${STAGE_DIR}/bin/hwtest" "${ROOT}/scripts/tools/hwtest.c"
+chmod 755 "${STAGE_DIR}/bin/jitterseed" "${STAGE_DIR}/bin/peek" "${STAGE_DIR}/bin/i2cpoke" "${STAGE_DIR}/bin/hwtest"
 
 # Install initramfs boot and DHCP scripts
 echo "[rootfs] Installing initramfs boot scripts ..."

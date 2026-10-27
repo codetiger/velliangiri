@@ -29,11 +29,11 @@ if [ -d /sys/class/net/usb0 ] || ip link show usb0 >/dev/null 2>&1; then
 	log_msg "usb0 configured at 10.55.0.2/24"
 fi
 
-# Spawn interactive getty/shell on USB CDC-ACM (/dev/ttyGS0)
+# Spawn interactive shell with controlling tty on USB CDC-ACM (/dev/ttyGS0)
 (
 	while true; do
 		if [ -c /dev/ttyGS0 ]; then
-			/sbin/getty -i -n -l /bin/sh 115200 ttyGS0 2>/dev/null || sleep 1
+			setsid cttyhack /bin/sh </dev/ttyGS0 >/dev/ttyGS0 2>&1 || sleep 1
 		else
 			sleep 1
 		fi
@@ -41,10 +41,10 @@ fi
 ) &
 log_msg "CDC-ACM console getty active on /dev/ttyGS0"
 
-# Start Dropbear SSH server on port 22 in background
+# Start Dropbear SSH server on port 22 in background (permit empty root password)
 mkdir -p /etc/dropbear
 if [ -x /usr/sbin/dropbear ]; then
-	/usr/sbin/dropbear -R -E -p 22 2>/dev/kmsg &
+	/usr/sbin/dropbear -B -R -E -p 22 2>/dev/kmsg &
 	log_msg "dropbear SSH daemon listening on port 22 (root login permitted)"
 fi
 

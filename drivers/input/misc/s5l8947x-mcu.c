@@ -461,32 +461,12 @@ static void s5l8947x_mcu_poll_work_fn(struct work_struct *work)
 
 	mutex_lock(&mcu->lock);
 	if (!mcu->init_done) {
-		u8 ver_buf[MCU_MAX_PAYLOAD + 1];
-		size_t ver_len = MCU_MAX_PAYLOAD;
-		u8 active = MCU_STATE_ACTIVE;
-		int ret;
-
 		mcu->init_done = true;
-		s5l8947x_mcu_pulse_break(mcu);
-		ret = s5l8947x_mcu_transact(mcu, MCU_CMD_PING_VERSION, NULL, 0,
-					    ver_buf, &ver_len);
-		if (ret == 0 && ver_len > 0) {
-			ver_buf[ver_len - 1] = '\0';
-			strscpy(mcu->fw_version, (const char *)ver_buf,
-				sizeof(mcu->fw_version));
-			(void)s5l8947x_mcu_transact(mcu, MCU_CMD_SET_STATE,
-						    &active, 1, NULL, NULL);
-			dev_info(mcu->dev,
-				 "IR/system MCU online at 250000 baud (fw: %s)\n",
-				 mcu->fw_version);
-		} else {
-			strscpy(mcu->fw_version, "online-250k",
-				sizeof(mcu->fw_version));
-			s5l8947x_mcu_send_frame(mcu, MCU_CMD_SET_STATE,
-						&active, 1);
-			dev_info(mcu->dev,
-				 "UART1 250000 baud link active (active state sent)\n");
-		}
+		s5l8947x_mcu_drain_rx(mcu);
+		strscpy(mcu->fw_version, "online-250k",
+			sizeof(mcu->fw_version));
+		dev_info(mcu->dev,
+			 "UART1 250000 baud IR/system MCU receiver active\n");
 	} else {
 		s5l8947x_mcu_drain_rx(mcu);
 	}
@@ -563,16 +543,36 @@ static ssize_t send_cmd_store(struct device *dev,
 	u8 payload[1];
 	int parsed, ret;
 
-	parsed = sscanf(buf, "%x %x", &cmd, &arg);
-	if (parsed < 1 || cmd > 0xffU)
-		return -EINVAL;
-
 	mutex_lock(&mcu->lock);
 	if (!mcu->hw_ready && mcu->pmgr &&
 	    s5l8947x_pmgr_enable_gate(mcu->pmgr, PMGR_GATE_UART1) == 0) {
 		mcu->hw_ready = true;
 		s5l8947x_uart_hw_init(mcu->regs, S5L_UBRDIV_250000);
 		schedule_delayed_work(&mcu->poll_work, msecs_to_jiffies(20));
+	}
+	if (sysfs_streq(buf, "break")) {
+		s5l8947x_mcu_pulse_break(mcu);
+		mutex_unlock(&mcu->lock);
+		return count;
+	}
+	if (sysfs_streq(buf, "ping")) {
+		u8 ver_buf[MCU_MAX_PAYLOAD + 1];
+		size_t ver_len = MCU_MAX_PAYLOAD;
+
+		ret = s5l8947x_mcu_transact(mcu, MCU_CMD_PING_VERSION, NULL, 0,
+					    ver_buf, &ver_len);
+		if (ret == 0 && ver_len > 0) {
+			ver_buf[ver_len - 1] = '\0';
+			strscpy(mcu->fw_version, (const char *)ver_buf,
+				sizeof(mcu->fw_version));
+		}
+		mutex_unlock(&mcu->lock);
+		return count;
+	}
+	parsed = sscanf(buf, "%x %x", &cmd, &arg);
+	if (parsed < 1 || cmd > 0xffU) {
+		mutex_unlock(&mcu->lock);
+		return -EINVAL;
 	}
 	if (parsed == 2) {
 		payload[0] = arg & 0xffU;
