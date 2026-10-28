@@ -86,6 +86,11 @@ t_gpu() {
 	else
 		fail "cfg0 $id, expected $want"
 	fi
+	cg=$(field clkgate "$(rd "$GPU/core_info")")
+	case "$cg" in
+	"" | 0x00000000 | 0xffffffff) fail "clock gate register not live ($cg)" ;;
+	*) pass "clock gate register live ($cg)" ;;
+	esac
 	case "$(rd /dev/sgx0)" in
 	*"cfg0=$id"*) pass "/dev/sgx0 agrees with sysfs" ;;
 	*) fail "/dev/sgx0 cfg0 differs from sysfs ($id)" ;;

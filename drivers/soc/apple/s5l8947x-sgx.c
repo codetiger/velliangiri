@@ -2,8 +2,9 @@
 /*
  * S5L8947X PowerVR SGX543 GPU Power/Clock Domain & Telemetry Driver
  *
- * Switches the PowerVR SGX543 (0x35100000, IRQ 49) clock/power domain and
- * exposes the master configuration registers.
+ * Switches the PowerVR SGX543 (0x35100000, IRQ 49) clock/power domain,
+ * releases the cores from reset with automatic clock gating, and exposes the
+ * master configuration registers.
  */
 
 #define pr_fmt(fmt) "s5l8947x-sgx: " fmt
@@ -20,13 +21,32 @@
 #include <linux/platform_device.h>
 
 /*
- * SGX543 master block registers (offset from 0x35100000). They stay readable
- * while the cores are clock gated; the per-core registers at the bottom of the
- * window hang the bus until a core is brought up, so they are never read here.
+ * SGX543 registers (offset from 0x35100000). The master block at 0x4000 stays
+ * readable while the cores are clock gated; the per-core registers at the
+ * bottom of the window hang the bus until the clock gating below has been
+ * programmed, and not every offset there is implemented. Only offsets known to
+ * answer are read.
  */
+#define SGX_CLKGATE0			0x0000
+#define SGX_CLKGATE1			0x0004
+#define SGX_CLKGATE_EXT			0x0310
+#define SGX_MASTER_CORES		0x4000
+#define SGX_MASTER_CORE_EN		0x4004
 #define SGX_MASTER_CFG0			0x4010
 #define SGX_MASTER_CFG1			0x4014
+#define SGX_MASTER_CLKGATE		0x4020
+#define SGX_MASTER_RESET		0x4080
+#define SGX_MASTER_MEM0			0x4d00
+#define SGX_MASTER_MEM1			0x4d04
 #define SGX_MASTER_CFG0_CORES		GENMASK(11, 8)
+
+#define SGX_MASTER_CLKGATE_AUTO		0x00000155
+#define SGX_MASTER_RESET_ALL		0x000004f0
+#define SGX_MASTER_RESET_EXT		BIT(8)
+#define SGX_MASTER_MEM0_VAL		0x0044c000
+#define SGX_MASTER_MEM1_VAL		0x04001e40
+#define SGX_CLKGATE0_AUTO		0x10155555
+#define SGX_CLKGATE1_AUTO		0x05454555
 
 struct s5l8947x_sgx {
 	struct device *dev;
@@ -39,7 +59,41 @@ struct s5l8947x_sgx {
 	bool powered;
 	u32 cfg0;
 	u32 cfg1;
+	u32 clkgate0;
 };
+
+/*
+ * Release the cores from reset with automatic clock gating, in the order the
+ * hardware expects. Called with the clocks running.
+ */
+static void s5l8947x_sgx_hw_init(struct s5l8947x_sgx *sgx)
+{
+	u32 cores, en = 0, rst = SGX_MASTER_RESET_ALL | SGX_MASTER_RESET_EXT;
+	unsigned int i;
+
+	sgx->cfg0 = readl(sgx->regs + SGX_MASTER_CFG0);
+	sgx->cfg1 = readl(sgx->regs + SGX_MASTER_CFG1);
+	cores = max_t(u32, FIELD_GET(SGX_MASTER_CFG0_CORES, sgx->cfg0), 1);
+
+	for (i = 0; i < cores; i++) {
+		en |= BIT(2 * i);
+		rst |= BIT(i);
+	}
+
+	writel(cores - 1, sgx->regs + SGX_MASTER_CORES);
+	writel(SGX_MASTER_CLKGATE_AUTO, sgx->regs + SGX_MASTER_CLKGATE);
+	writel(en, sgx->regs + SGX_MASTER_CORE_EN);
+
+	writel(rst, sgx->regs + SGX_MASTER_RESET);
+	writel(SGX_MASTER_MEM0_VAL, sgx->regs + SGX_MASTER_MEM0);
+	writel(SGX_MASTER_MEM1_VAL, sgx->regs + SGX_MASTER_MEM1);
+	writel(0, sgx->regs + SGX_MASTER_RESET);
+
+	writel(SGX_CLKGATE0_AUTO, sgx->regs + SGX_CLKGATE0);
+	writel(SGX_CLKGATE1_AUTO, sgx->regs + SGX_CLKGATE1);
+	writel(1, sgx->regs + SGX_CLKGATE_EXT);
+	sgx->clkgate0 = readl(sgx->regs + SGX_CLKGATE0);
+}
 
 /* Called with sgx->lock held */
 static int s5l8947x_sgx_power_set(struct s5l8947x_sgx *sgx, bool on)
@@ -59,8 +113,7 @@ static int s5l8947x_sgx_power_set(struct s5l8947x_sgx *sgx, bool on)
 	if (ret)
 		return ret;
 	sgx->powered = true;
-	sgx->cfg0 = readl(sgx->regs + SGX_MASTER_CFG0);
-	sgx->cfg1 = readl(sgx->regs + SGX_MASTER_CFG1);
+	s5l8947x_sgx_hw_init(sgx);
 	return 0;
 }
 
@@ -99,9 +152,10 @@ static ssize_t core_info_show(struct device *dev,
 	struct s5l8947x_sgx *sgx = dev_get_drvdata(dev);
 
 	return sysfs_emit(buf,
-			  "model=PowerVR-SGX543 mmio=0x35100000 irq=%d cfg0=0x%08x cfg1=0x%08x cores=%lu\n",
+			  "model=PowerVR-SGX543 mmio=0x35100000 irq=%d cfg0=0x%08x cfg1=0x%08x cores=%lu clkgate=0x%08x\n",
 			  sgx->irq, sgx->cfg0, sgx->cfg1,
-			  FIELD_GET(SGX_MASTER_CFG0_CORES, sgx->cfg0));
+			  FIELD_GET(SGX_MASTER_CFG0_CORES, sgx->cfg0),
+			  sgx->clkgate0);
 }
 static DEVICE_ATTR_RO(core_info);
 
@@ -121,9 +175,9 @@ static ssize_t s5l8947x_sgx_misc_read(struct file *file, char __user *ubuf,
 	int len;
 
 	len = scnprintf(info, sizeof(info),
-			"SGX543 mmio=0x35100000 irq=%d state=%s cfg0=0x%08x cfg1=0x%08x\n",
+			"SGX543 mmio=0x35100000 irq=%d state=%s cfg0=0x%08x cfg1=0x%08x clkgate=0x%08x\n",
 			sgx->irq, sgx->powered ? "on" : "standby",
-			sgx->cfg0, sgx->cfg1);
+			sgx->cfg0, sgx->cfg1, sgx->clkgate0);
 	return simple_read_from_buffer(ubuf, count, ppos, info, len);
 }
 
