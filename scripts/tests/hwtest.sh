@@ -2,14 +2,14 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # On-demand hardware tests for S5L8947X (j33iap); installed as /bin/hwtest
 #
-# Usage: hwtest [-i] [all|probe|clocks|display|audio|gpu|mcu|wireless]...
+# Usage: hwtest [-i] [all|probe|clocks|display|audio|mcu|wireless]...
 #   -i   interactive: ask the operator to confirm what was seen/heard
 #
 # Environment:
 #   HWTEST_DIR=<dir>     load test files from <dir> (e.g. scp'd from the repo)
 #   HWTEST_MCU_PING=0    skip the (read-only) IR MCU firmware version query
 
-ALL="probe clocks display audio gpu mcu wireless"
+ALL="probe clocks display audio mcu wireless"
 
 usage() {
 	echo "Usage: hwtest [-i] [all|$(echo "$ALL" | tr ' ' '|')]..." >&2

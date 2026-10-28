@@ -8,7 +8,7 @@ Mainline **Linux 6.12** kernel port and open-source (`GPL-2.0-only`) hardware dr
   - `aic,1` interrupt controller (`0x3f200000`) with per-CPU event handling (`0x5004`) and built-in **24 MHz local timer** (`clock_event_device`, rating 400).
   - Continuous **24 MHz hardware watchdog clocksource** (`apple-wdt-24m`, rating 350) and `sched_clock` at `0x3f103020` (active across `WFI`), Cortex-A9 `PMCCNTR` delay calibration, SoC restart handler, and `/dev/watchdog` character device.
 - **Clocks & Pinctrl (`drivers/clk/clk-s5l8940x-pmgr.c`, `drivers/pinctrl/pinctrl-s5l8940x-gpio.c`)**:
-  - PMGR peripheral clock gate provider (`0x3f101008`, one specifier cell = gate index, request/status handshake). Drivers switch gates only through the common clock framework (`clocks = <&pmgr_gates N>`), so `hwtest clocks` can account for them. The I2C gates are still left running by the pre-kernel loader rather than claimed by the I2C driver, and the not-yet-used USB host/HSIC PHY path switches its PMGR power domains directly.
+  - PMGR peripheral clock gate provider (`0x3f101008`, one specifier cell = gate index, request/status handshake). Drivers switch gates only through the common clock framework (`clocks = <&pmgr_gates N>`), so `hwtest clocks` can account for them. The I2C controllers claim their own gates, and the USB PHY holds the OTG gates while bound and the host/HSIC gates while the host PHY is powered. The pre-kernel loader still pre-enables a few gates for the console and early boot.
   - 224-pin GPIO / pinctrl and GPIO interrupt controller driver (`0x3f000000`). It is built but not instantiated yet: the device tree has no GPIO node.
 - **I2C & Power Management (`drivers/i2c/busses/i2c-s5l8940x.c`, `drivers/mfd/apple-pmu-i2c.c`, `drivers/regulator/apple-pmu-pwrsw.c`)**:
   - Hardware I2C master (`i2c0@33200000`, `i2c1@33300000`, `i2c2@33400000`) with combined repeated-START FIFO transactions.
@@ -26,8 +26,16 @@ Mainline **Linux 6.12** kernel port and open-source (`GPL-2.0-only`) hardware dr
 - **Audio (`sound/arm/s5l8947x-audio.c`)** — *bring-up, HDMI audio not yet confirmed on hardware*:
   - ALSA PCM and mixer driver (`S5L8947X HDMI/SPDIF`, 48 kHz S16_LE stereo) for `i2s0` HDMI audio (`0x34190000`) and the `spdif` optical TOSLINK transmitter (`0x34194000`).
   - No DMA engine driver yet: the ring buffer is fed to the I2S0 TX FIFO by PIO from a 250 µs hrtimer, paced by the FIFO full flag; S/PDIF gets one 16-bit sample per write. The I2S block turned out not to use the Samsung register layout the driver programs; the measured layout is documented at the top of `scripts/tools/audiotest.c`, whose `rate` and `pio` commands already use it. I2S0 runs from 24 MHz, so the closest rate to 48 kHz is 46 875 Hz; HDMI audio is still silent.
-- **PowerVR SGX543 GPU (`drivers/soc/apple/s5l8947x-sgx.c`)**:
+- **PowerVR SGX543 GPU (`drivers/soc/apple/s5l8947x-sgx.c`)** — *on hold*:
   - Clock/power domain switch (PMGR gates 7/8/9 (GFX_SYS, GFX, HPERF-NRT)) and core telemetry driver (`/dev/sgx0`) for the `sgx` GPU at `0x35100000` (IRQ 49). Only the always-clocked master block (`cfg0` at `0x4010`) is read; the per-core registers at the bottom of the window hang the bus until a core is brought up.
+
+## Pending Work
+
+See [progress.md](progress.md) for the full list. In short:
+
+- **Not started:** NAND flash controller (FMI), central DMA, hardware crypto, I2S1..3.
+- **On hold:** SGX GPU (no command submission, no on-device test).
+- **Partly done:** HDMI audio (register layout rework, no DMA), Wi-Fi over HSIC (no EHCI node or `brcmfmac`), USB host mode, GPIO/pinctrl (no DT node), L2 cache (disabled).
 
 ## Repository Layout
 
@@ -76,7 +84,7 @@ Build outputs are written to `out/`:
 Nothing is tested at boot. The initramfs ships an on-demand test suite (`scripts/tests/`, installed as `/bin/hwtest`) and the `audiotest` helper (`scripts/tools/audiotest.c`):
 
 ```bash
-ssh root@10.55.0.2 hwtest                 # probe, clocks, display, audio, gpu, mcu, wireless
+ssh root@10.55.0.2 hwtest                 # probe, clocks, display, audio, mcu, wireless
 ssh -t root@10.55.0.2 hwtest -i audio     # interactive: confirm what the TV played
 ssh root@10.55.0.2 audiotest rate         # measure the I2S0 frame clock (FIFO-paced, 1 s)
 

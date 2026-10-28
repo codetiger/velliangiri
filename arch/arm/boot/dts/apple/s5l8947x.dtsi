@@ -108,7 +108,7 @@
 			reg = <0x3200000 0x1000>;
 			interrupts = <18>;
 			clock-frequency = <100000>;
-			clocks = <&osc24m>;
+			clocks = <&pmgr_gates 68>;
 			clock-names = "i2c";
 			#address-cells = <1>;
 			#size-cells = <0>;
@@ -120,7 +120,7 @@
 			reg = <0x3300000 0x1000>;
 			interrupts = <19>;
 			clock-frequency = <100000>;
-			clocks = <&osc24m>;
+			clocks = <&pmgr_gates 69>;
 			clock-names = "i2c";
 			#address-cells = <1>;
 			#size-cells = <0>;
@@ -132,7 +132,7 @@
 			reg = <0x3400000 0x1000>;
 			interrupts = <20>;
 			clock-frequency = <100000>;
-			clocks = <&osc24m>;
+			clocks = <&pmgr_gates 70>;
 			clock-names = "i2c";
 			#address-cells = <1>;
 			#size-cells = <0>;
@@ -146,7 +146,9 @@
 			      <0x6100e00 0x4>;
 			#phy-cells = <1>;
 			clocks = <&pmgr_gates 30>, <&pmgr_gates 31>,
-				 <&pmgr_gates 36>;
+				 <&pmgr_gates 36>, <&pmgr_gates 32>,
+				 <&pmgr_gates 78>;
+			clock-names = "uperf", "otg", "reg", "host", "cplx";
 			apple,uotgtune1-device = <0x349>;
 			apple,uotgtune2-device = <0x6ff3>;
 			status = "okay";

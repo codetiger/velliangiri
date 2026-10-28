@@ -6,9 +6,9 @@
  *   - index 0: USB 2.0 Synopsys OTG PHY at 0x36000000 (paired with dwc2 @ 0x36100000)
  *   - index 1: USB 2.0 Host / HSIC PHY (paired with ehci / ohci)
  *
- * The OTG PHY clock gates come from the PMGR clock provider and stay on
- * while the driver is bound. The host PHY still switches its PMGR power
- * domains directly; nothing uses it until the HSIC host is enabled.
+ * All clock gates come from the PMGR clock provider. The three OTG gates
+ * ("uperf", "otg", "reg") stay on while the driver is bound; the two host
+ * gates ("host", "cplx") are held only while the host PHY is powered.
  */
 
 #define pr_fmt(fmt) "s5l-usb-phy: " fmt
@@ -36,11 +36,6 @@
 #define ORSTCON_PHYSWRESET		BIT(0)
 #define OPHYUNK4_START			0x200
 
-/* PMGR registers for the S5L8947X USB host PHY power domains */
-#define PMGR_BASE			0x3f100000UL
-#define PMGR_GATE_ON			0x0fU
-#define PMGR_USB20_HOST			0x1088U
-#define PMGR_GATE_90			0x1140U
 #define USBCPLX_HSIC_EN			BIT(2)
 
 /* Defaults for the j33iap board when the DT carries no tuning */
@@ -49,35 +44,21 @@
 
 struct s5l_usbphy {
 	void __iomem *base;
-	void __iomem *pmgr;
 	void __iomem *usbcplx;
 	void __iomem *pcgcctl;
 	struct regulator *hsic_supply;
 	bool hsic_supply_on;
 	struct regulator *lpo_supply;
 	bool lpo_supply_on;
+	struct clk *host_clk;
+	struct clk *cplx_clk;
+	bool host_clks_on;
 	struct device *dev;
 	struct phy *phys[2];
 	u32 tune1;
 	u32 tune2;
 	int ref_clock_sel;
 };
-
-static int s5l_pmgr_on(struct s5l_usbphy *p, u32 off)
-{
-	u32 v = readl(p->pmgr + off);
-	int n;
-
-	writel((v & ~0x10fU) | PMGR_GATE_ON, p->pmgr + off);
-	for (n = 0; n < 1000; n++) {
-		v = readl(p->pmgr + off);
-		if (!((v ^ (v >> 4)) & 0xfU))
-			return 0;
-		udelay(1);
-	}
-	dev_err(p->dev, "PMGR +0x%x stuck at 0x%08x\n", off, v);
-	return -ETIMEDOUT;
-}
 
 static int s5l_usbphy_init(struct phy *phy)
 {
@@ -165,10 +146,15 @@ static int s5l_hostphy_power_on(struct phy *phy)
 		msleep(10);
 	}
 
-	ret = s5l_pmgr_on(p, PMGR_USB20_HOST);
-	if (ret)
-		return ret;
-	s5l_pmgr_on(p, PMGR_GATE_90);
+	if (!p->host_clks_on) {
+		ret = clk_prepare_enable(p->host_clk);
+		if (ret)
+			return ret;
+		ret = clk_prepare_enable(p->cplx_clk);
+		if (ret)
+			dev_warn(p->dev, "USB complex gate: %d\n", ret);
+		p->host_clks_on = true;
+	}
 	if (p->usbcplx)
 		writel(readl(p->usbcplx) | USBCPLX_HSIC_EN, p->usbcplx);
 
@@ -179,6 +165,11 @@ static int s5l_hostphy_power_off(struct phy *phy)
 {
 	struct s5l_usbphy *p = phy_get_drvdata(phy);
 
+	if (p->host_clks_on) {
+		clk_disable_unprepare(p->cplx_clk);
+		clk_disable_unprepare(p->host_clk);
+		p->host_clks_on = false;
+	}
 	if (p->hsic_supply_on) {
 		regulator_disable(p->hsic_supply);
 		p->hsic_supply_on = false;
@@ -212,10 +203,11 @@ static int s5l_usbphy_probe(struct platform_device *pdev)
 	struct s5l_usbphy *p;
 	struct phy *phy;
 	struct phy_provider *provider;
-	struct clk_bulk_data *clks;
+	static const char * const otg_clks[] = { "uperf", "otg", "reg" };
+	struct clk *clk;
 	struct resource *r;
 	u32 sel;
-	int ret;
+	int i;
 
 	p = devm_kzalloc(&pdev->dev, sizeof(*p), GFP_KERNEL);
 	if (!p)
@@ -231,17 +223,25 @@ static int s5l_usbphy_probe(struct platform_device *pdev)
 	if (!device_property_read_u32(&pdev->dev, "apple,ref-clock-sel", &sel))
 		p->ref_clock_sel = sel & OPHYCLK_CLKSEL_MASK;
 
-	ret = devm_clk_bulk_get_all_enable(&pdev->dev, &clks);
-	if (ret)
-		return dev_err_probe(&pdev->dev, ret, "failed to enable clocks\n");
+	for (i = 0; i < ARRAY_SIZE(otg_clks); i++) {
+		clk = devm_clk_get_enabled(&pdev->dev, otg_clks[i]);
+		if (IS_ERR(clk))
+			return dev_err_probe(&pdev->dev, PTR_ERR(clk),
+					     "failed to enable %s clock\n", otg_clks[i]);
+	}
+
+	p->host_clk = devm_clk_get(&pdev->dev, "host");
+	if (IS_ERR(p->host_clk))
+		return dev_err_probe(&pdev->dev, PTR_ERR(p->host_clk),
+				     "failed to get host clock\n");
+	p->cplx_clk = devm_clk_get(&pdev->dev, "cplx");
+	if (IS_ERR(p->cplx_clk))
+		return dev_err_probe(&pdev->dev, PTR_ERR(p->cplx_clk),
+				     "failed to get cplx clock\n");
 
 	p->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(p->base))
 		return PTR_ERR(p->base);
-
-	p->pmgr = devm_ioremap(&pdev->dev, PMGR_BASE, 0x2000);
-	if (!p->pmgr)
-		return -ENOMEM;
 
 	if (platform_get_resource(pdev, IORESOURCE_MEM, 1)) {
 		p->usbcplx = devm_platform_ioremap_resource(pdev, 1);

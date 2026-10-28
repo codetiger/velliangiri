@@ -3,7 +3,7 @@
 
 t_probe() {
 	section "Driver probe"
-	for dev in "$UART1" "$UART2" "$DISP" "$AUD" "$GPU" "$WLPWR"; do
+	for dev in "$UART1" "$UART2" "$DISP" "$AUD" "$WLPWR"; do
 		name=${dev##*/}
 		if bound "$dev"; then
 			drv=$(readlink "$dev/driver")
@@ -27,6 +27,6 @@ t_probe() {
 
 	info "kernel log:"
 	dmesg 2>/dev/null |
-		grep -E "AIC-TIMER|apple-wdt|s5l8947x-cpufreq|s5l-fe|dwc2|pmgr-gate|3[26][0-9a-f]{6}\.serial|s5l8947x-(mcu|display|audio|sgx)|Bluetooth: hci|hci0" |
+		grep -E "AIC-TIMER|apple-wdt|s5l8947x-cpufreq|s5l-fe|dwc2|pmgr-gate|3[26][0-9a-f]{6}\.serial|s5l8947x-(mcu|display|audio)|Bluetooth: hci|hci0" |
 		sed 's/^/          /'
 }

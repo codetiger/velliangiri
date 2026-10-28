@@ -6,7 +6,6 @@ UART1=$PLAT/32600000.serial
 UART2=$PLAT/32700000.serial
 DISP=$PLAT/3a200000.display-controller
 AUD=$PLAT/34190000.audio-controller
-GPU=$PLAT/35100000.gpu
 WLPWR=$PLAT/wlan-power
 
 # serdev clients are named after their controller; find them by driver
