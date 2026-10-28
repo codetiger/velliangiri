@@ -10,6 +10,7 @@ menuconfig ARCH_APPLE_S5L
 	select COMMON_CLK
 	select GENERIC_IRQ_CHIP
 	select GPIOLIB
+	select MIGHT_HAVE_CACHE_L2X0
 	select PINCTRL
 	help
 	  Support for 32-bit ARMv7 S5L8940X and S5L8947X SoC platforms

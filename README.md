@@ -7,6 +7,8 @@ Mainline **Linux 6.12** kernel port and open-source (`GPL-2.0-only`) hardware dr
 - **Core SoC (`arch/arm/mach-apple/`, `drivers/irqchip/irq-apple-aic1.c`)**:
   - `aic,1` interrupt controller (`0x3f200000`) with per-CPU event handling (`0x5004`) and built-in **24 MHz local timer** (`clock_event_device`, rating 400).
   - Continuous **24 MHz hardware watchdog clocksource** (`apple-wdt-24m`, rating 350) and `sched_clock` at `0x3f103020` (active across `WFI`), Cortex-A9 `PMCCNTR` delay calibration, SoC restart handler, and `/dev/watchdog` character device.
+- **L2 cache (mainline `arch/arm/mm/cache-l2x0.c`, `0x3e000000`)**:
+  - PL310 r3p1-50rel0, 16 ways x 32 KB = 512 KB, brought up by `l2x0_of_init()` from `s5l8947x_init_irq()` (a machine without auxiliary overrides is otherwise never initialised). The pre-kernel loader cleans and invalidates L2 and leaves it **disabled**, so Linux always configures it from a known state: erratum 769419 workaround, early BRESP, full line of zeros, clock gating. Latencies stay at the hardware defaults and prefetch is off, because prefetch measured slower. `l2bench` shows the effect: 64-512 KB working sets read in 45-69 ns against 136-160 ns from DRAM.
 - **Clocks & Pinctrl (`drivers/clk/clk-s5l8940x-pmgr.c`, `drivers/pinctrl/pinctrl-s5l8940x-gpio.c`)**:
   - PMGR peripheral clock gate provider (`0x3f101008`, one specifier cell = gate index, request/status handshake). Drivers switch gates only through the common clock framework (`clocks = <&pmgr_gates N>`), so `hwtest clocks` can account for them. The I2C controllers claim their own gates, and the USB PHY holds the OTG gates while bound and the host/HSIC gates while the host PHY is powered. The pre-kernel loader still pre-enables a few gates for the console and early boot.
   - 224-pin GPIO / pinctrl and GPIO interrupt controller driver (`0x3f000000`). It is built but not instantiated yet: the device tree has no GPIO node.
@@ -35,7 +37,7 @@ See [progress.md](progress.md) for the full list. In short:
 
 - **Not started:** NAND flash controller (FMI), central DMA, hardware crypto, I2S1..3.
 - **On hold:** SGX GPU (no command submission, no on-device test).
-- **Partly done:** HDMI audio (register layout rework, no DMA), Wi-Fi over HSIC (no EHCI node or `brcmfmac`), USB host mode, GPIO/pinctrl (no DT node), L2 cache (disabled).
+- **Partly done:** HDMI audio (register layout rework, no DMA), Wi-Fi over HSIC (no EHCI node or `brcmfmac`), USB host mode, GPIO/pinctrl (no DT node).
 
 ## Repository Layout
 
@@ -84,8 +86,9 @@ Build outputs are written to `out/`:
 Nothing is tested at boot. The initramfs ships an on-demand test suite (`scripts/tests/`, installed as `/bin/hwtest`) and the `audiotest` helper (`scripts/tools/audiotest.c`):
 
 ```bash
-ssh root@10.55.0.2 hwtest                 # probe, clocks, display, audio, mcu, wireless
+ssh root@10.55.0.2 hwtest                 # probe, clocks, cache, display, audio, mcu, wireless
 ssh -t root@10.55.0.2 hwtest -i audio     # interactive: confirm what the TV played
+ssh root@10.55.0.2 l2bench              # memory latency by working-set size
 ssh root@10.55.0.2 audiotest rate         # measure the I2S0 frame clock (FIFO-paced, 1 s)
 
 # Run updated test scripts without rebuilding the initramfs

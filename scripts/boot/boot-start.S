@@ -4,7 +4,7 @@
  *
  * Sets up a stack at 0x80007000 (below zImage at 0x80008000), calls
  * linux_boot_main() to initialize PMGR clocks and 720p HDMI scanout,
- * flushes L1/L2 caches, and jumps to zImage at 0x80008000 with
+ * flushes L1 and L2 (leaving L2 disabled for the kernel), and jumps to zImage at 0x80008000 with
  * r0=0, r1=0xffffffff, r2=DTB_PHYS.
  */
 
@@ -120,5 +120,12 @@ l2x0_flush_all:
 1:	ldr	r1, [r0, #0x7fc]
 	tst	r1, #1
 	bne	1b
+	mov	r1, #0
+	str	r1, [r0, #0x730]	@ CACHE_SYNC
+1:	ldr	r1, [r0, #0x730]
+	tst	r1, #1
+	bne	1b
+	mov	r1, #0
+	str	r1, [r0, #0x100]	@ leave it disabled: Linux sets it up
 2:	dsb
 	pop	{r0, r1, r2, pc}

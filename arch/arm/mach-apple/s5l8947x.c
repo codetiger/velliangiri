@@ -13,6 +13,7 @@
 #include <linux/of_platform.h>
 #include <linux/sizes.h>
 
+#include <asm/hardware/cache-l2x0.h>
 #include <asm/mach/arch.h>
 #include <asm/mach/map.h>
 
@@ -52,6 +53,8 @@ static void __init s5l8947x_map_io(void)
 static void __init s5l8947x_init_irq(void)
 {
 	irqchip_init();
+	/* Mainline does not call this for a machine without auxiliary overrides */
+	l2x0_of_init(0, ~0U);
 }
 
 /*

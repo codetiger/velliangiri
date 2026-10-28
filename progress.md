@@ -8,6 +8,7 @@ Status of every hardware block, checked against the drivers in the tree and the 
 |---|---|---|
 | Interrupt controller, 24 MHz timer | `0x3f200000` | `drivers/irqchip/irq-apple-aic1.c` |
 | Watchdog, clocksource, restart | `0x3f103020` | `arch/arm/mach-apple/` |
+| L2 cache (PL310, 512 KB) | `0x3e000000` | mainline `cache-l2x0.c`, started from `arch/arm/mach-apple/s5l8947x.c`; loader leaves it disabled |
 | PMGR clock gates | `0x3f101008` | `drivers/clk/clk-s5l8940x-pmgr.c`; I2C and USB host gates are claimed by their drivers. The loader still pre-enables a few for the console and early boot. |
 | CPU frequency (212.5 / 425 / 850 MHz) | `0x3f100000` | `drivers/cpufreq/s5l8947x-cpufreq.c` |
 | I2C 0/1/2 | `0x33200000`.. | `drivers/i2c/busses/i2c-s5l8940x.c` |
@@ -29,7 +30,6 @@ Status of every hardware block, checked against the drivers in the tree and the 
 | GPIO / pinctrl (224 pins) | Driver builds | No GPIO node in the device tree, so it never probes. Blocks MCU line GPIO 2 and the Wi-Fi wake GPIO. |
 | System MCU | Button input, firmware query, break, raw commands | Reset-to-recovery trigger and wake source are not wired; standby is only sent on halt. |
 | Bluetooth speed | 115200 baud via `hci_uart_bcm` | The board's higher operating speed is not set up. |
-| L2 cache (PL310) | Node present | `status = "disabled"`; not enabled or tested. |
 
 ## Not started
 
