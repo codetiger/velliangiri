@@ -18,12 +18,12 @@ Status of every hardware block, checked against the drivers in the tree and the 
 | Display pipe, HDMI 720p, scaler, gamma | `0x3a200000` | `drivers/video/fbdev/s5l8947x-display.c` |
 | System / IR remote MCU (UART1) | `0x32600000` | `drivers/input/misc/s5l8947x-mcu.c` |
 | Bluetooth (UART2) | `0x32700000` | mainline `hci_uart_bcm` |
+| Audio: S/PDIF -> HDMI and optical | `0x34194000` | `sound/arm/s5l8947x-audio.c`; ALSA PCM at 46 875 / 31 250 Hz, measured register layout, real FIFO-occupancy pointer. HDMI packet layer in `s5l8947x-display.c` (ACR from the produced rate, valid AUI, S/PDIF receiver enabled, `I2S_CLK_CON=0` on this path). Audible on hardware. PIO only: the 16-entry S/PDIF FIFO (64 us) drops a sample every few seconds, so DMA is the remaining work. |
 
 ## Partly implemented
 
 | Block | Works | Pending |
 |---|---|---|
-| Audio: I2S0 (HDMI) and S/PDIF | ALSA PCM and mixer, PIO feed from an hrtimer | HDMI audio is silent. The driver still programs the Samsung I2S layout, but the block uses the measured layout in `research/docs/audio-i2s-registers.md`. Needs a rewrite on that layout, then DMA. I2S0 is limited to 46.875 kHz from the 24 MHz clock. |
 | SGX543 GPU — **on hold** | Gates 7/8/9, cores released from reset, telemetry at `/dev/sgx0` | No command submission, no DRM driver. Per-core registers hang the bus until a core is brought up. No further work and no on-device test until this is resumed. |
 | Wi-Fi (BCM4334, HSIC) | `REG_ON` switch via PMU, HSIC PHY path in the USB PHY driver | No EHCI node in the device tree, `brcmfmac` not enabled, wake GPIO unused. |
 | USB host mode | Device mode only | `dr_mode` is `peripheral`; host needs the host PHY tuning values and a role switch. |
@@ -44,7 +44,7 @@ Status of every hardware block, checked against the drivers in the tree and the 
 ## Suggested order
 
 1. Add the GPIO node (driver already exists).
-2. Fix the I2S register layout so HDMI audio works with PIO.
+2. Move the PCM engine to CDMA DMA (audio works, but PIO cannot keep the S/PDIF FIFO fed).
 3. Enable the HSIC EHCI host and `brcmfmac`.
 4. Add host mode to the USB controller.
 5. NAND reconnaissance, then the CDMA and FMI drivers.

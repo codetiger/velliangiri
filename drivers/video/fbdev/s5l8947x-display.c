@@ -18,6 +18,7 @@
 #include <linux/clk.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -56,11 +57,6 @@
 #define HDMI_MODE_SEL		0x10040
 #define HDMI_GCP_CON		0x10200
 #define HDMI_ASP_CON		0x10300
-#define HDMI_ASP_SP_FLAT	0x10304
-#define HDMI_ASP_CHCFG0		0x10310
-#define HDMI_ASP_CHCFG1		0x10314
-#define HDMI_ASP_CHCFG2		0x10318
-#define HDMI_ASP_CHCFG3		0x1031c
 #define HDMI_ACR_CON		0x10400
 #define HDMI_ACR_MCTS0		0x10410
 #define HDMI_ACR_CTS0		0x10420
@@ -71,6 +67,11 @@
 #define HDMI_AUI_HEADER2	0x10818
 #define HDMI_AUI_CHECK_SUM	0x1081c
 #define HDMI_AUI_BYTE1		0x10820
+
+/* HDMI internal S/PDIF receiver (0x39730000) */
+#define HDMI_SPDIF_RX_CLK	0x30000
+#define HDMI_SPDIF_RX_OP	0x30004
+#define HDMI_SPDIF_RX_IRQ	0x3000c
 
 /* HDMI internal I2S receiver & subpacket mux (0x39740000) */
 #define HDMI_I2S_CLK_CON	0x40000
@@ -152,37 +153,41 @@ static void s5l8947x_display_program_gamma(struct s5l8947x_display *d,
 	writel(9, d->out + OUT_GAMMA_EN);
 }
 
-int s5l8947x_hdmi_audio_configure(unsigned int sample_rate, bool enable)
+/*
+ * HDMI Audio Clock Regeneration. N and CTS must describe the rate the audio
+ * engine actually produces, not a nominal one: CTS = fTMDS * N / (128 * fs).
+ * Writing the measured (MCTS) register is pointless, it is hardware-owned.
+ */
+static u32 s5l8947x_hdmi_acr_cts(unsigned int sample_rate)
+{
+	/*
+	 * CTS = fTMDS(74.25 MHz) * N(6144) / (128 * fs) = 3 564 000 000 / fs.
+	 * Integer only: the kernel does not do floating point.
+	 */
+	return (u32)div_u64(3564000000ULL + sample_rate / 2, sample_rate);
+}
+
+int s5l8947x_hdmi_audio_configure(unsigned int sample_rate, bool enable,
+				  bool spdif_source)
 {
 	struct s5l8947x_display *d = g_s5l_display;
-	u32 n_val, cts_val, con0;
+	u32 n_val = 6144U, cts_val = s5l8947x_hdmi_acr_cts(sample_rate), con0;
 	u8 aui[5] = { 0x01, 0x00, 0x00, 0x00, 0x00 };
 	u32 csum;
 	int i;
 
 	if (!d)
 		return -ENODEV;
-
-	switch (sample_rate) {
-	case 44100:
-		n_val = 6272U;
-		cts_val = 82500U;
-		break;
-	case 32000:
-		n_val = 4096U;
-		cts_val = 74250U;
-		break;
-	case 48000:
-	default:
-		sample_rate = 48000;
-		n_val = 6144U;
-		cts_val = 74250U;
-		break;
-	}
+	if (!sample_rate)
+		return -EINVAL;
 
 	mutex_lock(&d->lock);
 	if (!enable) {
 		writel(0x00, d->hdmi + HDMI_ACR_CON);
+		if (spdif_source) {
+			writel(0x00, d->hdmi + HDMI_SPDIF_RX_OP);
+			writel(0x02, d->hdmi + HDMI_SPDIF_RX_CLK);
+		}
 		writel(0x00, d->hdmi + HDMI_ASP_CON);
 		writel(0x00, d->hdmi + HDMI_AUI_CON);
 		con0 = readl(d->hdmi + HDMI_CON_0) & 0xffU;
@@ -197,23 +202,30 @@ int s5l8947x_hdmi_audio_configure(unsigned int sample_rate, bool enable)
 	writel(0x00, d->hdmi + HDMI_CON_2);
 	writel(0x00, d->hdmi + HDMI_AUDIO_CLKSEL);
 
-	/* Program HDMI 1.4 Audio Clock Regeneration (ACR) N and CTS for 74.25 MHz TMDS */
+	/* Program HDMI 1.4 Audio Clock Regeneration (ACR) N and CTS */
 	s5l8947x_hdmi_write_bytes(d->hdmi, HDMI_ACR_N0, n_val, 3);
-	s5l8947x_hdmi_write_bytes(d->hdmi, HDMI_ACR_MCTS0, cts_val, 3);
 	s5l8947x_hdmi_write_bytes(d->hdmi, HDMI_ACR_CTS0, cts_val, 3);
 	writel(0x04, d->hdmi + HDMI_ACR_CON);
 
-	/* Enable 2-channel LPCM Audio Sample Packet (ASP) at HDMI 1.4 offset 0x10300 */
-	writel(0x00, d->hdmi + HDMI_ASP_SP_FLAT);
-	writel(0x08, d->hdmi + HDMI_ASP_CHCFG0);
-	writel(0x1a, d->hdmi + HDMI_ASP_CHCFG1);
-	writel(0x2c, d->hdmi + HDMI_ASP_CHCFG2);
-	writel(0x3e, d->hdmi + HDMI_ASP_CHCFG3);
-	writel(0x00, d->hdmi + HDMI_ASP_CON);
+	/* S/PDIF receiver: +0x00 = 1 run, +0x04 = 3 receive and feed the mux */
+	if (spdif_source) {
+		writel(0xff, d->hdmi + HDMI_SPDIF_RX_IRQ);
+		writel(1, d->hdmi + HDMI_SPDIF_RX_CLK);
+		writel(3, d->hdmi + HDMI_SPDIF_RX_OP);
+	} else {
+		writel(0, d->hdmi + HDMI_SPDIF_RX_OP);
+		writel(2, d->hdmi + HDMI_SPDIF_RX_CLK);
+	}
 
-	/* Enable HDMI 1.4 internal I2S receiver and subpacket mux (0x39740000) */
+	/*
+	 * Enable the HDMI 1.4 internal I2S receiver and subpacket mux.
+	 * CLK_CON=1 selects the I2S bit clock, which does not exist when the
+	 * mux is fed from the S/PDIF receiver: on that path CLK_CON must stay
+	 * 0 or the packetiser (and the ACR) see no audio clock at all.
+	 */
 	writel(0x00, d->hdmi + HDMI_I2S_CLK_CON);
-	writel(0x01, d->hdmi + HDMI_I2S_CLK_CON);
+	if (!spdif_source)
+		writel(0x01, d->hdmi + HDMI_I2S_CLK_CON);
 	writel(readl(d->hdmi + HDMI_I2S_DSD_CON) | 0x01U, d->hdmi + HDMI_I2S_DSD_CON);
 	writel(0x56, d->hdmi + HDMI_I2S_PIN_SEL_0); /* SCLK=5, LRCK=6 */
 	writel(0x34, d->hdmi + HDMI_I2S_PIN_SEL_1); /* SDATA1=3, SDATA0=4 */
@@ -227,15 +239,21 @@ int s5l8947x_hdmi_audio_configure(unsigned int sample_rate, bool enable)
 	writel((sample_rate == 44100) ? 0x00 : 0x02, d->hdmi + HDMI_I2S_CH_ST_3);
 	writel(0x02, d->hdmi + HDMI_I2S_CH_ST_4);   /* 16-bit word length */
 	writel(0x01, d->hdmi + HDMI_I2S_CH_ST_CON); /* Reload channel status */
-	writel(0xff, d->hdmi + HDMI_I2S_MUX_CH);    /* Enable all channels */
+	writel(0x03, d->hdmi + HDMI_I2S_MUX_CH);    /* CH0 L/R: two channels */
 	writel(0x03, d->hdmi + HDMI_I2S_MUX_CUV);   /* Enable L+R CUV */
-	writel(0x07, d->hdmi + HDMI_I2S_MUX_CON);   /* IN_ENABLE | AUD_I2S | CUV_I2S | MUX_EN */
+	/* S/PDIF input: IN_DISABLE | AUD_SPDIF | CUV_SPDIF | MUX_EN; I2S: 0x07 */
+	writel(spdif_source ? 0x11 : 0x07, d->hdmi + HDMI_I2S_MUX_CON);
 
-	/* Program CEA-861 Audio InfoFrame (0x84, ver 0x01, len 0x0a) */
-	writel(0x84, d->hdmi + HDMI_AUI_HEADER0);
+	/*
+	 * Program the CEA-861 Audio InfoFrame. The header is three byte-wide
+	 * registers (type, version, length), the same bytes
+	 * hdmi_audio_infoframe_pack() produces; 0x84 in the type register is
+	 * version 4 and the sink drops the frame.
+	 */
+	writel(0x04, d->hdmi + HDMI_AUI_HEADER0);
 	writel(0x01, d->hdmi + HDMI_AUI_HEADER1);
 	writel(0x0a, d->hdmi + HDMI_AUI_HEADER2);
-	csum = 0x84U + 0x01U + 0x0aU;
+	csum = 0x04U + 0x01U + 0x0aU;
 	for (i = 0; i < 5; i++) {
 		csum += aui[i];
 		writel(aui[i], d->hdmi + HDMI_AUI_BYTE1 + i * 4);
@@ -254,6 +272,26 @@ int s5l8947x_hdmi_audio_configure(unsigned int sample_rate, bool enable)
 	return 0;
 }
 EXPORT_SYMBOL_GPL(s5l8947x_hdmi_audio_configure);
+
+/*
+ * Re-arm the Audio Clock Regeneration once the audio clock is running. The
+ * block drops N/CTS if ACR_CON is set before any audio clock is present, which
+ * is exactly what happens when the bridge is configured before playback starts.
+ * Atomic context safe: register writes only.
+ */
+void s5l8947x_hdmi_audio_arm(unsigned int sample_rate)
+{
+	struct s5l8947x_display *d = g_s5l_display;
+
+	if (!d || !sample_rate)
+		return;
+	writel(0x00, d->hdmi + HDMI_ACR_CON);
+	s5l8947x_hdmi_write_bytes(d->hdmi, HDMI_ACR_N0, 6144U, 3);
+	s5l8947x_hdmi_write_bytes(d->hdmi, HDMI_ACR_CTS0,
+				  s5l8947x_hdmi_acr_cts(sample_rate), 3);
+	writel(0x04, d->hdmi + HDMI_ACR_CON);
+}
+EXPORT_SYMBOL_GPL(s5l8947x_hdmi_audio_arm);
 
 static ssize_t hpd_connected_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
@@ -404,8 +442,12 @@ static ssize_t hdmi_audio_store(struct device *dev,
 	else if (kstrtouint(buf, 0, &rate))
 		return -EINVAL;
 
-	ret = s5l8947x_hdmi_audio_configure(rate, rate != 0);
-	return ret < 0 ? ret : count;
+	ret = s5l8947x_hdmi_audio_configure(rate, rate != 0, true);
+	if (ret < 0)
+		return ret;
+	if (rate)
+		s5l8947x_hdmi_audio_arm(rate);
+	return count;
 }
 static DEVICE_ATTR_RW(hdmi_audio);
 

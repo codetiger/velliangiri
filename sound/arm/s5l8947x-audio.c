@@ -1,16 +1,33 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * S5L8947X Audio Engine (i2s0 / spdif + HDMI Audio) ALSA PCM Driver
+ * S5L8947X Audio Engine — ALSA PCM for the S/PDIF transmitter (HDMI + optical)
+ * and the I2S0 controller.
  *
- * Drives the S5L8947X digital audio complex:
- *   - i2s0  @ 0x34190000: I2S controller feeding the HDMI transmitter
- *   - spdif @ 0x34194000: S/PDIF Optical TOSLINK digital transmitter
+ * The engine is programmed from the measured register model, not the Samsung
+ * v5 I2S map:
  *
- * There is no DMA engine driver yet, so the ring buffer is fed into the
- * I2S0 TX FIFO by PIO from a high-resolution timer. The FIFO full flag
- * paces the feeder, so the reported hardware pointer follows the real
- * I2S frame clock; a FIFO that never fills or never drains surfaces as an
- * ALSA error instead of silent progress.
+ *   S/PDIF 0x34194000        I2S0 0x34190000
+ *   +0x00 CLKCON  power      +0x00 CTL     bit0 enable, bit6 soft reset
+ *   +0x04 CON     format,    +0x04 TXCON   BCLK = 24 MHz / (2 * (div+1)),
+ *                 FIFO level              [4:3] frame = 32/48/64 BCLK
+ *   +0x0c CSTAS   status     +0x08 TXCOM   bit2 TX enable, bit0 pause,
+ *   +0x10 DATA    16-bit                    keep [24:19]
+ *                            +0x10 TXDATA  one word per channel sample
+ *                            +0x3c STATUS  [12:7] FIFO level
+ *
+ * Both blocks are clocked from the 24 MHz reference, so the reachable frame
+ * rates are 46875 Hz (24 MHz / 512) and 31250 Hz (24 MHz / 768). Those are the
+ * only rates advertised: the hardware cannot produce 48000, and pretending it
+ * does would make the HDMI ACR announce a rate that is not being sent.
+ *
+ * Playback is fed by PIO from an hrtimer. The timer period is derived from the
+ * FIFO depth and the frame rate (32 us for the 16-entry S/PDIF FIFO, 256 us for
+ * the 64-entry I2S FIFO), and the hardware pointer is computed from the FIFO
+ * occupancy: consumed = written - level. That pointer is the real one, so an
+ * underrun is visible to ALSA instead of being hidden by the byte count.
+ *
+ * DMA (central DMA at 0x37000000) is the next step; until then PIO is the only
+ * transport. The 85 us S/PDIF FIFO is the reason the tick is this short.
  */
 
 #define pr_fmt(fmt) "s5l8947x-audio: " fmt
@@ -18,8 +35,8 @@
 #include <linux/clk.h>
 #include <linux/hrtimer.h>
 #include <linux/io.h>
-#include <linux/kernel.h>
 #include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
@@ -30,76 +47,96 @@
 #include <sound/initval.h>
 #include <sound/pcm.h>
 
-/* I2S0 controller registers (0x34190000) */
-#define I2S_CON			0x00
-#define I2S_MOD			0x04
-#define I2S_FIC			0x08
-#define I2S_PSR			0x0c
-#define I2S_TXD			0x10
+/* I2S0 controller (measured layout) */
+#define I2S_CTL			0x00
+#define I2S_TXCON		0x04
+#define I2S_TXCOM		0x08
+#define I2S_TXDATA		0x10
+#define I2S_STATUS		0x3c
 
-#define I2S_CON_RSTCLR		BIT(31)
-#define I2S_CON_TXFIFO_FULL	BIT(8)
-#define I2S_CON_TXDMA_ACTIVE	BIT(2)
-#define I2S_CON_ACTIVE		BIT(0)
-#define I2S_FIC_TXFLUSH		BIT(15)
-#define I2S_FIC_TXCOUNT(v)	(((v) >> 8) & 0x7fU)
+#define I2S_CTL_SOFT_RESET	0x00000041U	/* bit6 resets the block */
+#define I2S_CTL_ENABLE		0x00000021U
+#define I2S_TXCOM_BASE		0x01f80000U	/* reserved, must be kept */
+#define I2S_TXCOM_TX_EN		0x00000004U
+#define I2S_TXCOM_TX_PAUSE	0x00000001U
+#define I2S_STATUS_LEVEL(v)	(((v) >> 7) & 0x3fU)
+#define I2S_FIFO_DEPTH		64U
 
-/* S/PDIF TOSLINK transmitter registers (0x34194000) */
+/* S/PDIF transmitter (measured layout, matches mainline samsung/spdif.c) */
 #define SPDIF_CLKCON		0x00
 #define SPDIF_CON		0x04
 #define SPDIF_CSTAS		0x0c
-#define SPDIF_DAT		0x10
+#define SPDIF_DATA		0x10
 
-#define SPDIF_CLKCON_ON		0x01U
-#define SPDIF_CON_FIFO_LEVEL(v)	(((v) >> 22) & 0x1fU)
-#define SPDIF_CON_SW_RESET	BIT(5)
-#define SPDIF_CON_PCM_16BIT	0x00381001U
-#define SPDIF_CSTAS_48KHZ	0x02000104U
-/* The S/PDIF FIFO takes one 16-bit sample per write, so two per frame */
+#define SPDIF_CLKCON_PWR	0x00000001U
+#define SPDIF_CON_SW_RESET	0x00000020U
+#define SPDIF_CON_BASE		0x00381001U	/* PCM, 16-bit, FIFO threshold 7 */
+#define SPDIF_CON_MCLK_384	0x00000008U	/* CON[4:3] = 1 -> /768 */
+#define SPDIF_CON_LEVEL(v)	(((v) >> 22) & 0x1fU)
 #define SPDIF_FIFO_DEPTH	16U
+#define SPDIF_CSTAS_BASE	0x00000104U	/* consumer, PCM, no copyright */
+#define SPDIF_CSTAS_FS(code)	((u32)(code) << 24)
 
-#define AUDIO_RATE		48000U
-#define AUDIO_TICK_NS		(250 * NSEC_PER_USEC)
-/* Frames pushed per tick at most; 48 kHz drains only 12 frames per tick */
-#define AUDIO_TX_BURST		64U
-/* Consecutive full bursts without the FIFO filling before giving up */
-#define AUDIO_STALL_TICKS	8U
+/* Reachable frame rates from the 24 MHz reference */
+#define AUDIO_RATE_HIGH		46875U
+#define AUDIO_RATE_LOW		31250U
 
-/*
- * I2S0 clock configuration. The operating clock source and prescaler that
- * yield an exact 48 kHz frame clock are still being characterised; use
- * "audiotest rate" to measure candidates and set these at runtime through
- * /sys/module/s5l8947x_audio/parameters/ before opening the PCM.
- */
-static uint i2s_mod = 0xc0000000U;	/* PCLK, TX only, 16-bit, 256fs, 32fs */
-module_param(i2s_mod, uint, 0644);
-MODULE_PARM_DESC(i2s_mod, "I2S0 MOD register value used for playback");
+enum s5l8947x_out_kind {
+	OUT_SPDIF,
+	OUT_I2S,
+};
 
-static uint i2s_psr = 0x00008100U;	/* prescaler enabled, divide by 2 */
-module_param(i2s_psr, uint, 0644);
-MODULE_PARM_DESC(i2s_psr, "I2S0 PSR register value used for playback");
+struct s5l8947x_out {
+	enum s5l8947x_out_kind kind;
+	unsigned int wpf;	/* words per stereo frame */
+	unsigned int depth;	/* FIFO entries */
+	unsigned int maxlevel;	/* highest level value that is not ambiguous */
+	unsigned int high;	/* refill watermark, 3/4 of maxlevel */
+};
 
 struct s5l8947x_audio {
 	struct device *dev;
 	struct snd_card *card;
 	struct snd_pcm_substream *substream;
 
-	void __iomem *i2s0;
+	void __iomem *i2s;
 	void __iomem *spdif;
+	struct s5l8947x_out out;
 
 	spinlock_t lock;
 	struct hrtimer timer;
-	size_t hw_ptr;
-	size_t period_pos;
-	unsigned int stall_ticks;
-	bool running;
-	bool hdmi_enable;
-	bool spdif_enable;
+	ktime_t tick;
+	unsigned int rate;
 
-	u64 frames_pushed;
-	unsigned long empty_ticks;
-	unsigned long stalls;
-	unsigned long spdif_drops;
+	u64 frames_written;	/* frames handed to the FIFO this stream */
+	u32 pos;		/* ring write index */
+	u64 period_base;	/* frame count of the last reported period */
+	u64 last_frames;	/* consumed frames at the last progress check */
+	ktime_t last_progress;
+
+	bool running;
+	bool armed;
+	bool hdmi_enable;
+	unsigned long gaps;	/* FIFO found empty while data was queued */
+	unsigned long xruns;	/* no progress: the frame clock stopped */
+};
+
+/*
+ * S/PDIF feeds the HDMI transmitter and the optical output from the same
+ * stream. I2S0 is selectable for bring-up; the HDMI I2S receiver has never
+ * been seen to clock it, so S/PDIF is the default.
+ */
+static unsigned int output = OUT_SPDIF;
+module_param(output, uint, 0444);
+MODULE_PARM_DESC(output, "0 = S/PDIF transmitter (HDMI + optical), 1 = I2S0");
+
+static const unsigned int s5l8947x_rates[] = {
+	AUDIO_RATE_HIGH, AUDIO_RATE_LOW,
+};
+
+static const struct snd_pcm_hw_constraint_list s5l8947x_rate_constraint = {
+	.count	= ARRAY_SIZE(s5l8947x_rates),
+	.list	= s5l8947x_rates,
 };
 
 static const struct snd_pcm_hardware s5l8947x_pcm_hw = {
@@ -107,9 +144,9 @@ static const struct snd_pcm_hardware s5l8947x_pcm_hw = {
 				  SNDRV_PCM_INFO_MMAP_VALID |
 				  SNDRV_PCM_INFO_INTERLEAVED,
 	.formats		= SNDRV_PCM_FMTBIT_S16_LE,
-	.rates			= SNDRV_PCM_RATE_48000,
-	.rate_min		= AUDIO_RATE,
-	.rate_max		= AUDIO_RATE,
+	.rates			= SNDRV_PCM_RATE_KNOT,
+	.rate_min		= AUDIO_RATE_LOW,
+	.rate_max		= AUDIO_RATE_HIGH,
 	.channels_min		= 2,
 	.channels_max		= 2,
 	.buffer_bytes_max	= 64 * 1024,
@@ -119,120 +156,273 @@ static const struct snd_pcm_hardware s5l8947x_pcm_hw = {
 	.periods_max		= 32,
 };
 
-static void s5l8947x_audio_hw_prepare(struct s5l8947x_audio *aud)
+/* TXCON for a frame rate, 0 if the 24 MHz reference cannot produce it */
+static u32 s5l8947x_i2s_txcon(unsigned int rate)
 {
-	writel_relaxed(I2S_CON_RSTCLR, aud->i2s0 + I2S_CON);
-	writel_relaxed(I2S_FIC_TXFLUSH, aud->i2s0 + I2S_FIC);
-	writel_relaxed(0, aud->i2s0 + I2S_FIC);
-	writel_relaxed(READ_ONCE(i2s_mod), aud->i2s0 + I2S_MOD);
-	writel_relaxed(READ_ONCE(i2s_psr), aud->i2s0 + I2S_PSR);
+	static const unsigned int frame_bits[3] = { 32, 48, 64 };
+	unsigned int i;
 
-	if (aud->spdif && aud->spdif_enable) {
-		writel_relaxed(SPDIF_CON_SW_RESET, aud->spdif + SPDIF_CON);
-		writel_relaxed(SPDIF_CON_PCM_16BIT, aud->spdif + SPDIF_CON);
-		writel_relaxed(SPDIF_CSTAS_48KHZ, aud->spdif + SPDIF_CSTAS);
-		writel_relaxed(SPDIF_CLKCON_ON, aud->spdif + SPDIF_CLKCON);
+	for (i = 0; i < ARRAY_SIZE(frame_bits); i++) {
+		unsigned int denom = 2 * frame_bits[i] * rate;
+		unsigned int div;
+
+		if (!denom || 24000000U % denom)
+			continue;
+		div = 24000000U / denom;
+		if (div >= 1 && div <= 8)
+			return ((div - 1) << 8) | (i << 3);
 	}
+	return 0;
+}
+
+static u32 s5l8947x_spdif_con(unsigned int rate)
+{
+	switch (rate) {
+	case AUDIO_RATE_HIGH:
+		return SPDIF_CON_BASE;
+	case AUDIO_RATE_LOW:
+		return SPDIF_CON_BASE | SPDIF_CON_MCLK_384;
+	default:
+		return 0;
+	}
+}
+
+/* Consumer channel status: 48 kHz code for 46875, 32 kHz code for 31250 */
+static u32 s5l8947x_spdif_cstas(unsigned int rate)
+{
+	if (rate == AUDIO_RATE_LOW)
+		return SPDIF_CSTAS_BASE | SPDIF_CSTAS_FS(0x3);
+	return SPDIF_CSTAS_BASE | SPDIF_CSTAS_FS(0x2);
+}
+
+static unsigned int s5l8947x_level(struct s5l8947x_audio *aud)
+{
+	if (aud->out.kind == OUT_SPDIF)
+		return SPDIF_CON_LEVEL(readl_relaxed(aud->spdif + SPDIF_CON));
+	return I2S_STATUS_LEVEL(readl_relaxed(aud->i2s + I2S_STATUS));
+}
+
+static void s5l8947x_put_frame(struct s5l8947x_audio *aud, u32 frame)
+{
+	u16 l = frame & 0xffffU;
+	u16 r = frame >> 16;
+
+	if (aud->out.kind == OUT_I2S) {
+		/* One FIFO entry per channel sample, sample in both halves */
+		writel_relaxed((u32)l | (u32)l << 16, aud->i2s + I2S_TXDATA);
+		writel_relaxed((u32)r | (u32)r << 16, aud->i2s + I2S_TXDATA);
+		return;
+	}
+
+	/*
+	 * One subframe is two FIFO words holding the low and high 16 bits of
+	 * the 32-bit sample, so a 16-bit sample is left-justified: 0, L, 0, R.
+	 * Feeding two words, or right-justified samples, is silent.
+	 */
+	writel_relaxed(0, aud->spdif + SPDIF_DATA);
+	writel_relaxed(l, aud->spdif + SPDIF_DATA);
+	writel_relaxed(0, aud->spdif + SPDIF_DATA);
+	writel_relaxed(r, aud->spdif + SPDIF_DATA);
+}
+
+/* Frames written to the FIFO but not yet played = written - occupancy */
+static u64 s5l8947x_frames_done(struct s5l8947x_audio *aud)
+{
+	unsigned int level = s5l8947x_level(aud) / aud->out.wpf;
+
+	if (level >= aud->frames_written)
+		return 0;
+	return aud->frames_written - level;
 }
 
 /*
- * I2S0 paces the feeder; S/PDIF runs from its own clock, so a frame is
- * dropped rather than overrunning its FIFO.
+ * Frames in the ring that the application has queued for playback. Both
+ * counters start at zero in prepare(); the application can never be more than
+ * one buffer ahead, so the 32-bit modular difference is the true distance even
+ * when appl_ptr wraps at runtime->boundary.
  */
-static void s5l8947x_audio_spdif_put(struct s5l8947x_audio *aud, u32 frame)
+static unsigned int s5l8947x_ring_avail(struct s5l8947x_audio *aud,
+					struct snd_pcm_runtime *runtime)
 {
-	u32 con = readl_relaxed(aud->spdif + SPDIF_CON);
+	u32 appl = READ_ONCE(runtime->control->appl_ptr);
+	u64 delta = (u32)(appl - (u32)aud->frames_written);
 
-	if (SPDIF_CON_FIFO_LEVEL(con) > SPDIF_FIFO_DEPTH - 2) {
-		aud->spdif_drops++;
+	if (delta > runtime->buffer_size)
+		delta = runtime->buffer_size;
+	return delta;
+}
+
+/* Push as many queued frames as the FIFO has room for. Called with lock held. */
+static void s5l8947x_fill(struct s5l8947x_audio *aud,
+			  struct snd_pcm_runtime *runtime)
+{
+	unsigned int buf = runtime->buffer_size;
+	unsigned int level, room, avail, n, i, pos;
+
+	if (!buf || !aud->out.wpf)
 		return;
+
+	/*
+	 * The occupancy field wraps to 0 when the FIFO is full, so a written
+	 * level of 0 is only unambiguous while the FIFO never fills up. Stay
+	 * below maxlevel and the level can be trusted.
+	 */
+	level = s5l8947x_level(aud);
+	if (level > aud->out.maxlevel)
+		level = aud->out.maxlevel;
+	room = (aud->out.maxlevel - level) / aud->out.wpf;
+	if (!room)
+		return;
+
+	pos = aud->pos;
+	avail = s5l8947x_ring_avail(aud, runtime);
+	n = min(room, avail);
+
+	for (i = 0; i < n; i++) {
+		u32 frame = *(u32 *)(runtime->dma_area + pos * 4);
+
+		s5l8947x_put_frame(aud, frame);
+		if (++pos == buf)
+			pos = 0;
 	}
-	writel_relaxed(frame & 0xffffU, aud->spdif + SPDIF_DAT);
-	writel_relaxed(frame >> 16, aud->spdif + SPDIF_DAT);
+	aud->pos = pos;
+	aud->frames_written += n;
 }
 
-/* Push frames until the TX FIFO is full. Called with aud->lock held. */
-static bool s5l8947x_audio_fill(struct s5l8947x_audio *aud,
-				struct snd_pcm_runtime *runtime)
+static u64 s5l8947x_tick_ns(struct s5l8947x_audio *aud)
 {
-	size_t period_bytes = frames_to_bytes(runtime, runtime->period_size);
-	size_t buf_bytes = frames_to_bytes(runtime, runtime->buffer_size);
-	bool elapsed = false;
-	unsigned int n;
+	u64 ns;
 
-	if (!I2S_FIC_TXCOUNT(readl_relaxed(aud->i2s0 + I2S_FIC)))
-		aud->empty_ticks++;
-
-	for (n = 0; n < AUDIO_TX_BURST; n++) {
-		u32 frame;
-
-		if (readl_relaxed(aud->i2s0 + I2S_CON) & I2S_CON_TXFIFO_FULL)
-			break;
-
-		frame = *(const u32 *)(runtime->dma_area + aud->hw_ptr);
-		writel_relaxed(frame, aud->i2s0 + I2S_TXD);
-		if (aud->spdif && aud->spdif_enable)
-			s5l8947x_audio_spdif_put(aud, frame);
-
-		aud->hw_ptr += 4;
-		if (aud->hw_ptr >= buf_bytes)
-			aud->hw_ptr = 0;
-		aud->period_pos += 4;
-		if (aud->period_pos >= period_bytes) {
-			aud->period_pos -= period_bytes;
-			elapsed = true;
-		}
-	}
-
-	aud->frames_pushed += n;
-	if (n == AUDIO_TX_BURST)
-		aud->stall_ticks++;
-	else
-		aud->stall_ticks = 0;
-	return elapsed;
+	if (!aud->rate || !aud->out.wpf)
+		return 256000;
+	/* Half the time it takes to drain the refill watermark */
+	ns = div_u64((u64)aud->out.high * NSEC_PER_SEC,
+		     2U * aud->rate * aud->out.wpf);
+	return ns < 20000 ? 20000 : ns;
 }
 
-static enum hrtimer_restart s5l8947x_audio_timer_cb(struct hrtimer *timer)
+static int s5l8947x_engine_config(struct s5l8947x_audio *aud)
+{
+	if (aud->out.kind == OUT_SPDIF) {
+		u32 con = s5l8947x_spdif_con(aud->rate);
+
+		if (!con)
+			return -EINVAL;
+		writel(0, aud->spdif + SPDIF_CLKCON);
+		writel(SPDIF_CON_SW_RESET, aud->spdif + SPDIF_CON);
+		writel(con, aud->spdif + SPDIF_CON);
+		writel(s5l8947x_spdif_cstas(aud->rate), aud->spdif + SPDIF_CSTAS);
+	} else {
+		u32 txcon = s5l8947x_i2s_txcon(aud->rate);
+
+		if (!txcon)
+			return -EINVAL;
+		writel(I2S_CTL_SOFT_RESET, aud->i2s + I2S_CTL);
+		writel(I2S_TXCOM_BASE | I2S_TXCOM_TX_EN | I2S_TXCOM_TX_PAUSE,
+		       aud->i2s + I2S_TXCOM);
+		writel(txcon, aud->i2s + I2S_TXCON);
+		writel(I2S_CTL_ENABLE, aud->i2s + I2S_CTL);
+	}
+	return 0;
+}
+
+static void s5l8947x_engine_start(struct s5l8947x_audio *aud)
+{
+	if (aud->out.kind == OUT_SPDIF)
+		writel(SPDIF_CLKCON_PWR, aud->spdif + SPDIF_CLKCON);
+	else
+		writel(I2S_TXCOM_BASE | I2S_TXCOM_TX_EN,
+		       aud->i2s + I2S_TXCOM);
+}
+
+static void s5l8947x_engine_stop(struct s5l8947x_audio *aud)
+{
+	if (aud->out.kind == OUT_SPDIF) {
+		writel(0, aud->spdif + SPDIF_CLKCON);
+		writel(SPDIF_CON_SW_RESET, aud->spdif + SPDIF_CON);
+	} else {
+		writel(I2S_CTL_SOFT_RESET, aud->i2s + I2S_CTL);
+	}
+}
+
+static enum hrtimer_restart s5l8947x_timer_cb(struct hrtimer *timer)
 {
 	struct s5l8947x_audio *aud =
 		container_of(timer, struct s5l8947x_audio, timer);
 	struct snd_pcm_substream *substream;
-	bool elapsed, stalled;
+	struct snd_pcm_runtime *runtime;
+	unsigned long flags;
+	unsigned int level, avail;
+	bool elapsed = false, stalled = false;
+	u64 frames;
 
-	spin_lock(&aud->lock);
+	spin_lock_irqsave(&aud->lock, flags);
 	substream = aud->substream;
-	if (!aud->running || !substream) {
-		spin_unlock(&aud->lock);
+	if (!aud->running || !substream || !substream->runtime) {
+		spin_unlock_irqrestore(&aud->lock, flags);
 		return HRTIMER_NORESTART;
 	}
-	elapsed = s5l8947x_audio_fill(aud, substream->runtime);
-	stalled = aud->stall_ticks >= AUDIO_STALL_TICKS;
-	if (stalled) {
-		aud->running = false;
-		aud->stalls++;
+	runtime = substream->runtime;
+
+	if (!aud->armed) {
+		/* Arm the ACR on the first tick: the audio clock is running now */
+		if (aud->hdmi_enable)
+			s5l8947x_hdmi_audio_arm(aud->rate);
+		aud->armed = true;
 	}
-	spin_unlock(&aud->lock);
+
+	level = s5l8947x_level(aud);
+	avail = s5l8947x_ring_avail(aud, runtime);
+	s5l8947x_fill(aud, runtime);
+
+	frames = s5l8947x_frames_done(aud);
+	if (frames != aud->last_frames) {
+		aud->last_frames = frames;
+		aud->last_progress = ktime_get();
+	} else if (level || avail) {
+		/* Data is queued (or stuck in the FIFO) and nothing moves */
+		if (ktime_after(ktime_get(),
+				ktime_add_ns(aud->last_progress, 200 * NSEC_PER_MSEC)))
+			stalled = true;
+	}
+	if (frames - aud->period_base >= runtime->period_size) {
+		aud->period_base += runtime->period_size;
+		elapsed = true;
+	}
+	if (!level && avail)
+		aud->gaps++;
+	if (stalled)
+		aud->running = false;
+	spin_unlock_irqrestore(&aud->lock, flags);
 
 	if (stalled) {
+		aud->xruns++;
 		dev_err_ratelimited(aud->dev,
-			"I2S0 TX FIFO never reports full (CON=0x%08x FIC=0x%08x); frame clock not running\n",
-			readl_relaxed(aud->i2s0 + I2S_CON),
-			readl_relaxed(aud->i2s0 + I2S_FIC));
+			"audio FIFO stopped draining (level=%u, rate=%u); frame clock lost\n",
+			level, aud->rate);
 		snd_pcm_stop_xrun(substream);
 		return HRTIMER_NORESTART;
 	}
 	if (elapsed)
 		snd_pcm_period_elapsed(substream);
 
-	hrtimer_forward_now(timer, ns_to_ktime(AUDIO_TICK_NS));
+	hrtimer_forward_now(timer, aud->tick);
 	return HRTIMER_RESTART;
 }
 
 static int s5l8947x_pcm_open(struct snd_pcm_substream *substream)
 {
 	struct s5l8947x_audio *aud = snd_pcm_substream_chip(substream);
+	struct snd_pcm_runtime *runtime = substream->runtime;
+	int ret;
 
-	substream->runtime->hw = s5l8947x_pcm_hw;
+	runtime->hw = s5l8947x_pcm_hw;
+
+	ret = snd_pcm_hw_constraint_list(runtime, 0, SNDRV_PCM_HW_PARAM_RATE,
+					 &s5l8947x_rate_constraint);
+	if (ret < 0)
+		return ret;
+
 	aud->substream = substream;
 	return 0;
 }
@@ -242,46 +432,81 @@ static int s5l8947x_pcm_close(struct snd_pcm_substream *substream)
 	struct s5l8947x_audio *aud = snd_pcm_substream_chip(substream);
 
 	hrtimer_cancel(&aud->timer);
+	aud->running = false;
+	s5l8947x_engine_stop(aud);
 	aud->substream = NULL;
 	if (aud->hdmi_enable)
-		s5l8947x_hdmi_audio_configure(AUDIO_RATE, false);
+		s5l8947x_hdmi_audio_configure(aud->rate, false,
+					       aud->out.kind == OUT_SPDIF);
 	return 0;
 }
 
 static int s5l8947x_pcm_prepare(struct snd_pcm_substream *substream)
 {
 	struct s5l8947x_audio *aud = snd_pcm_substream_chip(substream);
+	unsigned long flags;
+	int ret;
 
-	aud->hw_ptr = 0;
-	aud->period_pos = 0;
-	aud->stall_ticks = 0;
-	s5l8947x_audio_hw_prepare(aud);
+	aud->rate = substream->runtime->rate;
+	aud->out.wpf = aud->out.kind == OUT_SPDIF ? 4 : 2;
+
+	ret = s5l8947x_engine_config(aud);
+	if (ret < 0)
+		return ret;
+
+	spin_lock_irqsave(&aud->lock, flags);
+	aud->frames_written = 0;
+	aud->pos = 0;
+	aud->armed = false;
+	aud->period_base = 0;
+	aud->last_frames = 0;
+	aud->last_progress = ktime_get();
+	spin_unlock_irqrestore(&aud->lock, flags);
+
+	aud->tick = ns_to_ktime(s5l8947x_tick_ns(aud));
+
 	if (aud->hdmi_enable)
-		s5l8947x_hdmi_audio_configure(AUDIO_RATE, true);
+		s5l8947x_hdmi_audio_configure(aud->rate, true,
+					       aud->out.kind == OUT_SPDIF);
 	return 0;
 }
 
 static int s5l8947x_pcm_trigger(struct snd_pcm_substream *substream, int cmd)
 {
 	struct s5l8947x_audio *aud = snd_pcm_substream_chip(substream);
+	unsigned long flags;
 
 	switch (cmd) {
 	case SNDRV_PCM_TRIGGER_START:
-		spin_lock(&aud->lock);
+		spin_lock_irqsave(&aud->lock, flags);
+		aud->last_progress = ktime_get();
+		aud->last_frames = 0;
+		/*
+		 * S/PDIF starts draining as soon as the block is powered, so
+		 * power it first; I2S accepts FIFO writes while paused, so fill
+		 * before releasing the pause bit.
+		 */
+		if (aud->out.kind == OUT_SPDIF) {
+			s5l8947x_engine_start(aud);
+			s5l8947x_fill(aud, substream->runtime);
+		} else {
+			s5l8947x_fill(aud, substream->runtime);
+			s5l8947x_engine_start(aud);
+		}
+		/* The clock is running now, so the ACR will latch */
+		if (aud->hdmi_enable)
+			s5l8947x_hdmi_audio_arm(aud->rate);
 		aud->running = true;
-		s5l8947x_audio_fill(aud, substream->runtime);
-		writel(I2S_CON_RSTCLR | I2S_CON_TXDMA_ACTIVE | I2S_CON_ACTIVE,
-		       aud->i2s0 + I2S_CON);
-		spin_unlock(&aud->lock);
-		hrtimer_start(&aud->timer, ns_to_ktime(AUDIO_TICK_NS),
-			      HRTIMER_MODE_REL);
+		spin_unlock_irqrestore(&aud->lock, flags);
+		hrtimer_start(&aud->timer, aud->tick, HRTIMER_MODE_REL);
 		return 0;
 
 	case SNDRV_PCM_TRIGGER_STOP:
-		spin_lock(&aud->lock);
+		spin_lock_irqsave(&aud->lock, flags);
 		aud->running = false;
-		writel(I2S_CON_RSTCLR, aud->i2s0 + I2S_CON);
-		spin_unlock(&aud->lock);
+		aud->armed = false;
+		s5l8947x_engine_stop(aud);
+		spin_unlock_irqrestore(&aud->lock, flags);
 		hrtimer_try_to_cancel(&aud->timer);
 		return 0;
 
@@ -302,8 +527,17 @@ static snd_pcm_uframes_t
 s5l8947x_pcm_pointer(struct snd_pcm_substream *substream)
 {
 	struct s5l8947x_audio *aud = snd_pcm_substream_chip(substream);
+	unsigned long flags;
+	u64 frames;
+	u32 buf = substream->runtime->buffer_size;
 
-	return bytes_to_frames(substream->runtime, READ_ONCE(aud->hw_ptr));
+	if (!buf)
+		return 0;
+	/* frames_written is 64-bit and updated from the timer */
+	spin_lock_irqsave(&aud->lock, flags);
+	frames = s5l8947x_frames_done(aud);
+	spin_unlock_irqrestore(&aud->lock, flags);
+	return do_div(frames, buf);
 }
 
 static const struct snd_pcm_ops s5l8947x_pcm_ops = {
@@ -329,9 +563,8 @@ static int s5l8947x_ctl_switch_get(struct snd_kcontrol *kcontrol,
 				   struct snd_ctl_elem_value *ucontrol)
 {
 	struct s5l8947x_audio *aud = snd_kcontrol_chip(kcontrol);
-	bool val = kcontrol->private_value ? aud->spdif_enable : aud->hdmi_enable;
 
-	ucontrol->value.integer.value[0] = val ? 1 : 0;
+	ucontrol->value.integer.value[0] = aud->hdmi_enable ? 1 : 0;
 	return 0;
 }
 
@@ -341,18 +574,12 @@ static int s5l8947x_ctl_switch_put(struct snd_kcontrol *kcontrol,
 	struct s5l8947x_audio *aud = snd_kcontrol_chip(kcontrol);
 	bool en = !!ucontrol->value.integer.value[0];
 
-	if (kcontrol->private_value) {
-		if (aud->spdif_enable == en)
-			return 0;
-		aud->spdif_enable = en;
-		return 1;
-	}
-
 	if (aud->hdmi_enable == en)
 		return 0;
 	aud->hdmi_enable = en;
 	if (aud->substream)
-		s5l8947x_hdmi_audio_configure(AUDIO_RATE, en);
+		s5l8947x_hdmi_audio_configure(aud->rate, en,
+					       aud->out.kind == OUT_SPDIF);
 	return 1;
 }
 
@@ -363,15 +590,6 @@ static const struct snd_kcontrol_new s5l8947x_audio_controls[] = {
 		.info		= s5l8947x_ctl_switch_info,
 		.get		= s5l8947x_ctl_switch_get,
 		.put		= s5l8947x_ctl_switch_put,
-		.private_value	= 0,
-	},
-	{
-		.iface		= SNDRV_CTL_ELEM_IFACE_MIXER,
-		.name		= "IEC958 Playback Switch",
-		.info		= s5l8947x_ctl_switch_info,
-		.get		= s5l8947x_ctl_switch_get,
-		.put		= s5l8947x_ctl_switch_put,
-		.private_value	= 1,
 	},
 };
 
@@ -379,14 +597,21 @@ static ssize_t fifo_stats_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
 {
 	struct s5l8947x_audio *aud = dev_get_drvdata(dev);
+	unsigned long flags;
+	unsigned int level;
+	u64 frames;
+
+	spin_lock_irqsave(&aud->lock, flags);
+	level = s5l8947x_level(aud);
+	frames = s5l8947x_frames_done(aud);
+	spin_unlock_irqrestore(&aud->lock, flags);
 
 	return sysfs_emit(buf,
-			  "frames=%llu empty_ticks=%lu stalls=%lu con=0x%08x mod=0x%08x fic=0x%08x psr=0x%08x spdif_con=0x%08x spdif_drops=%lu\n",
-			  aud->frames_pushed, aud->empty_ticks, aud->stalls,
-			  readl(aud->i2s0 + I2S_CON), readl(aud->i2s0 + I2S_MOD),
-			  readl(aud->i2s0 + I2S_FIC), readl(aud->i2s0 + I2S_PSR),
-			  aud->spdif ? readl(aud->spdif + SPDIF_CON) : 0,
-			  aud->spdif_drops);
+			  "output=%s rate=%u level=%u depth=%u frames=%llu gaps=%lu xruns=%lu tick_us=%llu\n",
+			  aud->out.kind == OUT_SPDIF ? "spdif" : "i2s",
+			  aud->rate, level, aud->out.depth,
+			  frames, aud->gaps, aud->xruns,
+			  div_u64((u64)ktime_to_ns(aud->tick), 1000));
 }
 static DEVICE_ATTR_RO(fifo_stats);
 
@@ -414,21 +639,36 @@ static int s5l8947x_audio_probe(struct platform_device *pdev)
 	aud->dev = &pdev->dev;
 	aud->card = card;
 	aud->hdmi_enable = true;
-	aud->spdif_enable = true;
+	aud->rate = AUDIO_RATE_HIGH;
 	spin_lock_init(&aud->lock);
 	hrtimer_init(&aud->timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	aud->timer.function = s5l8947x_audio_timer_cb;
+	aud->timer.function = s5l8947x_timer_cb;
+	aud->tick = ns_to_ktime(s5l8947x_tick_ns(aud));
 	platform_set_drvdata(pdev, aud);
 
-	aud->i2s0 = devm_platform_ioremap_resource_byname(pdev, "i2s0");
-	if (IS_ERR(aud->i2s0)) {
-		ret = PTR_ERR(aud->i2s0);
+	aud->i2s = devm_platform_ioremap_resource_byname(pdev, "i2s0");
+	if (IS_ERR(aud->i2s)) {
+		ret = PTR_ERR(aud->i2s);
 		goto err_free_card;
 	}
 
 	aud->spdif = devm_platform_ioremap_resource_byname(pdev, "spdif");
-	if (IS_ERR(aud->spdif))
-		aud->spdif = NULL;
+	if (IS_ERR(aud->spdif)) {
+		ret = PTR_ERR(aud->spdif);
+		goto err_free_card;
+	}
+
+	if (output == OUT_I2S) {
+		aud->out.kind = OUT_I2S;
+		aud->out.wpf = 2;
+		aud->out.depth = I2S_FIFO_DEPTH;
+	} else {
+		aud->out.kind = OUT_SPDIF;
+		aud->out.wpf = 4;
+		aud->out.depth = SPDIF_FIFO_DEPTH;
+	}
+	aud->out.maxlevel = aud->out.depth - 1;
+	aud->out.high = aud->out.maxlevel / 4 * 3;
 
 	ret = devm_clk_bulk_get_all_enable(&pdev->dev, &clks);
 	if (ret) {
@@ -439,7 +679,8 @@ static int s5l8947x_audio_probe(struct platform_device *pdev)
 	strscpy(card->driver, "s5l8947x-audio", sizeof(card->driver));
 	strscpy(card->shortname, "S5L8947X HDMI/SPDIF", sizeof(card->shortname));
 	snprintf(card->longname, sizeof(card->longname),
-		 "S5L8947X Audio Engine (I2S0/SPDIF) at 0x34190000");
+		 "S5L8947X Audio Engine (%s) at 0x34190000",
+		 aud->out.kind == OUT_SPDIF ? "S/PDIF -> HDMI/optical" : "I2S0");
 
 	ret = snd_pcm_new(card, "S5L8947X Digital PCM", 0, 1, 0, &pcm);
 	if (ret < 0)
@@ -462,8 +703,12 @@ static int s5l8947x_audio_probe(struct platform_device *pdev)
 	if (ret < 0)
 		goto err_free_card;
 
-	dev_info(&pdev->dev, "registered ALSA card '%s' (I2S0 PIO, SPDIF=%s)\n",
-		 card->shortname, aud->spdif ? "ok" : "none");
+	dev_info(&pdev->dev,
+		 "registered '%s': %s, %u Hz, %u words/frame, %u-entry FIFO, tick %llu us\n",
+		 card->shortname,
+		 aud->out.kind == OUT_SPDIF ? "S/PDIF -> HDMI + optical" : "I2S0",
+		 aud->rate, aud->out.wpf, aud->out.depth,
+		 div_u64((u64)ktime_to_ns(aud->tick), 1000));
 	return 0;
 
 err_free_card:
@@ -496,5 +741,5 @@ static struct platform_driver s5l8947x_audio_driver = {
 };
 module_platform_driver(s5l8947x_audio_driver);
 
-MODULE_DESCRIPTION("S5L8947X Audio Engine (I2S0 / SPDIF + HDMI) ALSA Driver");
+MODULE_DESCRIPTION("S5L8947X Audio Engine (S/PDIF -> HDMI/optical, I2S0) ALSA Driver");
 MODULE_LICENSE("GPL");

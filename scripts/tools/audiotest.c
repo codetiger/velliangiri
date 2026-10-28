@@ -7,7 +7,8 @@
  *   audiotest pio   [-t sec] [-f hz] [-c txcon] [-C cts]
  *                                              FIFO-paced tone straight to I2S0
  *                                              with HDMI audio enabled
- *   audiotest alsa  [-t sec] [-f hz]           tone through the ALSA PCM
+ *   audiotest alsa  [-t sec] [-f hz]           tone through the ALSA PCM at 46875 Hz
+ *   audiotest hdmi  [options]                  S/PDIF -> HDMI packet-layer matrix
  *
  * rate and pio program I2S0 directly through /dev/mem and refuse to run while
  * the ALSA PCM is open. Exit status: 0 pass, 1 fail, 2 error.
@@ -20,11 +21,45 @@
  *   +0x10 TXDATA  one FIFO entry per channel sample
  *   +0x3c STATUS  bit0 LRCK, [12:7] TX FIFO level (64 entries; writes to a
  *                 full FIFO are not refused, so the level must be watched)
+ *
+ * S/PDIF transmitter register model (measured, matches mainline samsung/spdif.c):
+ *   +0x00 CLKCON  bit0 power, bit2 external MCLK
+ *   +0x04 CON     bit0 PCM, [2:1] width, [4:3] MCLK/256,384,512, bit5 SW reset,
+ *                 [26:22] FIFO level (16 entries, 0 = empty or overflow)
+ *   +0x0c CSTAS   consumer channel status, [27:24] sample-rate code
+ *   +0x10 DATA    one 16-bit sample in [15:0] per write
+ *   Frame rate is 24 MHz / (2 * mclk_divider), i.e. 46875 / 31250 / 23437 Hz
+ *   for 256 / 384 / 512 fs. The FIFO is only four frames deep (85 us at 46875),
+ *   and its occupancy field wraps to 0 when full, so a feeder must stay at or
+ *   below 15 and never fill the last entry.
+ *
+ * HDMI packet layer (0x39700000 window, HDMI 1.4 offsets):
+ *   +0x10000 CON_0 bit0 HDMI enable, bit2 ASP (audio sample packet) enable
+ *   +0x10400 ACR_CON, +0x10410 MCTS0 (measured CTS, read-only),
+ *             +0x10420 CTS0, +0x10430 N0 (three byte-wide registers each)
+ *   +0x10800 AUI_CON, +0x10810..0x1081c header0/1/2 + checksum, +0x10820 payload
+ *   +0x30000 S/PDIF receiver (clk ctrl, op ctrl, IRQ status at +0x0c)
+ *   +0x40000 I2S receiver / sample-packet mux (MUX_CON at +0x20)
+ *   The AUI header is three separate bytes (type 4, version 1, length 10); the
+ *   three-byte value 0x84 0x01 0x0a the kernel driver writes decodes as
+ *   version 4 and fails the sink's checksum check.
+ *
+ * audiotest hdmi drives the S/PDIF -> HDMI chain entirely from userspace. It is
+ * how the working configuration was established, and it stays useful to compare
+ * a userspace stream against the driver when one of them is silent: it saves and
+ * restores every register it touches and keeps the HDMI audio path off between
+ * runs. The confirmed layout is "left" (0, L, 0, R); the other layouts are kept
+ * as controls because they are the ones that look plausible and are silent.
+ *
+ * Note: the measured CTS (MCTS) is not a liveness oracle. It reads small values
+ * most of the time even while the sink is playing.
  */
 
 #include <errno.h>
 #include <fcntl.h>
 #include <math.h>
+#include <sched.h>
+#include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -36,7 +71,9 @@
 #include <sound/asound.h>
 
 #define I2S0_PHYS		0x34190000UL
-#define HDMI_ACR_PHYS		0x39710000UL	/* HDMI + 0x10000 */
+#define SPDIF_PHYS		0x34194000UL
+#define HDMI_PHYS		0x39700000UL
+#define HDMI_MAP_SIZE		0x90000UL
 
 #define I2S_CTL			(0x00 / 4)
 #define I2S_TXCON		(0x04 / 4)
@@ -55,14 +92,72 @@
 #define I2S_LEVEL(st)		(((st) >> 7) & 0x3fU)
 #define I2S_FIFO_HIGH		48U
 
+/* S/PDIF transmitter (0x34194000) */
+#define SPDIF_CLKCON		(0x00 / 4)
+#define SPDIF_CON		(0x04 / 4)
+#define SPDIF_CSTAS		(0x0c / 4)
+#define SPDIF_DATA		(0x10 / 4)
+
+#define SPDIF_CLK_ON		0x01U
+#define SPDIF_CON_SW_RESET	0x20U
+#define SPDIF_CON_LEVEL(v)	(((v) >> 22) & 0x1fU)
+#define SPDIF_FIFO_DEPTH	16U
+/* The level field wraps to 0 when the FIFO is full; never write the last entry */
+#define SPDIF_FIFO_MAXLEVEL	(SPDIF_FIFO_DEPTH - 1)
+#define SPDIF_CON_256FS		0x00381001U	/* PCM 16-bit, MCLK/256 -> 46875 Hz */
+#define SPDIF_CON_384FS		0x00381009U	/* MCLK/384 -> 31250 Hz */
+#define SPDIF_CON_512FS		0x00381011U	/* MCLK/512 -> 23437 Hz */
+#define SPDIF_CSTAS_48K		0x02000104U
+
+/* HDMI core, absolute offsets inside the 0x39700000 window */
+#define HDMI_HPD_STATUS		0x00000c
+#define HDMI_AUDIO_CLKSEL	0x000070
+#define HDMI_CON_0		0x010000
+#define HDMI_MODE_SEL		0x010040
+#define HDMI_GCP_CON		0x010200
+#define HDMI_GCP_BYTE1		0x010210
+#define HDMI_ASP_CON		0x010300
+#define HDMI_ACR_CON		0x010400
+#define HDMI_ACR_MCTS0		0x010410
+#define HDMI_ACR_CTS0		0x010420
+#define HDMI_ACR_N0		0x010430
+#define HDMI_AUI_CON		0x010800
+#define HDMI_AUI_HEADER0	0x010810
+#define HDMI_AUI_HEADER1	0x010814
+#define HDMI_AUI_HEADER2	0x010818
+#define HDMI_AUI_CHECK_SUM	0x01081c
+#define HDMI_AUI_BYTE1		0x010820
+
+#define HDMI_SPDIF_RX_CLK	0x030000
+#define HDMI_SPDIF_RX_OP	0x030004
+#define HDMI_SPDIF_RX_IRQ	0x03000c
+#define HDMI_SPDIF_RX_CSTAS	0x030030
+#define HDMI_SPDIF_RX_PERIOD	0x030048
+#define HDMI_SPDIF_RX_LAST	0x030060
+
+#define HDMI_I2S_MUX_CON	0x040020
+#define HDMI_I2S_MUX_CH		0x040054
+#define HDMI_I2S_MUX_CUV	0x040058
+
+/* MUX_CON for the S/PDIF input: IN_DISABLE | AUD_SPDIF | CUV_SPDIF | MUX_EN */
+#define HDMI_MUX_SPDIF		0x11U
+#define HDMI_MUX_CUV_RL		0x03U
+#define HDMI_MUX_CH_STEREO	0x03U
+#define HDMI_MUX_CH_ALL		0xffU
+
+/* AUI header byte 0 candidates: type alone (mainline), packed CEA, current driver */
+#define AUI_HDR_TYPE		0x04U
+#define AUI_HDR_PACKED		0x81U
+#define AUI_HDR_DRIVER		0x84U
+#define AUI_LEN			0x0aU
+
 /* HDMI Audio Clock Regeneration, one byte per 32-bit register */
-#define ACR_CTS0		(0x420 / 4)
-#define ACR_N0			(0x430 / 4)
 #define TMDS_HZ			74250000.0
+#define ACR_N			6144U
 
 #define I2S_REF_HZ		24000000.0
 #define DEF_TXCON		0x00000700U	/* BCLK 1.5 MHz, 32-bit frame: 46875 Hz */
-#define RATE			48000U		/* rate the ALSA driver advertises */
+#define RATE			46875U		/* rate the audio engine produces */
 #define RATE_TOLERANCE		0.005
 #define STALL_NS		50000000LL
 
@@ -71,10 +166,55 @@
 #define HDMI_AUDIO_ATTR		"/sys/bus/platform/devices/3a200000.display-controller/hdmi_audio"
 #define AUDIO_STATS_ATTR	"/sys/bus/platform/devices/34190000.audio-controller/fifo_stats"
 
+/* Frame rate the S/PDIF transmitter produces for each reachable CON value */
+struct spdif_rate {
+	unsigned int rate;
+	uint32_t con;
+	const char *label;
+};
+
+static const struct spdif_rate spdif_rates[] = {
+	{ 46875, SPDIF_CON_256FS, "256fs" },
+	{ 31250, SPDIF_CON_384FS, "384fs" },
+	{ 23437, SPDIF_CON_512FS, "512fs" },
+};
+
+/*
+ * Words per stereo frame. A S/PDIF frame is two subframes; 4 words per frame is
+ * what the transmitter consumed in the 184.4k word/s measurement, while the
+ * early audible run used 4 and every silent run used 2.
+ */
+enum frame_pack {
+	PACK_2,		/* L, R (16-bit sample in [15:0]) */
+	PACK_LLRR,	/* L, L, R, R */
+	PACK_LRLR,	/* L, R, L, R */
+	PACK_DUP,	/* (R << 16 | L) repeated four times */
+	PACK_LEFT,	/* 0, L, 0, R: 16-bit sample left-justified (confirmed) */
+};
+
+struct hdmi_run {
+	const char *name;
+	enum frame_pack pack;
+	unsigned int aui;
+	unsigned int mux_ch;	/* 0 = default */
+};
+
+static const struct hdmi_run hdmi_matrix[] = {
+	{ "4w left aui=04",		PACK_LEFT, AUI_HDR_TYPE,   0 },
+	{ "4w llrr aui=04",		PACK_LLRR, AUI_HDR_TYPE,   0 },
+	{ "4w lrlr aui=04",		PACK_LRLR, AUI_HDR_TYPE,   0 },
+	{ "4w dup  aui=04",		PACK_DUP,  AUI_HDR_TYPE,   0 },
+	{ "2w lrlr aui=04",		PACK_2,    AUI_HDR_TYPE,   0 },
+	{ "4w llrr aui=84",		PACK_LLRR, AUI_HDR_DRIVER, 0 },
+	{ "4w llrr aui=81",		PACK_LLRR, AUI_HDR_PACKED, 0 },
+	{ "4w llrr aui=04 muxch=ff",	PACK_LLRR, AUI_HDR_TYPE,   HDMI_MUX_CH_ALL },
+};
+
 struct audio_map {
 	int fd;
 	volatile uint32_t *i2s;
-	volatile uint32_t *acr;
+	volatile uint32_t *spdif;
+	volatile uint32_t *hdmi;
 };
 
 static int64_t now_ns(void)
@@ -83,6 +223,14 @@ static int64_t now_ns(void)
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (int64_t)ts.tv_sec * 1000000000LL + ts.tv_nsec;
+}
+
+static void msleep(unsigned int ms)
+{
+	struct timespec ts = { .tv_sec = ms / 1000, .tv_nsec = (long)(ms % 1000) * 1000000L };
+
+	while (nanosleep(&ts, &ts) && errno == EINTR)
+		;
 }
 
 static void print_file(const char *label, const char *path)
@@ -139,7 +287,7 @@ static double expected_rate(uint32_t txcon)
 
 static int map_audio(struct audio_map *m)
 {
-	void *i2s, *acr;
+	void *i2s, *spdif, *hdmi;
 
 	m->fd = open("/dev/mem", O_RDWR | O_SYNC);
 	if (m->fd < 0) {
@@ -147,22 +295,542 @@ static int map_audio(struct audio_map *m)
 		return -1;
 	}
 	i2s = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, m->fd, I2S0_PHYS);
-	acr = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, m->fd, HDMI_ACR_PHYS);
-	if (i2s == MAP_FAILED || acr == MAP_FAILED) {
+	spdif = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, m->fd, SPDIF_PHYS);
+	hdmi = mmap(NULL, HDMI_MAP_SIZE, PROT_READ | PROT_WRITE, MAP_SHARED, m->fd,
+		    HDMI_PHYS);
+	if (i2s == MAP_FAILED || spdif == MAP_FAILED || hdmi == MAP_FAILED) {
 		perror("audiotest: mmap");
 		close(m->fd);
 		return -1;
 	}
 	m->i2s = i2s;
-	m->acr = acr;
+	m->spdif = spdif;
+	m->hdmi = hdmi;
 	return 0;
 }
 
 static void unmap_audio(struct audio_map *m)
 {
 	munmap((void *)m->i2s, 4096);
-	munmap((void *)m->acr, 4096);
+	munmap((void *)m->spdif, 4096);
+	munmap((void *)m->hdmi, HDMI_MAP_SIZE);
 	close(m->fd);
+}
+
+/*
+ * HDMI register access. The block stores 24-bit ACR values as one byte per
+ * 32-bit register, least significant byte first.
+ */
+static uint32_t hdmi_rd(struct audio_map *m, unsigned int off)
+{
+	return m->hdmi[off / 4];
+}
+
+static void hdmi_wr(struct audio_map *m, unsigned int off, uint32_t val)
+{
+	m->hdmi[off / 4] = val;
+}
+
+static uint32_t hdmi_rd3(struct audio_map *m, unsigned int off)
+{
+	return (hdmi_rd(m, off) & 0xffU) |
+	       (hdmi_rd(m, off + 4) & 0xffU) << 8 |
+	       (hdmi_rd(m, off + 8) & 0xffU) << 16;
+}
+
+static void hdmi_wr3(struct audio_map *m, unsigned int off, uint32_t val)
+{
+	hdmi_wr(m, off, val & 0xffU);
+	hdmi_wr(m, off + 4, (val >> 8) & 0xffU);
+	hdmi_wr(m, off + 8, (val >> 16) & 0xffU);
+}
+
+static uint32_t acr_cts(unsigned int rate)
+{
+	return (uint32_t)(TMDS_HZ * ACR_N / (128.0 * rate) + 0.5);
+}
+
+static const struct spdif_rate *spdif_rate(unsigned int rate)
+{
+	unsigned int i;
+
+	for (i = 0; i < sizeof(spdif_rates) / sizeof(spdif_rates[0]); i++)
+		if (spdif_rates[i].rate == rate)
+			return &spdif_rates[i];
+	return NULL;
+}
+
+/*
+ * Audio InfoFrame. The header is three byte-wide registers (type, version,
+ * length) plus a checksum register, exactly what hdmi_audio_infoframe_pack()
+ * produces and what exynos_hdmi.c writes. header0 selects the variant under
+ * test: 0x04 type only, 0x81 packed CEA header, 0x84 what the driver writes.
+ */
+static void hdmi_aui(struct audio_map *m, unsigned int header0)
+{
+	uint8_t payload[AUI_LEN];
+	unsigned int i, sum;
+
+	memset(payload, 0, sizeof(payload));
+	payload[0] = 0x01;	/* LPCM, channel count - 1 = 1 */
+
+	hdmi_wr(m, HDMI_AUI_HEADER0, header0);
+	hdmi_wr(m, HDMI_AUI_HEADER1, 0x01);
+	hdmi_wr(m, HDMI_AUI_HEADER2, AUI_LEN);
+	sum = header0 + 0x01U + AUI_LEN;
+	for (i = 0; i < sizeof(payload); i++)
+		sum += payload[i];
+	hdmi_wr(m, HDMI_AUI_CHECK_SUM, (0x100U - (sum & 0xffU)) & 0xffU);
+	for (i = 0; i < sizeof(payload); i++)
+		hdmi_wr(m, HDMI_AUI_BYTE1 + 4 * i, payload[i]);
+}
+
+struct hdmi_state {
+	uint32_t clksel, mux_con, mux_ch, mux_cuv;
+	uint32_t spdif_rx_clk, spdif_rx_op;
+	uint32_t spdif_clkcon, spdif_con, spdif_cstas;
+	uint32_t con0, acr_con, aui_con, asp_con, n, cts;
+	uint32_t aui[14];	/* header 0..2, checksum, 10 payload bytes */
+};
+
+static void hdmi_state_save(struct audio_map *m, struct hdmi_state *s)
+{
+	unsigned int i;
+
+	s->clksel = hdmi_rd(m, HDMI_AUDIO_CLKSEL) & 0xffU;
+	s->mux_con = hdmi_rd(m, HDMI_I2S_MUX_CON) & 0xffU;
+	s->mux_ch = hdmi_rd(m, HDMI_I2S_MUX_CH) & 0xffU;
+	s->mux_cuv = hdmi_rd(m, HDMI_I2S_MUX_CUV) & 0xffU;
+	s->spdif_rx_clk = hdmi_rd(m, HDMI_SPDIF_RX_CLK) & 0xffU;
+	s->spdif_rx_op = hdmi_rd(m, HDMI_SPDIF_RX_OP) & 0xffU;
+	s->spdif_clkcon = m->spdif[SPDIF_CLKCON];
+	s->spdif_con = m->spdif[SPDIF_CON];
+	s->spdif_cstas = m->spdif[SPDIF_CSTAS];
+	s->con0 = hdmi_rd(m, HDMI_CON_0);
+	s->acr_con = hdmi_rd(m, HDMI_ACR_CON);
+	s->aui_con = hdmi_rd(m, HDMI_AUI_CON);
+	s->asp_con = hdmi_rd(m, HDMI_ASP_CON);
+	s->n = hdmi_rd3(m, HDMI_ACR_N0);
+	s->cts = hdmi_rd3(m, HDMI_ACR_CTS0);
+	for (i = 0; i < 14; i++)
+		s->aui[i] = hdmi_rd(m, HDMI_AUI_HEADER0 + 4 * i) & 0xffU;
+}
+
+static void hdmi_state_restore(struct audio_map *m, const struct hdmi_state *s)
+{
+	unsigned int i;
+
+	/* Quiet the path before the packet data and enables go back */
+	hdmi_wr(m, HDMI_AUI_CON, 0);
+	hdmi_wr(m, HDMI_ACR_CON, 0);
+	hdmi_wr(m, HDMI_CON_0, hdmi_rd(m, HDMI_CON_0) & ~0x04U);
+
+	hdmi_wr(m, HDMI_I2S_MUX_CON, s->mux_con);
+	hdmi_wr(m, HDMI_I2S_MUX_CH, s->mux_ch);
+	hdmi_wr(m, HDMI_I2S_MUX_CUV, s->mux_cuv);
+	hdmi_wr(m, HDMI_AUDIO_CLKSEL, s->clksel);
+	hdmi_wr(m, HDMI_SPDIF_RX_IRQ, 0xff);
+	hdmi_wr(m, HDMI_SPDIF_RX_OP, s->spdif_rx_op);
+	hdmi_wr(m, HDMI_SPDIF_RX_CLK, s->spdif_rx_clk);
+
+	m->spdif[SPDIF_CLKCON] = 0;
+	m->spdif[SPDIF_CON] = SPDIF_CON_SW_RESET;
+	m->spdif[SPDIF_CSTAS] = s->spdif_cstas;
+	m->spdif[SPDIF_CON] = s->spdif_con;
+	m->spdif[SPDIF_CLKCON] = s->spdif_clkcon;
+
+	hdmi_wr3(m, HDMI_ACR_N0, s->n);
+	hdmi_wr3(m, HDMI_ACR_CTS0, s->cts);
+	for (i = 0; i < 14; i++)
+		hdmi_wr(m, HDMI_AUI_HEADER0 + 4 * i, s->aui[i]);
+
+	hdmi_wr(m, HDMI_ASP_CON, s->asp_con);
+	hdmi_wr(m, HDMI_CON_0, s->con0);
+	hdmi_wr(m, HDMI_ACR_CON, s->acr_con);
+	hdmi_wr(m, HDMI_AUI_CON, s->aui_con);
+}
+
+static void spdif_tx_start(struct audio_map *m, uint32_t con)
+{
+	m->spdif[SPDIF_CLKCON] = 0;
+	m->spdif[SPDIF_CON] = SPDIF_CON_SW_RESET;
+	m->spdif[SPDIF_CON] = con;
+	m->spdif[SPDIF_CSTAS] = SPDIF_CSTAS_48K;
+	m->spdif[SPDIF_CLKCON] = SPDIF_CLK_ON;
+}
+
+static void spdif_tx_stop(struct audio_map *m)
+{
+	m->spdif[SPDIF_CLKCON] = 0;
+	m->spdif[SPDIF_CON] = SPDIF_CON_SW_RESET;
+}
+
+/*
+ * Program everything except the audio sample packet enable, so the packetiser
+ * starts on a stream that is already running.
+ */
+static void hdmi_prepare(struct audio_map *m, const struct hdmi_run *run,
+			 unsigned int rate, unsigned int clksel,
+			 unsigned int mux_ch, bool gcp)
+{
+	hdmi_wr(m, HDMI_AUI_CON, 0);
+	hdmi_wr(m, HDMI_ACR_CON, 0);
+	hdmi_wr(m, HDMI_CON_0, hdmi_rd(m, HDMI_CON_0) & ~0x04U);
+
+	/* S/PDIF receiver -> sample-packet mux */
+	hdmi_wr(m, HDMI_I2S_MUX_CON, HDMI_MUX_SPDIF);
+	hdmi_wr(m, HDMI_I2S_MUX_CH, mux_ch);
+	hdmi_wr(m, HDMI_I2S_MUX_CUV, HDMI_MUX_CUV_RL);
+	hdmi_wr(m, HDMI_SPDIF_RX_IRQ, 0xff);
+	hdmi_wr(m, HDMI_SPDIF_RX_CLK, 1);
+	hdmi_wr(m, HDMI_SPDIF_RX_OP, 3);
+
+	hdmi_wr(m, HDMI_AUDIO_CLKSEL, clksel);
+	hdmi_wr(m, HDMI_MODE_SEL, 2);
+	if (gcp) {
+		/* Loader defaults: send a GCP with Clear_AVMUTE */
+		hdmi_wr(m, HDMI_GCP_CON, 0x0e);
+		hdmi_wr(m, HDMI_GCP_BYTE1, 0x10);
+	}
+
+	hdmi_wr3(m, HDMI_ACR_N0, ACR_N);
+	hdmi_wr3(m, HDMI_ACR_CTS0, acr_cts(rate));
+	hdmi_wr(m, HDMI_ACR_CON, 4);
+	hdmi_aui(m, run->aui);
+}
+
+static void hdmi_go(struct audio_map *m)
+{
+	hdmi_wr(m, HDMI_CON_0, hdmi_rd(m, HDMI_CON_0) | 0x05U);
+	hdmi_wr(m, HDMI_AUI_CON, 2);
+}
+
+static void hdmi_stop(struct audio_map *m)
+{
+	hdmi_wr(m, HDMI_AUI_CON, 0);
+	hdmi_wr(m, HDMI_CON_0, hdmi_rd(m, HDMI_CON_0) & ~0x04U);
+	hdmi_wr(m, HDMI_ACR_CON, 0);
+}
+
+static void hdmi_dump(struct audio_map *m, const char *tag)
+{
+	uint32_t n = hdmi_rd3(m, HDMI_ACR_N0);
+	uint32_t cts = hdmi_rd3(m, HDMI_ACR_CTS0);
+	uint32_t mcts = hdmi_rd3(m, HDMI_ACR_MCTS0);
+
+	printf("%s con0=%02x clksel=%u mux=%02x muxch=%02x cuv=%02x asp=%02x "
+	       "acr_con=%u n=%u cts=%u mcts=%u",
+	       tag, hdmi_rd(m, HDMI_CON_0) & 0xffU,
+	       hdmi_rd(m, HDMI_AUDIO_CLKSEL) & 0xffU,
+	       hdmi_rd(m, HDMI_I2S_MUX_CON) & 0xffU,
+	       hdmi_rd(m, HDMI_I2S_MUX_CH) & 0xffU,
+	       hdmi_rd(m, HDMI_I2S_MUX_CUV) & 0xffU,
+	       hdmi_rd(m, HDMI_ASP_CON) & 0xffU,
+	       hdmi_rd(m, HDMI_ACR_CON) & 0xffU, n, cts, mcts);
+	if (mcts)
+		printf(" -> %.1f Hz", TMDS_HZ * n / (128.0 * mcts));
+	printf("\n");
+
+	printf("%s aui=%02x/%02x/%02x gcp=%02x/%02x spdif_rx clk=%u op=%x irq=%02x "
+	       "cstas=%02x%02x%02x%02x period=%04x last=%08x %08x %08x %08x\n",
+	       tag,
+	       hdmi_rd(m, HDMI_AUI_HEADER0) & 0xffU,
+	       hdmi_rd(m, HDMI_AUI_HEADER1) & 0xffU,
+	       hdmi_rd(m, HDMI_AUI_HEADER2) & 0xffU,
+	       hdmi_rd(m, HDMI_GCP_CON) & 0xffU,
+	       hdmi_rd(m, HDMI_GCP_BYTE1) & 0xffU,
+	       hdmi_rd(m, HDMI_SPDIF_RX_CLK) & 0xffU,
+	       hdmi_rd(m, HDMI_SPDIF_RX_OP) & 0xffU,
+	       hdmi_rd(m, HDMI_SPDIF_RX_IRQ) & 0xffU,
+	       hdmi_rd(m, HDMI_SPDIF_RX_CSTAS) & 0xffU,
+	       hdmi_rd(m, HDMI_SPDIF_RX_CSTAS + 4) & 0xffU,
+	       hdmi_rd(m, HDMI_SPDIF_RX_CSTAS + 8) & 0xffU,
+	       hdmi_rd(m, HDMI_SPDIF_RX_CSTAS + 12) & 0xffU,
+	       hdmi_rd(m, HDMI_SPDIF_RX_PERIOD) & 0xffffU,
+	       hdmi_rd(m, HDMI_SPDIF_RX_LAST),
+	       hdmi_rd(m, HDMI_SPDIF_RX_LAST + 4),
+	       hdmi_rd(m, HDMI_SPDIF_RX_LAST + 8),
+	       hdmi_rd(m, HDMI_SPDIF_RX_LAST + 12));
+}
+
+static unsigned int frame_words(enum frame_pack pack, int16_t l, int16_t r,
+				uint32_t *w)
+{
+	switch (pack) {
+	case PACK_2:
+		w[0] = (uint16_t)l;
+		w[1] = (uint16_t)r;
+		return 2;
+	case PACK_LLRR:
+		w[0] = w[1] = (uint16_t)l;
+		w[2] = w[3] = (uint16_t)r;
+		return 4;
+	case PACK_LRLR:
+		w[0] = w[2] = (uint16_t)l;
+		w[1] = w[3] = (uint16_t)r;
+		return 4;
+	case PACK_DUP:
+		w[0] = w[1] = w[2] = w[3] =
+			(uint32_t)(uint16_t)r << 16 | (uint16_t)l;
+		return 4;
+	case PACK_LEFT:
+		w[0] = 0;
+		w[1] = (uint16_t)l;
+		w[2] = 0;
+		w[3] = (uint16_t)r;
+		return 4;
+	}
+	return 0;
+}
+
+struct tone {
+	double phase, step;
+	unsigned long underruns;	/* FIFO found empty: a gap in the stream */
+	unsigned long waits;		/* FIFO full: feeder back-pressure, normal */
+	uint64_t frames;
+};
+
+/*
+ * Keep the 16-entry TX FIFO fed for @ms. The level is checked once per frame;
+ * writing past the FIFO is not refused, it wraps the level and drops data, so
+ * the watermark has to account for the whole frame. Returns the elapsed time.
+ */
+static int64_t spdif_feed(struct audio_map *m, enum frame_pack pack, struct tone *tn,
+			  unsigned int ms, bool mute)
+{
+	uint32_t w[4];
+	unsigned int n = frame_words(pack, 0, 0, w);
+	unsigned int high = SPDIF_FIFO_MAXLEVEL - n;
+	int64_t t0 = now_ns(), end = t0 + (int64_t)ms * 1000000LL, now;
+	unsigned int lvl, i;
+
+	/* Wait for room; a FIFO that never drains means there is no clock */
+	while ((lvl = SPDIF_CON_LEVEL(m->spdif[SPDIF_CON])) > high) {
+		if (now_ns() - t0 > 20000000LL)
+			return -1;
+	}
+
+	while ((now = now_ns()) < end) {
+		lvl = SPDIF_CON_LEVEL(m->spdif[SPDIF_CON]);
+		if (lvl > high) {
+			tn->waits++;
+			continue;
+		}
+		if (!lvl)
+			tn->underruns++;
+
+		if (mute) {
+			n = frame_words(pack, 0, 0, w);
+		} else {
+			int16_t v = (int16_t)(12000.0 * sin(tn->phase));
+
+			n = frame_words(pack, v, v, w);
+			tn->phase += tn->step;
+			if (tn->phase >= 2.0 * M_PI)
+				tn->phase -= 2.0 * M_PI;
+		}
+		for (i = 0; i < n; i++)
+			m->spdif[SPDIF_DATA] = w[i];
+		tn->frames++;
+	}
+	return now - t0;
+}
+
+static int run_selected(const char *sel, unsigned int idx)
+{
+	const char *p = sel;
+
+	if (!sel || !strcmp(sel, "all"))
+		return 1;
+	while (*p) {
+		char *end;
+		unsigned long v = strtoul(p, &end, 0);
+
+		if (end == p)
+			return 0;
+		if (v == idx)
+			return 1;
+		if (*end != ',')
+			return 0;
+		p = end + 1;
+	}
+	return 0;
+}
+
+static int cmd_hdmi(unsigned int secs, unsigned int freq, unsigned int rate,
+		    const char *sel, const char *pack, const char *aui,
+		    int list_only, int dump_only, int clksel_force,
+		    int mux_ch_force, int gcp)
+{
+	const struct spdif_rate *sr = spdif_rate(rate);
+	struct hdmi_run custom;
+	const struct hdmi_run *runs;
+	struct hdmi_state saved;
+	struct audio_map m;
+	unsigned int nruns, i, run_no = 0;
+	int ret = 0;
+
+	if (list_only) {
+		printf("runs (default matrix):\n");
+		for (i = 0; i < sizeof(hdmi_matrix) / sizeof(hdmi_matrix[0]); i++)
+			printf("  %u  %s\n", i + 1, hdmi_matrix[i].name);
+		return 0;
+	}
+	if (!sr) {
+		fprintf(stderr, "audiotest: unsupported S/PDIF rate %u (use 46875, 31250 or 23437)\n",
+			rate);
+		return 2;
+	}
+
+	if (pack || aui) {
+		/* Single custom combination instead of the matrix */
+		memset(&custom, 0, sizeof(custom));
+		custom.name = "custom";
+		custom.pack = PACK_LEFT;
+		custom.aui = AUI_HDR_TYPE;
+		if (pack) {
+			if (!strcmp(pack, "2"))
+				custom.pack = PACK_2;
+			else if (!strcmp(pack, "llrr"))
+				custom.pack = PACK_LLRR;
+			else if (!strcmp(pack, "lrlr"))
+				custom.pack = PACK_LEFT;
+			else if (!strcmp(pack, "dup"))
+				custom.pack = PACK_DUP;
+			else if (!strcmp(pack, "left"))
+				custom.pack = PACK_LEFT;
+			else {
+				fprintf(stderr, "audiotest: unknown pack '%s' (2, llrr, lrlr, dup, left)\n",
+					pack);
+				return 2;
+			}
+		}
+		if (aui) {
+			char *end;
+			unsigned long v = strtoul(aui, &end, 16);
+
+			if (*end || v > 0xff) {
+				fprintf(stderr, "audiotest: bad AUI header '%s'\n", aui);
+				return 2;
+			}
+			custom.aui = v;
+		}
+		runs = &custom;
+		nruns = 1;
+	} else {
+		runs = hdmi_matrix;
+		nruns = sizeof(hdmi_matrix) / sizeof(hdmi_matrix[0]);
+	}
+
+	if (!pcm_is_idle())
+		return 2;
+	{
+		unsigned int selected = 0;
+
+		for (i = 0; i < nruns; i++)
+			selected += run_selected(sel, i + 1);
+		if (!selected) {
+			fprintf(stderr, "audiotest: no run selected (see -l)\n");
+			return 2;
+		}
+	}
+	if (map_audio(&m))
+		return 2;
+
+	if (dump_only) {
+		hdmi_dump(&m, "[hdmi]");
+		unmap_audio(&m);
+		return 0;
+	}
+
+	hdmi_state_save(&m, &saved);
+
+	/*
+	 * The S/PDIF FIFO is four frames deep (85 us at 46875 Hz); a normal
+	 * priority feeder cannot keep it full.
+	 */
+	{
+		struct sched_param sp = { .sched_priority = 50 };
+
+		if (sched_setscheduler(0, SCHED_FIFO, &sp))
+			printf("[hdmi] WARN: no SCHED_FIFO (%s); expect FIFO gaps\n",
+			       strerror(errno));
+		else
+			printf("[hdmi] feeder runs at SCHED_FIFO priority 50\n");
+	}
+
+	if (!(hdmi_rd(&m, HDMI_HPD_STATUS) & 1))
+		printf("[hdmi] WARN: no hot-plug detect; audio needs a connected sink\n");
+
+	if (clksel_force >= 0)
+		printf("[hdmi] AUDIO_CLKSEL forced to %d (boot value %u)\n",
+		       clksel_force, saved.clksel);
+	else
+		printf("[hdmi] using boot AUDIO_CLKSEL %u\n", saved.clksel);
+
+	printf("[hdmi] S/PDIF %s -> %u Hz, %u Hz tone, %u s per run, %u run(s)\n",
+	       sr->label, sr->rate, freq, secs, nruns);
+
+	for (i = 0; i < nruns; i++) {
+		const struct hdmi_run *run = &runs[i];
+		unsigned int clksel = clksel_force >= 0 ? (unsigned int)clksel_force
+							: saved.clksel;
+		unsigned int mux_ch = mux_ch_force >= 0 ? (unsigned int)mux_ch_force
+						       : (run->mux_ch ? run->mux_ch
+								      : HDMI_MUX_CH_STEREO);
+		unsigned int this_freq = freq + 60 * run_no;
+		struct tone tn = { 0 };
+		uint64_t frames0;
+		int64_t elapsed;
+		uint32_t mcts;
+
+		if (!run_selected(sel, i + 1))
+			continue;
+		run_no++;
+
+		tn.step = 2.0 * M_PI * this_freq / sr->rate;
+
+		printf("\n[%u/%u] %s: %u Hz, %u Hz tone for %u s\n", i + 1, nruns,
+		       run->name, sr->rate, this_freq, secs);
+		printf("      listen on the TV now\n");
+
+		spdif_tx_start(&m, sr->con);
+		if (spdif_feed(&m, run->pack, &tn, 150, true) < 0) {
+			printf("      FAIL: S/PDIF FIFO never drained, no frame clock\n");
+			spdif_tx_stop(&m);
+			ret = 1;
+			continue;
+		}
+
+		hdmi_prepare(&m, run, sr->rate, clksel, mux_ch, gcp);
+		hdmi_go(&m);
+		frames0 = tn.frames;
+		elapsed = spdif_feed(&m, run->pack, &tn, secs * 1000, false);
+		mcts = hdmi_rd3(&m, HDMI_ACR_MCTS0);
+
+		hdmi_dump(&m, "      ");
+		hdmi_stop(&m);
+		spdif_tx_stop(&m);
+
+		printf("      fed %.1f frames/s, FIFO gaps %lu, back-pressure %lu\n",
+		       elapsed > 0 ? (double)(tn.frames - frames0) * 1e9 / elapsed : 0.0,
+		       tn.underruns, tn.waits);
+		if (mcts)
+			printf("      MCTS %u -> sink announces %.1f Hz (N=%u, CTS written %u)\n",
+			       mcts, TMDS_HZ * ACR_N / (128.0 * mcts), ACR_N,
+			       acr_cts(sr->rate));
+		else
+			printf("      MCTS reads 0: the HDMI ACR sees no audio clock\n");
+
+		msleep(1500);
+	}
+
+	printf("\n[hdmi] done. Runs that are audible are the working configuration;\n"
+	       "       write down their name and the MCTS line above.\n");
+
+	hdmi_state_restore(&m, &saved);
+	unmap_audio(&m);
+	return ret;
 }
 
 static void i2s_stop(struct audio_map *m)
@@ -267,7 +935,7 @@ static int cmd_rate(uint32_t txcon)
 	return report_rate(rate, expect, underruns);
 }
 
-struct tone {
+struct pio_tone {
 	double phase, step;
 	int right;
 	uint32_t sample;
@@ -276,7 +944,7 @@ struct tone {
 /* Next FIFO word: one channel sample, copied into both 16-bit halves */
 static uint32_t tone_next(void *ctx)
 {
-	struct tone *tn = ctx;
+	struct pio_tone *tn = ctx;
 
 	if (!tn->right) {
 		uint16_t v = (uint16_t)(int16_t)(12000.0 * sin(tn->phase));
@@ -290,24 +958,11 @@ static uint32_t tone_next(void *ctx)
 	return tn->sample;
 }
 
-static uint32_t acr_read(struct audio_map *m, unsigned int reg)
-{
-	return (m->acr[reg] & 0xffU) | (m->acr[reg + 1] & 0xffU) << 8 |
-	       (m->acr[reg + 2] & 0xffU) << 16;
-}
-
-static void acr_write(struct audio_map *m, unsigned int reg, uint32_t val)
-{
-	m->acr[reg] = val & 0xffU;
-	m->acr[reg + 1] = (val >> 8) & 0xffU;
-	m->acr[reg + 2] = (val >> 16) & 0xffU;
-}
-
 static int cmd_pio(unsigned int secs, unsigned int freq, uint32_t txcon,
 		   uint32_t cts)
 {
 	double expect = expected_rate(txcon), rate;
-	struct tone tn = { 0 };
+	struct pio_tone tn = { 0 };
 	unsigned long underruns;
 	struct audio_map m;
 	uint32_t n;
@@ -323,11 +978,11 @@ static int cmd_pio(unsigned int secs, unsigned int freq, uint32_t txcon,
 	if (write_file(HDMI_AUDIO_ATTR, "48000"))
 		printf("[pio] WARN: could not enable HDMI audio via %s\n",
 		       HDMI_AUDIO_ATTR);
-	n = acr_read(&m, ACR_N0);
+	n = hdmi_rd3(&m, HDMI_ACR_N0);
 	if (cts)
-		acr_write(&m, ACR_CTS0, cts);
+		hdmi_wr3(&m, HDMI_ACR_CTS0, cts);
 	printf("[pio] I2S0 frame rate %.1f Hz; HDMI N=%u CTS=%u (CTS for this rate: %.1f)\n",
-	       expect, n, acr_read(&m, ACR_CTS0), TMDS_HZ * n / (128.0 * expect));
+	       expect, n, hdmi_rd3(&m, HDMI_ACR_CTS0), TMDS_HZ * n / (128.0 * expect));
 	print_file("[pio] hdmi: ", HDMI_AUDIO_ATTR);
 
 	tn.step = 2.0 * M_PI * freq / expect;
@@ -464,14 +1119,32 @@ static void usage(const char *prog)
 	fprintf(stderr,
 		"Usage: %s rate  [-c txcon]\n"
 		"       %s pio   [-t sec] [-f hz] [-c txcon] [-C cts]\n"
-		"       %s alsa  [-t sec] [-f hz]\n",
-		prog, prog, prog);
+		"       %s alsa  [-t sec] [-f hz]\n"
+		"       %s hdmi  [-t sec] [-f hz] [-r rate] [-i runs] [-p pack] [-a aui]\n"
+		"                [-k clksel] [-m muxch] [-g] [-l] [-D]\n"
+		"\n"
+		"hdmi options:\n"
+		"  -t secs    tone length per run (default 6)\n"
+		"  -f hz      first tone frequency, +60 Hz per run (default 440)\n"
+		"  -r rate    S/PDIF rate: 46875 (default), 31250, 23437\n"
+		"  -i runs    comma-separated run numbers, or 'all' (default)\n"
+		"  -p pack    layout: left (default), 2, llrr, lrlr, dup (single run)\n"
+		"  -a aui     AUI header byte 0 in hex: 04, 81, 84 (single run)\n"
+		"  -k clksel  force HDMI_AUDIO_CLKSEL (default: keep boot value)\n"
+		"  -m muxch   force HDMI_I2S_MUX_CH (default: 03, run may override)\n"
+		"  -g         send a GCP with Clear_AVMUTE before each run\n"
+		"  -l         list the default matrix\n"
+		"  -D         dump the current HDMI audio state and exit\n",
+		prog, prog, prog, prog);
 }
 
 int main(int argc, char **argv)
 {
 	uint32_t txcon = DEF_TXCON, cts = 0;
-	unsigned int secs = 3, freq = 440;
+	unsigned int secs = 3, freq = 440, rate = 46875;
+	const char *sel = NULL, *pack = NULL, *aui = NULL;
+	int clksel_force = -1, mux_ch_force = -1;
+	int list_only = 0, dump_only = 0, gcp = 0;
 	const char *cmd;
 	int opt;
 
@@ -480,8 +1153,10 @@ int main(int argc, char **argv)
 		return 2;
 	}
 	cmd = argv[1];
+	if (!strcmp(cmd, "hdmi"))
+		secs = 6;
 	optind = 2;
-	while ((opt = getopt(argc, argv, "c:C:t:f:")) != -1) {
+	while ((opt = getopt(argc, argv, "c:C:t:f:r:i:p:a:k:m:lgD")) != -1) {
 		switch (opt) {
 		case 'c':
 			txcon = (uint32_t)strtoul(optarg, NULL, 0);
@@ -494,6 +1169,33 @@ int main(int argc, char **argv)
 			break;
 		case 'f':
 			freq = (unsigned int)strtoul(optarg, NULL, 0);
+			break;
+		case 'r':
+			rate = (unsigned int)strtoul(optarg, NULL, 0);
+			break;
+		case 'i':
+			sel = optarg;
+			break;
+		case 'p':
+			pack = optarg;
+			break;
+		case 'a':
+			aui = optarg;
+			break;
+		case 'k':
+			clksel_force = (int)strtoul(optarg, NULL, 0);
+			break;
+		case 'm':
+			mux_ch_force = (int)strtoul(optarg, NULL, 0);
+			break;
+		case 'l':
+			list_only = 1;
+			break;
+		case 'D':
+			dump_only = 1;
+			break;
+		case 'g':
+			gcp = 1;
 			break;
 		default:
 			usage(argv[0]);
@@ -511,6 +1213,9 @@ int main(int argc, char **argv)
 		return cmd_pio(secs, freq, txcon, cts);
 	if (strcmp(cmd, "alsa") == 0)
 		return cmd_alsa(secs, freq);
+	if (strcmp(cmd, "hdmi") == 0)
+		return cmd_hdmi(secs, freq, rate, sel, pack, aui, list_only,
+				dump_only, clksel_force, mux_ch_force, gcp);
 	usage(argv[0]);
 	return 2;
 }
