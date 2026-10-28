@@ -7,12 +7,15 @@
  *   - rgbout  @ 0x3a200000: Display pipe & Plane 0 ARGB8888 scanout DMA
  *   - out     @ 0x39600000: Timing generator & 3x256 10-bit Gamma LUTs
  *   - hdmi    @ 0x39700000: HDMI 1.4 transmitter, PHY, AVI/Audio InfoFrames
- *   - scaler  @ 0x39200000: M2M YUV/RGB hardware scaler (PMGR gate 26)
+ *   - scaler  @ 0x39200000: M2M YUV/RGB hardware scaler
+ *
+ * The pipe and HDMI clocks stay on while the driver is bound; the scaler
+ * clock is switched through the scaler_status attribute.
  */
 
 #define pr_fmt(fmt) "s5l8947x-display: " fmt
 
-#include <linux/delay.h>
+#include <linux/clk.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
@@ -21,16 +24,6 @@
 #include <linux/platform_device.h>
 #include <linux/s5l8947x-display.h>
 #include <linux/slab.h>
-
-/* PMGR registers for display & scaler gates */
-#define PMGR_PHYS_BASE		0x3f100000UL
-#define PMGR_GATE_OFFSET(n)	(0x1008U + (n) * 4U)
-#define PMGR_GATE_HPERF_RT_A	15
-#define PMGR_GATE_RGBOUT_A	20
-#define PMGR_GATE_HPERF_RT_B	21
-#define PMGR_GATE_RGBOUT_B	25
-#define PMGR_GATE_SCALER	26
-#define PMGR_GATE_HDMI		80
 
 /* rgbout registers (0x3a200000) */
 #define RGB_SIZE		0x1030
@@ -102,13 +95,18 @@
 #define S5L_FB_BASE_MAX		0x9f000000U
 #define S5L_FB_PAGE_BYTES	(1280U * 720U * 4U)
 
+static const char * const s5l8947x_display_clk_names[] = {
+	"hperf-rt-a", "rgbout-a", "hperf-rt-b", "rgbout-b", "hdmi",
+};
+
 struct s5l8947x_display {
 	struct device *dev;
 	void __iomem *rgbout;
 	void __iomem *out;
 	void __iomem *hdmi;
 	void __iomem *scaler;
-	void __iomem *pmgr;
+	struct clk_bulk_data clks[ARRAY_SIZE(s5l8947x_display_clk_names)];
+	struct clk *scaler_clk;
 	struct mutex lock;
 	u32 plane_phys;
 	unsigned int gamma_brightness;
@@ -118,29 +116,6 @@ struct s5l8947x_display {
 };
 
 static struct s5l8947x_display *g_s5l_display;
-
-static int s5l8947x_pmgr_gate_set(struct s5l8947x_display *d, unsigned int gate,
-				  bool on)
-{
-	u32 off = PMGR_GATE_OFFSET(gate);
-	u32 v;
-	int i;
-
-	if (!d->pmgr)
-		return -ENODEV;
-
-	v = readl(d->pmgr + off);
-	if (!v)
-		return -ENODEV;
-	writel((v & ~0x10fU) | (on ? 0x0fU : 0x00U), d->pmgr + off);
-	for (i = 0; i < 10000; i++) {
-		v = readl(d->pmgr + off);
-		if (!((v ^ (v >> 4)) & 0x0fU))
-			return 0;
-		udelay(1);
-	}
-	return -ETIMEDOUT;
-}
 
 static void s5l8947x_hdmi_write_bytes(void __iomem *base, u32 off, u32 val,
 				      int nbytes)
@@ -369,10 +344,9 @@ static ssize_t scaler_status_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
 {
 	struct s5l8947x_display *d = dev_get_drvdata(dev);
-	u32 gate = d->pmgr ? readl(d->pmgr + PMGR_GATE_OFFSET(PMGR_GATE_SCALER)) : 0;
 
-	return sysfs_emit(buf, "enabled=%u pmgr_gate=0x%08x mmio=0x39200000\n",
-			  d->scaler_enabled ? 1U : 0U, gate);
+	return sysfs_emit(buf, "enabled=%u mmio=0x39200000\n",
+			  d->scaler_enabled ? 1U : 0U);
 }
 
 static ssize_t scaler_status_store(struct device *dev,
@@ -386,9 +360,14 @@ static ssize_t scaler_status_store(struct device *dev,
 	ret = kstrtobool(buf, &on);
 	if (ret)
 		return ret;
+	if (!d->scaler_clk)
+		return -ENODEV;
 
 	mutex_lock(&d->lock);
-	ret = s5l8947x_pmgr_gate_set(d, PMGR_GATE_SCALER, on);
+	if (on && !d->scaler_enabled)
+		ret = clk_prepare_enable(d->scaler_clk);
+	else if (!on && d->scaler_enabled)
+		clk_disable_unprepare(d->scaler_clk);
 	if (!ret)
 		d->scaler_enabled = on;
 	mutex_unlock(&d->lock);
@@ -396,12 +375,56 @@ static ssize_t scaler_status_store(struct device *dev,
 }
 static DEVICE_ATTR_RW(scaler_status);
 
+static u32 s5l8947x_hdmi_read_bytes(void __iomem *base, u32 off, int nbytes)
+{
+	u32 val = 0;
+
+	while (nbytes-- > 0)
+		val |= (readl(base + off + nbytes * 4) & 0xffU) << (nbytes * 8);
+	return val;
+}
+
+static ssize_t hdmi_audio_show(struct device *dev,
+			       struct device_attribute *attr, char *buf)
+{
+	struct s5l8947x_display *d = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf,
+			  "enabled=%u rate=%u con0=0x%02x acr_con=0x%02x n=%u cts=%u asp_con=0x%02x aui_con=0x%02x i2s_mux=0x%02x\n",
+			  d->audio_enabled ? 1U : 0U, d->audio_rate,
+			  readl(d->hdmi + HDMI_CON_0) & 0xffU,
+			  readl(d->hdmi + HDMI_ACR_CON) & 0xffU,
+			  s5l8947x_hdmi_read_bytes(d->hdmi, HDMI_ACR_N0, 3),
+			  s5l8947x_hdmi_read_bytes(d->hdmi, HDMI_ACR_CTS0, 3),
+			  readl(d->hdmi + HDMI_ASP_CON) & 0xffU,
+			  readl(d->hdmi + HDMI_AUI_CON) & 0xffU,
+			  readl(d->hdmi + HDMI_I2S_MUX_CON) & 0xffU);
+}
+
+static ssize_t hdmi_audio_store(struct device *dev,
+				struct device_attribute *attr,
+				const char *buf, size_t count)
+{
+	unsigned int rate;
+	int ret;
+
+	if (sysfs_streq(buf, "off"))
+		rate = 0;
+	else if (kstrtouint(buf, 0, &rate))
+		return -EINVAL;
+
+	ret = s5l8947x_hdmi_audio_configure(rate, rate != 0);
+	return ret < 0 ? ret : count;
+}
+static DEVICE_ATTR_RW(hdmi_audio);
+
 static struct attribute *s5l8947x_display_attrs[] = {
 	&dev_attr_hpd_connected.attr,
 	&dev_attr_phy_ready.attr,
 	&dev_attr_plane_phys.attr,
 	&dev_attr_gamma_brightness.attr,
 	&dev_attr_scaler_status.attr,
+	&dev_attr_hdmi_audio.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(s5l8947x_display);
@@ -410,6 +433,8 @@ static int s5l8947x_display_probe(struct platform_device *pdev)
 {
 	struct s5l8947x_display *d;
 	u32 wh, stride, hpd, phy;
+	unsigned int i;
+	int ret;
 
 	d = devm_kzalloc(&pdev->dev, sizeof(*d), GFP_KERNEL);
 	if (!d)
@@ -436,17 +461,22 @@ static int s5l8947x_display_probe(struct platform_device *pdev)
 	if (IS_ERR(d->scaler))
 		d->scaler = NULL;
 
-	d->pmgr = devm_ioremap(&pdev->dev, PMGR_PHYS_BASE, 0x2000);
-	if (!d->pmgr)
-		return -ENOMEM;
+	for (i = 0; i < ARRAY_SIZE(d->clks); i++)
+		d->clks[i].id = s5l8947x_display_clk_names[i];
+	ret = devm_clk_bulk_get(&pdev->dev, ARRAY_SIZE(d->clks), d->clks);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret, "failed to get clocks\n");
+	ret = clk_bulk_prepare_enable(ARRAY_SIZE(d->clks), d->clks);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret, "failed to enable clocks\n");
 
-	/* Ensure display pipe and M2M hardware scaler clock gates are active */
-	s5l8947x_pmgr_gate_set(d, PMGR_GATE_HPERF_RT_A, true);
-	s5l8947x_pmgr_gate_set(d, PMGR_GATE_HPERF_RT_B, true);
-	s5l8947x_pmgr_gate_set(d, PMGR_GATE_RGBOUT_A, true);
-	s5l8947x_pmgr_gate_set(d, PMGR_GATE_RGBOUT_B, true);
-	s5l8947x_pmgr_gate_set(d, PMGR_GATE_HDMI, true);
-	if (d->scaler && s5l8947x_pmgr_gate_set(d, PMGR_GATE_SCALER, true) == 0)
+	d->scaler_clk = devm_clk_get_optional(&pdev->dev, "scaler");
+	if (IS_ERR(d->scaler_clk)) {
+		clk_bulk_disable_unprepare(ARRAY_SIZE(d->clks), d->clks);
+		return dev_err_probe(&pdev->dev, PTR_ERR(d->scaler_clk),
+				     "failed to get scaler clock\n");
+	}
+	if (d->scaler && d->scaler_clk && !clk_prepare_enable(d->scaler_clk))
 		d->scaler_enabled = true;
 
 	d->plane_phys = readl(d->rgbout + RGB_PLANE0_BASE + RGB_PLANE_ADDR);
@@ -456,7 +486,6 @@ static int s5l8947x_display_probe(struct platform_device *pdev)
 	phy = readl(d->hdmi + HDMI_PHY_STATUS_0) & 0x01U;
 
 	g_s5l_display = d;
-	(void)s5l8947x_hdmi_audio_configure(48000, true);
 
 	dev_info(&pdev->dev,
 		 "rgbout %ux%u (stride %u, fb 0x%08x), HDMI HPD=%u PHY=%u, M2M scaler=%s\n",
@@ -467,8 +496,13 @@ static int s5l8947x_display_probe(struct platform_device *pdev)
 
 static void s5l8947x_display_remove(struct platform_device *pdev)
 {
-	if (g_s5l_display == platform_get_drvdata(pdev))
+	struct s5l8947x_display *d = platform_get_drvdata(pdev);
+
+	if (g_s5l_display == d)
 		g_s5l_display = NULL;
+	if (d->scaler_enabled)
+		clk_disable_unprepare(d->scaler_clk);
+	clk_bulk_disable_unprepare(ARRAY_SIZE(d->clks), d->clks);
 }
 
 static const struct of_device_id s5l8947x_display_of_match[] = {

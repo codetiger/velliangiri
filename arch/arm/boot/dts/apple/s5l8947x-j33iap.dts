@@ -13,6 +13,8 @@
 
 	aliases {
 		serial0 = &uart0;
+		serial1 = &uart1;
+		serial2 = &uart2;
 		ethernet0 = &eth0;
 	};
 
@@ -45,6 +47,12 @@
 		format = "a8r8g8b8";
 		memory-region = <&fb_region>;
 		status = "okay";
+	};
+
+	/* BCM4334 Wi-Fi power, switched from userspace until the HSIC host is up */
+	wlan_power: wlan-power {
+		compatible = "regulator-output";
+		vout-supply = <&wlan_reg_on>;
 	};
 };
 
@@ -97,28 +105,35 @@
 	};
 };
 
-/* 1. On-Board IR / System Management MCU (TI MSP430 on UART1 @ 250000 baud) */
-&mcu0 {
+&uart1 {
 	status = "okay";
+
+	/* TI MSP430 system / IR remote MCU */
+	mcu {
+		compatible = "apple,j33-mcu";
+		current-speed = <115200>;
+	};
 };
 
-/* 2. Wireless Combo Core (BCM4334 Wi-Fi HSIC + Bluetooth 4.0 on UART2) */
-&wireless0 {
+&uart2 {
 	status = "okay";
-	wlan-supply = <&wlan_reg_on>;
+
+	bluetooth {
+		compatible = "brcm,bcm4334-bt";
+	};
 };
 
-/* 3. Display Pipe (rgbout + out + HDMI + M2M Scaler) */
+/* Display pipe (rgbout + out + HDMI + M2M scaler) */
 &display_pipe {
 	status = "okay";
 };
 
-/* 4. Audio Engine (AE2 + I2S0 HDMI + S/PDIF Optical TOSLINK) */
+/* Audio (I2S0 to HDMI + S/PDIF optical) */
 &audio0 {
 	status = "okay";
 };
 
-/* 5. PowerVR SGX543 GPU */
+/* PowerVR SGX543 GPU */
 &sgx0 {
 	status = "okay";
 };

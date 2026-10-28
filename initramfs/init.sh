@@ -43,11 +43,6 @@ if [ -x /bin/jitterseed ]; then
 	r=$(/bin/jitterseed 2>&1) && msg "entropy: $r" || msg "entropy: jitterseed failed: $r"
 fi
 
-# Log early kernel subsystem verdicts to kmsg / HDMI console
-dmesg 2>/dev/null | grep -E "AIC-TIMER|apple-wdt|s5l8947x-cpufreq|s5l-fe|dwc2|s5l8947x-mcu|s5l8947x-bcm4334|s5l8947x-display|s5l8947x-audio|s5l8947x-sgx" | while read -r line; do
-	msg "verdict: $line"
-done
-
 hostname velliangiri 2>/dev/null || true
 ip link set lo up 2>/dev/null || true
 

@@ -1,55 +1,68 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * S5L8930X / S5L8940X / S5L8947X PMGR clock driver
+ * S5L8940X / S5L8947X PMGR clock gate driver
+ *
+ * Each peripheral clock gate is one 32-bit register in a linear table. The
+ * requested state is written to bits 3:0 (0xf on, 0x0 off) and the gate
+ * reports the state it has reached in bits 7:4. The single clock specifier
+ * cell is the gate's index in the table.
+ *
+ * Gates are flagged CLK_IGNORE_UNUSED: the boot loader leaves the console,
+ * display and bus gates running for devices Linux may never claim.
  */
 
+#include <linux/bitfield.h>
 #include <linux/clk-provider.h>
 #include <linux/io.h>
-#include <linux/module.h>
+#include <linux/iopoll.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
-#include <linux/platform_device.h>
 #include <linux/slab.h>
+
+#define PMGR_GATE_REQ		GENMASK(3, 0)
+#define PMGR_GATE_STATUS	GENMASK(7, 4)
+#define PMGR_GATE_CLEAR		(PMGR_GATE_REQ | BIT(8))
+#define PMGR_GATE_TIMEOUT_US	10000
 
 struct s5l8940x_pmgr_gate {
 	struct clk_hw hw;
-	const char *name;
-	void __iomem *base;
-	u32 index;
+	void __iomem *reg;
 };
 
-#define to_s5l8940x_pmgr_gate(_hw) \
-	container_of(_hw, struct s5l8940x_pmgr_gate, hw)
+#define to_pmgr_gate(_hw) container_of(_hw, struct s5l8940x_pmgr_gate, hw)
 
-#define REG_GATE_MASK		0x1d
-#define REG_GATE_ACTIVE		0x0d
-#define REG_GATE_INACTIVE	0x00
+static int s5l8940x_pmgr_gate_set(struct clk_hw *hw, bool on)
+{
+	struct s5l8940x_pmgr_gate *gate = to_pmgr_gate(hw);
+	u32 want = on ? PMGR_GATE_REQ : 0;
+	u32 v = readl(gate->reg);
+	int ret;
+
+	writel((v & ~PMGR_GATE_CLEAR) | want, gate->reg);
+	ret = readl_poll_timeout_atomic(gate->reg, v,
+					FIELD_GET(PMGR_GATE_STATUS, v) == want,
+					1, PMGR_GATE_TIMEOUT_US);
+	if (ret)
+		pr_err("%s: stuck at 0x%08x turning %s\n", clk_hw_get_name(hw),
+		       v, on ? "on" : "off");
+	return ret;
+}
 
 static int s5l8940x_pmgr_gate_enable(struct clk_hw *hw)
 {
-	struct s5l8940x_pmgr_gate *gate = to_s5l8940x_pmgr_gate(hw);
-	u32 reg = readl(gate->base + gate->index * 4);
-
-	if ((reg & REG_GATE_MASK) != REG_GATE_ACTIVE)
-		writel((reg & ~REG_GATE_MASK) | REG_GATE_ACTIVE,
-		       gate->base + gate->index * 4);
-	return 0;
+	return s5l8940x_pmgr_gate_set(hw, true);
 }
 
 static void s5l8940x_pmgr_gate_disable(struct clk_hw *hw)
 {
-	/*
-	 * Intentionally keep peripheral clock gates enabled once activated so
-	 * late unused-clock cleanup does not gate critical SoC buses.
-	 */
+	s5l8940x_pmgr_gate_set(hw, false);
 }
 
 static int s5l8940x_pmgr_gate_is_enabled(struct clk_hw *hw)
 {
-	struct s5l8940x_pmgr_gate *gate = to_s5l8940x_pmgr_gate(hw);
+	struct s5l8940x_pmgr_gate *gate = to_pmgr_gate(hw);
 
-	return (readl(gate->base + gate->index * 4) & REG_GATE_MASK) !=
-	       REG_GATE_INACTIVE;
+	return FIELD_GET(PMGR_GATE_STATUS, readl(gate->reg)) == PMGR_GATE_REQ;
 }
 
 static const struct clk_ops s5l8940x_pmgr_gate_ops = {
@@ -58,159 +71,61 @@ static const struct clk_ops s5l8940x_pmgr_gate_ops = {
 	.is_enabled	= s5l8940x_pmgr_gate_is_enabled,
 };
 
-struct s5l8940x_pmgr_pwm {
-	struct clk_hw hw;
-	const char *name;
-	void __iomem *base;
-	u32 index;
-	u32 config[3];
-};
-
-#define to_s5l8940x_pmgr_pwm(_hw) \
-	container_of(_hw, struct s5l8940x_pmgr_pwm, hw)
-
-static int s5l8940x_pmgr_pwm_enable(struct clk_hw *hw)
-{
-	struct s5l8940x_pmgr_pwm *pwm = to_s5l8940x_pmgr_pwm(hw);
-
-	writel(pwm->config[2], pwm->base + pwm->index * 12 + 8);
-	writel(pwm->config[1], pwm->base + pwm->index * 12 + 4);
-	writel(pwm->config[0] | 1, pwm->base + pwm->index * 12);
-	return 0;
-}
-
-static void s5l8940x_pmgr_pwm_disable(struct clk_hw *hw)
-{
-	struct s5l8940x_pmgr_pwm *pwm = to_s5l8940x_pmgr_pwm(hw);
-
-	writel(pwm->config[0] & ~1U, pwm->base + pwm->index * 12);
-}
-
-static int s5l8940x_pmgr_pwm_is_enabled(struct clk_hw *hw)
-{
-	struct s5l8940x_pmgr_pwm *pwm = to_s5l8940x_pmgr_pwm(hw);
-
-	return readl(pwm->base + pwm->index * 12) & 1;
-}
-
-static const struct clk_ops s5l8940x_pmgr_pwm_ops = {
-	.enable		= s5l8940x_pmgr_pwm_enable,
-	.disable	= s5l8940x_pmgr_pwm_disable,
-	.is_enabled	= s5l8940x_pmgr_pwm_is_enabled,
-};
-
-static void __init s5l8940x_pmgr_init(struct device_node *node)
+static void __init s5l8940x_pmgr_gates_init(struct device_node *node)
 {
 	struct clk_hw_onecell_data *clk_data;
-	struct clk_init_data init;
+	struct s5l8940x_pmgr_gate *gates;
+	struct clk_init_data init = {};
 	const char *parent_name;
+	struct resource res;
 	void __iomem *base;
-	int num, idx, err;
-	struct s5l8940x_pmgr_gate *gate;
-	struct s5l8940x_pmgr_pwm *pwm;
-	u32 index;
+	unsigned int i, num;
+	int err;
 
 	parent_name = of_clk_get_parent_name(node, 0);
-	if (!parent_name)
+	if (!parent_name || of_address_to_resource(node, 0, &res)) {
+		pr_err("%pOFn: missing parent clock or reg\n", node);
 		return;
+	}
 
+	num = resource_size(&res) / 4;
 	base = of_iomap(node, 0);
-	if (!base) {
-		pr_err("%pOFn: failed to map MMIO\n", node);
-		return;
-	}
-
-	num = of_property_count_strings(node, "clock-output-names");
-	if (num <= 0) {
-		pr_err("%pOFn: invalid clock-output-names\n", node);
-		return;
-	}
-
 	clk_data = kzalloc(struct_size(clk_data, hws, num), GFP_KERNEL);
-	if (!clk_data)
-		return;
+	gates = kcalloc(num, sizeof(*gates), GFP_KERNEL);
+	if (!base || !clk_data || !gates)
+		goto err_free;
 	clk_data->num = num;
 
-	for (idx = 0; idx < num; idx++) {
-		if (!of_property_read_u32_index(node, "clock-indices", idx,
-						&index)) {
-			gate = kzalloc(sizeof(*gate), GFP_KERNEL);
-			if (!gate)
-				break;
+	init.ops = &s5l8940x_pmgr_gate_ops;
+	init.flags = CLK_IGNORE_UNUSED;
+	init.parent_names = &parent_name;
+	init.num_parents = 1;
 
-			if (of_property_read_string_index(node,
-							  "clock-output-names",
-							  idx, &gate->name) < 0) {
-				kfree(gate);
-				break;
-			}
-
-			init.name = gate->name;
-			init.ops = &s5l8940x_pmgr_gate_ops;
-			init.flags = 0;
-			init.parent_names = &parent_name;
-			init.num_parents = 1;
-
-			gate->base = base;
-			gate->index = index;
-			gate->hw.init = &init;
-
-			err = clk_hw_register(NULL, &gate->hw);
-			if (err) {
-				kfree(gate);
-				break;
-			}
-			clk_data->hws[idx] = &gate->hw;
-		} else if (!of_property_read_u32_index(node, "pwm-indices", idx,
-						       &index)) {
-			pwm = kzalloc(sizeof(*pwm), GFP_KERNEL);
-			if (!pwm)
-				break;
-
-			if (of_property_read_string_index(node,
-							  "clock-output-names",
-							  idx, &pwm->name) < 0) {
-				kfree(pwm);
-				break;
-			}
-
-			if (of_property_read_u32_index(node, "pwm-config",
-						       idx * 3,
-						       &pwm->config[0]) < 0 ||
-			    of_property_read_u32_index(node, "pwm-config",
-						       idx * 3 + 1,
-						       &pwm->config[1]) < 0 ||
-			    of_property_read_u32_index(node, "pwm-config",
-						       idx * 3 + 2,
-						       &pwm->config[2]) < 0) {
-				kfree(pwm);
-				break;
-			}
-
-			init.name = pwm->name;
-			init.ops = &s5l8940x_pmgr_pwm_ops;
-			init.flags = 0;
-			init.parent_names = &parent_name;
-			init.num_parents = 1;
-
-			pwm->base = base;
-			pwm->index = index;
-			pwm->hw.init = &init;
-
-			err = clk_hw_register(NULL, &pwm->hw);
-			if (err) {
-				kfree(pwm);
-				break;
-			}
-			clk_data->hws[idx] = &pwm->hw;
-		} else {
-			break;
+	for (i = 0; i < num; i++) {
+		init.name = kasprintf(GFP_KERNEL, "pmgr-gate%u", i);
+		gates[i].reg = base + i * 4;
+		gates[i].hw.init = &init;
+		err = init.name ? clk_hw_register(NULL, &gates[i].hw) : -ENOMEM;
+		kfree(init.name);
+		if (err) {
+			pr_err("%pOFn: gate %u: %d\n", node, i, err);
+			clk_data->hws[i] = ERR_PTR(err);
+			continue;
 		}
+		clk_data->hws[i] = &gates[i].hw;
 	}
 
-	of_clk_add_hw_provider(node, of_clk_hw_onecell_get, clk_data);
+	err = of_clk_add_hw_provider(node, of_clk_hw_onecell_get, clk_data);
+	if (err)
+		pr_err("%pOFn: failed to add clock provider: %d\n", node, err);
+	return;
+
+err_free:
+	kfree(gates);
+	kfree(clk_data);
+	if (base)
+		iounmap(base);
 }
 
-CLK_OF_DECLARE_DRIVER(s5l8930x_pmgr, "apple,s5l8930x-pmgr-clocks", s5l8940x_pmgr_init);
-CLK_OF_DECLARE_DRIVER(s5l8940x_pmgr, "apple,s5l8940x-pmgr-clocks", s5l8940x_pmgr_init);
-CLK_OF_DECLARE_DRIVER(s5l8947x_pmgr, "apple,s5l8947x-pmgr-clocks", s5l8940x_pmgr_init);
+CLK_OF_DECLARE(s5l8940x_pmgr_gates, "apple,s5l8940x-pmgr-gates", s5l8940x_pmgr_gates_init);
+CLK_OF_DECLARE(s5l8947x_pmgr_gates, "apple,s5l8947x-pmgr-gates", s5l8940x_pmgr_gates_init);

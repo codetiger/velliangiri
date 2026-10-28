@@ -57,23 +57,28 @@
 			compatible = "apple,s5l-uart", "samsung,s3c6400-uart";
 			reg = <0x2500000 0x1000>;
 			interrupts = <21>;
-			clocks = <&osc24m>, <&osc24m>;
+			clocks = <&pmgr_gates 60>, <&osc24m>;
 			clock-names = "uart", "clk_uart_baud0";
 			status = "disabled";
 		};
 
-		mcu0: mcu@2600000 {
-			compatible = "apple,s5l8947x-mcu", "apple,j33-mcu";
+		/* System / IR remote MCU link */
+		uart1: serial@2600000 {
+			compatible = "apple,s5l-uart", "samsung,s3c6400-uart";
 			reg = <0x2600000 0x1000>;
 			interrupts = <22>;
-			current-speed = <250000>;
+			clocks = <&pmgr_gates 61>, <&osc24m>;
+			clock-names = "uart", "clk_uart_baud0";
 			status = "disabled";
 		};
 
-		wireless0: wireless@2700000 {
-			compatible = "apple,s5l8947x-bcm4334", "brcm,bcm4334-combo";
+		/* Bluetooth HCI link */
+		uart2: serial@2700000 {
+			compatible = "apple,s5l-uart", "samsung,s3c6400-uart";
 			reg = <0x2700000 0x1000>;
 			interrupts = <23>;
+			clocks = <&pmgr_gates 62>, <&osc24m>;
+			clock-names = "uart", "clk_uart_baud0";
 			status = "disabled";
 		};
 
@@ -89,6 +94,13 @@
 			compatible = "apple,s5l8940x-pmgr", "syscon";
 			reg = <0xf100000 0x7000>;
 			status = "disabled";
+		};
+
+		pmgr_gates: clock-controller@f101008 {
+			compatible = "apple,s5l8947x-pmgr-gates";
+			reg = <0xf101008 0x200>;
+			clocks = <&osc24m>;
+			#clock-cells = <1>;
 		};
 
 		i2c0: i2c@3200000 {
@@ -160,13 +172,15 @@
 			status = "disabled";
 		};
 
-		audio0: audio-controller@4000000 {
+		audio0: audio-controller@4190000 {
 			compatible = "apple,s5l8947x-audio";
-			reg = <0x4000000 0x10000>,
-			      <0x4190000 0x1000>,
+			reg = <0x4190000 0x1000>,
 			      <0x4194000 0x1000>;
-			reg-names = "ae2", "i2s0", "spdif";
+			reg-names = "i2s0", "spdif";
 			interrupts = <99 103>;
+			clocks = <&pmgr_gates 37>, <&pmgr_gates 38>,
+				 <&pmgr_gates 39>, <&pmgr_gates 40>,
+				 <&pmgr_gates 41>, <&pmgr_gates 42>;
 			status = "disabled";
 		};
 
@@ -178,6 +192,11 @@
 			      <0x9200000 0x4000>;
 			reg-names = "rgbout", "out", "hdmi", "scaler";
 			interrupts = <44 46 47>;
+			clocks = <&pmgr_gates 15>, <&pmgr_gates 20>,
+				 <&pmgr_gates 21>, <&pmgr_gates 25>,
+				 <&pmgr_gates 80>, <&pmgr_gates 26>;
+			clock-names = "hperf-rt-a", "rgbout-a", "hperf-rt-b",
+				      "rgbout-b", "hdmi", "scaler";
 			status = "disabled";
 		};
 
@@ -185,7 +204,7 @@
 			compatible = "apple,s5l8947x-sgx", "img,sgx543";
 			reg = <0x8000000 0x1000000>;
 			interrupts = <49>;
-			apple,clock-gates = <7 8 9>;
+			clocks = <&pmgr_gates 7>, <&pmgr_gates 8>, <&pmgr_gates 9>;
 			status = "disabled";
 		};
 	};

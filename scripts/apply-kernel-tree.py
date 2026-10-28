@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # SPDX-License-Identifier: GPL-2.0-only
 """
-Overlay clean-room S5L8947X files (arch/arm/, drivers/, include/) onto a
+Overlay clean-room S5L8947X files (arch/arm/, drivers/, include/, sound/) onto a
 mainline Linux 6.12 tree and apply scripts/patches/*.patch idempotently.
 """
 
@@ -16,7 +16,7 @@ import sys
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
-OVERLAY_DIRS = ("arch", "drivers", "include")
+OVERLAY_DIRS = ("arch", "drivers", "include", "sound")
 PATCH_DIR = os.path.join(HERE, "patches")
 
 

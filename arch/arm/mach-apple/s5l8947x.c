@@ -3,6 +3,7 @@
  * S5L8940X / S5L8947X machine support
  */
 
+#include <linux/clk-provider.h>
 #include <linux/init.h>
 #include <linux/io.h>
 #include <linux/irqchip.h>
@@ -42,6 +43,9 @@ static void __init s5l8947x_init_irq(void)
 static void __init s5l8947x_init_time(void)
 {
 	unsigned long cpu_hz;
+
+	/* A custom init_time replaces the default of_clk_init() call */
+	of_clk_init(NULL);
 
 	apple_s5l_pmccntr_enable_counter();
 	cpu_hz = apple_s5l_calibrate_cpu_hz();

@@ -37,11 +37,9 @@ def main() -> int:
         format=serialization.PublicFormat.Raw,
     )
 
-    blob = (
-        ssh_string(b"ssh-ed25519")
-        + ssh_string(pub_bytes)
-        + ssh_string(priv_bytes + pub_bytes)
-    )
+    # Dropbear's private key layout: key type, then one string holding the
+    # 32-byte seed followed by the 32-byte public key.
+    blob = ssh_string(b"ssh-ed25519") + ssh_string(priv_bytes + pub_bytes)
 
     with open(out_path, "wb") as f:
         f.write(blob)

@@ -2,13 +2,13 @@
 /*
  * S5L8947X PowerVR SGX543 GPU Power/Clock Domain & Telemetry Driver
  *
- * Manages the PowerVR SGX543 (0x38000000, IRQ 49) PMGR clock/power domain
- * gates and exposes safe hardware core identification and register inspection.
+ * Switches the PowerVR SGX543 (0x38000000, IRQ 49) clock/power domain and
+ * exposes the core identification registers.
  */
 
 #define pr_fmt(fmt) "s5l8947x-sgx: " fmt
 
-#include <linux/delay.h>
+#include <linux/clk.h>
 #include <linux/fs.h>
 #include <linux/io.h>
 #include <linux/kernel.h>
@@ -17,93 +17,45 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
-#include <linux/property.h>
-#include <linux/slab.h>
-#include <linux/uaccess.h>
-
-#define PMGR_PHYS_BASE			0x3f100000UL
-#define PMGR_GATE_OFFSET(n)		(0x1008U + (n) * 4U)
 
 /* SGX543 EUR_CR core identification registers (offset from 0x38000000) */
-#define EUR_CR_CLKGATECTL		0x0000
 #define EUR_CR_CORE_ID			0x0014
 #define EUR_CR_CORE_REVISION		0x0018
-#define EUR_CR_EVENT_STATUS		0x012c
-#define EUR_CR_SOFT_RESET		0x0080
-
-#define SGX_MAX_GATES			8
 
 struct s5l8947x_sgx {
 	struct device *dev;
 	void __iomem *regs;
-	void __iomem *pmgr;
+	struct clk_bulk_data *clks;
+	int num_clks;
 	struct miscdevice miscdev;
 	struct mutex lock;
 	int irq;
-	u32 gates[SGX_MAX_GATES];
-	unsigned int num_gates;
 	bool powered;
 	u32 core_id;
 	u32 core_rev;
 };
 
-static const u32 s5l8947x_sgx_default_gates[] = { 7, 8, 9 };
-
-static int s5l8947x_sgx_set_gate(struct s5l8947x_sgx *sgx, u32 gate, bool on)
+/* Called with sgx->lock held */
+static int s5l8947x_sgx_power_set(struct s5l8947x_sgx *sgx, bool on)
 {
-	u32 off = PMGR_GATE_OFFSET(gate);
-	u32 v;
-	int i;
+	int ret;
 
-	if (!sgx->pmgr || gate > 85)
-		return -EINVAL;
+	if (on == sgx->powered)
+		return 0;
 
-	v = readl(sgx->pmgr + off);
-	writel((v & ~0x10fU) | (on ? 0x0fU : 0x00U), sgx->pmgr + off);
-	for (i = 0; i < 10000; i++) {
-		v = readl(sgx->pmgr + off);
-		if (!((v ^ (v >> 4)) & 0x0fU))
-			return 0;
-		udelay(1);
-	}
-	return -ETIMEDOUT;
-}
-
-static bool s5l8947x_sgx_gates_all_active(struct s5l8947x_sgx *sgx)
-{
-	unsigned int i;
-
-	if (!sgx->pmgr || !sgx->num_gates)
-		return false;
-
-	for (i = 0; i < sgx->num_gates; i++) {
-		u32 v = readl(sgx->pmgr + PMGR_GATE_OFFSET(sgx->gates[i]));
-
-		if ((v & 0xffU) != 0xffU)
-			return false;
-	}
-	return true;
-}
-
-static int s5l8947x_sgx_power_set(struct s5l8947x_sgx *sgx, bool on,
-				  bool read_core_regs)
-{
-	unsigned int i;
-	int ret = 0;
-
-	for (i = 0; i < sgx->num_gates; i++) {
-		int rc = s5l8947x_sgx_set_gate(sgx, sgx->gates[i], on);
-
-		if (rc && !ret)
-			ret = rc;
+	if (!on) {
+		clk_bulk_disable_unprepare(sgx->num_clks, sgx->clks);
+		sgx->powered = false;
+		return 0;
 	}
 
-	sgx->powered = on && s5l8947x_sgx_gates_all_active(sgx);
-	if (sgx->powered && read_core_regs && sgx->regs) {
-		sgx->core_id = readl(sgx->regs + EUR_CR_CORE_ID);
-		sgx->core_rev = readl(sgx->regs + EUR_CR_CORE_REVISION);
-	}
-	return ret;
+	ret = clk_bulk_prepare_enable(sgx->num_clks, sgx->clks);
+	if (ret)
+		return ret;
+	sgx->powered = true;
+	sgx->core_id = readl(sgx->regs + EUR_CR_CORE_ID);
+	sgx->core_rev = readl(sgx->regs + EUR_CR_CORE_REVISION);
+	return 0;
 }
 
 static ssize_t power_state_show(struct device *dev,
@@ -122,13 +74,11 @@ static ssize_t power_state_store(struct device *dev,
 	int ret;
 
 	mutex_lock(&sgx->lock);
-	if (sysfs_streq(buf, "probe"))
-		ret = s5l8947x_sgx_power_set(sgx, true, true);
-	else if (sysfs_streq(buf, "on") || sysfs_streq(buf, "1"))
-		ret = s5l8947x_sgx_power_set(sgx, true, false);
+	if (sysfs_streq(buf, "on") || sysfs_streq(buf, "1"))
+		ret = s5l8947x_sgx_power_set(sgx, true);
 	else if (sysfs_streq(buf, "off") || sysfs_streq(buf, "0") ||
 		 sysfs_streq(buf, "standby"))
-		ret = s5l8947x_sgx_power_set(sgx, false, false);
+		ret = s5l8947x_sgx_power_set(sgx, false);
 	else
 		ret = -EINVAL;
 	mutex_unlock(&sgx->lock);
@@ -148,30 +98,9 @@ static ssize_t core_info_show(struct device *dev,
 }
 static DEVICE_ATTR_RO(core_info);
 
-static ssize_t gate_status_show(struct device *dev,
-				struct device_attribute *attr, char *buf)
-{
-	struct s5l8947x_sgx *sgx = dev_get_drvdata(dev);
-	unsigned int i;
-	int pos = 0;
-
-	for (i = 0; i < sgx->num_gates; i++) {
-		u32 g = sgx->gates[i];
-		u32 v = sgx->pmgr ?
-			readl(sgx->pmgr + PMGR_GATE_OFFSET(g)) : 0;
-
-		pos += sysfs_emit_at(buf, pos, "gate%u=0x%08x%s",
-				     g, v,
-				     (i + 1 < sgx->num_gates) ? " " : "\n");
-	}
-	return pos;
-}
-static DEVICE_ATTR_RO(gate_status);
-
 static struct attribute *s5l8947x_sgx_attrs[] = {
 	&dev_attr_power_state.attr,
 	&dev_attr_core_info.attr,
-	&dev_attr_gate_status.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(s5l8947x_sgx);
@@ -200,7 +129,7 @@ static const struct file_operations s5l8947x_sgx_fops = {
 static int s5l8947x_sgx_probe(struct platform_device *pdev)
 {
 	struct s5l8947x_sgx *sgx;
-	int n, ret;
+	int ret;
 
 	sgx = devm_kzalloc(&pdev->dev, sizeof(*sgx), GFP_KERNEL);
 	if (!sgx)
@@ -214,35 +143,30 @@ static int s5l8947x_sgx_probe(struct platform_device *pdev)
 	if (IS_ERR(sgx->regs))
 		return PTR_ERR(sgx->regs);
 
-	sgx->pmgr = devm_ioremap(&pdev->dev, PMGR_PHYS_BASE, 0x2000);
-	if (!sgx->pmgr)
-		return -ENOMEM;
-
 	sgx->irq = platform_get_irq_optional(pdev, 0);
 
-	sgx->num_gates = ARRAY_SIZE(s5l8947x_sgx_default_gates);
-	memcpy(sgx->gates, s5l8947x_sgx_default_gates,
-	       sizeof(s5l8947x_sgx_default_gates));
-	n = device_property_count_u32(&pdev->dev, "apple,clock-gates");
-	if (n > 0 && n <= SGX_MAX_GATES &&
-	    !device_property_read_u32_array(&pdev->dev, "apple,clock-gates",
-					    sgx->gates, n))
-		sgx->num_gates = n;
+	sgx->num_clks = devm_clk_bulk_get_all(&pdev->dev, &sgx->clks);
+	if (sgx->num_clks <= 0)
+		return dev_err_probe(&pdev->dev, sgx->num_clks ?: -ENODEV,
+				     "failed to get clocks\n");
 
-	(void)s5l8947x_sgx_power_set(sgx, true, true);
+	ret = s5l8947x_sgx_power_set(sgx, true);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret, "failed to power on\n");
 
 	sgx->miscdev.minor = MISC_DYNAMIC_MINOR;
 	sgx->miscdev.name = "sgx0";
 	sgx->miscdev.fops = &s5l8947x_sgx_fops;
 	sgx->miscdev.parent = &pdev->dev;
 	ret = misc_register(&sgx->miscdev);
-	if (ret)
+	if (ret) {
+		s5l8947x_sgx_power_set(sgx, false);
 		return ret;
+	}
 
 	dev_info(&pdev->dev,
-		 "PowerVR SGX543 registered (/dev/sgx0, irq=%d, gates=%u, state=%s, core_id=0x%08x)\n",
-		 sgx->irq, sgx->num_gates, sgx->powered ? "on" : "standby",
-		 sgx->core_id);
+		 "PowerVR SGX543 registered (/dev/sgx0, irq=%d, core_id=0x%08x rev=0x%08x)\n",
+		 sgx->irq, sgx->core_id, sgx->core_rev);
 	return 0;
 }
 
@@ -251,6 +175,7 @@ static void s5l8947x_sgx_remove(struct platform_device *pdev)
 	struct s5l8947x_sgx *sgx = platform_get_drvdata(pdev);
 
 	misc_deregister(&sgx->miscdev);
+	s5l8947x_sgx_power_set(sgx, false);
 }
 
 static const struct of_device_id s5l8947x_sgx_of_match[] = {
