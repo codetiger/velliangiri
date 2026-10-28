@@ -18,7 +18,7 @@ Status of every hardware block, checked against the drivers in the tree and the 
 | Display pipe, HDMI 720p, scaler, gamma | `0x3a200000` | `drivers/video/fbdev/s5l8947x-display.c` |
 | System / IR remote MCU (UART1) | `0x32600000` | `drivers/input/misc/s5l8947x-mcu.c` |
 | Bluetooth (UART2) | `0x32700000` | mainline `hci_uart_bcm` |
-| Audio: S/PDIF -> HDMI and optical | `0x34194000` | `sound/arm/s5l8947x-audio.c`; ALSA PCM at 46 875 / 31 250 Hz, measured register layout, real FIFO-occupancy pointer. HDMI packet layer in `s5l8947x-display.c` (ACR from the produced rate, valid AUI, S/PDIF receiver enabled, `I2S_CLK_CON=0` on this path). Audible on hardware. PIO only: the 16-entry S/PDIF FIFO (64 us) drops a sample every few seconds, so DMA is the remaining work. |
+| Audio: S/PDIF -> HDMI and optical | `0x34194000` | `sound/arm/s5l8947x-audio.c`; ALSA PCM at 46 875 / 31 250 Hz, measured register layout, real FIFO-occupancy pointer. HDMI packet layer in `s5l8947x-display.c` (ACR from the produced rate, valid AUI, S/PDIF receiver enabled, `I2S_CLK_CON=0` on this path). Audible on hardware; hot-plug loss mutes the packets and replug re-announces. PIO only: the 16-entry S/PDIF FIFO (64 us) drops a sample every few seconds, so DMA is the remaining work. |
 
 ## Partly implemented
 

@@ -21,10 +21,12 @@
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
+#include <linux/jiffies.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/s5l8947x-display.h>
 #include <linux/slab.h>
+#include <linux/workqueue.h>
 
 /* rgbout registers (0x3a200000) */
 #define RGB_SIZE		0x1030
@@ -109,6 +111,8 @@ struct s5l8947x_display {
 	struct clk_bulk_data clks[ARRAY_SIZE(s5l8947x_display_clk_names)];
 	struct clk *scaler_clk;
 	struct mutex lock;
+	struct delayed_work hpd_work;
+	bool hpd_present;
 	u32 plane_phys;
 	unsigned int gamma_brightness;
 	bool scaler_enabled;
@@ -292,6 +296,37 @@ void s5l8947x_hdmi_audio_arm(unsigned int sample_rate)
 	writel(0x04, d->hdmi + HDMI_ACR_CON);
 }
 EXPORT_SYMBOL_GPL(s5l8947x_hdmi_audio_arm);
+
+/*
+ * Hot-plug. There is no EDID/DDC path in this driver, so there is no ELD to
+ * hand to userspace; what the sink needs is for the audio packets to stop when
+ * it goes away and to be re-announced when it comes back. Polling is enough:
+ * the reaction time only has to beat the sink's own mute timeout.
+ */
+static void s5l8947x_hpd_poll(struct work_struct *work)
+{
+	struct s5l8947x_display *d =
+		container_of(work, struct s5l8947x_display, hpd_work.work);
+	bool present = readl(d->hdmi + HDMI_HPD_STATUS) & 0x01U;
+
+	if (present != d->hpd_present) {
+		d->hpd_present = present;
+		dev_info(d->dev, "HDMI hot-plug %s\n", present ? "connected" : "lost");
+		if (!present) {
+			/* Stop the audio sample packets, keep the configuration */
+			mutex_lock(&d->lock);
+			writel(0x00, d->hdmi + HDMI_AUI_CON);
+			writel(readl(d->hdmi + HDMI_CON_0) & ~0x04U,
+			       d->hdmi + HDMI_CON_0);
+			writel(0x00, d->hdmi + HDMI_ACR_CON);
+			mutex_unlock(&d->lock);
+		} else if (d->audio_enabled) {
+			s5l8947x_hdmi_audio_configure(d->audio_rate, true, true);
+			s5l8947x_hdmi_audio_arm(d->audio_rate);
+		}
+	}
+	schedule_delayed_work(&d->hpd_work, msecs_to_jiffies(500));
+}
 
 static ssize_t hpd_connected_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
@@ -518,6 +553,10 @@ static int s5l8947x_display_probe(struct platform_device *pdev)
 	hpd = readl(d->hdmi + HDMI_HPD_STATUS) & 0x01U;
 	phy = readl(d->hdmi + HDMI_PHY_STATUS_0) & 0x01U;
 
+	INIT_DELAYED_WORK(&d->hpd_work, s5l8947x_hpd_poll);
+	d->hpd_present = hpd;
+	schedule_delayed_work(&d->hpd_work, msecs_to_jiffies(500));
+
 	g_s5l_display = d;
 
 	dev_info(&pdev->dev,
@@ -531,6 +570,7 @@ static void s5l8947x_display_remove(struct platform_device *pdev)
 {
 	struct s5l8947x_display *d = platform_get_drvdata(pdev);
 
+	cancel_delayed_work_sync(&d->hpd_work);
 	if (g_s5l_display == d)
 		g_s5l_display = NULL;
 	if (d->scaler_enabled)
