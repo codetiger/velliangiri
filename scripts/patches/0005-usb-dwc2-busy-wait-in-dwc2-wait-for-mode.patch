@@ -1,0 +1,21 @@
+usb: dwc2: busy-wait while waiting for a mode change
+
+Poll the current-mode bit with mdelay(1) instead of usleep_range() in
+dwc2_wait_for_mode(), which is used on the S5L8947X dwc2 OTG controller.
+---
+ drivers/usb/dwc2/core.c | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/drivers/usb/dwc2/core.c b/drivers/usb/dwc2/core.c
+index 368da20..1752966 100644
+--- a/drivers/usb/dwc2/core.c
++++ b/drivers/usb/dwc2/core.c
+@@ -318,7 +318,7 @@ static void dwc2_wait_for_mode(struct dwc2_hsotg *hsotg,
+ 			break;
+ 		}
+ 
+-		usleep_range(1000, 2000);
++		mdelay(1);
+ 	}
+ }
+ 

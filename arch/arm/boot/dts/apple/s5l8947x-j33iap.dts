@@ -9,7 +9,7 @@
 
 / {
 	model = "S5L8947X j33iap";
-	compatible = "apple,j33iap", "apple,s5l8947x", "apple,s5l8940x", "apple,arm";
+	compatible = "apple,j33iap", "apple,s5l8947x", "apple,s5l8940x";
 
 	aliases {
 		serial0 = &uart0;

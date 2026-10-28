@@ -17,17 +17,9 @@
 
 static unsigned long apple_pmccntr_rate = PMCCNTR_RATE_FALLBACK;
 
-static u64 notrace apple_pmccntr_read(void)
-{
-	u32 cyc;
-
-	asm volatile("mrc p15, 0, %0, c9, c13, 0" : "=r"(cyc));
-	return cyc;
-}
-
 static u64 apple_pmccntr_cs_read(struct clocksource *cs)
 {
-	return apple_pmccntr_read();
+	return apple_s5l_pmccntr_read();
 }
 
 static struct clocksource apple_pmccntr_cs = {
@@ -41,7 +33,7 @@ static struct clocksource apple_pmccntr_cs = {
 
 static unsigned long apple_pmccntr_read_long(void)
 {
-	return (unsigned long)apple_pmccntr_read();
+	return apple_s5l_pmccntr_read();
 }
 
 static struct delay_timer apple_pmccntr_delay = {
@@ -49,7 +41,7 @@ static struct delay_timer apple_pmccntr_delay = {
 	.freq			= PMCCNTR_RATE_FALLBACK,
 };
 
-static void __init apple_pmccntr_enable(void)
+void __init apple_s5l_pmccntr_enable(void)
 {
 	u32 v;
 
@@ -73,11 +65,6 @@ static void __init apple_pmccntr_enable(void)
 	asm volatile("mcr p15, 0, %0, c9, c12, 0" :: "r"(v));
 
 	isb();
-}
-
-void __init apple_s5l_pmccntr_enable_counter(void)
-{
-	apple_pmccntr_enable();
 }
 
 void __init apple_s5l_pmccntr_init(unsigned long rate)

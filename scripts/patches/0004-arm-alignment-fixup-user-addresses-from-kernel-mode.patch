@@ -1,0 +1,51 @@
+ARM: alignment: fix up kernel accesses to user addresses as user accesses
+
+When the faulting address is below TASK_SIZE, emulate the unaligned
+LDRH/STRH, LDRD/STRD, LDR/STR and LDM/STM through the user access paths
+even if the access came from kernel mode (for example from uaccess
+helpers), instead of dereferencing the user pointer directly.
+---
+ arch/arm/mm/alignment.c | 9 +++++----
+ 1 file changed, 5 insertions(+), 4 deletions(-)
+
+diff --git a/arch/arm/mm/alignment.c b/arch/arm/mm/alignment.c
+index 3c6ddb1..c9e3608 100644
+--- a/arch/arm/mm/alignment.c
++++ b/arch/arm/mm/alignment.c
+@@ -343,7 +343,7 @@ do_alignment_ldrhstrh(unsigned long addr, u32 instr, struct pt_regs *regs)
+ 
+ 	ai_half += 1;
+ 
+-	if (user_mode(regs))
++	if (user_mode(regs) || addr < TASK_SIZE)
+ 		goto user;
+ 
+ 	if (LDST_L_BIT(instr)) {
+@@ -405,7 +405,7 @@ do_alignment_ldrdstrd(unsigned long addr, u32 instr, struct pt_regs *regs)
+ 
+ 	ai_dword += 1;
+ 
+-	if (user_mode(regs))
++	if (user_mode(regs) || addr < TASK_SIZE)
+ 		goto user;
+ 
+ 	if (load) {
+@@ -454,7 +454,8 @@ do_alignment_ldrstr(unsigned long addr, u32 instr, struct pt_regs *regs)
+ 
+ 	ai_word += 1;
+ 
+-	if ((!LDST_P_BIT(instr) && LDST_W_BIT(instr)) || user_mode(regs))
++	if ((!LDST_P_BIT(instr) && LDST_W_BIT(instr)) || user_mode(regs) ||
++	    addr < TASK_SIZE)
+ 		goto trans;
+ 
+ 	if (LDST_L_BIT(instr)) {
+@@ -545,7 +546,7 @@ do_alignment_ldmstm(unsigned long addr, u32 instr, struct pt_regs *regs)
+ 	}
+ #endif
+ 
+-	if (user_mode(regs)) {
++	if (user_mode(regs) || addr < TASK_SIZE) {
+ 		unsigned int __ua_flags = uaccess_save_and_enable();
+ 		for (regbits = REGMASK_BITS(instr), rd = 0; regbits;
+ 		     regbits >>= 1, rd += 1)

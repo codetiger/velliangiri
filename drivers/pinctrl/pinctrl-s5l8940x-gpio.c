@@ -35,14 +35,13 @@ struct s5l8940x_gpio_pinctrl {
 	struct pinctrl_dev *pctldev;
 
 	void __iomem *base;
-	struct clk *clk;
 
 	struct pinctrl_desc pinctrl_desc;
 	struct pinctrl_pin_desc *pins;
 	unsigned int npins;
 	unsigned int nirqs;
 	int *irqs;
-	int irq_Grps;
+	int nr_parent_irqs;
 
 	raw_spinlock_t lock;
 
@@ -205,7 +204,7 @@ static const struct pinmux_ops s5l8940x_pinmux_ops = {
 
 #define PIN_CONFIG_PERIPH	(PIN_CONFIG_END + 1)
 
-static const struct pinconf_generic_params s5l8940x_pinconf_DT_params[] = {
+static const struct pinconf_generic_params s5l8940x_pinconf_dt_params[] = {
 	{ "apple,peripheral-function", PIN_CONFIG_PERIPH, 0 },
 };
 
@@ -501,7 +500,7 @@ static void s5l8940x_gpio_irq_handler(struct irq_desc *desc)
 {
 	struct gpio_chip *gc = irq_desc_get_handler_data(desc);
 	struct s5l8940x_gpio_pinctrl *agp = gpiochip_get_data(gc);
-	struct irq_chip * parent_chip = irq_desc_get_chip(desc);
+	struct irq_chip *parent_chip = irq_desc_get_chip(desc);
 	unsigned int group = 0, pinh;
 	u32 grps, en, sts;
 	unsigned long flags;
@@ -534,6 +533,7 @@ static int s5l8940x_gpio_pinctrl_probe(struct platform_device *pdev)
 	struct s5l8940x_gpio_pinctrl *agp;
 	struct device_node *node = pdev->dev.of_node;
 	struct gpio_irq_chip *girq;
+	struct clk *clk;
 	unsigned int i;
 	int err;
 
@@ -564,19 +564,17 @@ static int s5l8940x_gpio_pinctrl_probe(struct platform_device *pdev)
 	if (IS_ERR(agp->base))
 		return PTR_ERR(agp->base);
 
-	agp->clk = devm_clk_get(&pdev->dev, NULL);
-	if (!IS_ERR(agp->clk))
-		clk_prepare_enable(agp->clk);
-	else
-		agp->clk = NULL;
+	clk = devm_clk_get_optional_enabled(&pdev->dev, NULL);
+	if (IS_ERR(clk))
+		return dev_err_probe(&pdev->dev, PTR_ERR(clk), "failed to enable clock\n");
 
-	agp->irq_Grps = of_irq_count(node);
-	if (agp->irq_Grps > 0) {
-		agp->irqs = devm_kcalloc(&pdev->dev, agp->irq_Grps,
+	agp->nr_parent_irqs = of_irq_count(node);
+	if (agp->nr_parent_irqs > 0) {
+		agp->irqs = devm_kcalloc(&pdev->dev, agp->nr_parent_irqs,
 					 sizeof(int), GFP_KERNEL);
 		if (!agp->irqs)
 			return -ENOMEM;
-		for (i = 0; i < (unsigned int)agp->irq_Grps; i++) {
+		for (i = 0; i < (unsigned int)agp->nr_parent_irqs; i++) {
 			err = platform_get_irq(pdev, i);
 			if (err < 0)
 				return err;
@@ -602,8 +600,8 @@ static int s5l8940x_gpio_pinctrl_probe(struct platform_device *pdev)
 	agp->pinctrl_desc.confops = &s5l8940x_pinconf_ops;
 	agp->pinctrl_desc.owner = THIS_MODULE;
 	agp->pinctrl_desc.num_custom_params =
-		ARRAY_SIZE(s5l8940x_pinconf_DT_params);
-	agp->pinctrl_desc.custom_params = s5l8940x_pinconf_DT_params;
+		ARRAY_SIZE(s5l8940x_pinconf_dt_params);
+	agp->pinctrl_desc.custom_params = s5l8940x_pinconf_dt_params;
 
 	err = devm_pinctrl_register_and_init(&pdev->dev, &agp->pinctrl_desc,
 					     agp, &agp->pctldev);
@@ -637,7 +635,7 @@ static int s5l8940x_gpio_pinctrl_probe(struct platform_device *pdev)
 	agp->irq_chip.irq_set_type = s5l8940x_gpio_irq_set_type;
 	agp->irq_chip.flags = IRQCHIP_MASK_ON_SUSPEND;
 
-	if (agp->irq_Grps > 0) {
+	if (agp->nr_parent_irqs > 0) {
 		for (i = 0; i * 32 < agp->nirqs; i++) {
 			writel(0xffffffffU, agp->base + REG_IRQ_DISABLE(i));
 			writel(0xffffffffU, agp->base + REG_IRQ_STATUS(i));
@@ -649,7 +647,7 @@ static int s5l8940x_gpio_pinctrl_probe(struct platform_device *pdev)
 		girq = &agp->gpio_chip.irq;
 		girq->chip = &agp->irq_chip;
 		girq->parent_handler = s5l8940x_gpio_irq_handler;
-		girq->num_parents = agp->irq_Grps;
+		girq->num_parents = agp->nr_parent_irqs;
 		girq->parents = agp->irqs;
 		girq->default_type = IRQ_TYPE_NONE;
 		girq->handler = handle_bad_irq;

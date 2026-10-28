@@ -5,10 +5,15 @@
  * Provides two PHYs via #phy-cells = <1>:
  *   - index 0: USB 2.0 Synopsys OTG PHY at 0x36000000 (paired with dwc2 @ 0x36100000)
  *   - index 1: USB 2.0 Host / HSIC PHY (paired with ehci / ohci)
+ *
+ * The OTG PHY clock gates come from the PMGR clock provider and stay on
+ * while the driver is bound. The host PHY still switches its PMGR power
+ * domains directly; nothing uses it until the HSIC host is enabled.
  */
 
 #define pr_fmt(fmt) "s5l-usb-phy: " fmt
 
+#include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
@@ -18,7 +23,6 @@
 #include <linux/platform_device.h>
 #include <linux/property.h>
 #include <linux/regulator/consumer.h>
-#include <linux/string.h>
 
 #define OPHYPWR				0x00
 #define OPHYCLK				0x04
@@ -32,18 +36,16 @@
 #define ORSTCON_PHYSWRESET		BIT(0)
 #define OPHYUNK4_START			0x200
 
-/* PMGR registers for S5L8947X USB clocks and host PHY power */
+/* PMGR registers for the S5L8947X USB host PHY power domains */
 #define PMGR_BASE			0x3f100000UL
-#define PMGR_GATE_BASE			0x3f101008UL
 #define PMGR_GATE_ON			0x0fU
 #define PMGR_USB20_HOST			0x1088U
 #define PMGR_GATE_90			0x1140U
 #define USBCPLX_HSIC_EN			BIT(2)
 
-/* DWC2 PCGCCTL register */
-#define S5L_OTG_PCGCCTL_PHYS		0x36100e00UL
-
-static const u32 s5l8947x_default_gates[] = { 30, 31, 36 };
+/* Defaults for the j33iap board when the DT carries no tuning */
+#define OPHY_TUNE1_DEFAULT		0x349
+#define OPHY_TUNE2_DEFAULT		0x6ff3
 
 struct s5l_usbphy {
 	void __iomem *base;
@@ -56,8 +58,6 @@ struct s5l_usbphy {
 	bool lpo_supply_on;
 	struct device *dev;
 	struct phy *phys[2];
-	u32 clock_gates[8];
-	u32 nr_clock_gates;
 	u32 tune1;
 	u32 tune2;
 	int ref_clock_sel;
@@ -79,34 +79,10 @@ static int s5l_pmgr_on(struct s5l_usbphy *p, u32 off)
 	return -ETIMEDOUT;
 }
 
-static int s5l_gate_switch(struct s5l_usbphy *p, u32 id, bool on)
-{
-	u32 off = (PMGR_GATE_BASE - PMGR_BASE) + id * 4;
-	u32 pre = readl(p->pmgr + off), v = pre;
-	int n;
-
-	writel(on ? (pre | PMGR_GATE_ON) : (pre & ~PMGR_GATE_ON), p->pmgr + off);
-	for (n = 0; n < 10000; n++) {
-		v = readl(p->pmgr + off);
-		if (!((v ^ (v >> 4)) & 0xfU))
-			break;
-		udelay(1);
-	}
-	dev_info(p->dev, "gate %u (PMGR +0x%x): 0x%08x -> 0x%08x%s\n",
-		 id, off, pre, v, n == 10000 ? " STUCK" : "");
-	return n == 10000 ? -ETIMEDOUT : 0;
-}
-
 static int s5l_usbphy_init(struct phy *phy)
 {
 	struct s5l_usbphy *p = phy_get_drvdata(phy);
-	unsigned int i;
-	int stuck = 0;
 	u32 v;
-
-	for (i = 0; i < p->nr_clock_gates; i++)
-		if (s5l_gate_switch(p, p->clock_gates[i], true))
-			stuck++;
 
 	if (p->pcgcctl) {
 		v = readl(p->pcgcctl);
@@ -133,7 +109,7 @@ static int s5l_usbphy_init(struct phy *phy)
 	mdelay(1);
 	writel(readl(p->base + OPHYUNK1) | BIT(1), p->base + OPHYUNK1);
 
-	dev_info(p->dev, "OTG PHY initialized (%d gate(s) stuck)\n", stuck);
+	dev_info(p->dev, "OTG PHY initialized\n");
 	return 0;
 }
 
@@ -236,35 +212,28 @@ static int s5l_usbphy_probe(struct platform_device *pdev)
 	struct s5l_usbphy *p;
 	struct phy *phy;
 	struct phy_provider *provider;
+	struct clk_bulk_data *clks;
 	struct resource *r;
-	int n;
 	u32 sel;
+	int ret;
 
 	p = devm_kzalloc(&pdev->dev, sizeof(*p), GFP_KERNEL);
 	if (!p)
 		return -ENOMEM;
 
 	p->dev = &pdev->dev;
-	p->nr_clock_gates = ARRAY_SIZE(s5l8947x_default_gates);
-	memcpy(p->clock_gates, s5l8947x_default_gates,
-	       sizeof(s5l8947x_default_gates));
-	p->tune1 = 0x349;
-	p->tune2 = 0x6ff3;
+	p->tune1 = OPHY_TUNE1_DEFAULT;
+	p->tune2 = OPHY_TUNE2_DEFAULT;
 	p->ref_clock_sel = -1;
-
-	n = device_property_count_u32(&pdev->dev, "apple,clock-gates");
-	if (n > 0 && n <= (int)ARRAY_SIZE(p->clock_gates) &&
-	    !device_property_read_u32_array(&pdev->dev, "apple,clock-gates",
-					    p->clock_gates, n))
-		p->nr_clock_gates = n;
 
 	device_property_read_u32(&pdev->dev, "apple,uotgtune1-device", &p->tune1);
 	device_property_read_u32(&pdev->dev, "apple,uotgtune2-device", &p->tune2);
-	device_property_read_u32(&pdev->dev, "apple,phy-tune1", &p->tune1);
-	device_property_read_u32(&pdev->dev, "apple,phy-tune2", &p->tune2);
-	if (!device_property_read_u32(&pdev->dev, "apple,ref-clock-sel", &sel) ||
-	    !device_property_read_u32(&pdev->dev, "apple,phy-clk-sel", &sel))
+	if (!device_property_read_u32(&pdev->dev, "apple,ref-clock-sel", &sel))
 		p->ref_clock_sel = sel & OPHYCLK_CLKSEL_MASK;
+
+	ret = devm_clk_bulk_get_all_enable(&pdev->dev, &clks);
+	if (ret)
+		return dev_err_probe(&pdev->dev, ret, "failed to enable clocks\n");
 
 	p->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(p->base))
@@ -280,11 +249,10 @@ static int s5l_usbphy_probe(struct platform_device *pdev)
 			p->usbcplx = NULL;
 	}
 
+	/* dwc2 PCGCCTL sits inside the dwc2 register block: map, don't request */
 	r = platform_get_resource(pdev, IORESOURCE_MEM, 2);
 	if (r)
 		p->pcgcctl = devm_ioremap(&pdev->dev, r->start, resource_size(r));
-	else
-		p->pcgcctl = devm_ioremap(&pdev->dev, S5L_OTG_PCGCCTL_PHYS, 4);
 
 	platform_set_drvdata(pdev, p);
 
@@ -305,12 +273,8 @@ static int s5l_usbphy_probe(struct platform_device *pdev)
 }
 
 static const struct of_device_id s5l_usbphy_of_match[] = {
-	{ .compatible = "apple,s5l-usb-phy" },
 	{ .compatible = "apple,s5l8947x-otgphy" },
-	{ .compatible = "apple,s5l8947x-usb-phy" },
-	{ .compatible = "apple,s5l8940x-otgphy" },
-	{ .compatible = "apple,s5l8940x-usb-phy" },
-	{ .compatible = "apple,s5l8930x-otgphy" },
+	{ .compatible = "apple,s5l-usb-phy" },
 	{ },
 };
 MODULE_DEVICE_TABLE(of, s5l_usbphy_of_match);

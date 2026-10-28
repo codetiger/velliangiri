@@ -5,11 +5,13 @@
  * Register layout (e.g. i2c0 at 0x33200000):
  *   0x00  MTXFIFO    write byte + START(0x100) / STOP(0x200) / READ(0x400)
  *   0x04  MRXFIFO    [7:0] = data byte, bit 8 = FIFO empty
- *   0x08  SMSTA      status bits (XEN=bit 27, XBUSY=bit 28,ERR=0x8007ff00)
+ *   0x08  SMSTA      status bits (XEN=bit 27, XBUSY=bit 28, ERR=0x8007ff00)
  *   0x0c  IMASK      interrupt mask
  *   0x10  CTL        [7:0] = clkdiv, bit 8 = MTR, bit 9 = MRR, bit 10 = UJM
  *   0x14  REV        controller revision
  *   0x28  FILTER     glitch filter control
+ *
+ * Transfers are polled; the controller interrupt is not used.
  */
 
 #include <linux/clk.h>
@@ -17,7 +19,6 @@
 #include <linux/err.h>
 #include <linux/i2c.h>
 #include <linux/init.h>
-#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
 #include <linux/kernel.h>
@@ -52,6 +53,7 @@
 
 #define REG_REV			0x14
 #define REG_FILTER		0x28
+#define  REG_FILTER_EN		0x100
 
 #define DEFAULT_FREQUENCY	100000
 
@@ -60,8 +62,6 @@ struct s5l8940x_i2c {
 	struct i2c_adapter adap;
 
 	void __iomem *base;
-	int irq;
-	struct clk *clk;
 	u32 frequency;
 	unsigned int clkdiv;
 	unsigned int version;
@@ -77,7 +77,15 @@ static inline u32 i2c_s5l_rd(struct s5l8940x_i2c *ai, unsigned int reg)
 	return readl_relaxed(ai->base + reg);
 }
 
-static int s5l8940x_i2c_wait_Complete(struct s5l8940x_i2c *ai, u32 *status)
+static void s5l8940x_i2c_set_ctl(struct s5l8940x_i2c *ai)
+{
+	i2c_s5l_wr(ai, REG_CTL,
+		   ai->clkdiv | REG_CTL_MTR | REG_CTL_MRR |
+		   (ai->version >= 6 ? REG_CTL_UJM : 0));
+}
+
+/* Wait for the queued FIFO sequence to finish and decode its status */
+static int s5l8940x_i2c_wait_complete(struct s5l8940x_i2c *ai)
 {
 	u32 val;
 	int err;
@@ -86,22 +94,25 @@ static int s5l8940x_i2c_wait_Complete(struct s5l8940x_i2c *ai, u32 *status)
 					 (val & (REG_SMSTA_XEN | REG_SMSTA_ERR)) ||
 					 !(val & REG_SMSTA_XBUSY),
 					 20, 100000);
-	*status = val;
 	if (val)
 		i2c_s5l_wr(ai, REG_SMSTA, val);
-	return err;
+	if (err)
+		return err;
+	if (val & REG_SMSTA_MTN)
+		return -ENXIO;
+	if (val & REG_SMSTA_ERR)
+		return -EIO;
+	return 0;
 }
 
 static int s5l8940x_i2c_xfer_msg(struct s5l8940x_i2c *ai, struct i2c_msg *msg,
 				 int stop)
 {
-	u32 status = 0;
+	u32 status;
 	unsigned int i;
 	int ret;
 
-	i2c_s5l_wr(ai, REG_CTL,
-		   ai->clkdiv | REG_CTL_MTR | REG_CTL_MRR |
-		   (ai->version >= 6 ? REG_CTL_UJM : 0));
+	s5l8940x_i2c_set_ctl(ai);
 
 	if (msg->flags & I2C_M_RD) {
 		i2c_s5l_wr(ai, REG_MTXFIFO,
@@ -109,13 +120,9 @@ static int s5l8940x_i2c_xfer_msg(struct s5l8940x_i2c *ai, struct i2c_msg *msg,
 		i2c_s5l_wr(ai, REG_MTXFIFO,
 			   REG_MTXFIFO_READ | msg->len |
 			   (stop ? REG_MTXFIFO_STOP : 0));
-		ret = s5l8940x_i2c_wait_Complete(ai, &status);
+		ret = s5l8940x_i2c_wait_complete(ai);
 		if (ret)
 			return ret;
-		if (status & REG_SMSTA_MTN)
-			return -ENXIO;
-		if (status & REG_SMSTA_ERR)
-			return -EIO;
 		for (i = 0; i < msg->len; i++) {
 			status = i2c_s5l_rd(ai, REG_MRXFIFO);
 			if (status & REG_MRXFIFO_EMPTY)
@@ -132,13 +139,9 @@ static int s5l8940x_i2c_xfer_msg(struct s5l8940x_i2c *ai, struct i2c_msg *msg,
 				   (i == (unsigned int)(msg->len - 1) && stop ?
 				    REG_MTXFIFO_STOP : 0));
 		}
-		ret = s5l8940x_i2c_wait_Complete(ai, &status);
+		ret = s5l8940x_i2c_wait_complete(ai);
 		if (ret)
 			return ret;
-		if (status & REG_SMSTA_MTN)
-			return -ENXIO;
-		if (status & REG_SMSTA_ERR)
-			return -EIO;
 	}
 	return 0;
 }
@@ -158,9 +161,7 @@ static int s5l8940x_i2c_xfer_combined(struct s5l8940x_i2c *ai,
 	int ret;
 
 	i2c_s5l_wr(ai, REG_SMSTA, i2c_s5l_rd(ai, REG_SMSTA));
-	i2c_s5l_wr(ai, REG_CTL,
-		   ai->clkdiv | REG_CTL_MTR | REG_CTL_MRR |
-		   (ai->version >= 6 ? REG_CTL_UJM : 0));
+	s5l8940x_i2c_set_ctl(ai);
 
 	/* 1. Queue write phase without STOP */
 	i2c_s5l_wr(ai, REG_MTXFIFO, REG_MTXFIFO_START | (wmsg->addr << 1));
@@ -172,13 +173,9 @@ static int s5l8940x_i2c_xfer_combined(struct s5l8940x_i2c *ai,
 	i2c_s5l_wr(ai, REG_MTXFIFO,
 		   REG_MTXFIFO_READ | rmsg->len | REG_MTXFIFO_STOP);
 
-	ret = s5l8940x_i2c_wait_Complete(ai, &status);
+	ret = s5l8940x_i2c_wait_complete(ai);
 	if (ret)
 		return ret;
-	if (status & REG_SMSTA_MTN)
-		return -ENXIO;
-	if (status & REG_SMSTA_ERR)
-		return -EIO;
 
 	for (i = 0; i < rmsg->len; i++) {
 		int wait = 1000;
@@ -229,7 +226,7 @@ static u32 s5l8940x_i2c_func(struct i2c_adapter *adap)
 }
 
 static const struct i2c_algorithm s5l8940x_i2c_algo = {
-	.master_xfer	= s5l8940x_i2c_xfer,
+	.xfer		= s5l8940x_i2c_xfer,
 	.functionality	= s5l8940x_i2c_func,
 };
 
@@ -237,6 +234,7 @@ static int s5l8940x_i2c_probe(struct platform_device *pdev)
 {
 	struct s5l8940x_i2c *ai;
 	struct device_node *np = pdev->dev.of_node;
+	struct clk *clk;
 	u32 clkrate;
 	int err;
 
@@ -249,34 +247,23 @@ static int s5l8940x_i2c_probe(struct platform_device *pdev)
 	if (IS_ERR(ai->base))
 		return PTR_ERR(ai->base);
 
-	ai->clk = devm_clk_get(&pdev->dev, NULL);
-	if (IS_ERR(ai->clk))
-		return PTR_ERR(ai->clk);
+	clk = devm_clk_get_enabled(&pdev->dev, NULL);
+	if (IS_ERR(clk))
+		return dev_err_probe(&pdev->dev, PTR_ERR(clk), "failed to enable clock\n");
 
-	err = clk_prepare_enable(ai->clk);
-	if (err)
-		return err;
-
-	ai->irq = platform_get_irq(pdev, 0);
 	if (of_property_read_u32(np, "clock-frequency", &ai->frequency))
 		ai->frequency = DEFAULT_FREQUENCY;
 
-	clkrate = clk_get_rate(ai->clk);
-	ai->clkdiv = DIV_ROUND_UP(clkrate, 16 * ai->frequency);
-	if (ai->clkdiv < 4)
-		ai->clkdiv = 4;
-	if (ai->clkdiv > 255)
-		ai->clkdiv = 255;
+	clkrate = clk_get_rate(clk);
+	ai->clkdiv = clamp(DIV_ROUND_UP(clkrate, 16 * ai->frequency), 4U, 255U);
 
 	platform_set_drvdata(pdev, ai);
 
 	ai->version = i2c_s5l_rd(ai, REG_REV);
-	i2c_s5l_wr(ai, REG_CTL,
-		   ai->clkdiv | REG_CTL_MTR | REG_CTL_MRR |
-		   (ai->version >= 6 ? REG_CTL_UJM : 0));
+	s5l8940x_i2c_set_ctl(ai);
 	i2c_s5l_wr(ai, REG_IMASK, 0);
 	i2c_s5l_wr(ai, REG_SMSTA, i2c_s5l_rd(ai, REG_SMSTA));
-	i2c_s5l_wr(ai, REG_FILTER, i2c_s5l_rd(ai, REG_FILTER) | 0x100);
+	i2c_s5l_wr(ai, REG_FILTER, i2c_s5l_rd(ai, REG_FILTER) | REG_FILTER_EN);
 
 	ai->adap.owner = THIS_MODULE;
 	strscpy(ai->adap.name, "s5l8940x-i2c", sizeof(ai->adap.name));
@@ -286,10 +273,8 @@ static int s5l8940x_i2c_probe(struct platform_device *pdev)
 	ai->adap.dev.of_node = np;
 
 	err = i2c_add_adapter(&ai->adap);
-	if (err) {
-		clk_disable_unprepare(ai->clk);
+	if (err)
 		return err;
-	}
 
 	dev_info(&pdev->dev, "S5L8940X I2C adapter rev %u (clkdiv=%u)\n",
 		 ai->version, ai->clkdiv);
@@ -301,14 +286,12 @@ static void s5l8940x_i2c_remove(struct platform_device *pdev)
 	struct s5l8940x_i2c *ai = platform_get_drvdata(pdev);
 
 	i2c_del_adapter(&ai->adap);
-	clk_disable_unprepare(ai->clk);
 }
 
 static const struct of_device_id s5l8940x_i2c_match[] = {
 	{ .compatible = "apple,s5l8930x-i2c" },
 	{ .compatible = "apple,s5l8940x-i2c" },
 	{ .compatible = "apple,s5l8947x-i2c" },
-	{ .compatible = "apple,i2c" },
 	{ },
 };
 MODULE_DEVICE_TABLE(of, s5l8940x_i2c_match);

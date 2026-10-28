@@ -40,6 +40,7 @@
 #include <linux/io.h>
 #include <linux/irq.h>
 #include <linux/irqchip.h>
+#include <linux/irqchip/apple-aic1.h>
 #include <linux/irqdomain.h>
 #include <linux/math64.h>
 #include <linux/of.h>
@@ -247,48 +248,13 @@ static unsigned int aic1_event_hwirq(struct apple_aic1 *aic, u32 event)
 	return aic->nr_irq;
 }
 
-void apple_aic1_quiesce(void);
-void apple_aic1_quiesce(void)
+static void aic1_rearm(struct apple_aic1 *aic)
 {
-	struct apple_aic1 *aic = apple_aic1;
-
-	if (!aic)
-		return;
-
-	aic1_clear_sticky_nirq(aic);
-}
-
-void apple_aic1_enable(void);
-void apple_aic1_enable(void)
-{
-	struct apple_aic1 *aic = apple_aic1;
-
-	if (!aic)
-		return;
-
-	aic1_enable_hw(aic);
-}
-
-void apple_aic1_rearm(void);
-void apple_aic1_rearm(void)
-{
-	struct apple_aic1 *aic = apple_aic1;
-	unsigned int i, nr_words;
-
-	if (!aic)
-		return;
-
-	nr_words = DIV_ROUND_UP(aic->nr_irq, 32);
-
 	/* Keep every HW line masked and free of stale SW triggers. */
-	for (i = 0; i < nr_words; i++) {
-		aic1_write(aic, AIC1_MASK_SET + i * 4, ~0U);
-		aic1_write(aic, AIC1_SW_CLR + i * 4, ~0U);
-	}
+	aic1_mask_all(aic);
 
 	/* Route every line at CPU0. */
-	for (i = 0; i < aic->nr_irq; i++)
-		aic1_write(aic, AIC1_TARGET_CPU + i * 4, BIT(0));
+	aic1_target_all(aic, BIT(0));
 
 	aic1_drain_events(aic);
 
@@ -298,6 +264,17 @@ void apple_aic1_rearm(void)
 
 	aic1_enable_hw(aic);
 	dsb(sy);
+}
+
+void apple_aic1_reinit(void)
+{
+	struct apple_aic1 *aic = apple_aic1;
+
+	if (!aic)
+		return;
+
+	aic1_clear_sticky_nirq(aic);
+	aic1_rearm(aic);
 }
 
 #ifdef CONFIG_SMP
@@ -502,7 +479,7 @@ static int __init aic1_of_init(struct device_node *node,
 	set_handle_irq(aic1_handle_irq);
 
 	aic1_init_smp(aic);
-	apple_aic1_rearm();
+	aic1_rearm(aic);
 
 	pr_info("aic,1: %u IRQs, WHOAMI=%u, CONFIG=%#x\n",
 		aic->nr_irq, aic1_read(aic, AIC1_WHOAMI),
@@ -657,6 +634,3 @@ arch_initcall(aic1_timer_init);
 
 IRQCHIP_DECLARE(apple_aic1, "aic,1", aic1_of_init);
 IRQCHIP_DECLARE(apple_aic1_vendor, "apple,aic1", aic1_of_init);
-IRQCHIP_DECLARE(apple_aic1_compat, "apple,aic", aic1_of_init);
-IRQCHIP_DECLARE(apple_s5l8940x_aic, "apple,s5l8940x-aic", aic1_of_init);
-IRQCHIP_DECLARE(apple_s5l8947x_aic, "apple,s5l8947x-aic", aic1_of_init);

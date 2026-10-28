@@ -1,0 +1,37 @@
+init: reinitialise the aic,1 interrupt controller before kernel_init
+
+The boot loader can hand over with an interrupt line still asserted on
+the S5L8947X aic,1 controller. Mask, retarget and drain every line
+again with apple_aic1_reinit() right before kernel_init_freeable() and
+make sure interrupts are on afterwards.
+
+Only built when CONFIG_APPLE_AIC1 is set.
+---
+ init/main.c | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/init/main.c b/init/main.c
+index 821df1f..f4b7cda 100644
+--- a/init/main.c
++++ b/init/main.c
+@@ -26,6 +26,7 @@
+ #include <linux/ioport.h>
+ #include <linux/init.h>
+ #include <linux/initrd.h>
++#include <linux/irqchip/apple-aic1.h>
+ #include <linux/memblock.h>
+ #include <linux/acpi.h>
+ #include <linux/bootconfig.h>
+@@ -1478,6 +1479,12 @@ static int __ref kernel_init(void *unused)
+ 	 */
+ 	wait_for_completion(&kthreadd_done);
+ 
++#ifdef CONFIG_APPLE_AIC1
++	/* Drop a stale nIRQ level left asserted by the boot loader */
++	apple_aic1_reinit();
++	early_boot_irqs_disabled = false;
++	local_irq_enable();
++#endif
+ 	kernel_init_freeable();
+ 	/* need to finish all async __init code before freeing the memory */
+ 	async_synchronize_full();

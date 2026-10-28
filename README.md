@@ -8,7 +8,8 @@ Mainline **Linux 6.12** kernel port and open-source (`GPL-2.0-only`) hardware dr
   - `aic,1` interrupt controller (`0x3f200000`) with per-CPU event handling (`0x5004`) and built-in **24 MHz local timer** (`clock_event_device`, rating 400).
   - Continuous **24 MHz hardware watchdog clocksource** (`apple-wdt-24m`, rating 350) and `sched_clock` at `0x3f103020` (active across `WFI`), Cortex-A9 `PMCCNTR` delay calibration, SoC restart handler, and `/dev/watchdog` character device.
 - **Clocks & Pinctrl (`drivers/clk/clk-s5l8940x-pmgr.c`, `drivers/pinctrl/pinctrl-s5l8940x-gpio.c`)**:
-  - PMGR peripheral clock gate provider (`0x3f101008`, one specifier cell = gate index, request/status handshake) used by every driver through the common clock framework, and 224-pin GPIO / hierarchical IRQ controller (`0x3f000000`).
+  - PMGR peripheral clock gate provider (`0x3f101008`, one specifier cell = gate index, request/status handshake). Drivers switch gates only through the common clock framework (`clocks = <&pmgr_gates N>`), so `hwtest clocks` can account for them. The I2C gates are still left running by the pre-kernel loader rather than claimed by the I2C driver, and the not-yet-used USB host/HSIC PHY path switches its PMGR power domains directly.
+  - 224-pin GPIO / pinctrl and GPIO interrupt controller driver (`0x3f000000`). It is built but not instantiated yet: the device tree has no GPIO node.
 - **I2C & Power Management (`drivers/i2c/busses/i2c-s5l8940x.c`, `drivers/mfd/apple-pmu-i2c.c`, `drivers/regulator/apple-pmu-pwrsw.c`)**:
   - Hardware I2C master (`i2c0@33200000`, `i2c1@33300000`, `i2c2@33400000`) with combined repeated-START FIFO transactions.
   - Dialog D1815 PMU MFD (`0x74` on `i2c0`, 8-bit regmap) and GPIO power-switch regulators (`eth-phy-reset` at `0x58` and `wifi-reg-on` at `0x57`).
@@ -36,7 +37,18 @@ Mainline **Linux 6.12** kernel port and open-source (`GPL-2.0-only`) hardware dr
 - `sound/arm/` — `S5L8947X` I2S0 / S/PDIF ALSA driver
 - `config/` — Linux 6.12 configuration fragments (`s5l8947x.config`, `s5l8947x-trim.config`) and initramfs prune list
 - `initramfs/` — Early boot (`/init`), Stage 2 service bring-up, and `udhcpc` scripts
-- `scripts/` — Dockerized cross-build environment, kernel fetch/patch/build scripts, pre-kernel loader (`scripts/boot/`), and userspace diagnostic tools (`scripts/tools/`)
+- `scripts/` — Dockerized cross-build environment, kernel fetch/patch/build scripts, pre-kernel loader (`scripts/boot/`), userspace diagnostic tools (`scripts/tools/`), and the on-device test suite (`scripts/tests/`)
+- `scripts/patches/` — Changes to mainline files, applied in order on top of Linux 6.12. `0001` only wires the platform and drivers into Kconfig/Makefiles; the rest are small, individually described changes to core code (Samsung UART, AIC re-init in `init/main.c`, ARM alignment fixup, dwc2, scheduler)
+
+## Kernel Tree Overlay
+
+`scripts/apply-kernel-tree.py` copies `arch/`, `drivers/`, `include/` and `sound/` into the kernel tree and applies `scripts/patches/`. It is idempotent and keeps the tree in step with the repository:
+
+- files moved or deleted here are removed from the kernel tree (tracked in `.velliangiri-overlay-files`);
+- if any patch was edited, renamed or removed, every previously applied patch is reverted and the current series is applied again;
+- `--revert` restores the pristine tree.
+
+Inside the build container the tree lives in the `velliangiri-kbuild` Docker volume at `/kbuild/linux`; `./scripts/velliangiri.sh shell` opens a shell with the same mounts.
 
 ## Building
 

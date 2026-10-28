@@ -133,8 +133,6 @@ static void s5l8947x_display_program_gamma(struct s5l8947x_display *d,
 	u32 base_idx;
 	int c, i;
 
-	if (!d->out)
-		return;
 	if (pct > 100)
 		pct = 100;
 
@@ -162,7 +160,7 @@ int s5l8947x_hdmi_audio_configure(unsigned int sample_rate, bool enable)
 	u32 csum;
 	int i;
 
-	if (!d || !d->hdmi)
+	if (!d)
 		return -ENODEV;
 
 	switch (sample_rate) {
@@ -261,9 +259,7 @@ static ssize_t hpd_connected_show(struct device *dev,
 				  struct device_attribute *attr, char *buf)
 {
 	struct s5l8947x_display *d = dev_get_drvdata(dev);
-	u32 hpd = d->hdmi ? (readl(d->hdmi + HDMI_HPD_STATUS) & 0x01U) : 0;
-
-	return sysfs_emit(buf, "%u\n", hpd);
+	return sysfs_emit(buf, "%u\n", readl(d->hdmi + HDMI_HPD_STATUS) & 0x01U);
 }
 static DEVICE_ATTR_RO(hpd_connected);
 
@@ -271,9 +267,7 @@ static ssize_t phy_ready_show(struct device *dev,
 			      struct device_attribute *attr, char *buf)
 {
 	struct s5l8947x_display *d = dev_get_drvdata(dev);
-	u32 rdy = d->hdmi ? (readl(d->hdmi + HDMI_PHY_STATUS_0) & 0x01U) : 0;
-
-	return sysfs_emit(buf, "%u\n", rdy);
+	return sysfs_emit(buf, "%u\n", readl(d->hdmi + HDMI_PHY_STATUS_0) & 0x01U);
 }
 static DEVICE_ATTR_RO(phy_ready);
 
@@ -281,11 +275,8 @@ static ssize_t plane_phys_show(struct device *dev,
 			       struct device_attribute *attr, char *buf)
 {
 	struct s5l8947x_display *d = dev_get_drvdata(dev);
-	u32 addr = d->rgbout ?
-		   readl(d->rgbout + RGB_PLANE0_BASE + RGB_PLANE_ADDR) :
-		   d->plane_phys;
-
-	return sysfs_emit(buf, "0x%08x\n", addr);
+	return sysfs_emit(buf, "0x%08x\n",
+			  readl(d->rgbout + RGB_PLANE0_BASE + RGB_PLANE_ADDR));
 }
 
 static ssize_t plane_phys_store(struct device *dev,

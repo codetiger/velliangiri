@@ -10,13 +10,10 @@
 #include <linux/err.h>
 #include <linux/i2c.h>
 #include <linux/init.h>
-#include <linux/kernel.h>
 #include <linux/module.h>
 #include <linux/of.h>
-#include <linux/of_device.h>
 #include <linux/of_platform.h>
 #include <linux/regmap.h>
-#include <linux/slab.h>
 
 static const struct regmap_config apple_pmu_regmap_8bit = {
 	.reg_bits	= 8,
@@ -33,7 +30,7 @@ static const struct regmap_config apple_pmu_regmap_16bit = {
 static int apple_pmu_i2c_probe(struct i2c_client *client)
 {
 	struct device *dev = &client->dev;
-	struct device_node *node = dev->of_node, *child;
+	struct device_node *node = dev->of_node;
 	struct apple_pmu *pmu;
 	const struct regmap_config *cfg = &apple_pmu_regmap_8bit;
 	u32 reg_bits = 8;
@@ -56,10 +53,8 @@ static int apple_pmu_i2c_probe(struct i2c_client *client)
 	dev_info(dev, "Dialog PMU I2C MFD initialized (%u-bit regmap @ 0x%02x)\n",
 		 reg_bits, client->addr);
 
-	for_each_child_of_node(node, child)
-		of_platform_device_create(child, NULL, dev);
-
-	return 0;
+	/* Child nodes (power switches) become platform devices on the regmap */
+	return devm_of_platform_populate(dev);
 }
 
 static const struct of_device_id apple_pmu_of_match[] = {

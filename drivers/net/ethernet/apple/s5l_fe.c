@@ -29,6 +29,7 @@
  */
 
 #include <linux/bitops.h>
+#include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/etherdevice.h>
@@ -116,9 +117,6 @@
 #define JABBER_SIZE		0x600
 #define MAX_FRAME		(ETH_FRAME_LEN + ETH_FCS_LEN + 4)
 
-#define PMGR_BASE		0x3f100000UL
-#define PMGR_GATE(n)		(0x1008 + 4 * (n))
-
 struct s5l_fe_desc {
 	__le32 status;
 	__le32 ctrl;
@@ -136,8 +134,6 @@ struct s5l_fe {
 	struct net_device *ndev;
 	struct device *dev;
 	void __iomem *base;
-	void __iomem *pmgr;
-	u32 gate;
 	int irq;
 
 	struct mii_bus *mii;
@@ -169,20 +165,6 @@ static inline u32 fe_rd(struct s5l_fe *p, u32 off)
 static inline void fe_wr(struct s5l_fe *p, u32 off, u32 val)
 {
 	writel(val, p->base + off);
-}
-
-static int s5l_fe_gate_on(struct s5l_fe *p)
-{
-	void __iomem *reg = p->pmgr + PMGR_GATE(p->gate);
-	u32 v, before = readl(reg);
-	int ret;
-
-	writel((before & ~0xfU) | 0xfU, reg);
-	ret = readl_poll_timeout(reg, v, ((v >> 4) & 0xfU) == (v & 0xfU), 1, 10000);
-	dev_dbg(p->dev, "clock gate %u (PMGR +0x%x): 0x%08x -> 0x%08x%s\n",
-		p->gate, PMGR_GATE(p->gate), before, readl(reg),
-		ret ? " (did not settle)" : "");
-	return ret;
 }
 
 static int s5l_fe_mdio_wait(struct s5l_fe *p)
@@ -632,6 +614,7 @@ static int s5l_fe_probe(struct platform_device *pdev)
 	struct device_node *np = dev->of_node;
 	struct net_device *ndev;
 	struct s5l_fe *p;
+	struct clk *clk;
 	int ret;
 
 	ndev = devm_alloc_etherdev(dev, sizeof(*p));
@@ -651,17 +634,13 @@ static int s5l_fe_probe(struct platform_device *pdev)
 	if (p->irq < 0)
 		return p->irq;
 
-	p->gate = 79;
-	of_property_read_u32(np, "apple,clock-gate", &p->gate);
-	p->pmgr = devm_ioremap(dev, PMGR_BASE, 0x2000);
-	if (!p->pmgr)
-		return -ENOMEM;
+	clk = devm_clk_get_enabled(dev, NULL);
+	if (IS_ERR(clk))
+		return dev_err_probe(dev, PTR_ERR(clk), "failed to enable clock\n");
 
 	ret = dma_set_mask_and_coherent(dev, DMA_BIT_MASK(32));
 	if (ret)
 		return ret;
-
-	s5l_fe_gate_on(p);
 
 	fe_wr(p, DMA_CONFIG, DMA_CONFIG_RESET);
 	fe_wr(p, DMA_CONFIG, 0);
@@ -741,7 +720,6 @@ static void s5l_fe_remove(struct platform_device *pdev)
 
 static const struct of_device_id s5l_fe_of_match[] = {
 	{ .compatible = "apple,s5l8947x-ethernet" },
-	{ .compatible = "apple,s5l-fe" },
 	{ }
 };
 MODULE_DEVICE_TABLE(of, s5l_fe_of_match);

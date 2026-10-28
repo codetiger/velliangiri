@@ -13,13 +13,13 @@
 
 #include "s5l8947x.h"
 
-#define APPLE_WDT_HZ		24000000U
+/* BITE_TIME is a 32-bit count of 24 MHz ticks: at most 178 s */
 #define APPLE_WDT_MAX_SECS	170U
 #define APPLE_WDT_DEFAULT_SECS	60U
 
 static int apple_wdt_ping(struct watchdog_device *wdd)
 {
-	apple_s5l_wdt_rebase_and_arm(wdd->timeout * APPLE_WDT_HZ);
+	apple_s5l_wdt_rebase_and_arm(wdd->timeout * APPLE_S5L_WDT_HZ);
 	return 0;
 }
 

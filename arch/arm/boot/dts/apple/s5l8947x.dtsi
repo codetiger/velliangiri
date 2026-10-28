@@ -10,7 +10,7 @@
 	#address-cells = <1>;
 	#size-cells = <1>;
 	interrupt-parent = <&aic>;
-	compatible = "apple,s5l8947x", "apple,s5l8940x", "apple,arm";
+	compatible = "apple,s5l8947x", "apple,s5l8940x";
 
 	cpus {
 		#address-cells = <1>;
@@ -145,7 +145,8 @@
 			      <0xf108000 0x1000>,
 			      <0x6100e00 0x4>;
 			#phy-cells = <1>;
-			apple,clock-gates = <30 31 36>;
+			clocks = <&pmgr_gates 30>, <&pmgr_gates 31>,
+				 <&pmgr_gates 36>;
 			apple,uotgtune1-device = <0x349>;
 			apple,uotgtune2-device = <0x6ff3>;
 			status = "okay";
@@ -168,7 +169,7 @@
 			compatible = "apple,s5l8947x-ethernet";
 			reg = <0xb000000 0x10000>;
 			interrupts = <27>;
-			apple,clock-gate = <79>;
+			clocks = <&pmgr_gates 79>;
 			status = "disabled";
 		};
 

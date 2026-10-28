@@ -18,30 +18,40 @@ IMAGE="${IMAGE:-velliangiri-build}"
 CMD="${1:-all}"
 shift || true
 
+build_image() {
+	echo "[velliangiri] Building container image '${IMAGE}' ..."
+	docker build -t "${IMAGE}" -f "${ROOT}/scripts/container.conf" "${ROOT}/scripts"
+}
+
 ensure_image() {
-	if ! docker image inspect "${IMAGE}" >/dev/null 2>&1; then
-		echo "[velliangiri] Building container image '${IMAGE}' ..."
-		docker build -t "${IMAGE}" -f "${ROOT}/scripts/container.conf" "${ROOT}/scripts"
-	fi
+	docker image inspect "${IMAGE}" >/dev/null 2>&1 || build_image
+}
+
+# The kernel tree lives in a named volume: a case-sensitive Linux filesystem
+# that survives between runs and keeps incremental builds fast.
+docker_run() { # <-i|-it> <command...>
+	local tty="$1"
+	shift
+	ensure_image
+	docker run --rm "${tty}" \
+		-v "${ROOT}:/workspace" \
+		-v velliangiri-kbuild:/kbuild \
+		-e KERNEL_TREE=/kbuild/linux \
+		-w /workspace \
+		"${IMAGE}" "$@"
 }
 
 run_in_container() {
 	if [ -f /.dockerenv ]; then
 		"$@"
 	else
-		ensure_image
-		docker run --rm -i \
-			-v "${ROOT}:/workspace" \
-			-v velliangiri-kbuild:/kbuild \
-			-e KERNEL_TREE=/kbuild/linux \
-			-w /workspace \
-			"${IMAGE}" "$@"
+		docker_run -i "$@"
 	fi
 }
 
 case "${CMD}" in
 	image)
-		docker build -t "${IMAGE}" -f "${ROOT}/scripts/container.conf" "${ROOT}/scripts"
+		build_image
 		;;
 	rootfs)
 		run_in_container bash scripts/build-alpine-rootfs.sh "$@"
@@ -64,8 +74,7 @@ case "${CMD}" in
 		bash "${ROOT}/scripts/check-no-proprietary.sh" --all
 		;;
 	shell)
-		ensure_image
-		docker run --rm -it -v "${ROOT}:/workspace" -w /workspace "${IMAGE}" /bin/bash
+		docker_run -it /bin/bash
 		;;
 	*)
 		echo "Usage: $0 {all|image|rootfs|kernel|bundle|check|shell}" >&2

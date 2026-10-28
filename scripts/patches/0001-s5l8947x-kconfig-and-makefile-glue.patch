@@ -1,4 +1,47 @@
+S5L8947X: hook the platform and drivers into Kconfig and Makefiles
+
+Wire the out-of-tree arch/arm/mach-apple machine, the j33iap device tree
+and the S5L8940X / S5L8947X drivers copied in by apply-kernel-tree.py
+into the kernel build. Every new symbol depends on ARCH_APPLE_S5L (or
+COMPILE_TEST) and defaults to it, so other ARMv7 builds are unaffected.
+
+NET_VENDOR_APPLE and the Apple SoC driver menu are opened up to
+ARCH_APPLE_S5L so the Ethernet MAC and SGX driver can live next to the
+existing Apple drivers.
+---
+ arch/arm/Kconfig                    |  2 ++
+ arch/arm/Makefile                   |  1 +
+ arch/arm/boot/dts/Makefile          |  1 +
+ drivers/clk/Kconfig                 |  8 ++++++++
+ drivers/clk/Makefile                |  1 +
+ drivers/cpufreq/Kconfig.arm         |  8 ++++++++
+ drivers/cpufreq/Makefile            |  1 +
+ drivers/i2c/busses/Kconfig          |  8 ++++++++
+ drivers/i2c/busses/Makefile         |  1 +
+ drivers/input/misc/Kconfig          | 10 ++++++++++
+ drivers/input/misc/Makefile         |  1 +
+ drivers/irqchip/Kconfig             | 11 +++++++++++
+ drivers/irqchip/Makefile            |  1 +
+ drivers/mfd/Kconfig                 | 11 +++++++++++
+ drivers/mfd/Makefile                |  1 +
+ drivers/net/ethernet/apple/Kconfig  | 11 ++++++++++-
+ drivers/net/ethernet/apple/Makefile |  1 +
+ drivers/phy/Kconfig                 |  9 +++++++++
+ drivers/phy/Makefile                |  1 +
+ drivers/pinctrl/Kconfig             | 16 ++++++++++++++++
+ drivers/pinctrl/Makefile            |  1 +
+ drivers/regulator/Kconfig           |  8 ++++++++
+ drivers/regulator/Makefile          |  1 +
+ drivers/soc/apple/Kconfig           | 11 ++++++++++-
+ drivers/soc/apple/Makefile          |  2 ++
+ drivers/video/fbdev/Kconfig         |  9 +++++++++
+ drivers/video/fbdev/Makefile        |  1 +
+ sound/arm/Kconfig                   | 11 +++++++++++
+ sound/arm/Makefile                  |  2 ++
+ 29 files changed, 148 insertions(+), 2 deletions(-)
+
 diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
+index cc8becc..f8c2184 100644
 --- a/arch/arm/Kconfig
 +++ b/arch/arm/Kconfig
 @@ -359,6 +359,8 @@ source "arch/arm/mach-actions/Kconfig"
@@ -11,9 +54,10 @@ diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
  
  source "arch/arm/mach-aspeed/Kconfig"
 diff --git a/arch/arm/Makefile b/arch/arm/Makefile
+index dee8c9f..9dd7954 100644
 --- a/arch/arm/Makefile
 +++ b/arch/arm/Makefile
-@@ -173,6 +173,7 @@ textofs-$(CONFIG_ARCH_AXXIA) := 0x003080
+@@ -173,6 +173,7 @@ textofs-$(CONFIG_ARCH_AXXIA) := 0x00308000
  # by CONFIG_* macro name.
  machine-$(CONFIG_ARCH_ACTIONS)		+= actions
  machine-$(CONFIG_ARCH_ALPINE)		+= alpine
@@ -22,6 +66,7 @@ diff --git a/arch/arm/Makefile b/arch/arm/Makefile
  machine-$(CONFIG_ARCH_ASPEED)           += aspeed
  machine-$(CONFIG_ARCH_AT91)		+= at91
 diff --git a/arch/arm/boot/dts/Makefile b/arch/arm/boot/dts/Makefile
+index efe38eb..bafe0a8 100644
 --- a/arch/arm/boot/dts/Makefile
 +++ b/arch/arm/boot/dts/Makefile
 @@ -39,3 +39,4 @@ subdir-y += unisoc
@@ -29,55 +74,17 @@ diff --git a/arch/arm/boot/dts/Makefile b/arch/arm/boot/dts/Makefile
  subdir-y += xen
  subdir-y += xilinx
 +subdir-y += apple
-diff --git a/arch/arm/mm/alignment.c b/arch/arm/mm/alignment.c
---- a/arch/arm/mm/alignment.c
-+++ b/arch/arm/mm/alignment.c
-@@ -343,7 +343,7 @@ do_alignment_ldrhstrh(unsigned long addr
- 
- 	ai_half += 1;
- 
--	if (user_mode(regs))
-+	if (user_mode(regs) || addr < TASK_SIZE)
- 		goto user;
- 
- 	if (LDST_L_BIT(instr)) {
-@@ -405,7 +405,7 @@ do_alignment_ldrdstrd(unsigned long addr
- 
- 	ai_dword += 1;
- 
--	if (user_mode(regs))
-+	if (user_mode(regs) || addr < TASK_SIZE)
- 		goto user;
- 
- 	if (load) {
-@@ -454,7 +454,8 @@ do_alignment_ldrstr(unsigned long addr,
- 
- 	ai_word += 1;
- 
--	if ((!LDST_P_BIT(instr) && LDST_W_BIT(instr)) || user_mode(regs))
-+	if ((!LDST_P_BIT(instr) && LDST_W_BIT(instr)) || user_mode(regs) ||
-+	    addr < TASK_SIZE)
- 		goto trans;
- 
- 	if (LDST_L_BIT(instr)) {
-@@ -545,7 +546,7 @@ do_alignment_ldmstm(unsigned long addr,
- 	}
- #endif
- 
--	if (user_mode(regs)) {
-+	if (user_mode(regs) || addr < TASK_SIZE) {
- 		unsigned int __ua_flags = uaccess_save_and_enable();
- 		for (regbits = REGMASK_BITS(instr), rd = 0; regbits;
- 		     regbits >>= 1, rd += 1)
 diff --git a/drivers/clk/Kconfig b/drivers/clk/Kconfig
+index 0fe07a5..1e6a45e 100644
 --- a/drivers/clk/Kconfig
 +++ b/drivers/clk/Kconfig
-@@ -544,4 +544,11 @@ config CLK_FD_KUNIT_TEST
+@@ -544,4 +544,12 @@ config CLK_FD_KUNIT_TEST
  	help
  	  Kunit test for the clk-fractional-divider type.
  
 +config S5L8940X_PMGR_CLK
 +	bool "S5L8940X / S5L8947X PMGR clock gates"
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
 +	depends on OF
 +	default ARCH_APPLE_S5L
 +	help
@@ -85,6 +92,7 @@ diff --git a/drivers/clk/Kconfig b/drivers/clk/Kconfig
 +
  endif
 diff --git a/drivers/clk/Makefile b/drivers/clk/Makefile
+index db202b6..675483e 100644
 --- a/drivers/clk/Makefile
 +++ b/drivers/clk/Makefile
 @@ -148,3 +148,4 @@ endif
@@ -93,6 +101,7 @@ diff --git a/drivers/clk/Makefile b/drivers/clk/Makefile
  obj-$(CONFIG_COMMON_CLK_ZYNQMP)         += zynqmp/
 +obj-$(CONFIG_S5L8940X_PMGR_CLK)		+= clk-s5l8940x-pmgr.o
 diff --git a/drivers/cpufreq/Kconfig.arm b/drivers/cpufreq/Kconfig.arm
+index 71f4b61..65551e7 100644
 --- a/drivers/cpufreq/Kconfig.arm
 +++ b/drivers/cpufreq/Kconfig.arm
 @@ -270,3 +270,11 @@ config ARM_PXA2xx_CPUFREQ
@@ -108,42 +117,53 @@ diff --git a/drivers/cpufreq/Kconfig.arm b/drivers/cpufreq/Kconfig.arm
 +	  PMGR hardware performance-state CPU frequency scaling driver for
 +	  S5L8940X and S5L8947X SoCs (212.5 MHz, 425.0 MHz, and 850.0 MHz).
 diff --git a/drivers/cpufreq/Makefile b/drivers/cpufreq/Makefile
+index 0f18403..65a6fed 100644
 --- a/drivers/cpufreq/Makefile
 +++ b/drivers/cpufreq/Makefile
-@@ -107,3 +107,4 @@ obj-$(CONFIG_LOONGSON3_CPUFREQ)		+= loon
+@@ -107,3 +107,4 @@ obj-$(CONFIG_LOONGSON3_CPUFREQ)		+= loongson3_cpufreq.o
  obj-$(CONFIG_SH_CPU_FREQ)		+= sh-cpufreq.o
  obj-$(CONFIG_SPARC_US2E_CPUFREQ)	+= sparc-us2e-cpufreq.o
  obj-$(CONFIG_SPARC_US3_CPUFREQ)		+= sparc-us3-cpufreq.o
 +obj-$(CONFIG_ARM_S5L8947X_CPUFREQ)	+= s5l8947x-cpufreq.o
 diff --git a/drivers/i2c/busses/Kconfig b/drivers/i2c/busses/Kconfig
+index 0e679cc..7ea443b 100644
 --- a/drivers/i2c/busses/Kconfig
 +++ b/drivers/i2c/busses/Kconfig
-@@ -1532,4 +1532,8 @@ config I2C_VIRTIO
+@@ -1532,4 +1532,12 @@ config I2C_VIRTIO
            This driver can also be built as a module. If so, the module
            will be called i2c-virtio.
  
 +config I2C_S5L8940X
 +	tristate "S5L8940X / S5L8947X I2C controller"
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
 +	depends on OF
-+	default y
++	default ARCH_APPLE_S5L
++	help
++	  I2C master controller found on S5L8940X and S5L8947X SoCs.
++
  endmenu
 diff --git a/drivers/i2c/busses/Makefile b/drivers/i2c/busses/Makefile
+index ecc07c5..37d8d49 100644
 --- a/drivers/i2c/busses/Makefile
 +++ b/drivers/i2c/busses/Makefile
-@@ -160,3 +160,4 @@ obj-$(CONFIG_I2C_FSI)		+= i2c-fsi.o
+@@ -158,5 +158,6 @@ obj-$(CONFIG_I2C_XGENE_SLIMPRO) += i2c-xgene-slimpro.o
+ obj-$(CONFIG_SCx200_ACB)	+= scx200_acb.o
+ obj-$(CONFIG_I2C_FSI)		+= i2c-fsi.o
  obj-$(CONFIG_I2C_VIRTIO)	+= i2c-virtio.o
++obj-$(CONFIG_I2C_S5L8940X)	+= i2c-s5l8940x.o
  
  ccflags-$(CONFIG_I2C_DEBUG_BUS) := -DDEBUG
-+obj-$(CONFIG_I2C_S5L8940X)	+= i2c-s5l8940x.o
 diff --git a/drivers/input/misc/Kconfig b/drivers/input/misc/Kconfig
+index 6a852c7..ad2fcce 100644
 --- a/drivers/input/misc/Kconfig
 +++ b/drivers/input/misc/Kconfig
-@@ -956,4 +956,13 @@ config INPUT_STPMIC1_ONKEY
+@@ -956,4 +956,14 @@ config INPUT_STPMIC1_ONKEY
  	  To compile this driver as a module, choose M here: the
  	  module will be called stpmic1_onkey.
  
 +config INPUT_S5L8947X_MCU
 +	tristate "S5L8947X system / IR remote MCU"
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
 +	depends on SERIAL_DEV_BUS
 +	default ARCH_APPLE_S5L
 +	help
@@ -153,21 +173,22 @@ diff --git a/drivers/input/misc/Kconfig b/drivers/input/misc/Kconfig
 +
  endif
 diff --git a/drivers/input/misc/Makefile b/drivers/input/misc/Makefile
+index 4f7f736..8dcd0e0 100644
 --- a/drivers/input/misc/Makefile
 +++ b/drivers/input/misc/Makefile
-@@ -92,3 +92,4 @@ obj-$(CONFIG_INPUT_WM831X_ON)		+= wm831x
+@@ -92,3 +92,4 @@ obj-$(CONFIG_INPUT_WM831X_ON)		+= wm831x-on.o
  obj-$(CONFIG_INPUT_XEN_KBDDEV_FRONTEND)	+= xen-kbdfront.o
  obj-$(CONFIG_INPUT_YEALINK)		+= yealink.o
  obj-$(CONFIG_INPUT_IDEAPAD_SLIDEBAR)	+= ideapad_slidebar.o
 +obj-$(CONFIG_INPUT_S5L8947X_MCU)	+= s5l8947x-mcu.o
 diff --git a/drivers/irqchip/Kconfig b/drivers/irqchip/Kconfig
+index 5d5b3cf..7999b1c 100644
 --- a/drivers/irqchip/Kconfig
 +++ b/drivers/irqchip/Kconfig
-@@ -742,3 +742,14 @@ config SUNPLUS_SP7021_INTC
+@@ -741,4 +741,15 @@ config SUNPLUS_SP7021_INTC
+ 	  chained controller, routing all interrupt source in P-Chip to
  	  the primary controller on C-Chip.
  
- endmenu
-+
 +config APPLE_AIC1
 +	bool "S5L8940X / S5L8947X aic,1 interrupt controller and 24 MHz timer"
 +	depends on ARM && (ARCH_APPLE_S5L || COMPILE_TEST)
@@ -178,10 +199,13 @@ diff --git a/drivers/irqchip/Kconfig b/drivers/irqchip/Kconfig
 +	select IRQ_DOMAIN_HIERARCHY if SMP
 +	help
 +	  Support for the aic,1 interrupt controller and built-in 24 MHz timer.
++
+ endmenu
 diff --git a/drivers/irqchip/Makefile b/drivers/irqchip/Makefile
+index e3679ec..6a91a49 100644
 --- a/drivers/irqchip/Makefile
 +++ b/drivers/irqchip/Makefile
-@@ -8,6 +8,7 @@ obj-$(CONFIG_ATH79)			+= irq-ath79-misc.
+@@ -8,6 +8,7 @@ obj-$(CONFIG_ATH79)			+= irq-ath79-misc.o
  obj-$(CONFIG_ARCH_BCM2835)		+= irq-bcm2835.o
  obj-$(CONFIG_ARCH_BCM2835)		+= irq-bcm2836.o
  obj-$(CONFIG_ARCH_ACTIONS)		+= irq-owl-sirq.o
@@ -190,28 +214,37 @@ diff --git a/drivers/irqchip/Makefile b/drivers/irqchip/Makefile
  obj-$(CONFIG_EXYNOS_IRQ_COMBINER)	+= exynos-combiner.o
  obj-$(CONFIG_FARADAY_FTINTC010)		+= irq-ftintc010.o
 diff --git a/drivers/mfd/Kconfig b/drivers/mfd/Kconfig
+index f08b800..8353788 100644
 --- a/drivers/mfd/Kconfig
 +++ b/drivers/mfd/Kconfig
-@@ -2426,5 +2426,10 @@ config MFD_RSMU_SPI
+@@ -2426,5 +2426,16 @@ config MFD_RSMU_SPI
  	  Additional drivers must be enabled in order to use the functionality
  	  of the device.
  
 +config MFD_APPLE_PMU_I2C
 +	tristate "Dialog D1815 / D1974 / D2045 I2C PMU MFD"
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
 +	depends on I2C && OF
 +	select REGMAP_I2C
-+	default y
++	default ARCH_APPLE_S5L
++	help
++	  Core driver for the Dialog power management unit on S5L8947X
++	  boards. Child nodes, such as the GPIO power switches, are created
++	  as platform devices sharing the PMU regmap.
++
  endmenu
  endif
 diff --git a/drivers/mfd/Makefile b/drivers/mfd/Makefile
+index 2a9f91e..d0c0fa2 100644
 --- a/drivers/mfd/Makefile
 +++ b/drivers/mfd/Makefile
-@@ -289,3 +289,4 @@ obj-$(CONFIG_MFD_ATC260X_I2C)	+= atc260x
+@@ -289,3 +289,4 @@ obj-$(CONFIG_MFD_ATC260X_I2C)	+= atc260x-i2c.o
  
  obj-$(CONFIG_MFD_RSMU_I2C)	+= rsmu_i2c.o rsmu_core.o
  obj-$(CONFIG_MFD_RSMU_SPI)	+= rsmu_spi.o rsmu_core.o
 +obj-$(CONFIG_MFD_APPLE_PMU_I2C)	+= apple-pmu-i2c.o
 diff --git a/drivers/net/ethernet/apple/Kconfig b/drivers/net/ethernet/apple/Kconfig
+index a4176d2..487dafd 100644
 --- a/drivers/net/ethernet/apple/Kconfig
 +++ b/drivers/net/ethernet/apple/Kconfig
 @@ -6,7 +6,7 @@
@@ -223,20 +256,22 @@ diff --git a/drivers/net/ethernet/apple/Kconfig b/drivers/net/ethernet/apple/Kco
  	help
  	  If you have a network (Ethernet) card belonging to this class, say Y.
  
-@@ -60,4 +60,12 @@ config MACMACE
+@@ -60,4 +60,13 @@ config MACMACE
  	  the 660AV and 840AV Macintosh.  If you have one of these Macintoshes
  	  say Y here.
  
 +config S5L_FE
 +	tristate "S5L8947X 10/100 Fast Ethernet support"
 +	depends on ARCH_APPLE_S5L || COMPILE_TEST
-+	depends on OF
++	depends on OF && COMMON_CLK
 +	select PHYLIB
++	default ARCH_APPLE_S5L
 +	help
 +	  Support for the S5L8947X 10/100 Fast Ethernet MAC.
 +
  endif # NET_VENDOR_APPLE
 diff --git a/drivers/net/ethernet/apple/Makefile b/drivers/net/ethernet/apple/Makefile
+index 3224570..9086499 100644
 --- a/drivers/net/ethernet/apple/Makefile
 +++ b/drivers/net/ethernet/apple/Makefile
 @@ -6,3 +6,4 @@
@@ -245,20 +280,24 @@ diff --git a/drivers/net/ethernet/apple/Makefile b/drivers/net/ethernet/apple/Ma
  obj-$(CONFIG_MACMACE) += macmace.o
 +obj-$(CONFIG_S5L_FE) += s5l_fe.o
 diff --git a/drivers/phy/Kconfig b/drivers/phy/Kconfig
+index f73abff..11f5ac5 100644
 --- a/drivers/phy/Kconfig
 +++ b/drivers/phy/Kconfig
-@@ -112,3 +112,10 @@ source "drivers/phy/intel/Kconfig"
+@@ -112,3 +112,12 @@ source "drivers/phy/intel/Kconfig"
  source "drivers/phy/xilinx/Kconfig"
  
  endmenu
 +
 +config PHY_APPLE_S5L_USB
 +	tristate "S5L8940X / S5L8947X USB 2.0 PHY"
-+	depends on ARCH_APPLE_S5L
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
++	depends on COMMON_CLK
 +	select GENERIC_PHY
++	default ARCH_APPLE_S5L
 +	help
 +	  USB 2.0 OTG and Host PHY driver for S5L8940X and S5L8947X SoCs.
 diff --git a/drivers/phy/Makefile b/drivers/phy/Makefile
+index ebc3995..5c89aac 100644
 --- a/drivers/phy/Makefile
 +++ b/drivers/phy/Makefile
 @@ -39,3 +39,4 @@ obj-y					+= allwinner/	\
@@ -267,23 +306,32 @@ diff --git a/drivers/phy/Makefile b/drivers/phy/Makefile
  					   xilinx/
 +obj-$(CONFIG_PHY_APPLE_S5L_USB)	+= phy-apple-s5l-usb.o
 diff --git a/drivers/pinctrl/Kconfig b/drivers/pinctrl/Kconfig
+index e05174e..a5aecf7 100644
 --- a/drivers/pinctrl/Kconfig
 +++ b/drivers/pinctrl/Kconfig
-@@ -619,4 +619,13 @@ source "drivers/pinctrl/uniphier/Kconfig
+@@ -619,4 +619,20 @@ source "drivers/pinctrl/uniphier/Kconfig"
  source "drivers/pinctrl/visconti/Kconfig"
  source "drivers/pinctrl/vt8500/Kconfig"
  
 +config PINCTRL_S5L8940X_GPIO
 +	tristate "S5L8940X / S5L8947X GPIO and pinctrl driver"
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
 +	depends on OF
++	select GPIOLIB
++	select GPIOLIB_IRQCHIP
 +	select PINMUX
 +	select PINCONF
 +	select GENERIC_PINCONF
 +	select GENERIC_PINCTRL_GROUPS
 +	select GENERIC_PINMUX_FUNCTIONS
-+	default y
++	default ARCH_APPLE_S5L
++	help
++	  GPIO, pin configuration and GPIO interrupt controller of
++	  S5L8940X and S5L8947X SoCs.
++
  endif
 diff --git a/drivers/pinctrl/Makefile b/drivers/pinctrl/Makefile
+index 97823f5..b4f09dd 100644
 --- a/drivers/pinctrl/Makefile
 +++ b/drivers/pinctrl/Makefile
 @@ -87,3 +87,4 @@ obj-y				+= ti/
@@ -292,26 +340,35 @@ diff --git a/drivers/pinctrl/Makefile b/drivers/pinctrl/Makefile
  obj-$(CONFIG_ARCH_VT8500)	+= vt8500/
 +obj-$(CONFIG_PINCTRL_S5L8940X_GPIO)	+= pinctrl-s5l8940x-gpio.o
 diff --git a/drivers/regulator/Kconfig b/drivers/regulator/Kconfig
+index 39297f7..e4b440c 100644
 --- a/drivers/regulator/Kconfig
 +++ b/drivers/regulator/Kconfig
-@@ -1720,4 +1720,8 @@ config REGULATOR_QCOM_LABIBB
+@@ -1720,4 +1720,12 @@ config REGULATOR_QCOM_LABIBB
  	  boost regulator and IBB can be used as a negative boost regulator
  	  for LCD display panel.
  
 +config REGULATOR_APPLE_PMU_PWRSW
 +	tristate "Dialog PMU GPIO power-switch regulator"
 +	depends on MFD_APPLE_PMU_I2C
-+	default y
++	default MFD_APPLE_PMU_I2C
++	help
++	  On/off regulators backed by Dialog PMU GPIO outputs, used on
++	  S5L8947X boards for the Ethernet PHY reset and Wi-Fi REG_ON.
++
  endif
 diff --git a/drivers/regulator/Makefile b/drivers/regulator/Makefile
+index 3d5a803..48006b8 100644
 --- a/drivers/regulator/Makefile
 +++ b/drivers/regulator/Makefile
-@@ -203,3 +203,4 @@ obj-$(CONFIG_REGULATOR_WM8400) += wm8400
+@@ -201,5 +201,6 @@ obj-$(CONFIG_REGULATOR_WM831X) += wm831x-ldo.o
+ obj-$(CONFIG_REGULATOR_WM8350) += wm8350-regulator.o
+ obj-$(CONFIG_REGULATOR_WM8400) += wm8400-regulator.o
  obj-$(CONFIG_REGULATOR_WM8994) += wm8994-regulator.o
++obj-$(CONFIG_REGULATOR_APPLE_PMU_PWRSW)	+= apple-pmu-pwrsw.o
  
  ccflags-$(CONFIG_REGULATOR_DEBUG) += -DDEBUG
-+obj-$(CONFIG_REGULATOR_APPLE_PMU_PWRSW)	+= apple-pmu-pwrsw.o
 diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
+index 6388cbe..6d72f9e 100644
 --- a/drivers/soc/apple/Kconfig
 +++ b/drivers/soc/apple/Kconfig
 @@ -1,6 +1,6 @@
@@ -339,6 +396,7 @@ diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
  
  endif
 diff --git a/drivers/soc/apple/Makefile b/drivers/soc/apple/Makefile
+index 4d9ab8f..e77a163 100644
 --- a/drivers/soc/apple/Makefile
 +++ b/drivers/soc/apple/Makefile
 @@ -8,3 +8,5 @@ apple-rtkit-y = rtkit.o rtkit-crashlog.o
@@ -347,55 +405,11 @@ diff --git a/drivers/soc/apple/Makefile b/drivers/soc/apple/Makefile
  apple-sart-y = sart.o
 +
 +obj-$(CONFIG_APPLE_S5L8947X_SGX) += s5l8947x-sgx.o
-diff --git a/drivers/tty/serial/Kconfig b/drivers/tty/serial/Kconfig
---- a/drivers/tty/serial/Kconfig
-+++ b/drivers/tty/serial/Kconfig
-@@ -238,7 +238,7 @@ config SERIAL_CLPS711X_CONSOLE
- 
- config SERIAL_SAMSUNG
- 	tristate "Samsung SoC serial support"
--	depends on PLAT_SAMSUNG || ARCH_S5PV210 || ARCH_EXYNOS || ARCH_APPLE || ARCH_ARTPEC || COMPILE_TEST
-+	depends on PLAT_SAMSUNG || ARCH_S5PV210 || ARCH_EXYNOS || ARCH_APPLE || ARCH_APPLE_S5L || ARCH_ARTPEC || COMPILE_TEST
- 	select SERIAL_CORE
- 	help
- 	  Support for the on-chip UARTs on the Samsung
-diff --git a/drivers/tty/serial/samsung_tty.c b/drivers/tty/serial/samsung_tty.c
---- a/drivers/tty/serial/samsung_tty.c
-+++ b/drivers/tty/serial/samsung_tty.c
-@@ -1896,6 +1896,8 @@ static int s3c24xx_serial_init_port(stru
- 	ret = s3c24xx_serial_enable_baudclk(ourport);
- 	if (ret)
- 		pr_warn("uart: failed to enable baudclk\n");
-+	else if (ourport->baudclk_rate)
-+		port->uartclk = ourport->baudclk_rate;
- 
- 	/* Keep all interrupts masked and cleared */
- 	switch (ourport->info->type) {
-@@ -2537,7 +2539,7 @@ static const struct s3c24xx_serial_drv_d
- #define GS101_SERIAL_DRV_DATA NULL
- #endif
- 
--#ifdef CONFIG_ARCH_APPLE
-+#if defined(CONFIG_ARCH_APPLE) || defined(CONFIG_ARCH_APPLE_S5L)
- static const struct s3c24xx_serial_drv_data s5l_serial_drv_data = {
- 	.info = {
- 		.name		= "Apple S5L UART",
-diff --git a/drivers/usb/dwc2/core.c b/drivers/usb/dwc2/core.c
---- a/drivers/usb/dwc2/core.c
-+++ b/drivers/usb/dwc2/core.c
-@@ -318,7 +318,7 @@ static void dwc2_wait_for_mode(struct dw
- 			break;
- 		}
- 
--		usleep_range(1000, 2000);
-+		mdelay(1);
- 	}
- }
- 
 diff --git a/drivers/video/fbdev/Kconfig b/drivers/video/fbdev/Kconfig
+index de03507..ed90ec4 100644
 --- a/drivers/video/fbdev/Kconfig
 +++ b/drivers/video/fbdev/Kconfig
-@@ -1816,3 +1816,12 @@ source "drivers/video/fbdev/omap2/Kconfi
+@@ -1816,3 +1816,12 @@ source "drivers/video/fbdev/omap2/Kconfig"
  source "drivers/video/fbdev/mmp/Kconfig"
  
  source "drivers/video/fbdev/core/Kconfig"
@@ -409,46 +423,16 @@ diff --git a/drivers/video/fbdev/Kconfig b/drivers/video/fbdev/Kconfig
 +	  Support for the S5L8947X rgbout display pipe, 10-bit gamma stage,
 +	  HDMI 1.4 transmitter, and M2M hardware scaler.
 diff --git a/drivers/video/fbdev/Makefile b/drivers/video/fbdev/Makefile
+index b3d12f9..0cd2e04 100644
 --- a/drivers/video/fbdev/Makefile
 +++ b/drivers/video/fbdev/Makefile
-@@ -126,3 +126,4 @@ obj-$(CONFIG_FB_SIMPLE)           += sim
+@@ -126,3 +126,4 @@ obj-$(CONFIG_FB_SIMPLE)           += simplefb.o
  
  # the test framebuffer is last
  obj-$(CONFIG_FB_VIRTUAL)          += vfb.o
 +obj-$(CONFIG_FB_S5L8947X_DISPLAY) += s5l8947x-display.o
-diff --git a/init/main.c b/init/main.c
---- a/init/main.c
-+++ b/init/main.c
-@@ -1478,6 +1478,16 @@ static int __ref kernel_init(void *unuse
- 	 */
- 	wait_for_completion(&kthreadd_done);
- 
-+#ifdef CONFIG_ARCH_APPLE_S5L
-+	{
-+		void apple_aic1_quiesce(void);
-+		void apple_aic1_rearm(void);
-+		apple_aic1_quiesce();
-+		apple_aic1_rearm();
-+		early_boot_irqs_disabled = false;
-+		local_irq_enable();
-+	}
-+#endif
- 	kernel_init_freeable();
- 	/* need to finish all async __init code before freeing the memory */
- 	async_synchronize_full();
-diff --git a/kernel/sched/features.h b/kernel/sched/features.h
---- a/kernel/sched/features.h
-+++ b/kernel/sched/features.h
-@@ -55,7 +55,7 @@ SCHED_FEAT(CACHE_HOT_BUDDY, true)
-  *
-  * DELAY_ZERO clips the lag on dequeue (or wakeup) to 0.
-  */
--SCHED_FEAT(DELAY_DEQUEUE, true)
-+SCHED_FEAT(DELAY_DEQUEUE, false)
- SCHED_FEAT(DELAY_ZERO, true)
- 
- /*
 diff --git a/sound/arm/Kconfig b/sound/arm/Kconfig
+index dea2c66..756290b 100644
 --- a/sound/arm/Kconfig
 +++ b/sound/arm/Kconfig
 @@ -28,6 +28,17 @@ config SND_PXA2XX_AC97
@@ -470,9 +454,10 @@ diff --git a/sound/arm/Kconfig b/sound/arm/Kconfig
  
  config SND_PXA2XX_LIB
 diff --git a/sound/arm/Makefile b/sound/arm/Makefile
+index 899edb4..cbf6ac7 100644
 --- a/sound/arm/Makefile
 +++ b/sound/arm/Makefile
-@@ -12,3 +12,5 @@ snd-pxa2xx-lib-$(CONFIG_SND_PXA2XX_LIB_A
+@@ -12,3 +12,5 @@ snd-pxa2xx-lib-$(CONFIG_SND_PXA2XX_LIB_AC97)	+= pxa2xx-ac97-lib.o
  
  obj-$(CONFIG_SND_PXA2XX_AC97)	+= snd-pxa2xx-ac97.o
  snd-pxa2xx-ac97-y		:= pxa2xx-ac97.o

@@ -1,0 +1,48 @@
+tty: serial: samsung: support the S5L8947X UARTs
+
+The S5L8947X UARTs are the Samsung "Apple S5L UART" variant already
+supported for ARCH_APPLE. Allow SERIAL_SAMSUNG and the S5L driver data
+on ARCH_APPLE_S5L as well.
+
+Once the dedicated baud clock is enabled, set port->uartclk from its
+rate.
+---
+ drivers/tty/serial/Kconfig       | 2 +-
+ drivers/tty/serial/samsung_tty.c | 4 +++-
+ 2 files changed, 4 insertions(+), 2 deletions(-)
+
+diff --git a/drivers/tty/serial/Kconfig b/drivers/tty/serial/Kconfig
+index 1e92b16..3400785 100644
+--- a/drivers/tty/serial/Kconfig
++++ b/drivers/tty/serial/Kconfig
+@@ -238,7 +238,7 @@ config SERIAL_CLPS711X_CONSOLE
+ 
+ config SERIAL_SAMSUNG
+ 	tristate "Samsung SoC serial support"
+-	depends on PLAT_SAMSUNG || ARCH_S5PV210 || ARCH_EXYNOS || ARCH_APPLE || ARCH_ARTPEC || COMPILE_TEST
++	depends on PLAT_SAMSUNG || ARCH_S5PV210 || ARCH_EXYNOS || ARCH_APPLE || ARCH_APPLE_S5L || ARCH_ARTPEC || COMPILE_TEST
+ 	select SERIAL_CORE
+ 	help
+ 	  Support for the on-chip UARTs on the Samsung
+diff --git a/drivers/tty/serial/samsung_tty.c b/drivers/tty/serial/samsung_tty.c
+index 0d184ee..bd419f7 100644
+--- a/drivers/tty/serial/samsung_tty.c
++++ b/drivers/tty/serial/samsung_tty.c
+@@ -1896,6 +1896,8 @@ static int s3c24xx_serial_init_port(struct s3c24xx_uart_port *ourport,
+ 	ret = s3c24xx_serial_enable_baudclk(ourport);
+ 	if (ret)
+ 		pr_warn("uart: failed to enable baudclk\n");
++	else if (ourport->baudclk_rate)
++		port->uartclk = ourport->baudclk_rate;
+ 
+ 	/* Keep all interrupts masked and cleared */
+ 	switch (ourport->info->type) {
+@@ -2537,7 +2539,7 @@ static const struct s3c24xx_serial_drv_data gs101_serial_drv_data = {
+ #define GS101_SERIAL_DRV_DATA NULL
+ #endif
+ 
+-#ifdef CONFIG_ARCH_APPLE
++#if defined(CONFIG_ARCH_APPLE) || defined(CONFIG_ARCH_APPLE_S5L)
+ static const struct s3c24xx_serial_drv_data s5l_serial_drv_data = {
+ 	.info = {
+ 		.name		= "Apple S5L UART",
