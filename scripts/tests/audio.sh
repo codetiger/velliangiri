@@ -33,7 +33,7 @@ t_audio() {
 	if run audiotest rate; then
 		pass "I2S0 frame clock within 1% of 48 kHz"
 	else
-		fail "I2S0 frame clock (run 'audiotest sweep' to find a clock setting)"
+		fail "I2S0 frame clock (try 'audiotest rate -c <txcon>')"
 	fi
 
 	if run audiotest pio -t 3 -f 440; then

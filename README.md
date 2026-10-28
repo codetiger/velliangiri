@@ -25,7 +25,7 @@ Mainline **Linux 6.12** kernel port and open-source (`GPL-2.0-only`) hardware dr
   - Pre-kernel 720p@60Hz HDMI transmitter/PHY (`0x39700000`), `rgbout` display pipe (`0x3a200000`) scanning out reserved DRAM at `0x9ec00000` (`simple-framebuffer` / `fbcon`), runtime Plane 0 DMA page-flipping, 10-bit 3x256 hardware Gamma LUT scaling (`0x39600000`), HDMI Audio InfoFrame/ACR bridge, and M2M hardware scaler (`0x39200000`, PMGR gate 26, switched at runtime).
 - **Audio (`sound/arm/s5l8947x-audio.c`)** — *bring-up, HDMI audio not yet confirmed on hardware*:
   - ALSA PCM and mixer driver (`S5L8947X HDMI/SPDIF`, 48 kHz S16_LE stereo) for `i2s0` HDMI audio (`0x34190000`) and the `spdif` optical TOSLINK transmitter (`0x34194000`).
-  - No DMA engine driver yet: the ring buffer is fed to the I2S0 TX FIFO by PIO from a 250 µs hrtimer, paced by the FIFO full flag; S/PDIF gets one 16-bit sample per write. The I2S0 clock source/prescaler is still being characterised and is exposed as the `i2s_mod` / `i2s_psr` module parameters.
+  - No DMA engine driver yet: the ring buffer is fed to the I2S0 TX FIFO by PIO from a 250 µs hrtimer, paced by the FIFO full flag; S/PDIF gets one 16-bit sample per write. The I2S block turned out not to use the Samsung register layout the driver programs; the measured layout is documented at the top of `scripts/tools/audiotest.c`, whose `rate` and `pio` commands already use it. I2S0 runs from 24 MHz, so the closest rate to 48 kHz is 46 875 Hz; HDMI audio is still silent.
 - **PowerVR SGX543 GPU (`drivers/soc/apple/s5l8947x-sgx.c`)**:
   - Clock/power domain switch (PMGR gates 7/8/9) and core telemetry driver (`/dev/sgx0`, `core_id=0x0c3fd6a7`) for the `sgx` GPU at `0x38000000` (IRQ 49).
 
@@ -78,7 +78,7 @@ Nothing is tested at boot. The initramfs ships an on-demand test suite (`scripts
 ```bash
 ssh root@10.55.0.2 hwtest                 # probe, clocks, display, audio, gpu, mcu, wireless
 ssh -t root@10.55.0.2 hwtest -i audio     # interactive: confirm what the TV played
-ssh root@10.55.0.2 audiotest sweep        # measure the I2S0 frame clock per clock source
+ssh root@10.55.0.2 audiotest rate         # measure the I2S0 frame clock (FIFO-paced, 1 s)
 
 # Run updated test scripts without rebuilding the initramfs
 scp -r scripts/tests root@10.55.0.2:/tmp/tests
