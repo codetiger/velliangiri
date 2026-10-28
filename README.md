@@ -27,7 +27,7 @@ Mainline **Linux 6.12** kernel port and open-source (`GPL-2.0-only`) hardware dr
   - ALSA PCM and mixer driver (`S5L8947X HDMI/SPDIF`, 48 kHz S16_LE stereo) for `i2s0` HDMI audio (`0x34190000`) and the `spdif` optical TOSLINK transmitter (`0x34194000`).
   - No DMA engine driver yet: the ring buffer is fed to the I2S0 TX FIFO by PIO from a 250 µs hrtimer, paced by the FIFO full flag; S/PDIF gets one 16-bit sample per write. The I2S block turned out not to use the Samsung register layout the driver programs; the measured layout is documented at the top of `scripts/tools/audiotest.c`, whose `rate` and `pio` commands already use it. I2S0 runs from 24 MHz, so the closest rate to 48 kHz is 46 875 Hz; HDMI audio is still silent.
 - **PowerVR SGX543 GPU (`drivers/soc/apple/s5l8947x-sgx.c`)**:
-  - Clock/power domain switch (PMGR gates 7/8/9) and core telemetry driver (`/dev/sgx0`, `core_id=0x0c3fd6a7`) for the `sgx` GPU at `0x38000000` (IRQ 49).
+  - Clock/power domain switch (PMGR gates 7/8/9 (GFX_SYS, GFX, HPERF-NRT)) and core telemetry driver (`/dev/sgx0`) for the `sgx` GPU at `0x35100000` (IRQ 49). Only the always-clocked master block (`cfg0` at `0x4010`) is read; the per-core registers at the bottom of the window hang the bus until a core is brought up.
 
 ## Repository Layout
 

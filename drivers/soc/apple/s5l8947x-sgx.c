@@ -2,12 +2,13 @@
 /*
  * S5L8947X PowerVR SGX543 GPU Power/Clock Domain & Telemetry Driver
  *
- * Switches the PowerVR SGX543 (0x38000000, IRQ 49) clock/power domain and
- * exposes the core identification registers.
+ * Switches the PowerVR SGX543 (0x35100000, IRQ 49) clock/power domain and
+ * exposes the master configuration registers.
  */
 
 #define pr_fmt(fmt) "s5l8947x-sgx: " fmt
 
+#include <linux/bitfield.h>
 #include <linux/clk.h>
 #include <linux/fs.h>
 #include <linux/io.h>
@@ -18,9 +19,14 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 
-/* SGX543 EUR_CR core identification registers (offset from 0x38000000) */
-#define EUR_CR_CORE_ID			0x0014
-#define EUR_CR_CORE_REVISION		0x0018
+/*
+ * SGX543 master block registers (offset from 0x35100000). They stay readable
+ * while the cores are clock gated; the per-core registers at the bottom of the
+ * window hang the bus until a core is brought up, so they are never read here.
+ */
+#define SGX_MASTER_CFG0			0x4010
+#define SGX_MASTER_CFG1			0x4014
+#define SGX_MASTER_CFG0_CORES		GENMASK(11, 8)
 
 struct s5l8947x_sgx {
 	struct device *dev;
@@ -31,8 +37,8 @@ struct s5l8947x_sgx {
 	struct mutex lock;
 	int irq;
 	bool powered;
-	u32 core_id;
-	u32 core_rev;
+	u32 cfg0;
+	u32 cfg1;
 };
 
 /* Called with sgx->lock held */
@@ -53,8 +59,8 @@ static int s5l8947x_sgx_power_set(struct s5l8947x_sgx *sgx, bool on)
 	if (ret)
 		return ret;
 	sgx->powered = true;
-	sgx->core_id = readl(sgx->regs + EUR_CR_CORE_ID);
-	sgx->core_rev = readl(sgx->regs + EUR_CR_CORE_REVISION);
+	sgx->cfg0 = readl(sgx->regs + SGX_MASTER_CFG0);
+	sgx->cfg1 = readl(sgx->regs + SGX_MASTER_CFG1);
 	return 0;
 }
 
@@ -93,8 +99,9 @@ static ssize_t core_info_show(struct device *dev,
 	struct s5l8947x_sgx *sgx = dev_get_drvdata(dev);
 
 	return sysfs_emit(buf,
-			  "model=PowerVR-SGX543 mmio=0x38000000 irq=%d core_id=0x%08x core_rev=0x%08x\n",
-			  sgx->irq, sgx->core_id, sgx->core_rev);
+			  "model=PowerVR-SGX543 mmio=0x35100000 irq=%d cfg0=0x%08x cfg1=0x%08x cores=%lu\n",
+			  sgx->irq, sgx->cfg0, sgx->cfg1,
+			  FIELD_GET(SGX_MASTER_CFG0_CORES, sgx->cfg0));
 }
 static DEVICE_ATTR_RO(core_info);
 
@@ -114,9 +121,9 @@ static ssize_t s5l8947x_sgx_misc_read(struct file *file, char __user *ubuf,
 	int len;
 
 	len = scnprintf(info, sizeof(info),
-			"SGX543 mmio=0x38000000 irq=%d state=%s core_id=0x%08x core_rev=0x%08x\n",
+			"SGX543 mmio=0x35100000 irq=%d state=%s cfg0=0x%08x cfg1=0x%08x\n",
 			sgx->irq, sgx->powered ? "on" : "standby",
-			sgx->core_id, sgx->core_rev);
+			sgx->cfg0, sgx->cfg1);
 	return simple_read_from_buffer(ubuf, count, ppos, info, len);
 }
 
@@ -165,8 +172,8 @@ static int s5l8947x_sgx_probe(struct platform_device *pdev)
 	}
 
 	dev_info(&pdev->dev,
-		 "PowerVR SGX543 registered (/dev/sgx0, irq=%d, core_id=0x%08x rev=0x%08x)\n",
-		 sgx->irq, sgx->core_id, sgx->core_rev);
+		 "PowerVR SGX543 registered (/dev/sgx0, irq=%d, cfg0=0x%08x cfg1=0x%08x)\n",
+		 sgx->irq, sgx->cfg0, sgx->cfg1);
 	return 0;
 }
 

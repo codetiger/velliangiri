@@ -201,9 +201,9 @@
 			status = "disabled";
 		};
 
-		sgx0: gpu@8000000 {
+		sgx0: gpu@5100000 {
 			compatible = "apple,s5l8947x-sgx", "img,sgx543";
-			reg = <0x8000000 0x1000000>;
+			reg = <0x5100000 0x18000>, <0xf10b000 0x1000>;
 			interrupts = <49>;
 			clocks = <&pmgr_gates 7>, <&pmgr_gates 8>, <&pmgr_gates 9>;
 			status = "disabled";

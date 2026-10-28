@@ -133,7 +133,7 @@
 	status = "okay";
 };
 
-/* PowerVR SGX543 GPU */
+/* PowerVR SGX543 GPU (master block only; per-core registers hang the bus) */
 &sgx0 {
 	status = "okay";
 };
