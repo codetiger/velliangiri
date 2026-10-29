@@ -179,12 +179,30 @@
 			status = "disabled";
 		};
 
+		/*
+		 * Central DMA.  One interrupt per channel, in channel order:
+		 * entry N is the interrupt of channel N + 1.  The S/PDIF
+		 * transmitter is served by channel 31 (IRQ 81).
+		 */
+		cdma: dma-controller@7000000 {
+			compatible = "apple,s5l8947x-cdma";
+			reg = <0x7000000 0x2d000>,
+			      <0x7800000 0x9000>;
+			interrupts = <51 52 53 54 55 56 57 58 59 60 61 62 63 64
+				      65 66 67 68 69 70 71 72 73 74 75 76 77 78
+				      79 80 81 82 83 84 85 86 87 88 89 90 91 92>;
+			clock-gates = <85>;
+			status = "okay";
+		};
+
 		audio0: audio-controller@4190000 {
 			compatible = "apple,s5l8947x-audio";
 			reg = <0x4190000 0x1000>,
 			      <0x4194000 0x1000>;
 			reg-names = "i2s0", "spdif";
 			interrupts = <99 103>;
+			cdma = <&cdma>;
+			cdma-channel = <31>;
 			clocks = <&pmgr_gates 37>, <&pmgr_gates 38>,
 				 <&pmgr_gates 39>, <&pmgr_gates 40>,
 				 <&pmgr_gates 41>, <&pmgr_gates 42>;
