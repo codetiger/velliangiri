@@ -10,7 +10,7 @@
  *   0x37000000 + n * 0x1000  channel n, 1..42 (one interrupt each)
  *     +0x00 CSR            command / status
  *     +0x04 DCR            request line, width, burst, direction
- *     +0x08 DAR            device address, 24-bit offset in the 0x34000000 window
+ *     +0x08 DAR            device address, 24-bit offset inside a peripheral window
  *     +0x0c DBR            zero
  *     +0x10 MAR            memory read-ahead pointer (not the transfer position)
  *     +0x14 CAR            segment the channel is working on, 0 when finished
@@ -25,8 +25,11 @@
  * The status bits are write-1-to-clear, but every CSR write also replaces the
  * interrupt enables and the type field, so an acknowledge writes them back.
  *
- * Only memory-to-device transfers to peripherals in the 0x34000000 window are
- * supported: the other direction and the other windows have not been measured.
+ * DAR keeps only the low 24 bits of the device address; which window those
+ * bits fall in comes from the channel's wiring, not from a register. Two
+ * windows have been measured: 0x34000000 (audio, memory to device) and
+ * 0x31000000 (the NAND controllers' data and metadata FIFOs, device to
+ * memory). Addresses in other windows are refused.
  */
 
 #include <linux/bitfield.h>
@@ -88,8 +91,9 @@
 #define CDMA_DCR_BURST_16	3
 #define CDMA_DCR_REQUEST	GENMASK(20, 16)
 
-#define CDMA_DEV_WINDOW		0x34000000
 #define CDMA_DEV_WINDOW_MASK	GENMASK(23, 0)
+
+static const phys_addr_t s5l_cdma_windows[] = { 0x31000000, 0x34000000 };
 
 #define CDMA_SEG_CTL		(FIELD_PREP(GENMASK(25, 24), CDMA_TYPE) | 0x3)
 #define CDMA_SEG_CTL_IRQ	BIT(9)
@@ -190,11 +194,12 @@ static void s5l_cdma_start_next(struct s5l_cdma_chan *c)
 	d = to_cdma_desc(vd);
 	c->active = d;
 
-	csr = readl(c->base + CDMA_CSR);
-	if (csr & CDMA_CSR_ACTIVE)
-		s5l_cdma_hw_abort(c);
-	else
-		writel(CDMA_CSR_STATUS, c->base + CDMA_CSR);
+	/*
+	 * Always abort first: a channel whose list ran to its end without
+	 * reporting itself active still stops after the first segment of the
+	 * next list (seen with back-to-back device-to-memory transfers).
+	 */
+	s5l_cdma_hw_abort(c);
 
 	writel(d->dcr, c->base + CDMA_DCR);
 	writel(d->dar, c->base + CDMA_DAR);
@@ -261,6 +266,8 @@ static int s5l_cdma_alloc_chan_resources(struct dma_chan *chan)
 	/* A disabled channel drops register writes. */
 	writel(BIT(c->id & 31), regs + CDMA_ENABLE_SET(c->id));
 	usleep_range(1000, 2000);
+	/* Drop a transfer an earlier user left armed: it resumes on enable. */
+	s5l_cdma_hw_abort(c);
 	return 0;
 }
 
@@ -282,24 +289,49 @@ static int s5l_cdma_slave_config(struct dma_chan *chan,
 	return 0;
 }
 
-/* Channel register values for a memory-to-device transfer. */
+static bool s5l_cdma_reachable(phys_addr_t addr)
+{
+	unsigned int i;
+
+	for (i = 0; i < ARRAY_SIZE(s5l_cdma_windows); i++)
+		if ((addr & ~(phys_addr_t)CDMA_DEV_WINDOW_MASK) == s5l_cdma_windows[i])
+			return true;
+	return false;
+}
+
+/* Channel register values for a transfer to or from a peripheral FIFO. */
 static int s5l_cdma_dev_regs(struct s5l_cdma_chan *c,
 			     enum dma_transfer_direction dir,
 			     u32 *dcr, u32 *dar)
 {
 	struct dma_slave_config *cfg = &c->cfg;
+	enum dma_slave_buswidth bus_width;
 	unsigned int width, burst;
+	phys_addr_t addr;
+	u32 maxburst;
 
-	if (dir != DMA_MEM_TO_DEV)
-		return -EINVAL;
-
-	if ((cfg->dst_addr & ~(phys_addr_t)CDMA_DEV_WINDOW_MASK) != CDMA_DEV_WINDOW) {
-		dev_err(c->cdma->dev, "channel %u: device address %pa out of reach\n",
-			c->id, &cfg->dst_addr);
+	switch (dir) {
+	case DMA_MEM_TO_DEV:
+		addr = cfg->dst_addr;
+		bus_width = cfg->dst_addr_width;
+		maxburst = cfg->dst_maxburst;
+		break;
+	case DMA_DEV_TO_MEM:
+		addr = cfg->src_addr;
+		bus_width = cfg->src_addr_width;
+		maxburst = cfg->src_maxburst;
+		break;
+	default:
 		return -EINVAL;
 	}
 
-	switch (cfg->dst_addr_width) {
+	if (!s5l_cdma_reachable(addr)) {
+		dev_err(c->cdma->dev, "channel %u: device address %pa out of reach\n",
+			c->id, &addr);
+		return -EINVAL;
+	}
+
+	switch (bus_width) {
 	case DMA_SLAVE_BUSWIDTH_1_BYTE:
 		width = 0;
 		break;
@@ -314,7 +346,7 @@ static int s5l_cdma_dev_regs(struct s5l_cdma_chan *c,
 		return -EINVAL;
 	}
 
-	switch (cfg->dst_maxburst) {
+	switch (maxburst) {
 	case 0:
 	case 1:
 		burst = CDMA_DCR_BURST_1;
@@ -328,8 +360,10 @@ static int s5l_cdma_dev_regs(struct s5l_cdma_chan *c,
 
 	*dcr = FIELD_PREP(CDMA_DCR_REQUEST, c->request) |
 	       FIELD_PREP(CDMA_DCR_BURST, burst) |
-	       FIELD_PREP(CDMA_DCR_WIDTH, width) | CDMA_DCR_TO_DEV;
-	*dar = cfg->dst_addr & CDMA_DEV_WINDOW_MASK;
+	       FIELD_PREP(CDMA_DCR_WIDTH, width);
+	if (dir == DMA_MEM_TO_DEV)
+		*dcr |= CDMA_DCR_TO_DEV;
+	*dar = addr & CDMA_DEV_WINDOW_MASK;
 	return 0;
 }
 
@@ -599,10 +633,11 @@ static int s5l_cdma_probe(struct platform_device *pdev)
 	dd->device_issue_pending = s5l_cdma_issue_pending;
 	dd->device_terminate_all = s5l_cdma_terminate_all;
 	dd->device_synchronize = s5l_cdma_synchronize;
-	dd->directions = BIT(DMA_MEM_TO_DEV);
+	dd->directions = BIT(DMA_MEM_TO_DEV) | BIT(DMA_DEV_TO_MEM);
 	dd->dst_addr_widths = BIT(DMA_SLAVE_BUSWIDTH_1_BYTE) |
 			      BIT(DMA_SLAVE_BUSWIDTH_2_BYTES) |
 			      BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
+	dd->src_addr_widths = dd->dst_addr_widths;
 	dd->residue_granularity = DMA_RESIDUE_GRANULARITY_SEGMENT;
 	dd->max_burst = 16;
 	INIT_LIST_HEAD(&dd->channels);
