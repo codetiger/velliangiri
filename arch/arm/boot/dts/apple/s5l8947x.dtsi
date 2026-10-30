@@ -222,6 +222,39 @@
 		};
 
 		/*
+		 * Flash memory interface, two channels.  Each has a host block
+		 * (transfer setup and the data / metadata FIFOs), a sequencer
+		 * block (chip enables, commands, addresses) and an ECC block.
+		 * The FIFOs are drained by central DMA channels 5/6 (FMI0) and
+		 * 7/8 (FMI1) on request lines 0/1 and 2/3.
+		 */
+		fmi0: nand-controller@1200000 {
+			compatible = "apple,s5l8947x-fmi";
+			reg = <0x1200000 0x1000>,
+			      <0x1240000 0x1000>,
+			      <0x1280000 0x1000>;
+			reg-names = "host", "seq", "ecc";
+			interrupts = <33>;
+			clocks = <&pmgr_gates 47>, <&pmgr_gates 48>;
+			dmas = <&cdma 5 0>, <&cdma 6 1>;
+			dma-names = "data", "meta";
+			status = "disabled";
+		};
+
+		fmi1: nand-controller@1300000 {
+			compatible = "apple,s5l8947x-fmi";
+			reg = <0x1300000 0x1000>,
+			      <0x1340000 0x1000>,
+			      <0x1380000 0x1000>;
+			reg-names = "host", "seq", "ecc";
+			interrupts = <34>;
+			clocks = <&pmgr_gates 49>, <&pmgr_gates 50>;
+			dmas = <&cdma 7 2>, <&cdma 8 3>;
+			dma-names = "data", "meta";
+			status = "disabled";
+		};
+
+		/*
 		 * Central DMA.  One interrupt per channel, in channel order:
 		 * entry N is the interrupt of channel N + 1.  Clients name a
 		 * channel (1..42) and a request line; the S/PDIF transmitter

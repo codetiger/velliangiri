@@ -1,0 +1,40 @@
+mtd: devices: hook up the S5L8947X flash memory interface driver
+
+Add the Kconfig symbol and Makefile line for the read-only S5L8947X flash
+memory interface (managed NAND) driver copied in by apply-kernel-tree.py.
+---
+ drivers/mtd/devices/Kconfig  | 10 ++++++++++
+ drivers/mtd/devices/Makefile |  1 +
+ 2 files changed, 11 insertions(+)
+
+diff --git a/drivers/mtd/devices/Kconfig b/drivers/mtd/devices/Kconfig
+--- a/drivers/mtd/devices/Kconfig
++++ b/drivers/mtd/devices/Kconfig
+@@ -120,6 +120,16 @@
+ 	  registered by bcma as platform devices. This enables driver for
+ 	  serial flash memories.
+ 
++config MTD_S5L8947X_FMI
++	tristate "S5L8947X flash memory interface (managed NAND, read-only)"
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
++	depends on OF && HAS_DMA && DMA_ENGINE
++	help
++	  Read-only access to the managed NAND package behind the flash
++	  memory interface (FMI) of the S5L8947X SoC. Pages are moved by the
++	  central DMA controller; the package corrects its own errors and
++	  retires its own bad blocks.
++
+ config MTD_SLRAM
+ 	tristate "Uncached system RAM"
+ 	help
+diff --git a/drivers/mtd/devices/Makefile b/drivers/mtd/devices/Makefile
+--- a/drivers/mtd/devices/Makefile
++++ b/drivers/mtd/devices/Makefile
+@@ -4,6 +4,7 @@
+ #
+ 
+ obj-$(CONFIG_MTD_DOCG3)		+= docg3.o
++obj-$(CONFIG_MTD_S5L8947X_FMI)	+= s5l8947x-fmi.o
+ obj-$(CONFIG_MTD_SLRAM)		+= slram.o
+ obj-$(CONFIG_MTD_PHRAM)		+= phram.o
+ obj-$(CONFIG_MTD_PMC551)	+= pmc551.o

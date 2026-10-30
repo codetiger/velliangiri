@@ -166,6 +166,11 @@
 	status = "okay";
 };
 
+/* NAND: one managed NAND package on FMI0, CE0; FMI1 is unpopulated */
+&fmi0 {
+	status = "okay";
+};
+
 /* PowerVR SGX543 GPU (master block only; per-core registers hang the bus) */
 &sgx0 {
 	status = "okay";
