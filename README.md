@@ -39,13 +39,13 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2`); loads patch firmware at boot when extracted from your restore image; LE scanning verified with `btscan` |
 | **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`S5L8947X IR Remote`, `/dev/input/event*`) via the MSP430 system microcontroller on `uart1` |
 | **Hardware AES Engine** | CDMA AES crypto engine (`s5l8947x-aes` at `0x37801000`): `ecb(aes)` and `cbc(aes)` `skcipher` algorithms (128 / 192 / 256-bit keys) over CDMA channels 1 and 2, plus hardware device/group key operations (`s5l8947x_aes_hwkey_crypt()`) |
-| **Internal NAND & Volumes** | Managed NAND controller (`s5l8947x-fmi`, 8.9 GB, ~14 MB/s over CDMA) and read-only translation layer (`s5l8947x-ftl`) exposing `/dev/nand0`, `/dev/nand0p1` (`System`, 1.4 GB), and `/dev/nand0p2` (`Data`, 6.5 GB, key unwrapped from the reserved SLC key store and block-decrypted via hardware AES); both volumes mount read-only as `hfsplus` |
+| **Internal NAND & Volumes** | Managed NAND controller (`s5l8947x-fmi`, 8.9 GB, ~14 MB/s over CDMA) and read-only translation layer (`s5l8947x-ftl`) exposing `/dev/nand0`, `/dev/nand0p1` (`System`, 1.4 GB), and `/dev/nand0p2` (`Data`, 6.5 GB, volume and per-file keys unwrapped from the reserved SLC key store and decrypted via hardware AES); both volumes mount read-only as `hfsplus` |
 
 ### What doesn't work yet (honest limitations)
 
 | Area | Current Limitation |
 |---|---|
-| **Internal NAND writes & per-file encryption** | Both `/dev/nand0p1` (`System`) and volume-decrypted `/dev/nand0p2` (`Data`) mount read-only as `hfsplus`. Regular files inside `/dev/nand0p2` also carry a second per-file encryption layer (`com.apple.system.cprotect` extended attributes) on top of the volume encryption, and NAND write/erase support is not enabled yet so the stock flash contents remain untouched. |
+| **Internal NAND writes** | Both `/dev/nand0p1` (`System`) and decrypted `/dev/nand0p2` (`Data`, including class-4 per-file content protection) mount read-only as `hfsplus`; NAND write/erase support is not enabled yet so the stock flash contents remain untouched. |
 | **3D GPU acceleration** | On hold. The PowerVR SGX543 power domain and clocks come up for bus telemetry, but there is no DRM/3D rendering driver. Graphics use the 720p CPU framebuffer. |
 | **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a configfs CDC-ECM + CDC-ACM gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
 | **Audio sample rates** | The I2S and S/PDIF blocks are clocked from the 24 MHz crystal, so HDMI playback runs at `46,875 Hz` or `31,250 Hz` and optical at `46,875 Hz` instead of `48,000 Hz`. Use `wavplay` (which resamples automatically) or ALSA resampling. The optical output has not been checked on a receiver yet. |
@@ -143,7 +143,7 @@ Drivers that apply across the SoC family are already named `s5l8940x` and parame
 | **Central DMA** | `drivers/dma/s5l8947x-cdma.c` | 42-channel `dmaengine` provider: slave scatter-gather (both directions, audio `0x34000000` and NAND `0x31000000` windows) and cyclic transfers with per-channel interrupts. |
 | **Audio** | `sound/arm/s5l8947x-audio.c` | I2S (HDMI) and S/PDIF (optical) transmitters, each fed by a cyclic DMA transfer. |
 | **CDMA AES Engine** | `drivers/crypto/s5l8947x-aes.c`<br>`include/linux/s5l8947x-aes.h` | `ecb(aes)` and `cbc(aes)` `skcipher` algorithms over CDMA channels 1 and 2, plus `s5l8947x_aes_hwkey_crypt()` for the hardware device and group keys. |
-| **Managed NAND & FTL** | `drivers/mtd/devices/s5l8947x-fmi.c`<br>`drivers/mtd/s5l8947x-ftl.c` | Managed NAND controller (`FMI0`), translation layer (`/dev/nand0`), key-store unwrapping, and encrypted volume decryption (`/dev/nand0p1`, `/dev/nand0p2`). |
+| **Managed NAND & FTL** | `drivers/mtd/devices/s5l8947x-fmi.c`<br>`drivers/mtd/s5l8947x-ftl.c` | Managed NAND controller (`FMI0`), translation layer (`/dev/nand0`), key-store unwrapping, and encrypted volume + per-file decryption (`/dev/nand0p1`, `/dev/nand0p2`). |
 
 ### How the boot bundle works (`scripts/boot/`)
 
@@ -186,7 +186,7 @@ Instead of storing a full kernel source tree, this repository holds only the fil
 | `arch/arm/boot/dts/apple/` | SoC (`.dtsi`) and board (`.dts`) Device Trees |
 | `arch/arm/mach-apple/` | Machine init, CPU clock calibration, watchdog clocksource & reset |
 | `drivers/`, `sound/`, `include/` | Clean-room kernel drivers in their standard mainline paths |
-| `scripts/patches/` | 11 small, self-contained patches to mainline Linux 6.12 files |
+| `scripts/patches/` | 12 small, self-contained patches to mainline Linux 6.12 files |
 | `scripts/boot/` | Position-independent entry stub, pre-kernel C loader, HDMI init, boot splash and its generator |
 | `scripts/extract-firmware.py` | Rebuilds the Wi-Fi and Bluetooth firmware from your own restore image (`velliangiri.sh firmware`) |
 | `scripts/tests/` | On-device hardware test suite (`hwtest`) |
@@ -201,7 +201,7 @@ Instead of storing a full kernel source tree, this repository holds only the fil
 Contributions of any kind are welcome—whether that is a new board Device Tree, a driver for an unsupported hardware block, a bug fix, or hardware test coverage.
 
 High-impact open tasks on `S5L8947X` right now (see [progress.md](progress.md) for details):
-- **NAND per-file decryption & write path**: unwrap per-file content-protection keys (`com.apple.system.cprotect` class 4) for regular files on `nand0p2`, and add NAND write/erase support when repurposing the internal flash.
+- **NAND write & erase path**: add write/erase support when repurposing the internal flash.
 - **USB OTG host mode** (role switching + OHCI companion controller at `0x36500000`) to allow plugging in external USB devices.
 - **OTP / system config reader** to populate the factory Wi-Fi and Bluetooth MAC addresses automatically.
 - **Audio at exact 48 kHz**: clock the I2S master from the PMGR clock synthesizer instead of the 24 MHz crystal.

@@ -95,6 +95,11 @@ t_nand() {
 			else
 				fail "nand0p2 mounted but its root looks empty"
 			fi
+			if [ -f "$mnt/logs/lockdownd.log" ] && grep -q 'Starting Up' "$mnt/logs/lockdownd.log" 2>/dev/null; then
+				pass "nand0p2 per-file content protection decrypted"
+			else
+				fail "nand0p2 per-file content protection did not decrypt plaintext"
+			fi
 			umount "$mnt"
 		else
 			fail "nand0p2 does not mount as hfsplus"

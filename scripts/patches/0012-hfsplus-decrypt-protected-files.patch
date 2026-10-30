@@ -1,0 +1,152 @@
+hfsplus: decrypt per-file protected regular files on S5L8947X volumes
+
+When opening a regular file on an HFS+ volume, check for a content-protection
+extended attribute and unwrap its per-file AES-256 key through the S5L8947X
+key store helper when available. Decrypt 4 KiB data fork blocks in
+hfsplus_read_folio() using the unwrapped per-file key and IV key.
+---
+ fs/hfsplus/hfsplus_fs.h |  3 ++
+ fs/hfsplus/inode.c      | 68 ++++++++++++++++++++++++++++++++++++++++-
+ fs/hfsplus/super.c      |  5 +++
+ 3 files changed, 75 insertions(+), 1 deletion(-)
+
+diff --git a/fs/hfsplus/hfsplus_fs.h b/fs/hfsplus/hfsplus_fs.h
+--- a/fs/hfsplus/hfsplus_fs.h
++++ b/fs/hfsplus/hfsplus_fs.h
+@@ -250,6 +250,9 @@
+ 	struct list_head open_dir_list;
+ 	spinlock_t open_dir_lock;
+ 	loff_t phys_size;
++	s8 file_crypt;
++	u8 file_key[32];
++	u8 file_iv_key[16];
+ 
+ 	struct inode vfs_inode;
+ };
+diff --git a/fs/hfsplus/inode.c b/fs/hfsplus/inode.c
+--- a/fs/hfsplus/inode.c
++++ b/fs/hfsplus/inode.c
+@@ -18,6 +18,7 @@
+ #include <linux/cred.h>
+ #include <linux/uio.h>
+ #include <linux/fileattr.h>
++#include <linux/s5l8947x-aes.h>
+ 
+ #include "hfsplus_fs.h"
+ #include "hfsplus_raw.h"
+@@ -25,7 +26,54 @@
+ 
+ static int hfsplus_read_folio(struct file *file, struct folio *folio)
+ {
+-	return block_read_full_folio(folio, hfsplus_get_block);
++	struct inode *inode = folio->mapping->host;
++	struct hfsplus_inode_info *hip = HFSPLUS_I(inode);
++	struct super_block *sb = inode->i_sb;
++	struct buffer_head bh = {};
++	loff_t pos = folio_pos(folio);
++	loff_t size = i_size_read(inode);
++	size_t valid;
++	u8 *dst;
++	int err;
++
++	if (hip->file_crypt != 1 || sb->s_blocksize != PAGE_SIZE ||
++	    folio_size(folio) != PAGE_SIZE)
++		return block_read_full_folio(folio, hfsplus_get_block);
++
++	if (pos >= size) {
++		folio_zero_range(folio, 0, PAGE_SIZE);
++		folio_mark_uptodate(folio);
++		folio_unlock(folio);
++		return 0;
++	}
++
++	bh.b_size = PAGE_SIZE;
++	err = hfsplus_get_block(inode, folio->index, &bh, 0);
++	if (err)
++		goto out_unlock;
++	if (!buffer_mapped(&bh)) {
++		folio_zero_range(folio, 0, PAGE_SIZE);
++		folio_mark_uptodate(folio);
++		folio_unlock(folio);
++		return 0;
++	}
++
++	dst = kmap_local_folio(folio, 0);
++	err = s5l8947x_file_block_decrypt(sb->s_bdev, bh.b_blocknr,
++					  hip->file_key, hip->file_iv_key,
++					  pos, dst);
++	valid = min_t(loff_t, PAGE_SIZE, size - pos);
++	if (!err && valid < PAGE_SIZE)
++		memset(dst + valid, 0, PAGE_SIZE - valid);
++	kunmap_local(dst);
++	if (err)
++		goto out_unlock;
++
++	flush_dcache_folio(folio);
++	folio_mark_uptodate(folio);
++out_unlock:
++	folio_unlock(folio);
++	return err;
+ }
+ 
+ static void hfsplus_write_failed(struct address_space *mapping, loff_t to)
+@@ -234,11 +282,28 @@
+ 
+ static int hfsplus_file_open(struct inode *inode, struct file *file)
+ {
++	struct hfsplus_inode_info *hip;
++
+ 	if (HFSPLUS_IS_RSRC(inode))
+ 		inode = HFSPLUS_I(inode)->rsrc_inode;
+ 	if (!(file->f_flags & O_LARGEFILE) && i_size_read(inode) > MAX_NON_LFS)
+ 		return -EOVERFLOW;
+-	atomic_inc(&HFSPLUS_I(inode)->opencnt);
++	hip = HFSPLUS_I(inode);
++	if (S_ISREG(inode->i_mode) && !HFSPLUS_IS_RSRC(inode) && !hip->file_crypt) {
++		u8 attr[128];
++		ssize_t res;
++
++		res = __hfsplus_getxattr(inode, "com.apple.system.cprotect",
++					 attr, sizeof(attr));
++		if (res > 0 &&
++		    !s5l8947x_file_key_unwrap(attr, res, hip->file_key,
++					      hip->file_iv_key))
++			hip->file_crypt = 1;
++		else
++			hip->file_crypt = -1;
++		memzero_explicit(attr, sizeof(attr));
++	}
++	atomic_inc(&hip->opencnt);
+ 	return 0;
+ }
+ 
+@@ -426,6 +491,7 @@
+ 	hip->cached_start = 0;
+ 	hip->cached_blocks = 0;
+ 	hip->phys_size = 0;
++	hip->file_crypt = 0;
+ 	hip->fs_blocks = 0;
+ 	hip->rsrc_inode = NULL;
+ 	if (S_ISDIR(inode->i_mode)) {
+diff --git a/fs/hfsplus/super.c b/fs/hfsplus/super.c
+--- a/fs/hfsplus/super.c
++++ b/fs/hfsplus/super.c
+@@ -93,6 +93,7 @@
+ 	INIT_LIST_HEAD(&HFSPLUS_I(inode)->open_dir_list);
+ 	spin_lock_init(&HFSPLUS_I(inode)->open_dir_lock);
+ 	HFSPLUS_I(inode)->phys_size = 0;
++	HFSPLUS_I(inode)->file_crypt = 0;
+ 
+ 	if (inode->i_ino >= HFSPLUS_FIRSTUSER_CNID ||
+ 	    inode->i_ino == HFSPLUS_ROOT_CNID) {
+@@ -185,6 +186,10 @@
+ {
+ 	hfs_dbg(INODE, "hfsplus_evict_inode: %lu\n", inode->i_ino);
+ 	truncate_inode_pages_final(&inode->i_data);
++	memzero_explicit(HFSPLUS_I(inode)->file_key,
++			 sizeof(HFSPLUS_I(inode)->file_key));
++	memzero_explicit(HFSPLUS_I(inode)->file_iv_key,
++			 sizeof(HFSPLUS_I(inode)->file_iv_key));
+ 	clear_inode(inode);
+ 	if (HFSPLUS_IS_RSRC(inode)) {
+ 		HFSPLUS_I(HFSPLUS_I(inode)->rsrc_inode)->rsrc_inode = NULL;

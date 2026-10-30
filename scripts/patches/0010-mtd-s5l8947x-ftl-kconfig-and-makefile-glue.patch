@@ -10,7 +10,7 @@ translation layer and volume map driver copied in by apply-kernel-tree.py.
 diff --git a/drivers/mtd/Kconfig b/drivers/mtd/Kconfig
 --- a/drivers/mtd/Kconfig
 +++ b/drivers/mtd/Kconfig
-@@ -150,6 +150,19 @@
+@@ -150,6 +150,20 @@
  	  This enables read only access to SmartMedia formatted NAND
  	  flash. You can mount it with FAT file system.
  
@@ -21,6 +21,7 @@ diff --git a/drivers/mtd/Kconfig b/drivers/mtd/Kconfig
 +	select CRYPTO_SKCIPHER
 +	select CRYPTO_CBC
 +	select CRYPTO_AES
++	select CRYPTO_LIB_SHA1
 +	help
 +	  Read-only block devices for the managed NAND of S5L8947X devices as
 +	  written by the stock firmware: the logical disk behind its

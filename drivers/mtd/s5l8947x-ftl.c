@@ -46,6 +46,7 @@
  */
 
 #include <crypto/aes.h>
+#include <crypto/sha1.h>
 #include <crypto/skcipher.h>
 #include <linux/blk-mq.h>
 #include <linux/blkdev.h>
@@ -96,11 +97,19 @@
 #define KS_LOCKERS		0x40
 #define KS_L_MAGIC		0x4c6b
 #define KS_L_KEYS		0x4c77564d
+#define KS_L_FKEY		0xc46b6579
 #define KS_L_DONE		0x444f4e45
 #define KS_K_COUNT		0x0c
 #define KS_K_UUID		0x10
 #define KS_K_RECORDS		0x20
 #define KS_K_RECORD_SIZE	0x30
+#define KS_FKEY_WRAP_LEN	40
+
+#define RFC3394_IV		0xa6a6a6a6a6a6a6a6ULL
+#define CP_V4_VERSION		4
+#define CP_CLASS_OPEN		4
+#define CP_V4_HEADER_LEN	36
+#define CP_WRAP_LEN		40
 
 static const u8 lv_magic[2][16] = {
 	{ 0x6a, 0x90, 0x88, 0xcf, 0x8a, 0xfd, 0x63, 0x0a,
@@ -112,6 +121,10 @@ static const u8 lv_magic[2][16] = {
 static const u8 ftl_wrap_seed[AES_BLOCK_SIZE] = {
 	0x18, 0x3e, 0x99, 0x67, 0x6b, 0xb0, 0x3c, 0x54,
 	0x6f, 0xa4, 0x68, 0xf5, 0x1c, 0x0c, 0xbd, 0x49,
+};
+
+static const u8 ftl_fkey_seed[AES_BLOCK_SIZE] = {
+	[0 ... AES_BLOCK_SIZE - 1] = 0x01,
 };
 
 struct ftl;
@@ -154,6 +167,13 @@ struct ftl {
 static LIST_HEAD(ftl_list);
 static DEFINE_MUTEX(ftl_list_lock);
 static atomic_t ftl_count = ATOMIC_INIT(0);
+
+static DEFINE_MUTEX(ftl_file_lock);
+static struct crypto_skcipher *ftl_file_tfm;
+static struct skcipher_request *ftl_file_req;
+static u8 *ftl_file_buf;
+static u8 ftl_file_master_key[AES_KEYSIZE_256];
+static bool ftl_file_master_valid;
 
 /* --- reading the MTD --- */
 
@@ -595,6 +615,42 @@ static bool ftl_read_keystore(struct ftl *f, u8 *store)
 	return found;
 }
 
+/* RFC 3394 AES Key Unwrap for a 32-byte key (40-byte wrapped input). */
+static int ftl_rfc3394_unwrap(const u8 *kek, unsigned int kek_len,
+			      const u8 in[CP_WRAP_LEN], u8 out[AES_KEYSIZE_256])
+{
+	struct crypto_aes_ctx ctx;
+	u8 blk[AES_BLOCK_SIZE];
+	u64 a, r[4];
+	int i, j, ret;
+
+	ret = aes_expandkey(&ctx, kek, kek_len);
+	if (ret)
+		return ret;
+	a = get_unaligned_be64(in);
+	for (i = 0; i < 4; i++)
+		r[i] = get_unaligned_be64(in + 8 + 8 * i);
+	for (j = 5; j >= 0; j--) {
+		for (i = 3; i >= 0; i--) {
+			put_unaligned_be64(a ^ (u64)(4 * j + i + 1), blk);
+			put_unaligned_be64(r[i], blk + 8);
+			aes_decrypt(&ctx, blk, blk);
+			a = get_unaligned_be64(blk);
+			r[i] = get_unaligned_be64(blk + 8);
+		}
+	}
+	memzero_explicit(&ctx, sizeof(ctx));
+	memzero_explicit(blk, sizeof(blk));
+	if (a != RFC3394_IV) {
+		memzero_explicit(r, sizeof(r));
+		return -EBADMSG;
+	}
+	for (i = 0; i < 4; i++)
+		put_unaligned_be64(r[i], out + 8 * i);
+	memzero_explicit(r, sizeof(r));
+	return 0;
+}
+
 /* Unwrap the volume key locker (0x4c77564d) for media hdr; caller frees with kfree_sensitive. */
 static u8 *ftl_unwrap_keys(struct ftl *f, const u8 *hdr, u32 *nkeys)
 {
@@ -619,8 +675,10 @@ static u8 *ftl_unwrap_keys(struct ftl *f, const u8 *hdr, u32 *nkeys)
 
 		if (magic != KS_L_MAGIC || tag == KS_L_DONE || off + 8 + len > KS_SIZE)
 			break;
-		if (tag == KS_L_KEYS && len >= KS_K_RECORDS && !(len % AES_BLOCK_SIZE)) {
-			if (s5l8947x_aes_hwkey_crypt(S5L8947X_AES_KEY_DEVICE, true, iv,
+		if (!locker && tag == KS_L_KEYS && len >= KS_K_RECORDS &&
+		    !(len % AES_BLOCK_SIZE)) {
+			memset(iv, 0, sizeof(iv));
+			if (s5l8947x_aes_hwkey_crypt(S5L8947X_AES_KEY_DEVICE, true, NULL,
 						     ftl_wrap_seed, wkey, sizeof(wkey)))
 				break;
 			tfm = crypto_alloc_skcipher("cbc(aes)", 0, 0);
@@ -640,7 +698,12 @@ static u8 *ftl_unwrap_keys(struct ftl *f, const u8 *hdr, u32 *nkeys)
 			}
 			count = get_unaligned_le32(locker + KS_K_COUNT);
 			*nkeys = min_t(u32, count, (len - KS_K_RECORDS) / KS_K_RECORD_SIZE);
-			break;
+		} else if (tag == KS_L_FKEY && len == KS_FKEY_WRAP_LEN) {
+			if (!s5l8947x_aes_hwkey_crypt(S5L8947X_AES_KEY_DEVICE, true, NULL,
+						      ftl_fkey_seed, wkey, sizeof(wkey)) &&
+			    !ftl_rfc3394_unwrap(wkey, sizeof(wkey), store + off + 8,
+						ftl_file_master_key))
+				ftl_file_master_valid = true;
 		}
 		off += 8 + len;
 	}
@@ -651,6 +714,111 @@ out:
 	kfree_sensitive(store);
 	return locker;
 }
+
+int s5l8947x_file_key_unwrap(const void *attr, size_t len, u8 fkey[32], u8 iv_key[16])
+{
+	u32 digest[SHA1_DIGEST_WORDS], ws[SHA1_WORKSPACE_WORDS];
+	u8 blk[SHA1_BLOCK_SIZE] = {};
+	const u8 *p = attr;
+	int i, ret;
+
+	if (!ftl_file_master_valid)
+		return -ENOKEY;
+	if (len < CP_V4_HEADER_LEN + CP_WRAP_LEN)
+		return -EINVAL;
+	if (get_unaligned_le16(p) != CP_V4_VERSION ||
+	    (get_unaligned_le32(p + 8) & 0x1f) != CP_CLASS_OPEN ||
+	    get_unaligned_le32(p + 12) != CP_WRAP_LEN)
+		return -EOPNOTSUPP;
+	ret = ftl_rfc3394_unwrap(ftl_file_master_key, sizeof(ftl_file_master_key),
+				 p + CP_V4_HEADER_LEN, fkey);
+	if (ret)
+		return ret;
+
+	memcpy(blk, fkey, AES_KEYSIZE_256);
+	blk[AES_KEYSIZE_256] = 0x80;
+	put_unaligned_be64(AES_KEYSIZE_256 * 8, blk + SHA1_BLOCK_SIZE - 8);
+	sha1_init(digest);
+	sha1_transform(digest, blk, ws);
+	for (i = 0; i < 4; i++)
+		put_unaligned_be32(digest[i], iv_key + 4 * i);
+	memzero_explicit(blk, sizeof(blk));
+	memzero_explicit(digest, sizeof(digest));
+	memzero_explicit(ws, sizeof(ws));
+	return 0;
+}
+EXPORT_SYMBOL_GPL(s5l8947x_file_key_unwrap);
+
+int s5l8947x_file_block_decrypt(struct block_device *bdev, u64 blocknr,
+				const u8 fkey[32], const u8 iv_key[16],
+				u64 file_off, void *dst)
+{
+	struct ftl_disk *d = bdev ? bdev->bd_disk->private_data : NULL;
+	struct crypto_aes_ctx aes;
+	u8 iv[AES_BLOCK_SIZE];
+	__le32 lfsr[4];
+	struct ftl *f;
+	u64 pos, at;
+	int ret;
+
+	if (!d || !d->ftl || (file_off & (FTL_LP_SIZE - 1)))
+		return -EINVAL;
+	f = d->ftl;
+	pos = blocknr << FTL_LP_SHIFT;
+	if (pos + FTL_LP_SIZE > d->size)
+		return -EIO;
+	ret = aes_expandkey(&aes, iv_key, AES_KEYSIZE_128);
+	if (ret)
+		return ret;
+
+	mutex_lock(&ftl_file_lock);
+	if (!ftl_file_tfm) {
+		struct crypto_skcipher *tfm = crypto_alloc_skcipher("cbc(aes)", 0, 0);
+
+		if (IS_ERR(tfm)) {
+			ret = PTR_ERR(tfm);
+			goto out;
+		}
+		ftl_file_tfm = tfm;
+	}
+	if (!ftl_file_req) {
+		ftl_file_req = skcipher_request_alloc(ftl_file_tfm, GFP_KERNEL);
+		if (!ftl_file_req) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
+	if (!ftl_file_buf) {
+		ftl_file_buf = kmalloc(FTL_LP_SIZE, GFP_KERNEL);
+		if (!ftl_file_buf) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
+
+	at = ftl_disk_offset(d, pos);
+	mutex_lock(&f->lock);
+	ret = ftl_copy(f, NULL, at >> FTL_LP_SHIFT, 0, ftl_file_buf, FTL_LP_SIZE);
+	mutex_unlock(&f->lock);
+	if (ret)
+		goto out;
+
+	ret = crypto_skcipher_setkey(ftl_file_tfm, fkey, AES_KEYSIZE_256);
+	if (!ret) {
+		ftl_block_iv((u32)file_off, lfsr);
+		aes_encrypt(&aes, iv, (const u8 *)lfsr);
+		ret = ftl_decrypt(ftl_file_req, ftl_file_buf, ftl_file_buf,
+				  FTL_LP_SIZE, iv);
+		if (!ret)
+			memcpy(dst, ftl_file_buf, FTL_LP_SIZE);
+	}
+out:
+	mutex_unlock(&ftl_file_lock);
+	memzero_explicit(&aes, sizeof(aes));
+	memzero_explicit(iv, sizeof(iv));
+	return ret;
+}
+EXPORT_SYMBOL_GPL(s5l8947x_file_block_decrypt);
 
 static int ftl_setup_cipher(struct ftl_disk *d, const u8 *uuid, const u8 *locker, u32 nkeys)
 {
@@ -905,6 +1073,11 @@ static int __init ftl_init(void)
 static void __exit ftl_exit(void)
 {
 	unregister_mtd_user(&ftl_notifier);
+	skcipher_request_free(ftl_file_req);
+	crypto_free_skcipher(ftl_file_tfm);
+	kfree_sensitive(ftl_file_buf);
+	memzero_explicit(ftl_file_master_key, sizeof(ftl_file_master_key));
+	ftl_file_master_valid = false;
 }
 
 module_init(ftl_init);

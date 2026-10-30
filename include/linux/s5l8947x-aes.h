@@ -30,4 +30,25 @@ static inline int s5l8947x_aes_hwkey_crypt(enum s5l8947x_aes_hwkey key, bool enc
 }
 #endif
 
+struct block_device;
+
+#if IS_ENABLED(CONFIG_MTD_S5L8947X_FTL)
+int s5l8947x_file_key_unwrap(const void *attr, size_t len, u8 fkey[32], u8 iv_key[16]);
+int s5l8947x_file_block_decrypt(struct block_device *bdev, u64 blocknr,
+				const u8 fkey[32], const u8 iv_key[16],
+				u64 file_off, void *dst);
+#else
+static inline int s5l8947x_file_key_unwrap(const void *attr, size_t len,
+					   u8 fkey[32], u8 iv_key[16])
+{
+	return -ENODEV;
+}
+static inline int s5l8947x_file_block_decrypt(struct block_device *bdev, u64 blocknr,
+					      const u8 fkey[32], const u8 iv_key[16],
+					      u64 file_off, void *dst)
+{
+	return -ENODEV;
+}
+#endif
+
 #endif
