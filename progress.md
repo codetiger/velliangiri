@@ -30,9 +30,14 @@ Status of every hardware block, checked against the drivers in the tree and the 
 - HSIC runtime suspend stays off (USB default); enabling it needs the port's resume workaround.
 - The firmware is not distributable; `./scripts/velliangiri.sh firmware` extracts it (and the Bluetooth patch) from the user's own restore image into `research/firmware/`.
 
+### Central DMA known limits
+
+- Only memory-to-device transfers; device-to-memory is not implemented.
+- The device-address register holds only 24 bits (the `0x34000000` window). The window select for clients elsewhere (UART1/2 at `0x326..`/`0x327..`, SHA at `0x302..`, display at `0x3a1..`) is unknown, so those addresses are refused.
+
 ### Audio known limits
 
-- **Open bug:** speech and other music-like content plays with heavy static over HDMI, while tones, sweeps and noise are clean. The output seems to follow each sample's sign more than its value, which points at how the HDMI core packs the 16-bit S/PDIF sample. The sample rate is not the cause: exact 48 kHz from the PMGR NCO gave the same static. The DMA ring, FIFO level and the HDMI S/PDIF receiver's decoded samples all check out.
+- **Open bug:** speech and other music-like content plays with heavy static over HDMI, while tones, sweeps and noise are clean. The output seems to follow each sample's sign more than its value, which points at how the HDMI core packs the 16-bit S/PDIF sample. The sample rate is not the cause: exact 48 kHz from the PMGR NCO gave the same static. The DMA ring, FIFO level and the HDMI S/PDIF receiver's decoded samples all check out. Rechecked 2026-10-30 on the current kernel (fixed peripheral clocks, `dmaengine` cyclic transfer): the static is unchanged, so neither the old clock doubling nor the old hand-built DMA ring was the cause.
 - Only 46 875 and 31 250 Hz are advertised (24 MHz reference); `wavplay` and ALSA resample.
 
 ## Partly implemented
@@ -41,7 +46,6 @@ Status of every hardware block, checked against the drivers in the tree and the 
 |---|---|---|
 | SGX543 GPU — **on hold** | Gates 7/8/9, cores released from reset, telemetry at `/dev/sgx0` | No command submission, no DRM driver. Per-core registers hang the bus until a core is brought up. No further work and no on-device test until this is resumed. |
 | USB OTG port host mode | Device mode on `dwc2`; EHCI host serves only the internal HSIC port | `dr_mode` is `peripheral`; host on the OTG port needs a role switch. The OHCI companion (`0x36500000`, IRQ 13) is not described, so full/low-speed devices are unsupported. |
-| Central DMA | Memory-to-device transfers to peripherals in the `0x34000000` window (audio) | The device-address register holds only 24 bits, and the window select for clients elsewhere (UART1/2 at `0x326..`/`0x327..`, SHA at `0x302..`, display at `0x3a1..`) is unknown, so those addresses are refused. Device-to-memory is not implemented. |
 | System MCU | Button input, firmware query, break, raw commands | Reset-to-recovery trigger and wake source are not wired (the MCU line, GPIO 2, is unused); standby is only sent on halt. |
 | Bluetooth (UART2) | `hci_uart_bcm` brings up `hci0` at boot (verified 2026-10-30): patch firmware loaded (HCI 4.1, revision 2393, LE), repeated rebinds clean, `hwtest wireless` passes | The address is the controller default (the stock system sets it from system config). Stays at 115200: with integer divisors the 51.3 MHz clock reaches 460800 accurately but not the stock 3 Mbaud. No host-wake interrupt, so no UART sleep. No `bluetoothd`/BlueZ userland in the image. |
 
@@ -59,4 +63,4 @@ Status of every hardware block, checked against the drivers in the tree and the 
 1. NAND reconnaissance and the FMI driver; extend the CDMA driver to the FMI window and device-to-memory transfers.
 2. Wi-Fi and Bluetooth: read the real MAC and Bluetooth addresses instead of placeholders.
 3. Add host mode to the OTG port.
-4. Fix the audio speech-static bug: first recheck it now that the 850 MHz state no longer doubles peripheral clocks, then look at the HDMI sample packing, or feed HDMI through I2S as the stock system does.
+4. Fix the audio speech-static bug: look at the HDMI sample packing, or feed HDMI through I2S as the stock system does (the clock and DMA paths are ruled out).

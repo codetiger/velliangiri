@@ -29,10 +29,10 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 
 | Hardware | Status & Details |
 |---|---|
-| **CPU & Core SoC** | Single-core Cortex-A9 up to 850 MHz, CPU frequency scaling (`212.5` / `425` / `850 MHz`), 512 KB PL310 L2 cache, `aic,1` interrupt controller, 24 MHz timer, hardware watchdog, clean reboot and standby power-off |
+| **CPU & Core SoC** | Single-core Cortex-A9 up to 850 MHz, CPU frequency scaling (`212.5` / `425` / `850 MHz`), 512 KB PL310 L2 cache, `aic,1` interrupt controller, 24 MHz timer, 42-channel central DMA (`dmaengine`), hardware watchdog, clean reboot and standby power-off |
 | **Clocks, GPIO, I2C, PMU** | PMGR peripheral clock gates, 144-pin GPIO and pinctrl controller (with IRQs), 3x I2C controllers, Dialog I2C PMU power switches |
 | **HDMI Video** | 720p60 framebuffer console (`simple-framebuffer` + `s5l8947x-display`), a logo boot splash drawn by the pre-kernel loader, 10-bit hardware gamma LUT, and memory-to-memory hardware scaler |
-| **Audio (HDMI & Optical)** | ALSA PCM output over both HDMI and optical S/PDIF (`s5l8947x-audio`), driven by Central DMA channel 31, with HDMI hot-plug mute/unmute and a `wavplay` CLI player |
+| **Audio (HDMI & Optical)** | ALSA PCM output over both HDMI and optical S/PDIF (`s5l8947x-audio`), fed by a cyclic DMA transfer with period interrupts, with HDMI hot-plug mute/unmute and a `wavplay` CLI player |
 | **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
 | **USB Networking & Console** | Micro-USB port runs in USB device mode (`dwc2`), providing a virtual Ethernet link (`usb0` at `10.55.0.2`, SSH enabled) and a USB serial console (`/dev/ttyGS0`) |
 | **Wi-Fi (2.4 & 5 GHz)** | Broadcom BCM4334 over internal HSIC USB host (`ehci-platform` + custom PHY handshake); scans and joins WPA2 networks via `wpa_supplicant` and the built-in `wifi` helper (requires firmware extracted from your own restore image) |
@@ -46,7 +46,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **Internal NAND storage** | Not started. There is no driver for the NAND flash controller (`FMI0`/`FMI1`) yet, so the OS runs from RAM (`initramfs`) and resets on reboot. (NFS client tools are included if you want persistent network storage.) |
 | **3D GPU acceleration** | On hold. The PowerVR SGX543 power domain and clocks come up for bus telemetry, but there is no DRM/3D rendering driver. Graphics use the 720p CPU framebuffer. |
 | **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a configfs CDC-ECM + CDC-ACM gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
-| **Audio quality (open bug)** | Tones and test signals play cleanly, but speech and music have heavy static over HDMI. The cause is still being tracked down; it is not the sample rate. |
+| **Audio quality (open bug)** | Tones and test signals play cleanly, but speech and music have heavy static over HDMI. The cause is still being tracked down; it is not the sample rate, the peripheral clocks or the DMA path. |
 | **Audio sample rates** | The S/PDIF block is clocked from the 24 MHz crystal, so hardware playback runs at `46,875 Hz` or `31,250 Hz` instead of `48,000 Hz`. Use `wavplay` (which resamples automatically) or ALSA resampling. |
 | **Wi-Fi / BT factory addresses** | Wi-Fi uses a locally administered MAC address from the Device Tree, and Bluetooth runs at 115,200 baud with its default controller address (`BlueZ` userspace is not pre-installed in the small initramfs). |
 
@@ -180,7 +180,7 @@ Instead of storing a full kernel source tree, this repository holds only the fil
 | `arch/arm/boot/dts/apple/` | SoC (`.dtsi`) and board (`.dts`) Device Trees |
 | `arch/arm/mach-apple/` | Machine init, CPU clock calibration, watchdog clocksource & reset |
 | `drivers/`, `sound/`, `include/` | Clean-room kernel drivers in their standard mainline paths |
-| `scripts/patches/` | 7 small, self-contained patches to mainline Linux 6.12 files |
+| `scripts/patches/` | 8 small, self-contained patches to mainline Linux 6.12 files |
 | `scripts/boot/` | Position-independent entry stub, pre-kernel C loader, HDMI init, boot splash and its generator |
 | `scripts/extract-firmware.py` | Rebuilds the Wi-Fi and Bluetooth firmware from your own restore image (`velliangiri.sh firmware`) |
 | `scripts/tests/` | On-device hardware test suite (`hwtest`) |
