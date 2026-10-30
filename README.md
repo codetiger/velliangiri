@@ -16,14 +16,14 @@ Velliangiri brings a current, mainline **Linux 6.12** kernel and an **Alpine Lin
 Every driver in this repository is written from scratch based on observed hardware behaviour, uses standard Linux kernel subsystems, and is kept as a small overlay on top of a pristine kernel tree rather than a frozen vendor fork.
 
 This project is built for two groups of people:
-1. **Users and tinkerers** who want to boot Linux on the **S5L8947X (`j33iap`)** set-top box and use its hardware (HDMI video and audio, optical audio, Ethernet, Wi-Fi, Bluetooth, IR remote, and USB networking).
-2. **Developers and porters** who want to bring up mainline Linux on other devices in the same SoC family by reusing the interrupt controller, clock, GPIO, I2C, PMU, USB, display, and audio drivers already working here.
+1. **Users and tinkerers** who want to boot Linux on the **S5L8947X (`j33iap`)** set-top box and use its hardware (HDMI video and audio, optical audio, Ethernet, Wi-Fi, Bluetooth, IR remote, USB networking, internal NAND storage, and hardware AES).
+2. **Developers and porters** who want to bring up mainline Linux on other devices in the same SoC family by reusing the interrupt controller, clock, GPIO, I2C, PMU, USB, DMA, crypto, NAND, display, and audio drivers already working here.
 
 ---
 
 ## Hardware Support (`S5L8947X` / `j33iap`)
 
-Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) in about 20 seconds. Because it runs entirely from RAM, **it does not touch or modify the device's internal flash storage**.
+Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) in about 20 seconds and exposes the internal NAND volumes read-only. Because it runs from RAM and mounts internal flash read-only, **it does not modify the device's internal flash storage**.
 
 ### What works
 
@@ -38,12 +38,14 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **Wi-Fi (2.4 & 5 GHz)** | Broadcom BCM4334 over internal HSIC USB host (`ehci-platform` + custom PHY handshake); scans and joins WPA2 networks via `wpa_supplicant` and the built-in `wifi` helper (requires firmware extracted from your own restore image) |
 | **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2`); loads patch firmware at boot when extracted from your restore image; LE scanning verified with `btscan` |
 | **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`S5L8947X IR Remote`, `/dev/input/event*`) via the MSP430 system microcontroller on `uart1` |
+| **Hardware AES Engine** | CDMA AES crypto engine (`s5l8947x-aes` at `0x37801000`): `ecb(aes)` and `cbc(aes)` `skcipher` algorithms (128 / 192 / 256-bit keys) over CDMA channels 1 and 2, plus hardware device/group key operations (`s5l8947x_aes_hwkey_crypt()`) |
+| **Internal NAND & Volumes** | Managed NAND controller (`s5l8947x-fmi`, 8.9 GB, ~14 MB/s over CDMA) and read-only translation layer (`s5l8947x-ftl`) exposing `/dev/nand0`, `/dev/nand0p1` (`System`, 1.4 GB), and `/dev/nand0p2` (`Data`, 6.5 GB, key unwrapped from the reserved SLC key store and block-decrypted via hardware AES); both volumes mount read-only as `hfsplus` |
 
 ### What doesn't work yet (honest limitations)
 
 | Area | Current Limitation |
 |---|---|
-| **Internal NAND storage** | Not started. There is no driver for the NAND flash controller (`FMI0`/`FMI1`) yet, so the OS runs from RAM (`initramfs`) and resets on reboot. (NFS client tools are included if you want persistent network storage.) |
+| **Internal NAND writes & per-file encryption** | Both `/dev/nand0p1` (`System`) and volume-decrypted `/dev/nand0p2` (`Data`) mount read-only as `hfsplus`. Regular files inside `/dev/nand0p2` also carry a second per-file encryption layer (`com.apple.system.cprotect` extended attributes) on top of the volume encryption, and NAND write/erase support is not enabled yet so the stock flash contents remain untouched. |
 | **3D GPU acceleration** | On hold. The PowerVR SGX543 power domain and clocks come up for bus telemetry, but there is no DRM/3D rendering driver. Graphics use the 720p CPU framebuffer. |
 | **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a configfs CDC-ECM + CDC-ACM gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
 | **Audio sample rates** | The I2S and S/PDIF blocks are clocked from the 24 MHz crystal, so HDMI playback runs at `46,875 Hz` or `31,250 Hz` and optical at `46,875 Hz` instead of `48,000 Hz`. Use `wavplay` (which resamples automatically) or ALSA resampling. The optical output has not been checked on a receiver yet. |
@@ -107,6 +109,8 @@ Load `out/boot-bundle-s5l8947x-j33iap.bin` into the device's RAM over USB and ju
 ```bash
 hwtest                       # Run the automated on-device hardware test suite
 hwtest -i display audio      # Run interactive display and audio checks
+mount -t hfsplus -o ro /dev/nand0p1 /mnt  # Mount the stock System volume read-only
+mount -t hfsplus -o ro /dev/nand0p2 /mnt  # Mount the decrypted Data volume read-only
 wifi scan                    # Scan for 2.4 GHz and 5 GHz Wi-Fi networks
 wifi connect "MySSID" "PSK"  # Connect to WPA2 Wi-Fi and obtain a DHCP lease
 wifi status                  # Check Wi-Fi link speed and IP address
@@ -136,8 +140,10 @@ Drivers that apply across the SoC family are already named `s5l8940x` and parame
 | **USB 2.0 PHY** | `drivers/phy/phy-apple-s5l-usb.c` | OTG device PHY (paired with mainline `dwc2`) and EHCI HSIC host PHY with GPIO ready handshaking. |
 | **UART** | `scripts/patches/0002-*.patch` | Hooks `ARCH_APPLE_S5L` into mainline `samsung_tty.c` (`apple,s5l-uart`). |
 | **Display & HDMI** | `drivers/video/fbdev/s5l8947x-display.c` | `rgbout` display pipe, 10-bit gamma LUTs, M2M hardware scaler, and HDMI 1.4 transmitter. |
-| **Central DMA** | `drivers/dma/s5l8947x-cdma.c` | 42-channel `dmaengine` provider: slave scatter-gather and cyclic transfers with per-channel interrupts. |
+| **Central DMA** | `drivers/dma/s5l8947x-cdma.c` | 42-channel `dmaengine` provider: slave scatter-gather (both directions, audio `0x34000000` and NAND `0x31000000` windows) and cyclic transfers with per-channel interrupts. |
 | **Audio** | `sound/arm/s5l8947x-audio.c` | I2S (HDMI) and S/PDIF (optical) transmitters, each fed by a cyclic DMA transfer. |
+| **CDMA AES Engine** | `drivers/crypto/s5l8947x-aes.c`<br>`include/linux/s5l8947x-aes.h` | `ecb(aes)` and `cbc(aes)` `skcipher` algorithms over CDMA channels 1 and 2, plus `s5l8947x_aes_hwkey_crypt()` for the hardware device and group keys. |
+| **Managed NAND & FTL** | `drivers/mtd/devices/s5l8947x-fmi.c`<br>`drivers/mtd/s5l8947x-ftl.c` | Managed NAND controller (`FMI0`), translation layer (`/dev/nand0`), key-store unwrapping, and encrypted volume decryption (`/dev/nand0p1`, `/dev/nand0p2`). |
 
 ### How the boot bundle works (`scripts/boot/`)
 
@@ -180,7 +186,7 @@ Instead of storing a full kernel source tree, this repository holds only the fil
 | `arch/arm/boot/dts/apple/` | SoC (`.dtsi`) and board (`.dts`) Device Trees |
 | `arch/arm/mach-apple/` | Machine init, CPU clock calibration, watchdog clocksource & reset |
 | `drivers/`, `sound/`, `include/` | Clean-room kernel drivers in their standard mainline paths |
-| `scripts/patches/` | 8 small, self-contained patches to mainline Linux 6.12 files |
+| `scripts/patches/` | 11 small, self-contained patches to mainline Linux 6.12 files |
 | `scripts/boot/` | Position-independent entry stub, pre-kernel C loader, HDMI init, boot splash and its generator |
 | `scripts/extract-firmware.py` | Rebuilds the Wi-Fi and Bluetooth firmware from your own restore image (`velliangiri.sh firmware`) |
 | `scripts/tests/` | On-device hardware test suite (`hwtest`) |
@@ -195,8 +201,7 @@ Instead of storing a full kernel source tree, this repository holds only the fil
 Contributions of any kind are welcome—whether that is a new board Device Tree, a driver for an unsupported hardware block, a bug fix, or hardware test coverage.
 
 High-impact open tasks on `S5L8947X` right now (see [progress.md](progress.md) for details):
-- **NAND flash driver (`FMI0` / `FMI1` + BCH ECC)** for persistent storage on internal flash.
-- **Central DMA beyond audio**: device-to-memory transfers and the address window for peripherals outside `0x34000000` (needed by NAND, UART DMA and hardware crypto).
+- **NAND per-file decryption & write path**: unwrap per-file content-protection keys (`com.apple.system.cprotect` class 4) for regular files on `nand0p2`, and add NAND write/erase support when repurposing the internal flash.
 - **USB OTG host mode** (role switching + OHCI companion controller at `0x36500000`) to allow plugging in external USB devices.
 - **OTP / system config reader** to populate the factory Wi-Fi and Bluetooth MAC addresses automatically.
 - **Audio at exact 48 kHz**: clock the I2S master from the PMGR clock synthesizer instead of the 24 MHz crystal.
