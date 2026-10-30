@@ -15,19 +15,28 @@ Status of every hardware block, checked against the drivers in the tree and the 
 | Power management unit and power switches | I2C0 `0x74` | `drivers/mfd/apple-pmu-i2c.c`, `drivers/regulator/apple-pmu-pwrsw.c` |
 | 10/100 Ethernet | `0x3b000000` | `drivers/net/ethernet/apple/s5l_fe.c` |
 | USB 2.0 device mode and PHY | `0x36100000` | `drivers/phy/phy-apple-s5l-usb.c` + mainline `dwc2` |
+| USB 2.0 host (EHCI) on the HSIC port | `0x36400000` | mainline `ehci-platform`; host PHY in `drivers/phy/phy-apple-s5l-usb.c` (HSIC tuning, INCRx, port reset release, host-ready/device-ready handshake, device ready in about 42 ms) |
+| GPIO controller (144 pins, 18 ports) | `0x3fa00000` | `drivers/pinctrl/pinctrl-s5l8940x-gpio.c`, IRQ 119; probes on hardware and drives the HSIC handshake lines (GPIO 113 out, 128 in) |
 | Display pipe, HDMI 720p, scaler, gamma | `0x3a200000` | `drivers/video/fbdev/s5l8947x-display.c` |
 | System / IR remote MCU (UART1) | `0x32600000` | `drivers/input/misc/s5l8947x-mcu.c` |
+| Wi-Fi (BCM4334, HSIC) | EHCI port 2 | mainline `brcmfmac` USB, patched by `scripts/patches/0007-*` (boot loader `bd1a`, NVRAM packed into the TRX, optional CLM blob). Firmware 6.53.3 from user-supplied `.bin` + `.txt`, MAC from the DT. `wlan0` scans 2.4 and 5 GHz and joins WPA2-PSK networks with `wpa_supplicant` and the `wifi` helper (verified 2026-10-30: 5 GHz, 135 Mbit/s, DHCP lease, routed traffic; `hwtest wireless` 5/5). `wireless-regdb` installed; optional build-time `wpa_supplicant.conf` is joined at boot. |
 | Audio: S/PDIF -> HDMI and optical | `0x34194000` | `sound/arm/s5l8947x-audio.c`; ALSA PCM at 46 875 / 31 250 Hz, measured register layout, fed by CDMA channel 31 (frame-clock position, MAR liveness check). HDMI packet layer in `s5l8947x-display.c` (ACR from the produced rate, valid AUI, S/PDIF receiver enabled, `I2S_CLK_CON=0` on this path). Audible on hardware; hot-plug loss mutes the packets and replug re-announces. `wavplay` plays WAV files (resampled to 46 875 Hz). |
+
+### Wi-Fi known limits
+
+- The MAC is a locally administered placeholder from the DT; the real one is in OTP or system configuration.
+- The board's CLM blob is rejected by this firmware (`clmload` -52), so the firmware's built-in regulatory data is used; it still covers 2.4 and 5 GHz.
+- HSIC runtime suspend stays off (USB default); enabling it needs the port's resume workaround.
+- The firmware is not distributable and must be supplied in `research/firmware/wifi/`.
 
 ## Partly implemented
 
 | Block | Works | Pending |
 |---|---|---|
 | SGX543 GPU — **on hold** | Gates 7/8/9, cores released from reset, telemetry at `/dev/sgx0` | No command submission, no DRM driver. Per-core registers hang the bus until a core is brought up. No further work and no on-device test until this is resumed. |
-| Wi-Fi (BCM4334, HSIC) | Verified end to end 2026-10-30 (`hwtest wireless` 5/5): HSIC handshake, firmware 6.53.3 from plain `.bin` + `.txt` with the MAC from the DT, `wlan0` scans 2.4 and 5 GHz and joins a WPA2-PSK network on 5 GHz with `wifi connect` (135 Mbit/s, DHCP lease, routed traffic); `wireless-regdb` loaded. `brcmfmac` USB patched for `bd1a` / chip 0x4334, NVRAM in the TRX, CLM blob support. | The board's CLM blob is rejected by this firmware (`clmload` -52), so the built-in regulatory data is used. MAC is locally administered (the real one is in OTP or system config). HSIC runtime suspend is left off (USB default); enabling it would need the port's resume workaround. |
-| USB host mode | Device mode only | `dr_mode` is `peripheral`; host needs the host PHY tuning values and a role switch. |
-| GPIO / pinctrl (144 pins, 18 ports) | Node at `0x3fa00000`, IRQ 119; used for the HSIC handshake lines | Not yet probed on hardware. MCU line GPIO 2 is not wired. |
-| System MCU | Button input, firmware query, break, raw commands | Reset-to-recovery trigger and wake source are not wired; standby is only sent on halt. |
+| USB OTG port host mode | Device mode on `dwc2`; EHCI host serves only the internal HSIC port | `dr_mode` is `peripheral`; host on the OTG port needs a role switch. The OHCI companion (`0x36500000`, IRQ 13) is not described, so full/low-speed devices are unsupported. |
+| Central DMA | `0x37000000`: audio programs channel 31 directly | No `dmaengine` driver yet; NAND and crypto will need one. |
+| System MCU | Button input, firmware query, break, raw commands | Reset-to-recovery trigger and wake source are not wired (the MCU line, GPIO 2, is unused); standby is only sent on halt. |
 | Bluetooth (UART2) | `hci_uart_bcm` binds and registers `hci0` | The controller never answers HCI Reset (`-110`), in every recorded run since 2026-10-28, with or without the GPIO node and Wi-Fi power. UART2 takes almost no interrupts. The boot loader leaves RTS (pin 20) as a GPIO output held high; the stock tree drives RTS as a GPIO, BT power on GPIO 104 and BT wake on GPIO 105. Higher baud not set up. |
 
 ## Not started
@@ -35,13 +44,13 @@ Status of every hardware block, checked against the drivers in the tree and the 
 | Block | Address | Notes |
 |---|---|---|
 | NAND flash controller (FMI0 / FMI1, BCH) | `0x31200000`, `0x31300000` | Highest priority: persistent storage. Needs register reconnaissance first. |
-| Central DMA | `0x37000000` | Required by NAND, audio and crypto. |
 | Hardware crypto (SHA, AES, public-key engine) | `0x30200000`, `0x33100000` | Low priority. |
-| I2S1..3 | `0x341a0000`.. | Only I2S0 and S/PDIF are modelled. |
+| I2S ports | `0x341a0000`.. | The I2S bring-up code was removed; audio uses S/PDIF only. |
 | SD/MMC, SPI, RTC, thermal, hardware RNG | — | Not investigated; `CONFIG_MMC` is off. |
 
 ## Suggested order
 
-1. Wi-Fi: read the real MAC address instead of the DT placeholder.
-2. Add host mode to the USB controller.
-3. NAND reconnaissance, then the CDMA and FMI drivers.
+1. NAND reconnaissance, then a CDMA `dmaengine` driver and the FMI driver.
+2. Bluetooth: drive RTS, BT power (GPIO 104) and wake (GPIO 105) so the controller answers HCI Reset.
+3. Wi-Fi: read the real MAC address instead of the DT placeholder.
+4. Add host mode to the OTG port.
