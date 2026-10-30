@@ -14,6 +14,7 @@
 #define VELLIANGIRI_HDMI_720P_H
 
 #include <stdint.h>
+#include "splash.h"
 
 #define S5L_FB_PHYS		0x9ec00000U
 #define S5L_FB_W		1280
@@ -433,31 +434,10 @@ static int hdmi_start_video(const uint8_t *phy_cfg, int hdmi_mode)
 	return 0;
 }
 
-static void hdmi_draw_pattern(uint32_t fb)
-{
-	static const uint32_t bars[8] = {
-		0xffffffU, 0xffff00U, 0x00ffffU, 0x00ff00U,
-		0xff00ffU, 0xff0000U, 0x0000ffU, 0x000000U
-	};
-	int x, y;
-
-	for (y = 0; y < S5L_FB_H; y++) {
-		volatile uint32_t *row = (volatile uint32_t *)(fb + y * S5L_STRIDE);
-
-		for (x = 0; x < S5L_FB_W; x++) {
-			uint32_t c = (y < S5L_FB_H * 3 / 4) ?
-				     bars[x * 8 / S5L_FB_W] :
-				     ((x * 255 / S5L_FB_W) * 0x010101U);
-			if (x < 2 || y < 2 || x >= S5L_FB_W - 2 || y >= S5L_FB_H - 2)
-				c = 0xffffffU;
-			row[x] = c;
-		}
-	}
-}
-
 static int hdmi_720p_init(void)
 {
-	hdmi_draw_pattern(S5L_FB_PHYS);
+	splash_draw((volatile uint32_t *)S5L_FB_PHYS, S5L_FB_W, S5L_FB_H,
+		    S5L_STRIDE / S5L_BPP);
 	hdmi_gate(GATE_HPERF_RT_A, 1);
 	hdmi_gate(GATE_HPERF_RT_B, 1);
 	hdmi_gate(GATE_RGBOUT_A, 1);

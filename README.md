@@ -1,135 +1,222 @@
-# Project Velliangiri
+<p align="center">
+  <img src="logo.svg" alt="Velliangiri logo" width="160">
+</p>
 
-Mainline **Linux 6.12** kernel port and open-source (`GPL-2.0-only`) hardware drivers for the **S5L8947X** (32nm single-core ARMv7 Cortex-A9, `j33iap`) SoC platform.
+<h1 align="center">Velliangiri</h1>
 
-## Verified Hardware Subsystems (`S5L8947X` / `j33iap`)
+<p align="center">
+  <strong>Mainline Linux 6.12 for the S5L8947X (<code>j33iap</code>) and related ARMv7 devices.</strong><br>
+  Clean-room drivers · Upstream-style kernel overlay · <code>GPL-2.0-only</code>
+</p>
 
-- **Core SoC (`arch/arm/mach-apple/`, `drivers/irqchip/irq-apple-aic1.c`)**:
-  - `aic,1` interrupt controller (`0x3f200000`) with per-CPU event handling (`0x5004`) and built-in **24 MHz local timer** (`clock_event_device`, rating 400).
-  - Continuous **24 MHz hardware watchdog clocksource** (`apple-wdt-24m`, rating 350) and `sched_clock` at `0x3f103020` (active across `WFI`), Cortex-A9 `PMCCNTR` delay calibration, SoC restart handler, and `/dev/watchdog` character device.
-- **L2 cache (mainline `arch/arm/mm/cache-l2x0.c`, `0x3e000000`)**:
-  - PL310 r3p1-50rel0, 16 ways x 32 KB = 512 KB, brought up by `l2x0_of_init()` from `s5l8947x_init_irq()` (a machine without auxiliary overrides is otherwise never initialised). The pre-kernel loader cleans and invalidates L2 and leaves it **disabled**, so Linux always configures it from a known state: erratum 769419 workaround, early BRESP, full line of zeros, clock gating. Latencies stay at the hardware defaults and prefetch is off, because prefetch measured slower. `l2bench` shows the effect: 64-512 KB working sets read in 45-69 ns against 136-160 ns from DRAM.
-- **Clocks & Pinctrl (`drivers/clk/clk-s5l8940x-pmgr.c`, `drivers/pinctrl/pinctrl-s5l8940x-gpio.c`)**:
-  - PMGR peripheral clock gate provider (`0x3f101008`, one specifier cell = gate index, request/status handshake). Drivers switch gates only through the common clock framework (`clocks = <&pmgr_gates N>`), so `hwtest clocks` can account for them. The I2C controllers claim their own gates, and the USB PHY holds the OTG gates while bound and the host/HSIC gates while the host PHY is powered. The pre-kernel loader still pre-enables a few gates for the console and early boot.
-  - 224-pin GPIO / pinctrl and GPIO interrupt controller driver (`0x3f000000`). It is built but not instantiated yet: the device tree has no GPIO node.
-- **I2C & Power Management (`drivers/i2c/busses/i2c-s5l8940x.c`, `drivers/mfd/apple-pmu-i2c.c`, `drivers/regulator/apple-pmu-pwrsw.c`)**:
-  - Hardware I2C master (`i2c0@33200000`, `i2c1@33300000`, `i2c2@33400000`) with combined repeated-START FIFO transactions.
-  - Dialog D1815 PMU MFD (`0x74` on `i2c0`, 8-bit regmap) and GPIO power-switch regulators (`eth-phy-reset` at `0x58` and `wifi-reg-on` at `0x57`).
-- **Networking (`drivers/net/ethernet/apple/s5l_fe.c`)**:
-  - 10/100 Fast Ethernet MAC (`0x3b000000`, IRQ 27) with NAPI descriptor rings, MDIO bus, SMSC LAN8742 PHY, DHCP (`udhcpc`), Dropbear SSH, and UDP `netconsole`.
-- **USB 2.0 OTG & Host PHY (`drivers/phy/phy-apple-s5l-usb.c`)**:
-  - Synopsys `dwc2` USB 2.0 OTG peripheral (`0x36100000`, IRQ 11) with CDC-ECM (`usb0` at `10.55.0.2/24`) and CDC-ACM (`ttyGS0`) composite gadget, plus EHCI/HSIC host PHY support (`0x36400000`, IRQ 12).
-- **System / IR Remote MCU (`drivers/input/misc/s5l8947x-mcu.c`)**:
-  - serdev client of `uart1` (`0x32600000`, IRQ 22, 250000 baud 8N1, mainline Samsung UART driver) speaking CRC-16/CCITT-FALSE `"St"` frames. Reports remote buttons as the `S5L8947X IR Remote` input device; firmware query, line break and raw commands on demand through sysfs; standby is sent only on halt/power-off.
-- **BCM4334 Wi-Fi & Bluetooth**:
-  - Wi-Fi on EHCI port 2 over HSIC (`0x36400000`, IRQ 12), driven by `brcmfmac` over USB (`scripts/patches/0007-*`): the host PHY raises `REG_ON` (PMU `0x57`), releases the HSIC port and does the host/device-ready handshake (GPIO 113/128). Scans 2.4 and 5 GHz; `wpa_supplicant`, `iw` and the `wifi` helper (`wifi scan`, `wifi connect SSID [PSK]`, `wifi status`, `wifi down`) are in the initramfs, with the `wireless-regdb` database.
-  - Firmware and NVRAM are not distributable; `scripts/extract-firmware.py` rebuilds `brcmfmac4334.bin` and `brcmfmac4334.txt` in `research/firmware/wifi/` from your own restore image (see [Firmware](#firmware)). The firmware needs a MAC in its NVRAM; the DT supplies a locally administered one (`local-mac-address` on `wifi@2`). To join a network at boot, put a `wpa_supplicant.conf` at `research/wpa_supplicant.conf` (or set `WIFI_CONF`); it is copied into the image, so keep the built image private.
-  - Bluetooth via the mainline `hci_uart_bcm` serdev driver on `uart2` (`0x32700000`, IRQ 23) at 115200 baud with hardware flow control. The DT muxes the UART pins (the boot loader leaves RTS as a GPIO) and gives the driver BT power (GPIO 104) and wake (GPIO 105). The patch firmware is not distributable either; the same script carves `BCM4334B0.hcd` into `research/firmware/bt/`. Without it the controller runs its ROM firmware.
-  - All UARTs run from a 51.3 MHz peripheral clock, not the 24 MHz oscillator. It stays constant because every CPU performance state, including the 850 MHz one, keeps the same peripheral divider.
-- **Display Pipe, HDMI 1.4 & M2M Scaler (`scripts/boot/hdmi-720p.h`, `drivers/video/fbdev/s5l8947x-display.c`)**:
-  - Pre-kernel 720p@60Hz HDMI transmitter/PHY (`0x39700000`), `rgbout` display pipe (`0x3a200000`) scanning out reserved DRAM at `0x9ec00000` (`simple-framebuffer` / `fbcon`), runtime Plane 0 DMA page-flipping, 10-bit 3x256 hardware Gamma LUT scaling (`0x39600000`), HDMI Audio InfoFrame/ACR bridge, and M2M hardware scaler (`0x39200000`, PMGR gate 26, switched at runtime).
-- **Audio (`sound/arm/s5l8947x-audio.c`)**:
-  - ALSA PCM (`S5L8947X HDMI/SPDIF`, 16-bit stereo at 46 875 or 31 250 Hz) driving the S/PDIF transmitter (`0x34194000`), which feeds both the HDMI transmitter and the optical TOSLINK output. The only rates the 24 MHz reference can produce are 46 875 and 31 250 Hz, and those are exactly the rates advertised; applications resample.
-  - Fed by central DMA channel 31 from a coherent ring of 4 KB descriptors (single-word bursts, one word per FIFO request). The playback position follows the 24 MHz frame clock, and the controller's address register is watched as a liveness signal that raises an XRUN if the clock stops.
-  - The S/PDIF frame is four FIFO words (`0, L, 0, R`: the 16-bit sample left-justified in the 32-bit subframe), the ACR is programmed from the produced rate (`CTS = 3 564 000 000 / fs`), the Audio InfoFrame uses the three-byte header, and the S/PDIF receiver is enabled with `I2S_CLK_CON` left at 0 — setting it to 1 selects the (dead) I2S clock and silences the path.
-  - `wavplay` (`scripts/tools/wavplay.c`) plays 8/16-bit PCM WAV files of any rate and channel count, converting to 46 875 Hz stereo.
-- **PowerVR SGX543 GPU (`drivers/soc/apple/s5l8947x-sgx.c`)** — *on hold*:
-  - Clock/power domain switch (PMGR gates 7/8/9 (GFX_SYS, GFX, HPERF-NRT)) and core telemetry driver (`/dev/sgx0`) for the `sgx` GPU at `0x35100000` (IRQ 49). Only the always-clocked master block (`cfg0` at `0x4010`) is read; the per-core registers at the bottom of the window hang the bus until a core is brought up.
+---
 
-## Pending Work
+Velliangiri brings a current, mainline **Linux 6.12** kernel and an **Alpine Linux** userspace to retired ARMv7 hardware built around the **S5L8940X / S5L8947X** SoC family.
 
-See [progress.md](progress.md) for the full list. In short:
+Every driver in this repository is written from scratch based on observed hardware behaviour, uses standard Linux kernel subsystems, and is kept as a small overlay on top of a pristine kernel tree rather than a frozen vendor fork.
 
-- **Not started:** NAND flash controller (FMI), hardware crypto, I2S1..3.
-- **On hold:** SGX GPU (no command submission, no on-device test).
-- **Partly done:** HDMI audio (register layout rework, no DMA), Wi-Fi over HSIC (no EHCI node or `brcmfmac`), USB host mode, GPIO/pinctrl (no DT node).
+This project is built for two groups of people:
+1. **Users and tinkerers** who want to boot Linux on the **S5L8947X (`j33iap`)** set-top box and use its hardware (HDMI video and audio, optical audio, Ethernet, Wi-Fi, Bluetooth, IR remote, and USB networking).
+2. **Developers and porters** who want to bring up mainline Linux on other devices in the same SoC family by reusing the interrupt controller, clock, GPIO, I2C, PMU, USB, display, and audio drivers already working here.
+
+---
+
+## Hardware Support (`S5L8947X` / `j33iap`)
+
+Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) in about 20 seconds. Because it runs entirely from RAM, **it does not touch or modify the device's internal flash storage**.
+
+### What works
+
+| Hardware | Status & Details |
+|---|---|
+| **CPU & Core SoC** | Single-core Cortex-A9 up to 850 MHz, CPU frequency scaling (`212.5` / `425` / `850 MHz`), 512 KB PL310 L2 cache, `aic,1` interrupt controller, 24 MHz timer, hardware watchdog, clean reboot and standby power-off |
+| **Clocks, GPIO, I2C, PMU** | PMGR peripheral clock gates, 144-pin GPIO and pinctrl controller (with IRQs), 3x I2C controllers, Dialog I2C PMU power switches |
+| **HDMI Video** | 720p60 framebuffer console (`simple-framebuffer` + `s5l8947x-display`), boot splash, 10-bit hardware gamma LUT, and memory-to-memory hardware scaler |
+| **Audio (HDMI & Optical)** | ALSA PCM output over both HDMI and optical S/PDIF (`s5l8947x-audio`), driven by Central DMA channel 31, with HDMI hot-plug mute/unmute and a `wavplay` CLI player |
+| **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
+| **USB Networking & Console** | Micro-USB port runs in USB device mode (`dwc2`), providing a virtual Ethernet link (`usb0` at `10.55.0.2`, SSH enabled) and a USB serial console (`/dev/ttyGS0`) |
+| **Wi-Fi (2.4 & 5 GHz)** | Broadcom BCM4334 over internal HSIC USB host (`ehci-platform` + custom PHY handshake); scans and joins WPA2 networks via `wpa_supplicant` and the built-in `wifi` helper (requires firmware extracted from your own restore image) |
+| **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2`); loads patch firmware at boot when extracted from your restore image |
+| **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`/dev/input/event0`) via the MSP430 system microcontroller on `uart1` |
+
+### What doesn't work yet (honest limitations)
+
+| Area | Current Limitation |
+|---|---|
+| **Internal NAND storage** | Not started. There is no driver for the NAND flash controller (`FMI0`/`FMI1`) yet, so the OS runs from RAM (`initramfs`) and resets on reboot. (NFS client tools are included if you want persistent network storage.) |
+| **3D GPU acceleration** | On hold. The PowerVR SGX543 power domain and clocks come up for bus telemetry, but there is no DRM/3D rendering driver. Graphics use the 720p CPU framebuffer. |
+| **USB host on the external port** | The external Micro-USB port is currently wired for peripheral/device mode only (`g_cdc`). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
+| **Audio sample rates** | The S/PDIF block is clocked from the 24 MHz crystal, so hardware playback runs at `46,875 Hz` or `31,250 Hz` instead of `48,000 Hz`. Use `wavplay` (which resamples automatically) or ALSA resampling. |
+| **Wi-Fi / BT factory addresses** | Wi-Fi uses a locally administered MAC address from the Device Tree, and Bluetooth runs at 115,200 baud with its default controller address (`BlueZ` userspace is not pre-installed in the small initramfs). |
+
+For exact register addresses, driver file paths, and per-block notes, see [progress.md](progress.md).
+
+---
+
+## Running Linux on Your Device
+
+### 1. Prerequisites
+
+- **On your computer:** Docker (the build runs inside a reproducible Debian cross-compile container on Linux or macOS).
+- **For the device:** A Micro-USB cable and a way to load and jump to a raw binary payload in RAM over USB.
+
+### 2. Optional: Extract Wi-Fi and Bluetooth firmware
+
+The Broadcom Wi-Fi and Bluetooth firmware files cannot be redistributed in this repository. If you want wireless support, extract them locally from your own copy of the device's stock restore image (zip file or URL, or decrypted rootfs disk image):
+
+```bash
+./scripts/velliangiri.sh firmware --image <path-or-url-to-restore-image> --key <72-hex-digit-key>
+```
+
+This verifies the files by SHA-256 and places them in `research/firmware/` (which is git-ignored). When you build the rootfs, the build script automatically bundles them into `/lib/firmware/brcm/`.
+
+*(Optional)* To make the device join your Wi-Fi network automatically at boot, place a standard `wpa_supplicant.conf` at `research/wpa_supplicant.conf` before building. You can also pass `SSH_PUBKEY=/path/to/id_ed25519.pub` to install your SSH key.
+
+### 3. Build the bootable bundle
+
+```bash
+./scripts/velliangiri.sh all
+```
+
+This builds the Docker container, assembles the Alpine 3.21 `armhf` initramfs, fetches and patches mainline Linux 6.12, compiles the kernel and Device Tree, and packs everything into a single self-relocating image:
+
+```text
+out/boot-bundle-s5l8947x-j33iap.bin
+```
+
+You can also run individual build stages with `./scripts/velliangiri.sh rootfs | kernel | bundle`, or open an interactive cross-compile shell with `./scripts/velliangiri.sh shell`.
+
+### 4. Boot and connect
+
+Load `out/boot-bundle-s5l8947x-j33iap.bin` into the device's RAM over USB and jump to its entry point. Within ~20 seconds:
+
+1. **HDMI:** The Velliangiri boot splash appears on screen, followed by the Linux framebuffer console (`tty0`).
+2. **USB Network & SSH:** Your computer detects a USB Ethernet gadget. Assign your computer's side of the USB interface an IP in `10.55.0.0/24` (for example `10.55.0.1/24`) and SSH in as `root` (no password by default):
+   ```bash
+   ssh root@10.55.0.2
+   ```
+3. **USB Serial Console:** A virtual serial port (`/dev/ttyACM0` or `/dev/cu.usbmodem*`) also appears over the same USB cable with a root login prompt.
+4. **Ethernet:** If an Ethernet cable is plugged in, `eth0` gets an IP via DHCP automatically.
+
+### 5. Useful commands on the device
+
+```bash
+hwtest                       # Run the automated on-device hardware test suite
+hwtest -i display audio      # Run interactive display and audio checks
+wifi scan                    # Scan for 2.4 GHz and 5 GHz Wi-Fi networks
+wifi connect "MySSID" "PSK"  # Connect to WPA2 Wi-Fi and obtain a DHCP lease
+wifi status                  # Check Wi-Fi link speed and IP address
+wavplay /path/to/file.wav    # Play a WAV file over HDMI and optical audio
+```
+
+---
+
+## Porting to Similar Devices
+
+The `S5L8947X` is one chip in the **S5L8940X** family (alongside related dual-core and variant SoCs from the same generation). Most of the on-chip peripherals use the same register layout across the family, which makes bringing up another board much easier than starting from zero.
+
+### Reusable drivers in this repository
+
+Drivers that apply across the SoC family are already named `s5l8940x` and parameterized via Device Tree:
+
+| Subsystem | Driver Path | Notes for Porters |
+|---|---|---|
+| **Interrupts & Timer** | `drivers/irqchip/irq-apple-aic1.c` | `aic,1` controller and 24 MHz local timer. Already includes `CONFIG_SMP` IPI support and per-CPU register windows for multi-core chips. |
+| **Watchdog & Reset** | `arch/arm/mach-apple/` | 24 MHz watchdog timer, clocksource, and system restart handler (`apple,s5l8940x-wdt-timer`). |
+| **Clocks (PMGR)** | `drivers/clk/clk-s5l8940x-pmgr.c` | Linear table of 32-bit peripheral clock gate registers (`0xf` to enable, bits `7:4` status). |
+| **CPU Frequency** | `drivers/cpufreq/s5l8947x-cpufreq.c` | PMGR performance state switching without disturbing peripheral baud clocks. |
+| **GPIO & Pinctrl** | `drivers/pinctrl/pinctrl-s5l8940x-gpio.c` | Banked pin controller and GPIO IRQ chip (`apple,npins` set in DT). |
+| **I2C** | `drivers/i2c/busses/i2c-s5l8940x.c` | Master controller for `i2c0`..`i2c2`. |
+| **PMU & Regulators** | `drivers/mfd/apple-pmu-i2c.c`<br>`drivers/regulator/apple-pmu-pwrsw.c` | Dialog I2C PMU (`D1815` / `D1974` / `D2045`) regmap MFD and GPIO-backed power switches. |
+| **USB 2.0 PHY** | `drivers/phy/phy-apple-s5l-usb.c` | OTG device PHY (paired with mainline `dwc2`) and EHCI HSIC host PHY with GPIO ready handshaking. |
+| **UART** | `scripts/patches/0002-*.patch` | Hooks `ARCH_APPLE_S5L` into mainline `samsung_tty.c` (`apple,s5l-uart`). |
+| **Display & HDMI** | `drivers/video/fbdev/s5l8947x-display.c` | `rgbout` display pipe, 10-bit gamma LUTs, M2M hardware scaler, and HDMI 1.4 transmitter. |
+| **Audio** | `sound/arm/s5l8947x-audio.c` | S/PDIF transmitter and Central DMA ring setup. |
+
+### How the boot bundle works (`scripts/boot/`)
+
+Device bootloaders in this family do not boot standard Linux `zImage` + Device Tree pairs directly—they may enter with the MMU or caches active, leave peripheral clocks gated off, and pass custom boot arguments instead of a Flattened Device Tree.
+
+To solve this cleanly for any board, `scripts/build-bundle.sh` wraps the kernel in a tiny, self-relocating pre-kernel loader:
+
+1. **Position-independent entry stub (`scripts/boot/entry-stub.S`):** Runs from whatever RAM address the bootloader loads it at. It masks interrupts, cleanly flushes/invalidates L1 and PL310 L2 caches whether the MMU was on or off, disables the MMU, arms the hardware watchdog as a 120-second safety net, copies the payload to the start of RAM (`0x80000000`), and jumps there.
+2. **Pre-kernel C loader (`scripts/boot/boot-loader.c`):** Runs in the first 32 KB of RAM (`0x80000000..0x80007fff`), turns on essential PMGR clock gates, initializes scanout / boot splash for `simple-framebuffer`, and jumps to `zImage` at `0x80008000` with `r2` pointing to the appended `.dtb`.
+
+### Step-by-step guide to porting a new board
+
+If you have another device with a serial console (or USB / framebuffer output) and a way to load code into RAM:
+
+1. **Adapt the pre-kernel stub (`scripts/boot/`):**
+   - Check the physical RAM base address (`0x80000000` on `S5L8947X`) and watchdog base in `entry-stub.S`.
+   - If the bootloader already sets up a display framebuffer, point a `simple-framebuffer` node at that physical address to get an instant early console (`earlycon` / `tty0`) before writing any platform drivers.
+2. **Create a SoC `.dtsi` and board `.dts` (`arch/arm/boot/dts/apple/`):**
+   - Copy `s5l8947x.dtsi` and `s5l8947x-j33iap.dts` as a template.
+   - Update the MMIO base addresses, IRQ numbers, and clock gate indices for your chip. Start with just `aic`, `wdt`, `uart0` (or `usb0` for USB gadget console/network), and `simple-framebuffer`.
+3. **Use the built-in hardware exploration tools:**
+   - Once the initramfs boots to a shell over serial or USB, the image includes static diagnostic utilities compiled from `scripts/tools/`:
+     - `peek <phys-addr> [width] [value]` — read or write MMIO registers directly from userspace.
+     - `i2cpoke` — scan I2C buses and inspect PMU registers.
+     - `l2bench` — verify cache and memory bandwidth.
+4. **Enable peripherals incrementally:**
+   - Turn on `gpio`, `i2c`, `pmu`, `usb_phy`, `display_pipe`, and `audio` nodes one by one in your board's `.dts`, adding compatible strings or small register-offset tables to the existing drivers where your chip differs.
+
+If you are working on bringing up a related device, feel free to open an issue with your SoC and board details.
+
+---
 
 ## Repository Layout
 
-- `arch/arm/boot/dts/apple/` — `s5l8947x.dtsi` SoC include and `s5l8947x-j33iap.dts` board device tree
-- `arch/arm/mach-apple/` — `S5L8947X` machine descriptor, `PMCCNTR` calibration, 24 MHz WDT clocksource, and `/dev/watchdog`
-- `drivers/` — Clean-room `S5L8947X` kernel drivers (`irqchip`, `clk`, `cpufreq`, `pinctrl`, `i2c`, `mfd`, `regulator`, `phy`, `net/ethernet/apple`, `input/misc`, `video/fbdev`, `soc/apple`)
-- `sound/arm/` — `S5L8947X` I2S0 / S/PDIF ALSA driver
-- `config/` — Linux 6.12 configuration fragments (`s5l8947x.config`, `s5l8947x-trim.config`) and initramfs prune list
-- `initramfs/` — Early boot (`/init`), Stage 2 service bring-up, and `udhcpc` scripts
-- `scripts/` — Dockerized cross-build environment, kernel fetch/patch/build scripts, pre-kernel loader (`scripts/boot/`), userspace diagnostic tools (`scripts/tools/`), the on-device test suite (`scripts/tests/`), and the firmware extractor (`scripts/extract-firmware.py`)
-- `scripts/patches/` — Changes to mainline files, applied in order on top of Linux 6.12. `0001` only wires the platform and drivers into Kconfig/Makefiles; the rest are small, individually described changes to core code (Samsung UART, AIC re-init in `init/main.c`, ARM alignment fixup, dwc2, scheduler)
+Instead of storing a full kernel source tree, this repository holds only the files added for the platform and a short patch series for existing kernel files. `scripts/apply-kernel-tree.py` overlays them onto a clean Linux 6.12 checkout (and can `--revert` back to a pristine tree at any time).
 
-## Kernel Tree Overlay
+| Path | Contents |
+|---|---|
+| `arch/arm/boot/dts/apple/` | SoC (`.dtsi`) and board (`.dts`) Device Trees |
+| `arch/arm/mach-apple/` | Machine init, CPU clock calibration, watchdog clocksource & reset |
+| `drivers/`, `sound/`, `include/` | Clean-room kernel drivers in their standard mainline paths |
+| `scripts/patches/` | 7 small, self-contained patches to mainline Linux 6.12 files |
+| `scripts/boot/` | Position-independent entry stub, pre-kernel C loader, HDMI init, boot splash |
+| `scripts/tests/` | On-device hardware test suite (`hwtest`) |
+| `scripts/tools/` | Userspace MMIO/I2C diagnostic tools (`peek`, `i2cpoke`, `wavplay`, `l2bench`, `jitterseed`) |
+| `config/` | Kernel configuration fragments layered on `multi_v7_defconfig` |
+| `initramfs/` | Init scripts, USB gadget / SSH setup, and the `wifi` helper |
 
-`scripts/apply-kernel-tree.py` copies `arch/`, `drivers/`, `include/` and `sound/` into the kernel tree and applies `scripts/patches/`. It is idempotent and keeps the tree in step with the repository:
+---
 
-- files moved or deleted here are removed from the kernel tree (tracked in `.velliangiri-overlay-files`);
-- if any patch was edited, renamed or removed, every previously applied patch is reverted and the current series is applied again;
-- `--revert` restores the pristine tree.
+## Contributing & Clean-Room Rules
 
-Inside the build container the tree lives in the `velliangiri-kbuild` Docker volume at `/kbuild/linux`; `./scripts/velliangiri.sh shell` opens a shell with the same mounts.
+Contributions of any kind are welcome—whether that is a new board Device Tree, a driver for an unsupported hardware block, a bug fix, or hardware test coverage.
 
-## Building
+High-impact open tasks on `S5L8947X` right now (see [progress.md](progress.md) for details):
+- **NAND flash driver (`FMI0` / `FMI1` + BCH ECC)** for persistent storage on internal flash.
+- **Central DMA (`cdma`) `dmaengine` driver** (needed by NAND and hardware crypto; currently used directly by audio).
+- **USB OTG host mode** (role switching + OHCI companion controller at `0x36500000`) to allow plugging in external USB devices.
+- **OTP / system config reader** to populate the factory Wi-Fi and Bluetooth MAC addresses automatically.
+
+### Guardrails
+
+To keep the work upstreamable and legally clean, this repository enforces strict source-tree rules. Before making your first commit, install the git hooks:
 
 ```bash
-# Build everything (Alpine 3.21 armhf initramfs + Linux 6.12 zImage/DTB + boot bundle)
-./scripts/velliangiri.sh all
+./scripts/setup-guardrails.sh
+```
 
-# Optional: extract the Wi-Fi/Bluetooth firmware first (see Firmware below)
-./scripts/velliangiri.sh firmware --image <restore-image-url-or-zip>
+And run the verification check before submitting changes:
 
-# Individual stages
-./scripts/velliangiri.sh rootfs
-./scripts/velliangiri.sh kernel
-./scripts/velliangiri.sh bundle
-
-# Verify source tree hygiene and guardrail compliance
+```bash
 ./scripts/velliangiri.sh check
 ```
 
-Build outputs are written to `out/`:
-- `out/initramfs-s5l8947x.cpio` — Alpine `armhf` initramfs archive
-- `out/zImage` — Single-stream XZ compressed Linux 6.12 kernel with embedded initramfs
-- `out/s5l8947x-j33iap.dtb` — Compiled Flattened Device Tree
-- `out/boot-bundle-s5l8947x-j33iap.bin` — Self-relocating entry stub + pre-kernel loader + `zImage` + DTB
+1. **Clean-room & open-source (`GPL-2.0-only`) only:** Write code only from observed hardware behaviour and public specifications.
+2. **No binaries or blobs:** Never commit firmware, binary objects, archives, raw memory dumps, or cryptographic keys.
+3. **No proprietary terminology:** Do not use internal vendor codenames, proprietary bootloader names, or key names in code, comments, documentation, or commit messages.
+4. **Keep local research separate:** Store any local notes, firmware files, or non-distributable test material strictly inside the git-ignored `research/` directory.
 
-## Firmware
+---
 
-The Wi-Fi firmware, its NVRAM and the Bluetooth patch belong to their vendors and are never stored in this repository. `scripts/extract-firmware.py` rebuilds them locally from the device's stock 8.4.3 (build 12H1006) restore image, which you download yourself, and the build installs them when present.
+## The Name
 
-You need:
-
-- The restore image for the j33iap 8.4.3 (12H1006) build: either the zip file, or its URL on the vendor's update server. The script reads the URL with HTTP range requests and keeps only the root filesystem disk image (about 855 MB) in `research/firmware/cache/`.
-- The root filesystem decryption key for that build: 72 hexadecimal digits, published by the device research community. Put it in `research/firmware/rootfs.key` (git-ignored) or pass it with `--key`. It is not needed if you already have a decrypted disk image.
-
-```bash
-# From the restore image (URL or local zip); the key is read from research/firmware/rootfs.key
-./scripts/velliangiri.sh firmware --image <restore-image-url-or-zip>
-
-# Or from a root filesystem disk image you already have (encrypted or decrypted)
-./scripts/velliangiri.sh firmware --rootfs <disk-image.dmg>
-
-# Then rebuild the initramfs so the files are installed
-./scripts/velliangiri.sh rootfs
-```
-
-The script writes `research/firmware/wifi/brcmfmac4334.bin`, `research/firmware/wifi/brcmfmac4334.txt` and `research/firmware/bt/BCM4334B0.hcd`. It picks each file by its SHA-256 rather than by name and verifies it, so a different build or a wrong key stops with an error instead of producing a bad image. It also runs on the host (`python3 scripts/extract-firmware.py ...`) when the `cryptography` Python package is installed. `FIRMWARE_IMAGE`, `FIRMWARE_ROOTFS` and `FIRMWARE_KEY` can replace the options.
-
-Without these files the image still builds and boots: Wi-Fi does not load (no `wlan0`, and the `hwtest` Wi-Fi checks are skipped), and Bluetooth runs on the controller's ROM firmware.
-
-## Hardware Tests
-
-Nothing is tested at boot. The initramfs ships an on-demand test suite (`scripts/tests/`, installed as `/bin/hwtest`) and small helpers in `scripts/tools/`:
-
-```bash
-ssh root@10.55.0.2 hwtest                 # probe, clocks, cache, display, audio, mcu, wireless
-ssh -t root@10.55.0.2 hwtest -i audio     # interactive: confirm what the TV played
-ssh root@10.55.0.2 l2bench              # memory latency by working-set size
-scp sample.wav root@10.55.0.2:/tmp && ssh root@10.55.0.2 wavplay /tmp/sample.wav
-
-# Run updated test scripts without rebuilding the initramfs
-scp -r scripts/tests root@10.55.0.2:/tmp/tests
-ssh -t root@10.55.0.2 HWTEST_DIR=/tmp/tests sh /tmp/tests/hwtest.sh -i audio
-```
-
-Each check prints `PASS`, `FAIL`, or `SKIP`; the exit status is non-zero if anything failed. `hwtest clocks` checks every PMGR gate a driver holds against its status bits and lists the gates the boot loader left running. No test sends the MCU standby state, which puts the whole box into standby.
+Velliangiri is a mountain range in the Western Ghats of South India; *velli* means white. The logo is that peak, with a white slope and a Linux penguin's beak for a summit.
 
 ## License
 
-All kernel code, drivers, and build scripts in this repository are licensed under `GPL-2.0-only`. See [LICENSE](LICENSE) for details.
+All kernel code, drivers, and build scripts are licensed under `GPL-2.0-only`. See [LICENSE](LICENSE).

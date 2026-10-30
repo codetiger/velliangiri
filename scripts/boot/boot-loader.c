@@ -10,7 +10,8 @@
  * Responsibilities:
  *   1. Assert all required PMGR clock gates so peripheral blocks are clocked
  *      before kernel driver probe.
- *   2. Initialize 720p60 HDMI scanout at 0x9ec00000 for simple-framebuffer.
+ *   2. Draw the boot splash and initialize 720p60 HDMI scanout at 0x9ec00000
+ *      for simple-framebuffer.
  *   3. Jump to zImage at 0x80008000 with r0=0, r1=0xffffffff, r2=DTB_PHYS.
  */
 

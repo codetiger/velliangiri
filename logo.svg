@@ -1,0 +1,144 @@
+<!-- SPDX-License-Identifier: GPL-2.0-only -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 512 512" width="512" height="512" role="img" aria-labelledby="logo-title logo-desc">
+  <title id="logo-title">Project Velliangiri Logo</title>
+  <desc id="logo-desc">Minimalist Velliangiri mountain peak logo on a transparent background with a Linux penguin nose crowning the summit rock.</desc>
+
+  <defs>
+    <!-- Dark Mountain Ridge Gradients (Tux Obsidian Slopes) -->
+    <linearGradient id="hill-dark-l" x1="15%" y1="0%" x2="85%" y2="100%">
+      <stop offset="0%" stop-color="#334155"/>
+      <stop offset="100%" stop-color="#1E293B"/>
+    </linearGradient>
+
+    <linearGradient id="hill-dark-r" x1="15%" y1="0%" x2="85%" y2="100%">
+      <stop offset="0%" stop-color="#1E293B"/>
+      <stop offset="100%" stop-color="#0F172A"/>
+    </linearGradient>
+
+    <linearGradient id="ridge-outer-l" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#475569"/>
+      <stop offset="100%" stop-color="#1E293B"/>
+    </linearGradient>
+
+    <linearGradient id="ridge-outer-r" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1E293B"/>
+      <stop offset="100%" stop-color="#090D16"/>
+    </linearGradient>
+
+    <!-- Central Silver Glacier / Tux Belly ("Velli" = Silver) -->
+    <linearGradient id="silver-glacier-l" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#E2E8F0"/>
+    </linearGradient>
+
+    <linearGradient id="silver-glacier-r" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#E2E8F0"/>
+      <stop offset="100%" stop-color="#CBD5E1"/>
+    </linearGradient>
+
+    <!-- Penguin Nose / Summit Rock on Top -->
+    <linearGradient id="beak-upper-l" x1="20%" y1="0%" x2="80%" y2="100%">
+      <stop offset="0%" stop-color="#FDE047"/>
+      <stop offset="100%" stop-color="#F59E0B"/>
+    </linearGradient>
+
+    <linearGradient id="beak-upper-r" x1="20%" y1="0%" x2="80%" y2="100%">
+      <stop offset="0%" stop-color="#FBBF24"/>
+      <stop offset="100%" stop-color="#D97706"/>
+    </linearGradient>
+
+    <linearGradient id="beak-lower-l" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#F59E0B"/>
+      <stop offset="100%" stop-color="#D97706"/>
+    </linearGradient>
+
+    <linearGradient id="beak-lower-r" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#D97706"/>
+      <stop offset="100%" stop-color="#B45309"/>
+    </linearGradient>
+  </defs>
+
+  <g>
+    <!-- Flanking Mountain Ridge Shoulders (Mountain Peaks + Penguin Wings) -->
+    <path d="M184,156
+             L130,228
+             L106,216
+             L38,414
+             C34,425 42,436 54,436
+             L152,436
+             Z"
+          fill="url(#ridge-outer-l)"/>
+    <polygon points="106,216 130,228 152,436 92,436" fill="#1E293B" opacity="0.65"/>
+
+    <path d="M328,156
+             L382,228
+             L406,216
+             L474,414
+             C478,425 470,436 458,436
+             L360,436
+             Z"
+          fill="url(#ridge-outer-r)"/>
+    <polygon points="406,216 382,228 360,436 420,436" fill="#334155" opacity="0.55"/>
+
+    <!-- Main Central Hill Mass -->
+    <path d="M184,156
+             L256,156
+             L256,436
+             L114,436
+             Z"
+          fill="url(#hill-dark-l)"/>
+
+    <path d="M328,156
+             L256,156
+             L256,436
+             L398,436
+             Z"
+          fill="url(#hill-dark-r)"/>
+
+    <!-- Central Silver Snow Slope / Tux White Chest ("Velli" = Silver) -->
+    <path d="M256,196
+             C212,208 180,282 172,436
+             L256,436
+             Z"
+          fill="url(#silver-glacier-l)"/>
+
+    <path d="M256,196
+             C300,208 332,282 340,436
+             L256,436
+             Z"
+          fill="url(#silver-glacier-r)"/>
+
+    <!-- Penguin Nose on Top (The Summit Rock of Velliangiri Hill) -->
+    <path d="M256,76
+             C265,76 274,82 280,92
+             L328,156
+             Q256,174 184,156
+             L232,92
+             C238,82 247,76 256,76 Z"
+          fill="url(#beak-upper-l)"/>
+
+    <path d="M256,76
+             C265,76 274,82 280,92
+             L328,156
+             Q292,165 256,165
+             Z"
+          fill="url(#beak-upper-r)"/>
+
+    <!-- Lower Beak / Summit Rock Base Facet -->
+    <path d="M184,156
+             Q220,165 256,165
+             L256,214
+             C230,198 205,178 184,156 Z"
+          fill="url(#beak-lower-l)"/>
+
+    <path d="M328,156
+             Q292,165 256,165
+             L256,214
+             C282,198 307,178 328,156 Z"
+          fill="url(#beak-lower-r)"/>
+
+    <!-- Beak Ridge / Summit Rock Ledge Highlight -->
+    <path d="M184,156 Q256,174 328,156"
+          fill="none" stroke="#FEF08A" stroke-width="2.5" stroke-linecap="round" stroke-opacity="0.8"/>
+  </g>
+</svg>

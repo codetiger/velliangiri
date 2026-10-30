@@ -32,17 +32,22 @@ CFLAGS_BOOT=(-march=armv7-a -marm -mfloat-abi=soft -ffreestanding -fno-builtin -
 "${CC}" "${CFLAGS_BOOT[@]}" -c "${BOOT_SRC}/boot-start.S" -o "${BOOT_BUILD}/boot-start.o"
 "${CC}" "${CFLAGS_BOOT[@]}" -DDTB_PHYS="${DTB_PHYS}" -c "${BOOT_SRC}/boot-loader.c" -o "${BOOT_BUILD}/boot-loader.o"
 "${CC}" "${CFLAGS_BOOT[@]}" -c "${BOOT_SRC}/pmgr-init.c" -o "${BOOT_BUILD}/pmgr-init.o"
+python3 "${BOOT_SRC}/gen-splash.py" "${ROOT}/logo.svg" > "${BOOT_BUILD}/splash-data.h"
+"${CC}" "${CFLAGS_BOOT[@]}" -I"${BOOT_BUILD}" -c "${BOOT_SRC}/splash.c" -o "${BOOT_BUILD}/splash.o"
 
 "${LD}" -T "${BOOT_SRC}/boot-loader.ld" \
 	"${BOOT_BUILD}/boot-start.o" \
 	"${BOOT_BUILD}/boot-loader.o" \
 	"${BOOT_BUILD}/pmgr-init.o" \
+	"${BOOT_BUILD}/splash.o" \
 	-o "${BOOT_BUILD}/boot-loader.elf"
 "${OBJCOPY}" -O binary "${BOOT_BUILD}/boot-loader.elf" "${BOOT_BUILD}/boot-loader.bin"
 
+# The loader stack grows down from 0x80007000 inside the same 32 KB slot;
+# keep at least 4 KB of it clear of the image.
 LOADER_SIZE=$(wc -c < "${BOOT_BUILD}/boot-loader.bin" | tr -d ' ')
-if [ "${LOADER_SIZE}" -gt 32768 ]; then
-	echo "[bundle] ERROR: boot-loader.bin (${LOADER_SIZE} bytes) exceeds 32 KB slot" >&2
+if [ "${LOADER_SIZE}" -gt 24576 ]; then
+	echo "[bundle] ERROR: boot-loader.bin (${LOADER_SIZE} bytes) runs into the stack at +0x6000" >&2
 	exit 1
 fi
 

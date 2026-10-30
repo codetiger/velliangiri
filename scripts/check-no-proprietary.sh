@@ -21,7 +21,7 @@ ALLOWED_EXTENSIONS = {
     ".c", ".h", ".s", ".S", ".rs",
     ".dts", ".dtsi", ".yaml", ".yml",
     ".sh", ".py", ".pl", ".awk",
-    ".md", ".txt", ".rst", ".json", ".toml",
+    ".md", ".txt", ".rst", ".svg", ".json", ".toml",
     ".cfg", ".conf", ".config", ".patch", ".diff",
     ".ld", ".lds", ".cmake", ".mk",
 }
