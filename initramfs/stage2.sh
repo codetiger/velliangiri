@@ -55,6 +55,12 @@ if [ -d /sys/class/net/eth0 ] || ip link show eth0 >/dev/null 2>&1; then
 	log_msg "eth0 link up; udhcpc started in background"
 fi
 
+# Join Wi-Fi in background when a network was configured at build time
+if [ -f /etc/wpa_supplicant/wpa_supplicant.conf ] && [ -x /bin/wifi ]; then
+	/bin/wifi up >/dev/kmsg 2>&1 &
+	log_msg "wlan0: wpa_supplicant and udhcpc starting in background"
+fi
+
 log_msg "system ready"
 
 # Keep PID 1 alive on tty0 / fallback loop and reap orphans via wait

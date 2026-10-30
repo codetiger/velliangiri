@@ -3,7 +3,7 @@
 
 t_probe() {
 	section "Driver probe"
-	for dev in "$UART1" "$UART2" "$DISP" "$AUD" "$WLPWR"; do
+	for dev in "$UART1" "$UART2" "$DISP" "$AUD" "$EHCI"; do
 		name=${dev##*/}
 		if bound "$dev"; then
 			drv=$(readlink "$dev/driver")

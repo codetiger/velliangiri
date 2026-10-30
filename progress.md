@@ -1,6 +1,6 @@
 # Driver Progress (`S5L8947X` / `j33iap`)
 
-Status of every hardware block, checked against the drivers in the tree and the enabled nodes in `s5l8947x-j33iap.dts`. Last reviewed 2026-10-28.
+Status of every hardware block, checked against the drivers in the tree and the enabled nodes in `s5l8947x-j33iap.dts`. Last reviewed 2026-10-30.
 
 ## Done
 
@@ -17,7 +17,6 @@ Status of every hardware block, checked against the drivers in the tree and the 
 | USB 2.0 device mode and PHY | `0x36100000` | `drivers/phy/phy-apple-s5l-usb.c` + mainline `dwc2` |
 | Display pipe, HDMI 720p, scaler, gamma | `0x3a200000` | `drivers/video/fbdev/s5l8947x-display.c` |
 | System / IR remote MCU (UART1) | `0x32600000` | `drivers/input/misc/s5l8947x-mcu.c` |
-| Bluetooth (UART2) | `0x32700000` | mainline `hci_uart_bcm` |
 | Audio: S/PDIF -> HDMI and optical | `0x34194000` | `sound/arm/s5l8947x-audio.c`; ALSA PCM at 46 875 / 31 250 Hz, measured register layout, fed by CDMA channel 31 (frame-clock position, MAR liveness check). HDMI packet layer in `s5l8947x-display.c` (ACR from the produced rate, valid AUI, S/PDIF receiver enabled, `I2S_CLK_CON=0` on this path). Audible on hardware; hot-plug loss mutes the packets and replug re-announces. `wavplay` plays WAV files (resampled to 46 875 Hz). |
 
 ## Partly implemented
@@ -25,11 +24,11 @@ Status of every hardware block, checked against the drivers in the tree and the 
 | Block | Works | Pending |
 |---|---|---|
 | SGX543 GPU — **on hold** | Gates 7/8/9, cores released from reset, telemetry at `/dev/sgx0` | No command submission, no DRM driver. Per-core registers hang the bus until a core is brought up. No further work and no on-device test until this is resumed. |
-| Wi-Fi (BCM4334, HSIC) | `REG_ON` switch via PMU, HSIC PHY path in the USB PHY driver | No EHCI node in the device tree, `brcmfmac` not enabled, wake GPIO unused. |
+| Wi-Fi (BCM4334, HSIC) | Verified end to end 2026-10-30 (`hwtest wireless` 5/5): HSIC handshake, firmware 6.53.3 from plain `.bin` + `.txt` with the MAC from the DT, `wlan0` scans 2.4 and 5 GHz and joins a WPA2-PSK network on 5 GHz with `wifi connect` (135 Mbit/s, DHCP lease, routed traffic); `wireless-regdb` loaded. `brcmfmac` USB patched for `bd1a` / chip 0x4334, NVRAM in the TRX, CLM blob support. | The board's CLM blob is rejected by this firmware (`clmload` -52), so the built-in regulatory data is used. MAC is locally administered (the real one is in OTP or system config). HSIC runtime suspend is left off (USB default); enabling it would need the port's resume workaround. |
 | USB host mode | Device mode only | `dr_mode` is `peripheral`; host needs the host PHY tuning values and a role switch. |
-| GPIO / pinctrl (224 pins) | Driver builds | No GPIO node in the device tree, so it never probes. Blocks MCU line GPIO 2 and the Wi-Fi wake GPIO. |
+| GPIO / pinctrl (144 pins, 18 ports) | Node at `0x3fa00000`, IRQ 119; used for the HSIC handshake lines | Not yet probed on hardware. MCU line GPIO 2 is not wired. |
 | System MCU | Button input, firmware query, break, raw commands | Reset-to-recovery trigger and wake source are not wired; standby is only sent on halt. |
-| Bluetooth speed | 115200 baud via `hci_uart_bcm` | The board's higher operating speed is not set up. |
+| Bluetooth (UART2) | `hci_uart_bcm` binds and registers `hci0` | The controller never answers HCI Reset (`-110`), in every recorded run since 2026-10-28, with or without the GPIO node and Wi-Fi power. UART2 takes almost no interrupts. The boot loader leaves RTS (pin 20) as a GPIO output held high; the stock tree drives RTS as a GPIO, BT power on GPIO 104 and BT wake on GPIO 105. Higher baud not set up. |
 
 ## Not started
 
@@ -43,7 +42,6 @@ Status of every hardware block, checked against the drivers in the tree and the 
 
 ## Suggested order
 
-1. Add the GPIO node (driver already exists).
-2. Enable the HSIC EHCI host and `brcmfmac`.
-3. Add host mode to the USB controller.
-4. NAND reconnaissance, then the CDMA and FMI drivers.
+1. Wi-Fi: read the real MAC address instead of the DT placeholder.
+2. Add host mode to the USB controller.
+3. NAND reconnaissance, then the CDMA and FMI drivers.

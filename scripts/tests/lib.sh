@@ -6,7 +6,7 @@ UART1=$PLAT/32600000.serial
 UART2=$PLAT/32700000.serial
 DISP=$PLAT/3a200000.display-controller
 AUD=$PLAT/34190000.audio-controller
-WLPWR=$PLAT/wlan-power
+EHCI=$PLAT/36400000.usb
 
 # serdev clients are named after their controller; find them by driver
 serdev() { ls -d /sys/bus/serial/drivers/"$1"/serial* 2>/dev/null | head -n 1; }

@@ -94,6 +94,19 @@
 			status = "okay";
 		};
 
+		/* 18 ports of 8 pins; pin N is port N / 8, bit N % 8 */
+		gpio: gpio@fa00000 {
+			compatible = "apple,s5l8947x-gpio", "apple,s5l8940x-gpio";
+			reg = <0xfa00000 0x1000>;
+			interrupts = <119>;
+			gpio-controller;
+			#gpio-cells = <2>;
+			interrupt-controller;
+			#interrupt-cells = <2>;
+			apple,npins = <144>;
+			status = "disabled";
+		};
+
 		pmgr: power-management@f100000 {
 			compatible = "apple,s5l8940x-pmgr", "syscon";
 			reg = <0xf100000 0x7000>;
@@ -150,11 +163,12 @@
 			      <0x6100e00 0x4>;
 			#phy-cells = <1>;
 			clocks = <&pmgr_gates 30>, <&pmgr_gates 31>,
-				 <&pmgr_gates 36>, <&pmgr_gates 32>,
-				 <&pmgr_gates 78>;
-			clock-names = "uperf", "otg", "reg", "host", "cplx";
+				 <&pmgr_gates 36>, <&pmgr_gates 32>;
+			clock-names = "uperf", "otg", "reg", "host";
 			apple,uotgtune1-device = <0x349>;
 			apple,uotgtune2-device = <0x6ff3>;
+			apple,hsic-tuning = <0x53>;
+			apple,usbhostset-en-incrx = <0xe0>;
 			status = "okay";
 		};
 
@@ -169,6 +183,20 @@
 			g-np-tx-fifo-size = <128>;
 			g-tx-fifo-size = <128 128 128 128 128 128 128 128>;
 			status = "okay";
+		};
+
+		/*
+		 * EHCI host of the USB complex. Port 1 is the USB 2.0 host PHY,
+		 * port 2 is the HSIC link to the on-board Wi-Fi chip.
+		 */
+		usb_ehci: usb@6400000 {
+			compatible = "apple,s5l8947x-ehci", "generic-ehci";
+			reg = <0x6400000 0x10000>;
+			interrupts = <12>;
+			clocks = <&pmgr_gates 32>;
+			phys = <&usb_phy 1>;
+			phy-names = "usb";
+			status = "disabled";
 		};
 
 		eth0: ethernet@b000000 {

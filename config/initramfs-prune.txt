@@ -4,8 +4,6 @@
 
 sbin/apk
 usr/lib/libapk*
-usr/lib/libssl*
-usr/lib/libcrypto*
 usr/lib/engines-3
 usr/lib/ossl-modules
 usr/bin/ssl_client
@@ -36,3 +34,12 @@ usr/lib/libgssrpc*
 usr/lib/krb5
 usr/libexec
 bin/busybox.dynamic-removed
+
+# Wi-Fi: keep wpa_supplicant, wpa_cli, wpa_passphrase, regulatory.db and
+# libssl/libcrypto (wpa_supplicant links them)
+sbin/eapol_test
+usr/lib/crda
+usr/share/dbus-1
+usr/lib/libnl-idiag*
+usr/lib/libnl-nf*
+usr/lib/libnl-xfrm*

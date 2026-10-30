@@ -32,13 +32,13 @@ rm -rf "${STAGE_DIR}"
 mkdir -p "${STAGE_DIR}"
 tar --no-same-owner --no-same-permissions -xzf "${DL_DIR}/${TARBALL}" -C "${STAGE_DIR}"
 
-# Install APK packages (dropbear, nfs-utils, busybox-static) via pure-Python resolver
+# Install APK packages (dropbear, nfs-utils, busybox-static, Wi-Fi tools) via pure-Python resolver
 echo "[rootfs] Resolving and unpacking Alpine armhf packages ..."
 python3 "${ROOT}/scripts/apk-unpack.py" \
 	--repo "${REPO_MAIN}" \
 	--dest "${APK_WORK}" \
 	--rootfs "${STAGE_DIR}" \
-	dropbear dropbear-scp nfs-utils busybox-static
+	dropbear dropbear-scp nfs-utils busybox-static iw wpa_supplicant wireless-regdb
 
 (
 	cd "${APK_WORK}"
@@ -64,13 +64,39 @@ cp "${ROOT}"/scripts/tests/*.sh "${TEST_DIR}/"
 chmod 755 "${TEST_DIR}/hwtest.sh"
 ln -sf /usr/share/velliangiri/tests/hwtest.sh "${STAGE_DIR}/bin/hwtest"
 
+# Wi-Fi firmware is not distributable: install it only when the user has
+# placed brcmfmac4334.bin (firmware) and .txt (NVRAM) in the git-ignored
+# WIFI_FW_DIR. A .clm_blob is installed too if present, but this board's
+# firmware has its regulatory data built in and rejects a CLM download.
+WIFI_FW_DIR="${WIFI_FW_DIR:-${ROOT}/research/firmware/wifi}"
+if [ -f "${WIFI_FW_DIR}/brcmfmac4334.bin" ]; then
+	echo "[rootfs] Installing Wi-Fi firmware from ${WIFI_FW_DIR} ..."
+	mkdir -p "${STAGE_DIR}/lib/firmware/brcm"
+	for f in brcmfmac4334.bin brcmfmac4334.txt brcmfmac4334.clm_blob; do
+		[ -f "${WIFI_FW_DIR}/${f}" ] && cp "${WIFI_FW_DIR}/${f}" "${STAGE_DIR}/lib/firmware/brcm/"
+	done
+else
+	echo "[rootfs] No Wi-Fi firmware in ${WIFI_FW_DIR}; brcmfmac will not load"
+fi
+
 # Install initramfs boot and DHCP scripts
 echo "[rootfs] Installing initramfs boot scripts ..."
 mkdir -p "${STAGE_DIR}/sbin" "${STAGE_DIR}/etc/udhcpc" "${STAGE_DIR}/etc/dropbear" "${STAGE_DIR}/root/.ssh"
 cp "${ROOT}/initramfs/init.sh" "${STAGE_DIR}/init"
 cp "${ROOT}/initramfs/stage2.sh" "${STAGE_DIR}/sbin/velliangiri-stage2"
 cp "${ROOT}/initramfs/udhcpc.sh" "${STAGE_DIR}/etc/udhcpc/default.script"
-chmod 755 "${STAGE_DIR}/init" "${STAGE_DIR}/sbin/velliangiri-stage2" "${STAGE_DIR}/etc/udhcpc/default.script"
+cp "${ROOT}/initramfs/wifi.sh" "${STAGE_DIR}/bin/wifi"
+chmod 755 "${STAGE_DIR}/init" "${STAGE_DIR}/sbin/velliangiri-stage2" "${STAGE_DIR}/etc/udhcpc/default.script" "${STAGE_DIR}/bin/wifi"
+
+# Optional Wi-Fi network joined at boot: a wpa_supplicant.conf kept out of git
+# (it holds the passphrase); without it, join at runtime with 'wifi connect'
+WIFI_CONF="${WIFI_CONF:-${ROOT}/research/wpa_supplicant.conf}"
+if [ -f "${WIFI_CONF}" ]; then
+	echo "[rootfs] Installing Wi-Fi network configuration from ${WIFI_CONF} ..."
+	mkdir -p "${STAGE_DIR}/etc/wpa_supplicant"
+	cp "${WIFI_CONF}" "${STAGE_DIR}/etc/wpa_supplicant/wpa_supplicant.conf"
+	chmod 600 "${STAGE_DIR}/etc/wpa_supplicant/wpa_supplicant.conf"
+fi
 
 # Record build timestamp for early clock initialization
 date -u +%s > "${STAGE_DIR}/etc/build-date"

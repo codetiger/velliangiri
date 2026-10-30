@@ -7,14 +7,20 @@
  *   - index 1: USB 2.0 Host / HSIC PHY (paired with ehci / ohci)
  *
  * All clock gates come from the PMGR clock provider. The three OTG gates
- * ("uperf", "otg", "reg") stay on while the driver is bound; the two host
- * gates ("host", "cplx") are held only while the host PHY is powered.
+ * ("uperf", "otg", "reg") stay on while the driver is bound; the EHCI gate
+ * ("host") is held only while the host PHY is powered.
+ *
+ * Powering the host PHY brings up the HSIC link on EHCI port 2: the chip
+ * behind it is switched on, the HSIC PHY is tuned and taken out of reset,
+ * and the host signals it is ready, then waits for the device to answer.
  */
 
 #define pr_fmt(fmt) "s5l-usb-phy: " fmt
 
 #include <linux/clk.h>
+#include <linux/bits.h>
 #include <linux/delay.h>
+#include <linux/gpio/consumer.h>
 #include <linux/io.h>
 #include <linux/ioport.h>
 #include <linux/module.h>
@@ -30,13 +36,19 @@
 #define OPHYUNK1			0x1c
 #define OPHY_UOTGTUNE1			0x40
 #define OPHY_UOTGTUNE2			0x44
+#define OPHY_HSICTUNE			0x5c
 #define OPHYUNK4			0x60
 
 #define OPHYCLK_CLKSEL_MASK		0x3
 #define ORSTCON_PHYSWRESET		BIT(0)
+#define ORSTCON_HSIC_RESET		BIT(3)
 #define OPHYUNK4_START			0x200
 
 #define USBCPLX_HSIC_EN			BIT(2)
+/* Automatic PLL shutdown and clock gating, held off while the host runs */
+#define USBCPLX_AUTO_GATE		GENMASK(6, 4)
+
+#define HSIC_DEVICE_READY_TIMEOUT_MS	500
 
 /* Defaults for the j33iap board when the DT carries no tuning */
 #define OPHY_TUNE1_DEFAULT		0x349
@@ -50,13 +62,18 @@ struct s5l_usbphy {
 	bool hsic_supply_on;
 	struct regulator *lpo_supply;
 	bool lpo_supply_on;
+	struct gpio_desc *host_ready;
+	struct gpio_desc *device_ready;
+	bool hsic_gpios_looked_up;
 	struct clk *host_clk;
-	struct clk *cplx_clk;
 	bool host_clks_on;
+	u32 usbcplx_saved;
 	struct device *dev;
 	struct phy *phys[2];
 	u32 tune1;
 	u32 tune2;
+	u32 hsic_tune;
+	u32 host_incrx;
 	int ref_clock_sel;
 };
 
@@ -105,10 +122,56 @@ static const struct phy_ops s5l_usbphy_ops = {
 	.owner	= THIS_MODULE,
 };
 
+static int s5l_hostphy_get_gpios(struct s5l_usbphy *p)
+{
+	struct gpio_desc *d;
+
+	if (p->hsic_gpios_looked_up)
+		return 0;
+
+	d = devm_gpiod_get_optional(p->dev, "host-ready", GPIOD_OUT_LOW);
+	if (IS_ERR(d))
+		return dev_err_probe(p->dev, PTR_ERR(d), "host-ready GPIO\n");
+	p->host_ready = d;
+
+	d = devm_gpiod_get_optional(p->dev, "device-ready", GPIOD_IN);
+	if (IS_ERR(d))
+		return dev_err_probe(p->dev, PTR_ERR(d), "device-ready GPIO\n");
+	p->device_ready = d;
+
+	p->hsic_gpios_looked_up = true;
+	return 0;
+}
+
+static void s5l_hostphy_hsic_handshake(struct s5l_usbphy *p)
+{
+	unsigned int ms;
+
+	if (!p->host_ready)
+		return;
+
+	gpiod_set_value(p->host_ready, 1);
+	if (!p->device_ready)
+		return;
+
+	for (ms = 0; ms < HSIC_DEVICE_READY_TIMEOUT_MS; ms++) {
+		if (gpiod_get_value(p->device_ready) > 0) {
+			dev_info(p->dev, "HSIC device ready after %u ms\n", ms);
+			return;
+		}
+		usleep_range(1000, 2000);
+	}
+	dev_warn(p->dev, "HSIC device not ready after %u ms\n", ms);
+}
+
 static int s5l_hostphy_power_on(struct phy *phy)
 {
 	struct s5l_usbphy *p = phy_get_drvdata(phy);
 	int ret;
+
+	ret = s5l_hostphy_get_gpios(p);
+	if (ret)
+		return ret;
 
 	if (!p->lpo_supply) {
 		struct regulator *r = devm_regulator_get_optional(p->dev, "lpo");
@@ -150,14 +213,28 @@ static int s5l_hostphy_power_on(struct phy *phy)
 		ret = clk_prepare_enable(p->host_clk);
 		if (ret)
 			return ret;
-		ret = clk_prepare_enable(p->cplx_clk);
-		if (ret)
-			dev_warn(p->dev, "USB complex gate: %d\n", ret);
 		p->host_clks_on = true;
 	}
-	if (p->usbcplx)
-		writel(readl(p->usbcplx) | USBCPLX_HSIC_EN, p->usbcplx);
 
+	if (p->hsic_tune)
+		writel(p->hsic_tune, p->base + OPHY_HSICTUNE);
+	writel(readl(p->base + OPHYUNK4) | p->host_incrx, p->base + OPHYUNK4);
+
+	if (p->usbcplx) {
+		u32 v = readl(p->usbcplx);
+
+		p->usbcplx_saved = v;
+		writel((v & ~USBCPLX_AUTO_GATE) | USBCPLX_HSIC_EN, p->usbcplx);
+	}
+
+	writel(readl(p->base + ORSTCON) & ~ORSTCON_HSIC_RESET, p->base + ORSTCON);
+	usleep_range(1000, 2000);
+
+	dev_info(p->dev, "host PHY on: rstcon 0x%02x cplx 0x%08x -> 0x%08x\n",
+		 readl(p->base + ORSTCON), p->usbcplx_saved,
+		 p->usbcplx ? readl(p->usbcplx) : 0);
+
+	s5l_hostphy_hsic_handshake(p);
 	return 0;
 }
 
@@ -165,8 +242,15 @@ static int s5l_hostphy_power_off(struct phy *phy)
 {
 	struct s5l_usbphy *p = phy_get_drvdata(phy);
 
+	if (p->host_ready)
+		gpiod_set_value(p->host_ready, 0);
+
+	writel(readl(p->base + ORSTCON) | ORSTCON_HSIC_RESET, p->base + ORSTCON);
+	udelay(20);
+	if (p->usbcplx)
+		writel(p->usbcplx_saved, p->usbcplx);
+
 	if (p->host_clks_on) {
-		clk_disable_unprepare(p->cplx_clk);
 		clk_disable_unprepare(p->host_clk);
 		p->host_clks_on = false;
 	}
@@ -220,6 +304,9 @@ static int s5l_usbphy_probe(struct platform_device *pdev)
 
 	device_property_read_u32(&pdev->dev, "apple,uotgtune1-device", &p->tune1);
 	device_property_read_u32(&pdev->dev, "apple,uotgtune2-device", &p->tune2);
+	device_property_read_u32(&pdev->dev, "apple,hsic-tuning", &p->hsic_tune);
+	device_property_read_u32(&pdev->dev, "apple,usbhostset-en-incrx",
+				 &p->host_incrx);
 	if (!device_property_read_u32(&pdev->dev, "apple,ref-clock-sel", &sel))
 		p->ref_clock_sel = sel & OPHYCLK_CLKSEL_MASK;
 
@@ -234,10 +321,6 @@ static int s5l_usbphy_probe(struct platform_device *pdev)
 	if (IS_ERR(p->host_clk))
 		return dev_err_probe(&pdev->dev, PTR_ERR(p->host_clk),
 				     "failed to get host clock\n");
-	p->cplx_clk = devm_clk_get(&pdev->dev, "cplx");
-	if (IS_ERR(p->cplx_clk))
-		return dev_err_probe(&pdev->dev, PTR_ERR(p->cplx_clk),
-				     "failed to get cplx clock\n");
 
 	p->base = devm_platform_ioremap_resource(pdev, 0);
 	if (IS_ERR(p->base))

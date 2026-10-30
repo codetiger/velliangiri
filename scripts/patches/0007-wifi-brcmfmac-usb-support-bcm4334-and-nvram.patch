@@ -1,0 +1,268 @@
+wifi: brcmfmac: usb: support BCM4334 with NVRAM and CLM blob
+
+Match the BCM4334 USB boot loader (0a5c:bd1a), which the S5L8947X board
+reaches over HSIC, and map chip 0x4334 to brcm/brcmfmac4334.bin.
+
+Request brcm/<firmware>.txt as optional NVRAM. When present it is
+appended to the uncompressed TRX image in place of any padding after the
+firmware part, the header's NVRAM length field is set and the image CRC
+is recomputed, so the boot loader hands the variables to the firmware the
+same way the SDIO path does. The BCM4334 firmware stops right after it
+starts unless the NVRAM carries a MAC address; brcmfmac adds the platform
+one, e.g. local-mac-address on the device's DT node.
+
+Request brcm/<firmware>.clm_blob as an optional regulatory blob and hand
+it out through get_blob(), as the SDIO and PCIe buses do, instead of
+always reporting none.
+
+Report what the last boot loader query returned when the firmware does
+not come up.
+---
+ .../broadcom/brcm80211/brcmfmac/usb.c         | 113 +++++++++++++++++-
+ .../broadcom/brcm80211/include/brcm_hw_ids.h  |   1 +
+ 2 files changed, 110 insertions(+), 4 deletions(-)
+
+diff --git a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/usb.c b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/usb.c
+index 0364b81..0abe275 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/brcmfmac/usb.c
++++ b/drivers/net/wireless/broadcom/brcm80211/brcmfmac/usb.c
+@@ -3,6 +3,7 @@
+  * Copyright (c) 2011 Broadcom Corporation
+  */
+ 
++#include <linux/crc32.h>
+ #include <linux/kernel.h>
+ #include <linux/module.h>
+ #include <linux/firmware.h>
+@@ -38,6 +39,7 @@
+ BRCMF_FW_DEF(43143, "brcmfmac43143");
+ BRCMF_FW_DEF(43236B, "brcmfmac43236b");
+ BRCMF_FW_DEF(43242A, "brcmfmac43242a");
++BRCMF_FW_DEF(4334, "brcmfmac4334");
+ BRCMF_FW_DEF(43569, "brcmfmac43569");
+ BRCMF_FW_DEF(4373, "brcmfmac4373");
+ 
+@@ -47,6 +49,7 @@ static const struct brcmf_firmware_mapping brcmf_usb_fwnames[] = {
+ 	BRCMF_FW_ENTRY(BRCM_CC_43236_CHIP_ID, 0x00000008, 43236B),
+ 	BRCMF_FW_ENTRY(BRCM_CC_43238_CHIP_ID, 0x00000008, 43236B),
+ 	BRCMF_FW_ENTRY(BRCM_CC_43242_CHIP_ID, 0xFFFFFFFF, 43242A),
++	BRCMF_FW_ENTRY(BRCM_CC_4334_CHIP_ID, 0xFFFFFFFF, 4334),
+ 	BRCMF_FW_ENTRY(BRCM_CC_43566_CHIP_ID, 0xFFFFFFFF, 43569),
+ 	BRCMF_FW_ENTRY(BRCM_CC_43569_CHIP_ID, 0xFFFFFFFF, 43569),
+ 	BRCMF_FW_ENTRY(CY_CC_4373_CHIP_ID, 0xFFFFFFFF, 4373)
+@@ -57,6 +60,7 @@ static const struct brcmf_firmware_mapping brcmf_usb_fwnames[] = {
+ #define TRX_UNCOMP_IMAGE	0x20		/* Trx holds uncompressed img */
+ #define TRX_RDL_CHUNK		1500		/* size of each dl transfer */
+ #define TRX_OFFSETS_DLFWLEN_IDX	0
++#define TRX_OFFSETS_NVM_LEN_IDX	2
+ 
+ /* Control messages: bRequest values */
+ #define DL_GETSTATE	0	/* returns the rdl_state_t struct */
+@@ -137,6 +141,9 @@ struct brcmf_usbdev_info {
+ 	struct brcmf_usbreq *rx_reqs;
+ 
+ 	char fw_name[BRCMF_FW_NAME_LEN];
++	char nvram_name[BRCMF_FW_NAME_LEN];
++	char clm_name[BRCMF_FW_NAME_LEN];
++	const struct firmware *clm_fw;
+ 	const u8 *image;	/* buffer for combine fw and nvram */
+ 	int image_len;
+ 
+@@ -846,8 +853,9 @@ brcmf_usb_resetcfg(struct brcmf_usbdev_info *devinfo)
+ 		brcmf_usb_dl_cmd(devinfo, DL_RESETCFG, &id, sizeof(id));
+ 		return 0;
+ 	} else {
+-		brcmf_err("Cannot talk to Dongle. Firmware is not UP, %d ms\n",
+-			  BRCMF_USB_RESET_GETVER_SPINWAIT * loop_cnt);
++		brcmf_err("Cannot talk to Dongle. Firmware is not UP, %d ms (last GETVER: err %d, chip 0x%x rev 0x%x)\n",
++			  BRCMF_USB_RESET_GETVER_SPINWAIT * loop_cnt, err,
++			  le32_to_cpu(id.chip), le32_to_cpu(id.chiprev));
+ 		return -EINVAL;
+ 	}
+ }
+@@ -1152,8 +1160,22 @@ error:
+ static int brcmf_usb_get_blob(struct device *dev, const struct firmware **fw,
+ 			      enum brcmf_blob_type type)
+ {
+-	/* No blobs for USB devices... */
+-	return -ENOENT;
++	struct brcmf_bus *bus_if = dev_get_drvdata(dev);
++	struct brcmf_usbdev_info *devinfo = bus_if->bus_priv.usb->devinfo;
++
++	switch (type) {
++	case BRCMF_BLOB_CLM:
++		*fw = devinfo->clm_fw;
++		devinfo->clm_fw = NULL;
++		break;
++	default:
++		return -ENOENT;
++	}
++
++	if (!*fw)
++		return -ENOENT;
++
++	return 0;
+ }
+ 
+ static const struct brcmf_bus_ops brcmf_usb_bus_ops = {
+@@ -1166,6 +1188,62 @@ static const struct brcmf_bus_ops brcmf_usb_bus_ops = {
+ };
+ 
+ #define BRCMF_USB_FW_CODE	0
++#define BRCMF_USB_FW_NVRAM	1
++#define BRCMF_USB_FW_CLM	2
++
++/*
++ * Append the NVRAM variables to a TRX image so the boot loader places them
++ * with the firmware. Any padding after the firmware part (header plus
++ * offsets[0] bytes) is dropped and the NVRAM takes its place; the header
++ * records the NVRAM length and its CRC is recomputed over the new image,
++ * keeping whether the original stored the running CRC or its complement.
++ * Returns a new buffer the caller frees, or NULL to download the image
++ * unchanged.
++ */
++static u8 *brcmf_usb_trx_add_nvram(const struct firmware *fw, int fwlen,
++				   const void *nvram, u32 nvram_len,
++				   int *image_len)
++{
++	const struct trx_header_le *trx = (const void *)fw->data;
++	struct trx_header_le *hdr;
++	size_t crc_off = offsetof(struct trx_header_le, flag_version);
++	u32 len = le32_to_cpu(trx->len);
++	u32 crc, inv;
++	u8 *image;
++
++	if (trx->offsets[TRX_OFFSETS_NVM_LEN_IDX]) {
++		brcmf_dbg(USB, "image already carries NVRAM\n");
++		return NULL;
++	}
++	if (len < fwlen || len > fw->size) {
++		brcmf_err("unexpected TRX layout, NVRAM not appended\n");
++		return NULL;
++	}
++	crc = crc32_le(~0, fw->data + crc_off, len - crc_off);
++	if (crc == le32_to_cpu(trx->crc32)) {
++		inv = 0;
++	} else if (~crc == le32_to_cpu(trx->crc32)) {
++		inv = ~0;
++	} else {
++		brcmf_err("TRX CRC mismatch, NVRAM not appended\n");
++		return NULL;
++	}
++
++	image = kmalloc(fwlen + nvram_len, GFP_KERNEL);
++	if (!image)
++		return NULL;
++	memcpy(image, fw->data, fwlen);
++	memcpy(image + fwlen, nvram, nvram_len);
++
++	hdr = (struct trx_header_le *)image;
++	hdr->len = cpu_to_le32(fwlen + nvram_len);
++	hdr->offsets[TRX_OFFSETS_NVM_LEN_IDX] = cpu_to_le32(nvram_len);
++	crc = crc32_le(~0, image + crc_off, fwlen + nvram_len - crc_off);
++	hdr->crc32 = cpu_to_le32(crc ^ inv);
++
++	*image_len = fwlen + nvram_len;
++	return image;
++}
+ 
+ static void brcmf_usb_probe_phase2(struct device *dev, int ret,
+ 				   struct brcmf_fw_request *fwreq)
+@@ -1173,6 +1251,9 @@ static void brcmf_usb_probe_phase2(struct device *dev, int ret,
+ 	struct brcmf_bus *bus = dev_get_drvdata(dev);
+ 	struct brcmf_usbdev_info *devinfo = bus->bus_priv.usb->devinfo;
+ 	const struct firmware *fw;
++	void *nvram;
++	u32 nvram_len;
++	u8 *image = NULL;
+ 
+ 	if (ret)
+ 		goto error;
+@@ -1180,19 +1261,32 @@ static void brcmf_usb_probe_phase2(struct device *dev, int ret,
+ 	brcmf_dbg(USB, "Start fw downloading\n");
+ 
+ 	fw = fwreq->items[BRCMF_USB_FW_CODE].binary;
++	nvram = fwreq->items[BRCMF_USB_FW_NVRAM].nv_data.data;
++	nvram_len = fwreq->items[BRCMF_USB_FW_NVRAM].nv_data.len;
++	devinfo->clm_fw = fwreq->items[BRCMF_USB_FW_CLM].binary;
+ 	kfree(fwreq);
+ 
+ 	ret = check_file(fw->data);
+ 	if (ret < 0) {
+ 		brcmf_err("invalid firmware\n");
+ 		release_firmware(fw);
++		brcmf_fw_nvram_free(nvram);
+ 		goto error;
+ 	}
+ 
+ 	devinfo->image = fw->data;
+ 	devinfo->image_len = fw->size;
++	if (nvram) {
++		image = brcmf_usb_trx_add_nvram(fw, ret, nvram, nvram_len,
++						&devinfo->image_len);
++		if (image)
++			devinfo->image = image;
++		brcmf_fw_nvram_free(nvram);
++	}
+ 
+ 	ret = brcmf_usb_fw_download(devinfo);
++	devinfo->image = NULL;
++	kfree(image);
+ 	release_firmware(fw);
+ 	if (ret)
+ 		goto error;
+@@ -1206,10 +1300,14 @@ static void brcmf_usb_probe_phase2(struct device *dev, int ret,
+ 	if (ret)
+ 		goto error;
+ 
++	release_firmware(devinfo->clm_fw);
++	devinfo->clm_fw = NULL;
+ 	complete(&devinfo->dev_init_done);
+ 	return;
+ error:
+ 	brcmf_dbg(TRACE, "failed: dev=%s, err=%d\n", dev_name(dev), ret);
++	release_firmware(devinfo->clm_fw);
++	devinfo->clm_fw = NULL;
+ 	complete(&devinfo->dev_init_done);
+ 	device_release_driver(dev);
+ }
+@@ -1220,6 +1318,8 @@ brcmf_usb_prepare_fw_request(struct brcmf_usbdev_info *devinfo)
+ 	struct brcmf_fw_request *fwreq;
+ 	struct brcmf_fw_name fwnames[] = {
+ 		{ ".bin", devinfo->fw_name },
++		{ ".txt", devinfo->nvram_name },
++		{ ".clm_blob", devinfo->clm_name },
+ 	};
+ 
+ 	fwreq = brcmf_fw_alloc_request(devinfo->bus_pub.devid,
+@@ -1231,6 +1331,10 @@ brcmf_usb_prepare_fw_request(struct brcmf_usbdev_info *devinfo)
+ 		return NULL;
+ 
+ 	fwreq->items[BRCMF_USB_FW_CODE].type = BRCMF_FW_TYPE_BINARY;
++	fwreq->items[BRCMF_USB_FW_NVRAM].type = BRCMF_FW_TYPE_NVRAM;
++	fwreq->items[BRCMF_USB_FW_NVRAM].flags = BRCMF_FW_REQF_OPTIONAL;
++	fwreq->items[BRCMF_USB_FW_CLM].type = BRCMF_FW_TYPE_BINARY;
++	fwreq->items[BRCMF_USB_FW_CLM].flags = BRCMF_FW_REQF_OPTIONAL;
+ 
+ 	return fwreq;
+ }
+@@ -1541,6 +1645,7 @@ static const struct usb_device_id brcmf_usb_devid_table[] = {
+ 	BRCMF_USB_DEVICE(BRCM_USB_43143_DEVICE_ID),
+ 	BRCMF_USB_DEVICE(BRCM_USB_43236_DEVICE_ID),
+ 	BRCMF_USB_DEVICE(BRCM_USB_43242_DEVICE_ID),
++	BRCMF_USB_DEVICE(BRCM_USB_4334_DEVICE_ID),
+ 	BRCMF_USB_DEVICE(BRCM_USB_43569_DEVICE_ID),
+ 	LINKSYS_USB_DEVICE(BRCM_USB_43235_LINKSYS_DEVICE_ID),
+ 	CYPRESS_USB_DEVICE(CY_USB_4373_DEVICE_ID),
+diff --git a/drivers/net/wireless/broadcom/brcm80211/include/brcm_hw_ids.h b/drivers/net/wireless/broadcom/brcm80211/include/brcm_hw_ids.h
+index 44684bf..d8c89a9 100644
+--- a/drivers/net/wireless/broadcom/brcm80211/include/brcm_hw_ids.h
++++ b/drivers/net/wireless/broadcom/brcm80211/include/brcm_hw_ids.h
+@@ -66,6 +66,7 @@
+ #define BRCM_USB_43236_DEVICE_ID	0xbd17
+ #define BRCM_USB_43242_DEVICE_ID	0xbd1f
+ #define BRCM_USB_43242_LG_DEVICE_ID	0x3101
++#define BRCM_USB_4334_DEVICE_ID		0xbd1a
+ #define BRCM_USB_43569_DEVICE_ID	0xbd27
+ #define BRCM_USB_BCMFW_DEVICE_ID	0x0bdc
+ #define CY_USB_4373_DEVICE_ID		0xbd29

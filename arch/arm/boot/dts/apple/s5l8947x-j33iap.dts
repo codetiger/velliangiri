@@ -48,11 +48,33 @@
 		memory-region = <&fb_region>;
 		status = "okay";
 	};
+};
 
-	/* BCM4334 Wi-Fi power, switched from userspace until the HSIC host is up */
-	wlan_power: wlan-power {
-		compatible = "regulator-output";
-		vout-supply = <&wlan_reg_on>;
+&gpio {
+	status = "okay";
+};
+
+/*
+ * BCM4334 Wi-Fi on EHCI port 2 (HSIC). The host PHY raises REG_ON, then
+ * signals host ready (GPIO 113) and waits for device ready (GPIO 128)
+ * before the port is scanned.
+ */
+&usb_phy {
+	hsic-supply = <&wlan_reg_on>;
+	host-ready-gpios = <&gpio 113 GPIO_ACTIVE_HIGH>;
+	device-ready-gpios = <&gpio 128 GPIO_ACTIVE_HIGH>;
+};
+
+&usb_ehci {
+	status = "okay";
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	/* The firmware does not start without a MAC address in its NVRAM */
+	wifi@2 {
+		compatible = "usba5c,bd1a";
+		reg = <2>;
+		local-mac-address = [02 10 5a 33 00 44];
 	};
 };
 
