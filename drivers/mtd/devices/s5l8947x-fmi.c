@@ -170,6 +170,7 @@ struct s5l_fmi {
 	u32 caus;
 	u32 blocks;		/* per CAU */
 	u32 pages;		/* per block */
+	u32 cau_bits;
 	u32 block_bits;
 	u32 page_bits;
 	u32 page_size;		/* data bytes per page */
@@ -455,13 +456,16 @@ end:
 	return st;
 }
 
-static u32 s5l_fmi_row(struct s5l_fmi *fmi, u64 page)
+static u32 s5l_fmi_row(struct s5l_fmi *fmi, u64 page, bool slc)
 {
 	u32 pg = do_div(page, fmi->pages);
 	u32 block = do_div(page, fmi->blocks);
 	u32 cau = page;
+	u32 row = cau << (fmi->block_bits + fmi->page_bits) | block << fmi->page_bits | pg;
 
-	return cau << (fmi->block_bits + fmi->page_bits) | block << fmi->page_bits | pg;
+	if (slc)
+		row |= BIT(fmi->cau_bits + fmi->block_bits + fmi->page_bits);
+	return row;
 }
 
 /*
@@ -469,9 +473,9 @@ static u32 s5l_fmi_row(struct s5l_fmi *fmi, u64 page)
  * bitflips to report (1 when the package asks for a refresh), -EBADMSG with
  * the data still in the buffer, or another error.
  */
-static int s5l_fmi_read_one(struct s5l_fmi *fmi, u64 page)
+static int s5l_fmi_read_one(struct s5l_fmi *fmi, u64 page, bool slc)
 {
-	u32 row = s5l_fmi_row(fmi, page);
+	u32 row = s5l_fmi_row(fmi, page, slc);
 	int st, tries;
 
 	for (tries = 0; tries < 2; tries++) {
@@ -522,7 +526,7 @@ static int s5l_fmi_mtd_read_oob(struct mtd_info *mtd, loff_t from, struct mtd_oo
 			ret = -EINVAL;
 			break;
 		}
-		err = s5l_fmi_read_one(fmi, page);
+		err = s5l_fmi_read_one(fmi, page, ops->mode == MTD_OPS_RAW);
 		if (err == -EBADMSG) {
 			failed = true;
 		} else if (err < 0) {
@@ -637,16 +641,18 @@ static int s5l_fmi_identify(struct s5l_fmi *fmi)
 	fmi->caus = s5l_fmi_le32(p, MN_P_CAUS);
 	fmi->blocks = s5l_fmi_le32(p, MN_P_BLOCKS);
 	fmi->pages = s5l_fmi_le32(p, MN_P_PAGES);
+	fmi->cau_bits = s5l_fmi_le32(p, MN_P_CAU_BITS);
 	fmi->block_bits = s5l_fmi_le32(p, MN_P_BLOCK_BITS);
 	fmi->page_bits = s5l_fmi_le32(p, MN_P_PAGE_BITS);
 	fmi->page_size = rounddown_pow_of_two(s5l_fmi_le32(p, MN_P_PAGE_SIZE));
 	fmi->trst_ms = clamp(s5l_fmi_le32(p, MN_P_TRST_MS), 1U, 100U);
 
-	if (!fmi->caus || fmi->caus > 64 || !fmi->blocks || fmi->blocks > BIT(fmi->block_bits) ||
+	if (!fmi->caus || fmi->caus > BIT(fmi->cau_bits) || fmi->cau_bits > 6 ||
+	    !fmi->blocks || fmi->blocks > BIT(fmi->block_bits) ||
 	    fmi->pages != BIT(fmi->page_bits) || fmi->block_bits > 15 ||
 	    fmi->page_size < FMI_LP_SIZE || fmi->page_size % FMI_LP_SIZE ||
 	    fmi->page_size > SZ_16K * 2 ||
-	    fmi->block_bits + fmi->page_bits + order_base_2(fmi->caus) > 31) {
+	    fmi->cau_bits + fmi->block_bits + fmi->page_bits > 30) {
 		ret = dev_err_probe(fmi->dev, -EINVAL,
 				    "unexpected geometry: %u CAUs, %u blocks, %u pages of %u bytes\n",
 				    fmi->caus, fmi->blocks, fmi->pages, fmi->page_size);

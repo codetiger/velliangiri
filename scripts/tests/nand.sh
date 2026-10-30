@@ -87,5 +87,18 @@ t_nand() {
 	else
 		fail "nand0p1 does not mount as hfsplus"
 	fi
+	if [ -b /dev/nand0p2 ]; then
+		if mount -t hfsplus -o ro /dev/nand0p2 "$mnt" 2>/dev/null; then
+			n=$(ls "$mnt" | wc -l)
+			if [ "$n" -gt 0 ] && [ -d "$mnt/mobile" ]; then
+				pass "nand0p2 decrypted and mounts read-only ($n entries in /)"
+			else
+				fail "nand0p2 mounted but its root looks empty"
+			fi
+			umount "$mnt"
+		else
+			fail "nand0p2 does not mount as hfsplus"
+		fi
+	fi
 	rmdir "$mnt" 2>/dev/null
 }

@@ -3,14 +3,14 @@ mtd: hook up the S5L8947X managed NAND translation layer
 Add the Kconfig symbol and Makefile line for the read-only S5L8947X
 translation layer and volume map driver copied in by apply-kernel-tree.py.
 ---
- drivers/mtd/Kconfig  | 10 ++++++++++
+ drivers/mtd/Kconfig  | 13 +++++++++++++
  drivers/mtd/Makefile |  1 +
- 2 files changed, 11 insertions(+)
+ 2 files changed, 14 insertions(+)
 
 diff --git a/drivers/mtd/Kconfig b/drivers/mtd/Kconfig
 --- a/drivers/mtd/Kconfig
 +++ b/drivers/mtd/Kconfig
-@@ -150,6 +150,16 @@
+@@ -150,6 +150,19 @@
  	  This enables read only access to SmartMedia formatted NAND
  	  flash. You can mount it with FAT file system.
  
@@ -18,6 +18,9 @@ diff --git a/drivers/mtd/Kconfig b/drivers/mtd/Kconfig
 +	tristate "S5L8947X managed NAND translation layer (read-only)"
 +	depends on MTD && BLOCK
 +	depends on ARCH_APPLE_S5L || COMPILE_TEST
++	select CRYPTO_SKCIPHER
++	select CRYPTO_CBC
++	select CRYPTO_AES
 +	help
 +	  Read-only block devices for the managed NAND of S5L8947X devices as
 +	  written by the stock firmware: the logical disk behind its
