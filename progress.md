@@ -27,7 +27,7 @@ Status of every hardware block, checked against the drivers in the tree and the 
 - The MAC is a locally administered placeholder from the DT; the real one is in OTP or system configuration.
 - The board's CLM blob is rejected by this firmware (`clmload` -52), so the firmware's built-in regulatory data is used; it still covers 2.4 and 5 GHz.
 - HSIC runtime suspend stays off (USB default); enabling it needs the port's resume workaround.
-- The firmware is not distributable and must be supplied in `research/firmware/wifi/`.
+- The firmware is not distributable; `./scripts/velliangiri.sh firmware` extracts it (and the Bluetooth patch) from the user's own restore image into `research/firmware/`.
 
 ## Partly implemented
 

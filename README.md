@@ -23,8 +23,8 @@ Mainline **Linux 6.12** kernel port and open-source (`GPL-2.0-only`) hardware dr
   - serdev client of `uart1` (`0x32600000`, IRQ 22, 250000 baud 8N1, mainline Samsung UART driver) speaking CRC-16/CCITT-FALSE `"St"` frames. Reports remote buttons as the `S5L8947X IR Remote` input device; firmware query, line break and raw commands on demand through sysfs; standby is sent only on halt/power-off.
 - **BCM4334 Wi-Fi & Bluetooth**:
   - Wi-Fi on EHCI port 2 over HSIC (`0x36400000`, IRQ 12), driven by `brcmfmac` over USB (`scripts/patches/0007-*`): the host PHY raises `REG_ON` (PMU `0x57`), releases the HSIC port and does the host/device-ready handshake (GPIO 113/128). Scans 2.4 and 5 GHz; `wpa_supplicant`, `iw` and the `wifi` helper (`wifi scan`, `wifi connect SSID [PSK]`, `wifi status`, `wifi down`) are in the initramfs, with the `wireless-regdb` database.
-  - Firmware and NVRAM are not distributable: place `brcmfmac4334.bin` and `brcmfmac4334.txt` (the board's TRX firmware and NVRAM text from `/usr/share/firmware/wifi/4334b1/` in your own tvOS root filesystem) in `research/firmware/wifi/`. The firmware needs a MAC in its NVRAM; the DT supplies a locally administered one (`local-mac-address` on `wifi@2`). To join a network at boot, put a `wpa_supplicant.conf` at `research/wpa_supplicant.conf` (or set `WIFI_CONF`); it is copied into the image, so keep the built image private.
-  - Bluetooth via the mainline `hci_uart_bcm` serdev driver on `uart2` (`0x32700000`, IRQ 23) at 115200 baud with hardware flow control. The DT muxes the UART pins (the boot loader leaves RTS as a GPIO) and gives the driver BT power (GPIO 104) and wake (GPIO 105). The patch firmware is not distributable either: place `BCM4334B0.hcd` (the board's patch, built into the stock Bluetooth daemon) in `research/firmware/bt/`; without it the controller runs its ROM firmware.
+  - Firmware and NVRAM are not distributable; `scripts/extract-firmware.py` rebuilds `brcmfmac4334.bin` and `brcmfmac4334.txt` in `research/firmware/wifi/` from your own restore image (see [Firmware](#firmware)). The firmware needs a MAC in its NVRAM; the DT supplies a locally administered one (`local-mac-address` on `wifi@2`). To join a network at boot, put a `wpa_supplicant.conf` at `research/wpa_supplicant.conf` (or set `WIFI_CONF`); it is copied into the image, so keep the built image private.
+  - Bluetooth via the mainline `hci_uart_bcm` serdev driver on `uart2` (`0x32700000`, IRQ 23) at 115200 baud with hardware flow control. The DT muxes the UART pins (the boot loader leaves RTS as a GPIO) and gives the driver BT power (GPIO 104) and wake (GPIO 105). The patch firmware is not distributable either; the same script carves `BCM4334B0.hcd` into `research/firmware/bt/`. Without it the controller runs its ROM firmware.
   - All UARTs run from a 51.3 MHz peripheral clock, not the 24 MHz oscillator. It stays constant because every CPU performance state, including the 850 MHz one, keeps the same peripheral divider.
 - **Display Pipe, HDMI 1.4 & M2M Scaler (`scripts/boot/hdmi-720p.h`, `drivers/video/fbdev/s5l8947x-display.c`)**:
   - Pre-kernel 720p@60Hz HDMI transmitter/PHY (`0x39700000`), `rgbout` display pipe (`0x3a200000`) scanning out reserved DRAM at `0x9ec00000` (`simple-framebuffer` / `fbcon`), runtime Plane 0 DMA page-flipping, 10-bit 3x256 hardware Gamma LUT scaling (`0x39600000`), HDMI Audio InfoFrame/ACR bridge, and M2M hardware scaler (`0x39200000`, PMGR gate 26, switched at runtime).
@@ -52,7 +52,7 @@ See [progress.md](progress.md) for the full list. In short:
 - `sound/arm/` — `S5L8947X` I2S0 / S/PDIF ALSA driver
 - `config/` — Linux 6.12 configuration fragments (`s5l8947x.config`, `s5l8947x-trim.config`) and initramfs prune list
 - `initramfs/` — Early boot (`/init`), Stage 2 service bring-up, and `udhcpc` scripts
-- `scripts/` — Dockerized cross-build environment, kernel fetch/patch/build scripts, pre-kernel loader (`scripts/boot/`), userspace diagnostic tools (`scripts/tools/`), and the on-device test suite (`scripts/tests/`)
+- `scripts/` — Dockerized cross-build environment, kernel fetch/patch/build scripts, pre-kernel loader (`scripts/boot/`), userspace diagnostic tools (`scripts/tools/`), the on-device test suite (`scripts/tests/`), and the firmware extractor (`scripts/extract-firmware.py`)
 - `scripts/patches/` — Changes to mainline files, applied in order on top of Linux 6.12. `0001` only wires the platform and drivers into Kconfig/Makefiles; the rest are small, individually described changes to core code (Samsung UART, AIC re-init in `init/main.c`, ARM alignment fixup, dwc2, scheduler)
 
 ## Kernel Tree Overlay
@@ -71,6 +71,9 @@ Inside the build container the tree lives in the `velliangiri-kbuild` Docker vol
 # Build everything (Alpine 3.21 armhf initramfs + Linux 6.12 zImage/DTB + boot bundle)
 ./scripts/velliangiri.sh all
 
+# Optional: extract the Wi-Fi/Bluetooth firmware first (see Firmware below)
+./scripts/velliangiri.sh firmware --image <restore-image-url-or-zip>
+
 # Individual stages
 ./scripts/velliangiri.sh rootfs
 ./scripts/velliangiri.sh kernel
@@ -85,6 +88,30 @@ Build outputs are written to `out/`:
 - `out/zImage` — Single-stream XZ compressed Linux 6.12 kernel with embedded initramfs
 - `out/s5l8947x-j33iap.dtb` — Compiled Flattened Device Tree
 - `out/boot-bundle-s5l8947x-j33iap.bin` — Self-relocating entry stub + pre-kernel loader + `zImage` + DTB
+
+## Firmware
+
+The Wi-Fi firmware, its NVRAM and the Bluetooth patch belong to their vendors and are never stored in this repository. `scripts/extract-firmware.py` rebuilds them locally from the device's stock 8.4.3 (build 12H1006) restore image, which you download yourself, and the build installs them when present.
+
+You need:
+
+- The restore image for the j33iap 8.4.3 (12H1006) build: either the zip file, or its URL on the vendor's update server. The script reads the URL with HTTP range requests and keeps only the root filesystem disk image (about 855 MB) in `research/firmware/cache/`.
+- The root filesystem decryption key for that build: 72 hexadecimal digits, published by the device research community. Put it in `research/firmware/rootfs.key` (git-ignored) or pass it with `--key`. It is not needed if you already have a decrypted disk image.
+
+```bash
+# From the restore image (URL or local zip); the key is read from research/firmware/rootfs.key
+./scripts/velliangiri.sh firmware --image <restore-image-url-or-zip>
+
+# Or from a root filesystem disk image you already have (encrypted or decrypted)
+./scripts/velliangiri.sh firmware --rootfs <disk-image.dmg>
+
+# Then rebuild the initramfs so the files are installed
+./scripts/velliangiri.sh rootfs
+```
+
+The script writes `research/firmware/wifi/brcmfmac4334.bin`, `research/firmware/wifi/brcmfmac4334.txt` and `research/firmware/bt/BCM4334B0.hcd`. It picks each file by its SHA-256 rather than by name and verifies it, so a different build or a wrong key stops with an error instead of producing a bad image. It also runs on the host (`python3 scripts/extract-firmware.py ...`) when the `cryptography` Python package is installed. `FIRMWARE_IMAGE`, `FIRMWARE_ROOTFS` and `FIRMWARE_KEY` can replace the options.
+
+Without these files the image still builds and boots: Wi-Fi does not load (no `wlan0`, and the `hwtest` Wi-Fi checks are skipped), and Bluetooth runs on the controller's ROM firmware.
 
 ## Hardware Tests
 
