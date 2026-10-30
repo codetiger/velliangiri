@@ -36,7 +36,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
 | **USB Networking & Console** | Micro-USB port runs in USB device mode (`dwc2`), providing a virtual Ethernet link (`usb0` at `10.55.0.2`, SSH enabled) and a USB serial console (`/dev/ttyGS0`) |
 | **Wi-Fi (2.4 & 5 GHz)** | Broadcom BCM4334 over internal HSIC USB host (`ehci-platform` + custom PHY handshake); scans and joins WPA2 networks via `wpa_supplicant` and the built-in `wifi` helper (requires firmware extracted from your own restore image) |
-| **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2`); loads patch firmware at boot when extracted from your restore image |
+| **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2`); loads patch firmware at boot when extracted from your restore image; LE scanning verified with `btscan` |
 | **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`S5L8947X IR Remote`, `/dev/input/event*`) via the MSP430 system microcontroller on `uart1` |
 
 ### What doesn't work yet (honest limitations)
@@ -112,6 +112,7 @@ wifi scan                    # Scan for 2.4 GHz and 5 GHz Wi-Fi networks
 wifi connect "MySSID" "PSK"  # Connect to WPA2 Wi-Fi and obtain a DHCP lease
 wifi status                  # Check Wi-Fi link speed and IP address
 wavplay /path/to/file.wav    # Play a WAV file over HDMI and optical audio
+btscan 10                    # Scan for Bluetooth LE advertisers for 10 seconds
 ```
 
 ---
@@ -184,7 +185,7 @@ Instead of storing a full kernel source tree, this repository holds only the fil
 | `scripts/boot/` | Position-independent entry stub, pre-kernel C loader, HDMI init, boot splash and its generator |
 | `scripts/extract-firmware.py` | Rebuilds the Wi-Fi and Bluetooth firmware from your own restore image (`velliangiri.sh firmware`) |
 | `scripts/tests/` | On-device hardware test suite (`hwtest`) |
-| `scripts/tools/` | Userspace MMIO/I2C diagnostic tools (`peek`, `i2cpoke`, `wavplay`, `l2bench`, `jitterseed`) |
+| `scripts/tools/` | Userspace MMIO/I2C diagnostic tools (`peek`, `i2cpoke`, `wavplay`, `btscan`, `l2bench`, `jitterseed`) |
 | `config/` | Kernel configuration fragments layered on `multi_v7_defconfig` |
 | `initramfs/` | Init scripts, USB gadget / SSH setup, and the `wifi` helper |
 

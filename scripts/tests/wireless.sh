@@ -72,4 +72,19 @@ t_wireless() {
 		fail "controller did not answer on UART2 (no 'BCM: chip id' in the kernel log)"
 		info "$(dmesg | grep -E "hci0:|Bluetooth: hci" | tail -n 3 | tr '\n' ' ')"
 	fi
+
+	# Exercise the radio: a passive LE scan should hear nearby advertisers
+	if ! command -v btscan >/dev/null; then
+		skip "btscan not installed; radio not exercised"
+		return
+	fi
+	out=$(timeout 20 btscan 5 "${hci#hci}" 2>&1)
+	n=$(echo "$out" | sed -n 's/^\([0-9]*\) advertisers.*/\1/p')
+	if [ -n "$n" ] && [ "$n" -gt 0 ]; then
+		pass "LE scan heard $n advertisers"
+		info "$(echo "$out" | tail -n 1)"
+	else
+		fail "LE scan heard no advertisers"
+		info "$(echo "$out" | tail -n 2 | tr '\n' ' ')"
+	fi
 }
