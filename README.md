@@ -39,7 +39,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2`); loads patch firmware at boot when extracted from your restore image; LE scanning verified with `btscan` |
 | **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`S5L8947X IR Remote`, `/dev/input/event*`) via the MSP430 system microcontroller on `uart1` |
 | **Hardware AES Engine** | CDMA AES crypto engine (`s5l8947x-aes` at `0x37801000`): `ecb(aes)` and `cbc(aes)` `skcipher` algorithms (128 / 192 / 256-bit keys) over CDMA channels 1 and 2, plus hardware device/group key operations (`s5l8947x_aes_hwkey_crypt()`) |
-| **Internal NAND & Volumes** | Managed NAND controller (`s5l8947x-fmi`, 8.9 GB, ~14 MB/s over CDMA) and read-only translation layer (`s5l8947x-ftl`) exposing `/dev/nand0`, `/dev/nand0p1` (`System`, 1.4 GB), and `/dev/nand0p2` (`Data`, 6.5 GB, volume and per-file keys unwrapped from the reserved SLC key store and decrypted via hardware AES); both volumes mount read-only as `hfsplus` |
+| **Internal NAND & Volumes** | Managed NAND controller (`s5l8947x-fmi`, 8.9 GB, ~14 MB/s over CDMA) and read-only translation layer (`s5l8947x-ftl`) exposing `/dev/nand0`, `/dev/nand0p1` (`System`, 1.4 GB), and `/dev/nand0p2` (`Data`, 6.5 GB, volume and per-file `com.apple.system.cprotect` keys unwrapped from the reserved SLC key store and decrypted via hardware AES); both volumes mount read-only as `hfsplus` with transparent file decryption |
 
 ### What doesn't work yet (honest limitations)
 
