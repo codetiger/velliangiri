@@ -1,0 +1,40 @@
+mtd: hook up the S5L8947X managed NAND translation layer
+
+Add the Kconfig symbol and Makefile line for the read-only S5L8947X
+translation layer and volume map driver copied in by apply-kernel-tree.py.
+---
+ drivers/mtd/Kconfig  | 10 ++++++++++
+ drivers/mtd/Makefile |  1 +
+ 2 files changed, 11 insertions(+)
+
+diff --git a/drivers/mtd/Kconfig b/drivers/mtd/Kconfig
+--- a/drivers/mtd/Kconfig
++++ b/drivers/mtd/Kconfig
+@@ -150,6 +150,16 @@
+ 	  This enables read only access to SmartMedia formatted NAND
+ 	  flash. You can mount it with FAT file system.
+ 
++config MTD_S5L8947X_FTL
++	tristate "S5L8947X managed NAND translation layer (read-only)"
++	depends on MTD && BLOCK
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
++	help
++	  Read-only block devices for the managed NAND of S5L8947X devices as
++	  written by the stock firmware: the logical disk behind its
++	  translation layer (nandN) and each volume of its volume map
++	  (nandNpM), which can then be mounted, for example with hfsplus.
++
+ config SM_FTL
+ 	tristate "SmartMedia/xD new translation layer"
+ 	depends on BLOCK
+diff --git a/drivers/mtd/Makefile b/drivers/mtd/Makefile
+--- a/drivers/mtd/Makefile
++++ b/drivers/mtd/Makefile
+@@ -19,6 +19,7 @@
+ obj-$(CONFIG_RFD_FTL)		+= rfd_ftl.o
+ obj-$(CONFIG_SSFDC)		+= ssfdc.o
+ obj-$(CONFIG_SM_FTL)		+= sm_ftl.o
++obj-$(CONFIG_MTD_S5L8947X_FTL)	+= s5l8947x-ftl.o
+ obj-$(CONFIG_MTD_OOPS)		+= mtdoops.o
+ obj-$(CONFIG_MTD_PSTORE)	+= mtdpstore.o
+ obj-$(CONFIG_MTD_SWAP)		+= mtdswap.o
