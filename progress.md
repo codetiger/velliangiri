@@ -22,7 +22,7 @@ Status of every hardware block, checked against the drivers in the tree and the 
 | Wi-Fi (BCM4334, HSIC) | EHCI port 2 | mainline `brcmfmac` USB, patched by `scripts/patches/0007-*` (boot loader `bd1a`, NVRAM packed into the TRX, optional CLM blob). Firmware 6.53.3 from user-supplied `.bin` + `.txt`, MAC from the DT. `wlan0` scans 2.4 and 5 GHz and joins WPA2-PSK networks with `wpa_supplicant` and the `wifi` helper (verified 2026-10-30: 5 GHz, 135 Mbit/s, DHCP lease, routed traffic; `hwtest wireless` 5/5). `wireless-regdb` installed; optional build-time `wpa_supplicant.conf` is joined at boot. |
 | Bluetooth (BCM4334, UART2) | `0x32700000` | mainline `hci_uart_bcm`; patch firmware from the user's restore image is loaded at boot (HCI 4.1, revision 2393, LE), repeated rebinds clean. Verified 2026-10-30 on the radio: a passive LE scan with `btscan` (raw HCI socket, no Bluetooth userland needed) heard 19 advertisers and 546 reports in 10 s; `hwtest wireless` 8/8 runs the same scan. |
 | Central DMA (42 channels) | `0x37000000` | `drivers/dma/s5l8947x-cdma.c`, `dmaengine` provider (`dmas = <&cdma channel request>`): slave scatter-gather and cyclic transfers, per-channel interrupts (end of list, and per segment for cyclic periods), segment-granularity residue. Verified 2026-10-30 with audio: 3.00 s plays in 3.02 s at both rates, about 46 period interrupts a second, repeated start/stop clean, `hwtest` 55/55. |
-| Audio: S/PDIF -> HDMI and optical | `0x34194000` | `sound/arm/s5l8947x-audio.c`; ALSA PCM at 46 875 / 31 250 Hz, measured register layout, fed by a cyclic `dmaengine` transfer on CDMA channel 31 (period interrupts, position from the DMA residue). HDMI packet layer in `s5l8947x-display.c` (ACR from the produced rate, valid AUI, S/PDIF receiver enabled, `I2S_CLK_CON=0` on this path). Audible on hardware; hot-plug loss mutes the packets and replug re-announces. `wavplay` plays WAV files (resampled to 46 875 Hz). |
+| Audio: I2S -> HDMI, S/PDIF -> optical | `0x34190000`, `0x34194000`, `0x34195000` | `sound/arm/s5l8947x-audio.c`, two PCMs fed by cyclic `dmaengine` transfers (period interrupts, position from the DMA residue). PCM 0 (HDMI, `pcmC0D0p`): I2S0 as a slave of the I2S clock master, CDMA channel 23, 46 875 / 31 250 Hz; the slave only raises DMA requests with a FIFO threshold set in its TX control register. PCM 1 (optical, `pcmC0D1p`): S/PDIF at 46 875 Hz with one word per channel, CDMA channel 31. HDMI packet layer in `s5l8947x-display.c` (I2S receiver in basic I2S format, reset pin selection, ACR from the produced rate, valid AUI; `hdmi_audio` accepts `off`). Verified 2026-10-30: speech is clean over HDMI at both rates, 4.28 s plays in 4.31-4.33 s with about 46 period interrupts a second, measured CTS matches 46 875 and 31 250 Hz, optical DMA runs at real time, `hwtest audio` 5/5. Hot-plug loss mutes the packets and replug re-announces. `wavplay` plays WAV files (resampled to 46 875 Hz; `-d /dev/snd/pcmC0D1p` for optical). |
 
 ### Wi-Fi known limits
 
@@ -45,8 +45,10 @@ Status of every hardware block, checked against the drivers in the tree and the 
 
 ### Audio known limits
 
-- **Open bug:** speech and other music-like content plays with heavy static over HDMI, while tones, sweeps and noise are clean. The output seems to follow each sample's sign more than its value, which points at how the HDMI core packs the 16-bit S/PDIF sample. The sample rate is not the cause: exact 48 kHz from the PMGR NCO gave the same static. The DMA ring, FIFO level and the HDMI S/PDIF receiver's decoded samples all check out. Rechecked 2026-10-30 on the current kernel (fixed peripheral clocks, `dmaengine` cyclic transfer): the static is unchanged, so neither the old clock doubling nor the old hand-built DMA ring was the cause.
-- Only 46 875 and 31 250 Hz are advertised (24 MHz reference); `wavplay` and ALSA resample.
+- Fixed 2026-10-30: the speech static came from feeding HDMI through its internal S/PDIF receiver (samples arrived intact, but the output followed each sample's sign). HDMI now takes I2S, as the stock system does, and plays speech cleanly.
+- Optical output is not verified on a receiver; its DMA runs at real time. It plays 46 875 Hz only (one word per channel needs MCLK / 512).
+- Only 46 875 and 31 250 Hz are advertised (24 MHz reference); `wavplay` and ALSA resample. Exact 48 kHz needs the I2S master clocked from the PMGR NCO (channel 0).
+- Only stereo on I2S0; I2S1..3 (the other HDMI data lines, for multichannel) are unused.
 
 ## Partly implemented
 
@@ -62,7 +64,6 @@ Status of every hardware block, checked against the drivers in the tree and the 
 |---|---|---|
 | NAND flash controller (FMI0 / FMI1, BCH) | `0x31200000`, `0x31300000` | Highest priority: persistent storage. Needs register reconnaissance first. |
 | Hardware crypto (SHA, AES, public-key engine) | `0x30200000`, `0x33100000` | Low priority. |
-| I2S ports | `0x341a0000`.. | The I2S bring-up code was removed; audio uses S/PDIF only. |
 | SD/MMC, SPI, RTC, thermal, hardware RNG | — | Not investigated; `CONFIG_MMC` is off. |
 
 ## Suggested order
@@ -70,4 +71,4 @@ Status of every hardware block, checked against the drivers in the tree and the 
 1. NAND reconnaissance and the FMI driver; extend the CDMA driver to the FMI window and device-to-memory transfers.
 2. Wi-Fi and Bluetooth: read the real MAC and Bluetooth addresses instead of placeholders.
 3. Add host mode to the OTG port.
-4. Fix the audio speech-static bug: look at the HDMI sample packing, or feed HDMI through I2S as the stock system does (the clock and DMA paths are ruled out).
+4. Audio at exact 48 / 44.1 kHz: clock the I2S master from the PMGR NCO (channel 0) and verify the optical output on a receiver.

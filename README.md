@@ -32,7 +32,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **CPU & Core SoC** | Single-core Cortex-A9 up to 850 MHz, CPU frequency scaling (`212.5` / `425` / `850 MHz`), 512 KB PL310 L2 cache, `aic,1` interrupt controller, 24 MHz timer, 42-channel central DMA (`dmaengine`), hardware watchdog, clean reboot and standby power-off |
 | **Clocks, GPIO, I2C, PMU** | PMGR peripheral clock gates, 144-pin GPIO and pinctrl controller (with IRQs), 3x I2C controllers, Dialog I2C PMU power switches |
 | **HDMI Video** | 720p60 framebuffer console (`simple-framebuffer` + `s5l8947x-display`), a logo boot splash drawn by the pre-kernel loader, 10-bit hardware gamma LUT, and memory-to-memory hardware scaler |
-| **Audio (HDMI & Optical)** | ALSA PCM output over both HDMI and optical S/PDIF (`s5l8947x-audio`), fed by a cyclic DMA transfer with period interrupts, with HDMI hot-plug mute/unmute and a `wavplay` CLI player |
+| **Audio (HDMI & Optical)** | ALSA playback (`s5l8947x-audio`) on two PCM devices: HDMI over I2S (`pcmC0D0p`, verified clean with speech) and optical S/PDIF (`pcmC0D1p`), each fed by a cyclic DMA transfer with period interrupts, with HDMI hot-plug mute/unmute and a `wavplay` CLI player |
 | **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
 | **USB Networking & Console** | Micro-USB port runs in USB device mode (`dwc2`), providing a virtual Ethernet link (`usb0` at `10.55.0.2`, SSH enabled) and a USB serial console (`/dev/ttyGS0`) |
 | **Wi-Fi (2.4 & 5 GHz)** | Broadcom BCM4334 over internal HSIC USB host (`ehci-platform` + custom PHY handshake); scans and joins WPA2 networks via `wpa_supplicant` and the built-in `wifi` helper (requires firmware extracted from your own restore image) |
@@ -46,8 +46,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **Internal NAND storage** | Not started. There is no driver for the NAND flash controller (`FMI0`/`FMI1`) yet, so the OS runs from RAM (`initramfs`) and resets on reboot. (NFS client tools are included if you want persistent network storage.) |
 | **3D GPU acceleration** | On hold. The PowerVR SGX543 power domain and clocks come up for bus telemetry, but there is no DRM/3D rendering driver. Graphics use the 720p CPU framebuffer. |
 | **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a configfs CDC-ECM + CDC-ACM gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
-| **Audio quality (open bug)** | Tones and test signals play cleanly, but speech and music have heavy static over HDMI. The cause is still being tracked down; it is not the sample rate, the peripheral clocks or the DMA path. |
-| **Audio sample rates** | The S/PDIF block is clocked from the 24 MHz crystal, so hardware playback runs at `46,875 Hz` or `31,250 Hz` instead of `48,000 Hz`. Use `wavplay` (which resamples automatically) or ALSA resampling. |
+| **Audio sample rates** | The I2S and S/PDIF blocks are clocked from the 24 MHz crystal, so HDMI playback runs at `46,875 Hz` or `31,250 Hz` and optical at `46,875 Hz` instead of `48,000 Hz`. Use `wavplay` (which resamples automatically) or ALSA resampling. The optical output has not been checked on a receiver yet. |
 | **Wi-Fi / BT factory addresses** | Wi-Fi uses a locally administered MAC address from the Device Tree, and Bluetooth runs at 115,200 baud with its default controller address (`BlueZ` userspace is not pre-installed in the small initramfs). |
 
 For exact register addresses, driver file paths, and per-block notes, see [progress.md](progress.md).
@@ -111,7 +110,7 @@ hwtest -i display audio      # Run interactive display and audio checks
 wifi scan                    # Scan for 2.4 GHz and 5 GHz Wi-Fi networks
 wifi connect "MySSID" "PSK"  # Connect to WPA2 Wi-Fi and obtain a DHCP lease
 wifi status                  # Check Wi-Fi link speed and IP address
-wavplay /path/to/file.wav    # Play a WAV file over HDMI and optical audio
+wavplay /path/to/file.wav    # Play a WAV file over HDMI (-d /dev/snd/pcmC0D1p for optical)
 btscan 10                    # Scan for Bluetooth LE advertisers for 10 seconds
 ```
 
@@ -138,7 +137,7 @@ Drivers that apply across the SoC family are already named `s5l8940x` and parame
 | **UART** | `scripts/patches/0002-*.patch` | Hooks `ARCH_APPLE_S5L` into mainline `samsung_tty.c` (`apple,s5l-uart`). |
 | **Display & HDMI** | `drivers/video/fbdev/s5l8947x-display.c` | `rgbout` display pipe, 10-bit gamma LUTs, M2M hardware scaler, and HDMI 1.4 transmitter. |
 | **Central DMA** | `drivers/dma/s5l8947x-cdma.c` | 42-channel `dmaengine` provider: slave scatter-gather and cyclic transfers with per-channel interrupts. |
-| **Audio** | `sound/arm/s5l8947x-audio.c` | S/PDIF transmitter fed by a cyclic DMA transfer. |
+| **Audio** | `sound/arm/s5l8947x-audio.c` | I2S (HDMI) and S/PDIF (optical) transmitters, each fed by a cyclic DMA transfer. |
 
 ### How the boot bundle works (`scripts/boot/`)
 
@@ -200,7 +199,7 @@ High-impact open tasks on `S5L8947X` right now (see [progress.md](progress.md) f
 - **Central DMA beyond audio**: device-to-memory transfers and the address window for peripherals outside `0x34000000` (needed by NAND, UART DMA and hardware crypto).
 - **USB OTG host mode** (role switching + OHCI companion controller at `0x36500000`) to allow plugging in external USB devices.
 - **OTP / system config reader** to populate the factory Wi-Fi and Bluetooth MAC addresses automatically.
-- **HDMI audio static on speech and music**: the sample path checks out up to the HDMI receiver, so the HDMI sample packing (or an I2S-fed HDMI path) is the next place to look.
+- **Audio at exact 48 kHz**: clock the I2S master from the PMGR clock synthesizer instead of the 24 MHz crystal.
 
 ### Guardrails
 
