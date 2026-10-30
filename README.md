@@ -136,7 +136,8 @@ Drivers that apply across the SoC family are already named `s5l8940x` and parame
 | **USB 2.0 PHY** | `drivers/phy/phy-apple-s5l-usb.c` | OTG device PHY (paired with mainline `dwc2`) and EHCI HSIC host PHY with GPIO ready handshaking. |
 | **UART** | `scripts/patches/0002-*.patch` | Hooks `ARCH_APPLE_S5L` into mainline `samsung_tty.c` (`apple,s5l-uart`). |
 | **Display & HDMI** | `drivers/video/fbdev/s5l8947x-display.c` | `rgbout` display pipe, 10-bit gamma LUTs, M2M hardware scaler, and HDMI 1.4 transmitter. |
-| **Audio** | `sound/arm/s5l8947x-audio.c` | S/PDIF transmitter and Central DMA ring setup. |
+| **Central DMA** | `drivers/dma/s5l8947x-cdma.c` | 42-channel `dmaengine` provider: slave scatter-gather and cyclic transfers with per-channel interrupts. |
+| **Audio** | `sound/arm/s5l8947x-audio.c` | S/PDIF transmitter fed by a cyclic DMA transfer. |
 
 ### How the boot bundle works (`scripts/boot/`)
 
@@ -195,7 +196,7 @@ Contributions of any kind are welcome—whether that is a new board Device Tree,
 
 High-impact open tasks on `S5L8947X` right now (see [progress.md](progress.md) for details):
 - **NAND flash driver (`FMI0` / `FMI1` + BCH ECC)** for persistent storage on internal flash.
-- **Central DMA (`cdma`) `dmaengine` driver** (needed by NAND and hardware crypto; currently used directly by audio).
+- **Central DMA beyond audio**: device-to-memory transfers and the address window for peripherals outside `0x34000000` (needed by NAND, UART DMA and hardware crypto).
 - **USB OTG host mode** (role switching + OHCI companion controller at `0x36500000`) to allow plugging in external USB devices.
 - **OTP / system config reader** to populate the factory Wi-Fi and Bluetooth MAC addresses automatically.
 - **HDMI audio static on speech and music**: the sample path checks out up to the HDMI receiver, so the HDMI sample packing (or an I2S-fed HDMI path) is the next place to look.

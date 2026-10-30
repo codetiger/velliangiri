@@ -1,0 +1,58 @@
+dmaengine: hook up the S5L8947X central DMA driver
+
+Add the Kconfig symbol and Makefile line for the S5L8947X central DMA
+controller copied in by apply-kernel-tree.py, and make the S/PDIF audio
+driver depend on the DMA engine it now uses for its transfers.
+---
+ drivers/dma/Kconfig   | 12 ++++++++++++
+ drivers/dma/Makefile  |  1 +
+ sound/arm/Kconfig     |  1 +
+ 3 files changed, 14 insertions(+)
+
+diff --git a/drivers/dma/Kconfig b/drivers/dma/Kconfig
+index d9ec1e6..8c00ece 100644
+--- a/drivers/dma/Kconfig
++++ b/drivers/dma/Kconfig
+@@ -564,6 +564,18 @@ config PLX_DMA
+ 	  These are exposed via extra functions on the switch's
+ 	  upstream port. Each function exposes one DMA channel.
+ 
++config S5L8947X_CDMA
++	tristate "S5L8947X central DMA controller"
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
++	depends on OF
++	select DMA_ENGINE
++	select DMA_VIRTUAL_CHANNELS
++	default ARCH_APPLE_S5L
++	help
++	  Support for the central DMA controller (CDMA) of the S5L8947X SoC.
++	  It moves data between memory and on-chip peripheral FIFOs and serves
++	  the S/PDIF audio transmitter.
++
+ config STE_DMA40
+ 	bool "ST-Ericsson DMA40 support"
+ 	depends on ARCH_U8500
+diff --git a/drivers/dma/Makefile b/drivers/dma/Makefile
+index ad6a03c..78888e8 100644
+--- a/drivers/dma/Makefile
++++ b/drivers/dma/Makefile
+@@ -71,6 +71,7 @@ obj-$(CONFIG_PPC_BESTCOMM) += bestcomm/
+ obj-$(CONFIG_PXA_DMA) += pxa_dma.o
+ obj-$(CONFIG_RENESAS_DMA) += sh/
+ obj-$(CONFIG_SF_PDMA) += sf-pdma/
++obj-$(CONFIG_S5L8947X_CDMA) += s5l8947x-cdma.o
+ obj-$(CONFIG_STE_DMA40) += ste_dma40.o ste_dma40_ll.o
+ obj-$(CONFIG_SPRD_DMA) += sprd-dma.o
+ obj-$(CONFIG_TXX9_DMAC) += txx9dmac.o
+diff --git a/sound/arm/Kconfig b/sound/arm/Kconfig
+index 756290b..8175dcb 100644
+--- a/sound/arm/Kconfig
++++ b/sound/arm/Kconfig
+@@ -33,6 +33,7 @@ config SND_S5L8947X_AUDIO
+ 	depends on ARCH_APPLE_S5L || COMPILE_TEST
+ 	depends on OF && COMMON_CLK
+ 	depends on FB_S5L8947X_DISPLAY || !FB_S5L8947X_DISPLAY
++	depends on DMA_ENGINE
+ 	select SND_PCM
+ 	default ARCH_APPLE_S5L
+ 	help

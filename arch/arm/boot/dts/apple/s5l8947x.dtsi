@@ -223,8 +223,9 @@
 
 		/*
 		 * Central DMA.  One interrupt per channel, in channel order:
-		 * entry N is the interrupt of channel N + 1.  The S/PDIF
-		 * transmitter is served by channel 31 (IRQ 81).
+		 * entry N is the interrupt of channel N + 1.  Clients name a
+		 * channel (1..42) and a request line; the S/PDIF transmitter
+		 * is served by channel 31 (IRQ 81), request line 8.
 		 */
 		cdma: dma-controller@7000000 {
 			compatible = "apple,s5l8947x-cdma";
@@ -233,7 +234,8 @@
 			interrupts = <51 52 53 54 55 56 57 58 59 60 61 62 63 64
 				      65 66 67 68 69 70 71 72 73 74 75 76 77 78
 				      79 80 81 82 83 84 85 86 87 88 89 90 91 92>;
-			clock-gates = <85>;
+			clocks = <&pmgr_gates 85>;
+			#dma-cells = <2>;
 			status = "okay";
 		};
 
@@ -243,8 +245,8 @@
 			      <0x4194000 0x1000>;
 			reg-names = "i2s0", "spdif";
 			interrupts = <99 103>;
-			cdma = <&cdma>;
-			cdma-channel = <31>;
+			dmas = <&cdma 31 8>;
+			dma-names = "tx";
 			clocks = <&pmgr_gates 37>, <&pmgr_gates 38>,
 				 <&pmgr_gates 39>, <&pmgr_gates 40>,
 				 <&pmgr_gates 41>, <&pmgr_gates 42>;
