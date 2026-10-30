@@ -166,6 +166,11 @@
 	status = "okay";
 };
 
+/* AES engine (memory to memory through CDMA channels 1 and 2) */
+&aes {
+	status = "okay";
+};
+
 /* NAND: one managed NAND package on FMI0, CE0; FMI1 is unpopulated */
 &fmi0 {
 	status = "okay";

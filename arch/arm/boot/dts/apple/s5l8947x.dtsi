@@ -222,6 +222,24 @@
 		};
 
 		/*
+		 * AES engine inside the central DMA block: channel 1 feeds it,
+		 * channel 2 drains it. The driver programs those two channels
+		 * itself, so their register pages are listed here as well.
+		 */
+		aes: crypto@7801000 {
+			compatible = "apple,s5l8947x-aes";
+			reg = <0x7801000 0x1000>,
+			      <0x7800000 0x4>,
+			      <0x7001000 0x1000>,
+			      <0x7002000 0x1000>;
+			reg-names = "engine", "keys", "ch-in", "ch-out";
+			clocks = <&pmgr_gates 28>;
+			dmas = <&cdma 1 0>, <&cdma 2 0>;
+			dma-names = "in", "out";
+			status = "disabled";
+		};
+
+		/*
 		 * Flash memory interface, two channels.  Each has a host block
 		 * (transfer setup and the data / metadata FIFOs), a sequencer
 		 * block (chip enables, commands, addresses) and an ECC block.
