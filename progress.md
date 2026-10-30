@@ -21,7 +21,7 @@ Status of every hardware block, checked against the drivers in the tree and the 
 | System / IR remote MCU (UART1) | `0x32600000` | `drivers/input/misc/s5l8947x-mcu.c` |
 | Wi-Fi (BCM4334, HSIC) | EHCI port 2 | mainline `brcmfmac` USB, patched by `scripts/patches/0007-*` (boot loader `bd1a`, NVRAM packed into the TRX, optional CLM blob). Firmware 6.53.3 from user-supplied `.bin` + `.txt`, MAC from the DT. `wlan0` scans 2.4 and 5 GHz and joins WPA2-PSK networks with `wpa_supplicant` and the `wifi` helper (verified 2026-10-30: 5 GHz, 135 Mbit/s, DHCP lease, routed traffic; `hwtest wireless` 5/5). `wireless-regdb` installed; optional build-time `wpa_supplicant.conf` is joined at boot. |
 | Bluetooth (BCM4334, UART2) | `0x32700000` | mainline `hci_uart_bcm`; patch firmware from the user's restore image is loaded at boot (HCI 4.1, revision 2393, LE), repeated rebinds clean. Verified 2026-10-30 on the radio: a passive LE scan with `btscan` (raw HCI socket, no Bluetooth userland needed) heard 19 advertisers and 546 reports in 10 s; `hwtest wireless` 8/8 runs the same scan. |
-| Central DMA (42 channels) | `0x37000000` | `drivers/dma/s5l8947x-cdma.c`, `dmaengine` provider (`dmas = <&cdma channel request>`): slave scatter-gather and cyclic transfers, per-channel interrupts (end of list, and per segment for cyclic periods), segment-granularity residue. Verified 2026-10-30 with audio: 3.00 s plays in 3.02 s at both rates, about 46 period interrupts a second, repeated start/stop clean, `hwtest` 55/55. |
+| Central DMA (42 channels) | `0x37000000` | `drivers/dma/s5l8947x-cdma.c`, `dmaengine` provider (`dmas = <&cdma channel request>`): slave scatter-gather (both directions) and cyclic transfers, per-channel interrupts (end of list, and per segment for cyclic periods), segment-granularity residue. Verified 2026-10-30 with audio: 3.00 s plays in 3.02 s at both rates, about 46 period interrupts a second, repeated start/stop clean, `hwtest` 55/55. |
 | Audio: I2S -> HDMI, S/PDIF -> optical | `0x34190000`, `0x34194000`, `0x34195000` | `sound/arm/s5l8947x-audio.c`, two PCMs fed by cyclic `dmaengine` transfers (period interrupts, position from the DMA residue). PCM 0 (HDMI, `pcmC0D0p`): I2S0 as a slave of the I2S clock master, CDMA channel 23, 46 875 / 31 250 Hz; the slave only raises DMA requests with a FIFO threshold set in its TX control register. PCM 1 (optical, `pcmC0D1p`): S/PDIF at 46 875 Hz with one word per channel, CDMA channel 31. HDMI packet layer in `s5l8947x-display.c` (I2S receiver in basic I2S format, reset pin selection, ACR from the produced rate, valid AUI; `hdmi_audio` accepts `off`). Verified 2026-10-30: speech is clean over HDMI at both rates, 4.28 s plays in 4.31-4.33 s with about 46 period interrupts a second, measured CTS matches 46 875 and 31 250 Hz, optical DMA runs at real time, `hwtest audio` 5/5. Hot-plug loss mutes the packets and replug re-announces. `wavplay` plays WAV files (resampled to 46 875 Hz; `-d /dev/snd/pcmC0D1p` for optical). |
 
 ### Wi-Fi known limits
@@ -40,8 +40,8 @@ Status of every hardware block, checked against the drivers in the tree and the 
 
 ### Central DMA known limits
 
-- Only memory-to-device transfers; device-to-memory is not implemented.
-- The device-address register holds only 24 bits (the `0x34000000` window). The window select for clients elsewhere (UART1/2 at `0x326..`/`0x327..`, SHA at `0x302..`, display at `0x3a1..`) is unknown, so those addresses are refused.
+- The device-address register holds only 24 bits; the window comes from the channel's wiring, not from a register. Two windows are measured and accepted: `0x34000000` (audio, memory to device) and `0x31000000` (NAND FIFOs on channels 5-8, device to memory, verified 2026-10-30). Other clients (UART1/2, SHA, display) are still refused.
+- A channel restarted after a finished non-cyclic list stopped after its first segment, and a transfer left armed resumed when its channel was enabled again; `start_next` now always aborts first and channel allocation aborts stale state (verified 2026-10-30 with back-to-back NAND reads).
 
 ### Audio known limits
 
@@ -54,6 +54,7 @@ Status of every hardware block, checked against the drivers in the tree and the 
 
 | Block | Works | Pending |
 |---|---|---|
+| NAND (FMI0, managed NAND, 8.9 GB) | `drivers/mtd/devices/s5l8947x-fmi.c`: identifies the package and reads its geometry and timings from it; read-only `/dev/mtd0` (16 KiB pages, 64 B metadata per page as OOB, one erase region per CAU); pages move by CDMA (data ch 5, metadata ch 6); interface timing computed from the package (about 14 MB/s). `drivers/mtd/s5l8947x-ftl.c`: rebuilds the stock translation layer's map from the per-superblock tables of contents (about 4 s at boot) and exposes the 8 GB logical disk as `/dev/nand0` and each volume of its volume map as `/dev/nand0p1` (System, 1.4 GB) and `/dev/nand0p2` (Data, 6.5 GB), read-only. Verified 2026-10-30: the map equals a full metadata scan of a raw backup, the whole of `nand0p1` matches an image checked offline, `mount -t hfsplus -o ro /dev/nand0p1` lists the system volume (10,631 files), a 348 MB file reads at 14 MB/s; `hwtest nand` 8/8. | Data volume is block-encrypted (needs the hardware AES path and its wrapped key), so it does not mount. The system volume's journal is not replayed (Linux mounts the on-disk state read-only). No writes or erase; polled, no interrupts. FMI1 is unpopulated on j33iap. |
 | SGX543 GPU — **on hold** | Gates 7/8/9, cores released from reset, telemetry at `/dev/sgx0` | No command submission, no DRM driver. Per-core registers hang the bus until a core is brought up. No further work and no on-device test until this is resumed. |
 | USB OTG port host mode | Device mode on `dwc2`; EHCI host serves only the internal HSIC port | `dr_mode` is `peripheral`; host on the OTG port needs a role switch. The OHCI companion (`0x36500000`, IRQ 13) is not described, so full/low-speed devices are unsupported. |
 | System MCU | Button input, firmware query, break, raw commands | Reset-to-recovery trigger and wake source are not wired (the MCU line, GPIO 2, is unused); standby is only sent on halt. |
@@ -62,13 +63,12 @@ Status of every hardware block, checked against the drivers in the tree and the 
 
 | Block | Address | Notes |
 |---|---|---|
-| NAND flash controller (FMI0 / FMI1, BCH) | `0x31200000`, `0x31300000` | Highest priority: persistent storage. Needs register reconnaissance first. |
 | Hardware crypto (SHA, AES, public-key engine) | `0x30200000`, `0x33100000` | Low priority. |
 | SD/MMC, SPI, RTC, thermal, hardware RNG | — | Not investigated; `CONFIG_MMC` is off. |
 
 ## Suggested order
 
-1. NAND reconnaissance and the FMI driver; extend the CDMA driver to the FMI window and device-to-memory transfers.
+1. NAND: decrypt the Data volume (hardware AES and its wrapped volume key), then the write and erase path (needs a decision on the stock data, which is backed up).
 2. Wi-Fi and Bluetooth: read the real MAC and Bluetooth addresses instead of placeholders.
 3. Add host mode to the OTG port.
 4. Audio at exact 48 / 44.1 kHz: clock the I2S master from the PMGR NCO (channel 0) and verify the optical output on a receiver.
