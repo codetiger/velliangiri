@@ -31,13 +31,13 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 |---|---|
 | **CPU & Core SoC** | Single-core Cortex-A9 up to 850 MHz, CPU frequency scaling (`212.5` / `425` / `850 MHz`), 512 KB PL310 L2 cache, `aic,1` interrupt controller, 24 MHz timer, hardware watchdog, clean reboot and standby power-off |
 | **Clocks, GPIO, I2C, PMU** | PMGR peripheral clock gates, 144-pin GPIO and pinctrl controller (with IRQs), 3x I2C controllers, Dialog I2C PMU power switches |
-| **HDMI Video** | 720p60 framebuffer console (`simple-framebuffer` + `s5l8947x-display`), boot splash, 10-bit hardware gamma LUT, and memory-to-memory hardware scaler |
+| **HDMI Video** | 720p60 framebuffer console (`simple-framebuffer` + `s5l8947x-display`), a logo boot splash drawn by the pre-kernel loader, 10-bit hardware gamma LUT, and memory-to-memory hardware scaler |
 | **Audio (HDMI & Optical)** | ALSA PCM output over both HDMI and optical S/PDIF (`s5l8947x-audio`), driven by Central DMA channel 31, with HDMI hot-plug mute/unmute and a `wavplay` CLI player |
 | **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
 | **USB Networking & Console** | Micro-USB port runs in USB device mode (`dwc2`), providing a virtual Ethernet link (`usb0` at `10.55.0.2`, SSH enabled) and a USB serial console (`/dev/ttyGS0`) |
 | **Wi-Fi (2.4 & 5 GHz)** | Broadcom BCM4334 over internal HSIC USB host (`ehci-platform` + custom PHY handshake); scans and joins WPA2 networks via `wpa_supplicant` and the built-in `wifi` helper (requires firmware extracted from your own restore image) |
 | **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2`); loads patch firmware at boot when extracted from your restore image |
-| **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`/dev/input/event0`) via the MSP430 system microcontroller on `uart1` |
+| **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`S5L8947X IR Remote`, `/dev/input/event*`) via the MSP430 system microcontroller on `uart1` |
 
 ### What doesn't work yet (honest limitations)
 
@@ -45,7 +45,8 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 |---|---|
 | **Internal NAND storage** | Not started. There is no driver for the NAND flash controller (`FMI0`/`FMI1`) yet, so the OS runs from RAM (`initramfs`) and resets on reboot. (NFS client tools are included if you want persistent network storage.) |
 | **3D GPU acceleration** | On hold. The PowerVR SGX543 power domain and clocks come up for bus telemetry, but there is no DRM/3D rendering driver. Graphics use the 720p CPU framebuffer. |
-| **USB host on the external port** | The external Micro-USB port is currently wired for peripheral/device mode only (`g_cdc`). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
+| **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a configfs CDC-ECM + CDC-ACM gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
+| **Audio quality (open bug)** | Tones and test signals play cleanly, but speech and music have heavy static over HDMI. The cause is still being tracked down; it is not the sample rate. |
 | **Audio sample rates** | The S/PDIF block is clocked from the 24 MHz crystal, so hardware playback runs at `46,875 Hz` or `31,250 Hz` instead of `48,000 Hz`. Use `wavplay` (which resamples automatically) or ALSA resampling. |
 | **Wi-Fi / BT factory addresses** | Wi-Fi uses a locally administered MAC address from the Device Tree, and Bluetooth runs at 115,200 baud with its default controller address (`BlueZ` userspace is not pre-installed in the small initramfs). |
 
@@ -62,13 +63,17 @@ For exact register addresses, driver file paths, and per-block notes, see [progr
 
 ### 2. Optional: Extract Wi-Fi and Bluetooth firmware
 
-The Broadcom Wi-Fi and Bluetooth firmware files cannot be redistributed in this repository. If you want wireless support, extract them locally from your own copy of the device's stock restore image (zip file or URL, or decrypted rootfs disk image):
+The Broadcom Wi-Fi and Bluetooth firmware files cannot be redistributed in this repository. If you want wireless support, extract them locally from your own copy of the device's stock restore image:
 
 ```bash
+# From the restore image (a local zip, or a URL read with HTTP range requests)
 ./scripts/velliangiri.sh firmware --image <path-or-url-to-restore-image> --key <72-hex-digit-key>
+
+# Or from the root filesystem disk image itself
+./scripts/velliangiri.sh firmware --rootfs <disk-image> [--key <72-hex-digit-key>]
 ```
 
-This verifies the files by SHA-256 and places them in `research/firmware/` (which is git-ignored). When you build the rootfs, the build script automatically bundles them into `/lib/firmware/brcm/`.
+The key is only needed for an encrypted disk image; it can also be kept in `research/firmware/rootfs.key` or passed as `FIRMWARE_KEY`. The extractor verifies every file by SHA-256 and places them in `research/firmware/` (which is git-ignored). When you build the rootfs, the build script automatically bundles them into `/lib/firmware/brcm/`. Without them, Wi-Fi does not come up and Bluetooth runs on its ROM firmware.
 
 *(Optional)* To make the device join your Wi-Fi network automatically at boot, place a standard `wpa_supplicant.conf` at `research/wpa_supplicant.conf` before building. You can also pass `SSH_PUBKEY=/path/to/id_ed25519.pub` to install your SSH key.
 
@@ -140,7 +145,8 @@ Device bootloaders in this family do not boot standard Linux `zImage` + Device T
 To solve this cleanly for any board, `scripts/build-bundle.sh` wraps the kernel in a tiny, self-relocating pre-kernel loader:
 
 1. **Position-independent entry stub (`scripts/boot/entry-stub.S`):** Runs from whatever RAM address the bootloader loads it at. It masks interrupts, cleanly flushes/invalidates L1 and PL310 L2 caches whether the MMU was on or off, disables the MMU, arms the hardware watchdog as a 120-second safety net, copies the payload to the start of RAM (`0x80000000`), and jumps there.
-2. **Pre-kernel C loader (`scripts/boot/boot-loader.c`):** Runs in the first 32 KB of RAM (`0x80000000..0x80007fff`), turns on essential PMGR clock gates, initializes scanout / boot splash for `simple-framebuffer`, and jumps to `zImage` at `0x80008000` with `r2` pointing to the appended `.dtb`.
+2. **Pre-kernel C loader (`scripts/boot/boot-loader.c`):** Runs in the first 32 KB of RAM (`0x80000000..0x80007fff`), turns on essential PMGR clock gates, draws the boot splash and starts 720p scanout for `simple-framebuffer`, and jumps to `zImage` at `0x80008000` with `r2` pointing to the appended `.dtb`. Its stack grows down from `0x80007000` in the same slot, so the build rejects a loader image larger than 24 KB.
+3. **Boot splash (`scripts/boot/gen-splash.py`, `splash.c`):** At build time the generator flattens `logo.svg` and the wordmark into polygon tables with precomputed edge slopes, and the loader fills them into the framebuffer with no runtime division. To brand a port, replace `logo.svg`.
 
 ### Step-by-step guide to porting a new board
 
@@ -174,7 +180,8 @@ Instead of storing a full kernel source tree, this repository holds only the fil
 | `arch/arm/mach-apple/` | Machine init, CPU clock calibration, watchdog clocksource & reset |
 | `drivers/`, `sound/`, `include/` | Clean-room kernel drivers in their standard mainline paths |
 | `scripts/patches/` | 7 small, self-contained patches to mainline Linux 6.12 files |
-| `scripts/boot/` | Position-independent entry stub, pre-kernel C loader, HDMI init, boot splash |
+| `scripts/boot/` | Position-independent entry stub, pre-kernel C loader, HDMI init, boot splash and its generator |
+| `scripts/extract-firmware.py` | Rebuilds the Wi-Fi and Bluetooth firmware from your own restore image (`velliangiri.sh firmware`) |
 | `scripts/tests/` | On-device hardware test suite (`hwtest`) |
 | `scripts/tools/` | Userspace MMIO/I2C diagnostic tools (`peek`, `i2cpoke`, `wavplay`, `l2bench`, `jitterseed`) |
 | `config/` | Kernel configuration fragments layered on `multi_v7_defconfig` |
@@ -191,6 +198,7 @@ High-impact open tasks on `S5L8947X` right now (see [progress.md](progress.md) f
 - **Central DMA (`cdma`) `dmaengine` driver** (needed by NAND and hardware crypto; currently used directly by audio).
 - **USB OTG host mode** (role switching + OHCI companion controller at `0x36500000`) to allow plugging in external USB devices.
 - **OTP / system config reader** to populate the factory Wi-Fi and Bluetooth MAC addresses automatically.
+- **HDMI audio static on speech and music**: the sample path checks out up to the HDMI receiver, so the HDMI sample packing (or an I2S-fed HDMI path) is the next place to look.
 
 ### Guardrails
 

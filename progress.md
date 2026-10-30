@@ -17,7 +17,7 @@ Status of every hardware block, checked against the drivers in the tree and the 
 | USB 2.0 device mode and PHY | `0x36100000` | `drivers/phy/phy-apple-s5l-usb.c` + mainline `dwc2` |
 | USB 2.0 host (EHCI) on the HSIC port | `0x36400000` | mainline `ehci-platform`; host PHY in `drivers/phy/phy-apple-s5l-usb.c` (HSIC tuning, INCRx, port reset release, host-ready/device-ready handshake, device ready in about 42 ms) |
 | GPIO controller (144 pins, 18 ports) | `0x3fa00000` | `drivers/pinctrl/pinctrl-s5l8940x-gpio.c`, IRQ 119; probes on hardware and drives the HSIC handshake lines (GPIO 113 out, 128 in) |
-| Display pipe, HDMI 720p, scaler, gamma | `0x3a200000` | `drivers/video/fbdev/s5l8947x-display.c` |
+| Display pipe, HDMI 720p, scaler, gamma | `0x3a200000` | `drivers/video/fbdev/s5l8947x-display.c`; the pre-kernel loader (`scripts/boot/hdmi-720p.h`) brings up 720p60 scanout and draws a boot splash of `logo.svg` (polygon tables generated at build time by `scripts/boot/gen-splash.py`, rasterized by `splash.c`) in place of the old colour-bar pattern |
 | System / IR remote MCU (UART1) | `0x32600000` | `drivers/input/misc/s5l8947x-mcu.c` |
 | Wi-Fi (BCM4334, HSIC) | EHCI port 2 | mainline `brcmfmac` USB, patched by `scripts/patches/0007-*` (boot loader `bd1a`, NVRAM packed into the TRX, optional CLM blob). Firmware 6.53.3 from user-supplied `.bin` + `.txt`, MAC from the DT. `wlan0` scans 2.4 and 5 GHz and joins WPA2-PSK networks with `wpa_supplicant` and the `wifi` helper (verified 2026-10-30: 5 GHz, 135 Mbit/s, DHCP lease, routed traffic; `hwtest wireless` 5/5). `wireless-regdb` installed; optional build-time `wpa_supplicant.conf` is joined at boot. |
 | Audio: S/PDIF -> HDMI and optical | `0x34194000` | `sound/arm/s5l8947x-audio.c`; ALSA PCM at 46 875 / 31 250 Hz, measured register layout, fed by CDMA channel 31 (frame-clock position, MAR liveness check). HDMI packet layer in `s5l8947x-display.c` (ACR from the produced rate, valid AUI, S/PDIF receiver enabled, `I2S_CLK_CON=0` on this path). Audible on hardware; hot-plug loss mutes the packets and replug re-announces. `wavplay` plays WAV files (resampled to 46 875 Hz). |
@@ -28,6 +28,11 @@ Status of every hardware block, checked against the drivers in the tree and the 
 - The board's CLM blob is rejected by this firmware (`clmload` -52), so the firmware's built-in regulatory data is used; it still covers 2.4 and 5 GHz.
 - HSIC runtime suspend stays off (USB default); enabling it needs the port's resume workaround.
 - The firmware is not distributable; `./scripts/velliangiri.sh firmware` extracts it (and the Bluetooth patch) from the user's own restore image into `research/firmware/`.
+
+### Audio known limits
+
+- **Open bug:** speech and other music-like content plays with heavy static over HDMI, while tones, sweeps and noise are clean. The output seems to follow each sample's sign more than its value, which points at how the HDMI core packs the 16-bit S/PDIF sample. The sample rate is not the cause: exact 48 kHz from the PMGR NCO gave the same static. The DMA ring, FIFO level and the HDMI S/PDIF receiver's decoded samples all check out.
+- Only 46 875 and 31 250 Hz are advertised (24 MHz reference); `wavplay` and ALSA resample.
 
 ## Partly implemented
 
@@ -53,4 +58,4 @@ Status of every hardware block, checked against the drivers in the tree and the 
 1. NAND reconnaissance, then a CDMA `dmaengine` driver and the FMI driver.
 2. Wi-Fi and Bluetooth: read the real MAC and Bluetooth addresses instead of placeholders.
 3. Add host mode to the OTG port.
-4. Recheck the audio speech-noise bug: the old 850 MHz state also doubled peripheral clocks.
+4. Fix the audio speech-static bug: first recheck it now that the 850 MHz state no longer doubles peripheral clocks, then look at the HDMI sample packing, or feed HDMI through I2S as the stock system does.
