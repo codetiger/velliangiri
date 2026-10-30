@@ -14,3 +14,7 @@ This repository hosts only:
 - Never mention proprietary vendor terminology or internal bootloader/key names in public documentation, comments, or commit messages.
 - Keep all local research notes and non-distributable testing materials strictly inside the git-ignored `research/` directory.
 - Run `./scripts/check-no-proprietary.sh --all` before concluding any task that creates or modifies files, and never bypass git hooks (`--no-verify`).
+
+## 3. Commits
+
+- Never add `Co-authored-by:` (or any other co-author / AI attribution) trailers to commit messages. Commits carry only the author's own identity.
