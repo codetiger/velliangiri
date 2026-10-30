@@ -73,8 +73,9 @@ static void __init s5l8947x_pmgr_boost_cpu(void)
 
 	pll1 = readl_relaxed(pmgr + PMGR_PLL1_CTL);
 	if ((pll1 & PMGR_PLL_ENABLE_LOCKED) == PMGR_PLL_ENABLE_LOCKED) {
-		if (readl_relaxed(pmgr + PMGR_PERF_STATE2_W0) != 0x01220001U) {
-			writel_relaxed(0x01220001U, pmgr + PMGR_PERF_STATE2_W0);
+		/* W0[3:0] = 2 keeps the UART peripheral clock as in the other states */
+		if (readl_relaxed(pmgr + PMGR_PERF_STATE2_W0) != 0x01220002U) {
+			writel_relaxed(0x01220002U, pmgr + PMGR_PERF_STATE2_W0);
 			writel_relaxed(0x00210141U, pmgr + PMGR_PERF_STATE2_W1);
 			writel_relaxed(0x00000021U, pmgr + PMGR_PERF_STATE2_W2);
 			writel_relaxed(0x00000000U, pmgr + PMGR_PERF_STATE2_W3);

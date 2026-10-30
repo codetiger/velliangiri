@@ -2,7 +2,7 @@
 /*
  * S5L8947X (j33iap) system / IR remote MCU
  *
- * The MCU is a serdev client of UART1 (115200 baud 8N1). Frames in both
+ * The MCU is a serdev client of UART1 (250000 baud 8N1). Frames in both
  * directions are
  *
  *   'S' 't' cmd 0x01 len_hi len_lo payload... crc_hi crc_lo
@@ -37,7 +37,7 @@
 #include <linux/unaligned.h>
 #include <linux/workqueue.h>
 
-#define MCU_BAUD		115200U
+#define MCU_BAUD		250000U
 #define MCU_SYNC_BYTE0		0x53U /* 'S' */
 #define MCU_SYNC_BYTE1		0x74U /* 't' */
 #define MCU_PROTO_VER		0x01U

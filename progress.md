@@ -10,7 +10,7 @@ Status of every hardware block, checked against the drivers in the tree and the 
 | Watchdog, clocksource, restart | `0x3f103020` | `arch/arm/mach-apple/` |
 | L2 cache (PL310, 512 KB) | `0x3e000000` | mainline `cache-l2x0.c`, started from `arch/arm/mach-apple/s5l8947x.c`; loader leaves it disabled |
 | PMGR clock gates | `0x3f101008` | `drivers/clk/clk-s5l8940x-pmgr.c`; I2C and USB host gates are claimed by their drivers. The loader still pre-enables a few for the console and early boot. |
-| CPU frequency (212.5 / 425 / 850 MHz) | `0x3f100000` | `drivers/cpufreq/s5l8947x-cpufreq.c` |
+| CPU frequency (212.5 / 425 / 850 MHz) | `0x3f100000` | `drivers/cpufreq/s5l8947x-cpufreq.c`; every state keeps the peripheral divider, so the 51.3 MHz UART clock does not change with the CPU speed |
 | I2C 0/1/2 | `0x33200000`.. | `drivers/i2c/busses/i2c-s5l8940x.c` |
 | Power management unit and power switches | I2C0 `0x74` | `drivers/mfd/apple-pmu-i2c.c`, `drivers/regulator/apple-pmu-pwrsw.c` |
 | 10/100 Ethernet | `0x3b000000` | `drivers/net/ethernet/apple/s5l_fe.c` |
@@ -37,7 +37,7 @@ Status of every hardware block, checked against the drivers in the tree and the 
 | USB OTG port host mode | Device mode on `dwc2`; EHCI host serves only the internal HSIC port | `dr_mode` is `peripheral`; host on the OTG port needs a role switch. The OHCI companion (`0x36500000`, IRQ 13) is not described, so full/low-speed devices are unsupported. |
 | Central DMA | `0x37000000`: audio programs channel 31 directly | No `dmaengine` driver yet; NAND and crypto will need one. |
 | System MCU | Button input, firmware query, break, raw commands | Reset-to-recovery trigger and wake source are not wired (the MCU line, GPIO 2, is unused); standby is only sent on halt. |
-| Bluetooth (UART2) | `hci_uart_bcm` binds and registers `hci0` | The controller never answers HCI Reset (`-110`), in every recorded run since 2026-10-28, with or without the GPIO node and Wi-Fi power. UART2 takes almost no interrupts. The boot loader leaves RTS (pin 20) as a GPIO output held high; the stock tree drives RTS as a GPIO, BT power on GPIO 104 and BT wake on GPIO 105. Higher baud not set up. |
+| Bluetooth (UART2) | `hci_uart_bcm` brings up `hci0` at boot (verified 2026-10-30): patch firmware loaded (HCI 4.1, revision 2393, LE), repeated rebinds clean, `hwtest wireless` passes | The address is the controller default (the stock system sets it from system config). Stays at 115200: with integer divisors the 51.3 MHz clock reaches 460800 accurately but not the stock 3 Mbaud. No host-wake interrupt, so no UART sleep. No `bluetoothd`/BlueZ userland in the image. |
 
 ## Not started
 
@@ -51,6 +51,6 @@ Status of every hardware block, checked against the drivers in the tree and the 
 ## Suggested order
 
 1. NAND reconnaissance, then a CDMA `dmaengine` driver and the FMI driver.
-2. Bluetooth: drive RTS, BT power (GPIO 104) and wake (GPIO 105) so the controller answers HCI Reset.
-3. Wi-Fi: read the real MAC address instead of the DT placeholder.
-4. Add host mode to the OTG port.
+2. Wi-Fi and Bluetooth: read the real MAC and Bluetooth addresses instead of placeholders.
+3. Add host mode to the OTG port.
+4. Recheck the audio speech-noise bug: the old 850 MHz state also doubled peripheral clocks.

@@ -79,6 +79,16 @@ else
 	echo "[rootfs] No Wi-Fi firmware in ${WIFI_FW_DIR}; brcmfmac will not load"
 fi
 
+# Bluetooth patch firmware is not distributable either: install
+# BCM4334B0.hcd from the git-ignored BT_FW_DIR when present. Without it the
+# controller runs its ROM firmware.
+BT_FW_DIR="${BT_FW_DIR:-${ROOT}/research/firmware/bt}"
+if [ -f "${BT_FW_DIR}/BCM4334B0.hcd" ]; then
+	echo "[rootfs] Installing Bluetooth patch firmware from ${BT_FW_DIR} ..."
+	mkdir -p "${STAGE_DIR}/lib/firmware/brcm"
+	cp "${BT_FW_DIR}/BCM4334B0.hcd" "${STAGE_DIR}/lib/firmware/brcm/"
+fi
+
 # Install initramfs boot and DHCP scripts
 echo "[rootfs] Installing initramfs boot scripts ..."
 mkdir -p "${STAGE_DIR}/sbin" "${STAGE_DIR}/etc/udhcpc" "${STAGE_DIR}/etc/dropbear" "${STAGE_DIR}/root/.ssh"

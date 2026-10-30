@@ -49,6 +49,10 @@ struct s5l8947x_opp {
  * States 6, 3, and 2 share identical SDRAM/display/peripheral bus divisors
  * (W1 = 0x00210141), scaling only the Cortex-A9 core clock so 720p60 HDMI
  * scanout, USB 2.0 OTG DMA, and Fast Ethernet remain glitch-free.
+ *
+ * W0[3:0] divides the peripheral clock that feeds the UARTs. It must stay
+ * at 2 in every state: with 1 in the 850 MHz state the UARTs ran at twice
+ * their programmed baud rate whenever the CPU was boosted.
  */
 static const struct s5l8947x_opp s5l8947x_opps[] = {
 	{
@@ -67,7 +71,7 @@ static const struct s5l8947x_opp s5l8947x_opps[] = {
 		.freq_khz	= 850000,
 		.perf_state	= 2,
 		.doubler_div	= 1,
-		.tbl		= { 0x01220001U, 0x00210141U, 0x00000021U, 0x00000000U },
+		.tbl		= { 0x01220002U, 0x00210141U, 0x00000021U, 0x00000000U },
 	},
 };
 

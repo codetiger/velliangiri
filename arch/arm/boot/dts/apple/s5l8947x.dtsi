@@ -42,6 +42,20 @@
 		clock-output-names = "osc24m";
 	};
 
+	/*
+	 * UART baud clock, a PMGR peripheral clock rather than the 24 MHz
+	 * oscillator: timing long transmits and the Bluetooth controller's
+	 * accepted baud window both put it at 51.3 MHz. It only stays there
+	 * because every CPU performance state keeps the same peripheral
+	 * divider.
+	 */
+	uart_clk: clock-51300000 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <51300000>;
+		clock-output-names = "uart_clk";
+	};
+
 	soc: soc@30000000 {
 		compatible = "simple-bus";
 		#address-cells = <1>;
@@ -61,7 +75,7 @@
 			compatible = "apple,s5l-uart", "samsung,s3c6400-uart";
 			reg = <0x2500000 0x1000>;
 			interrupts = <21>;
-			clocks = <&pmgr_gates 60>, <&osc24m>;
+			clocks = <&pmgr_gates 60>, <&uart_clk>;
 			clock-names = "uart", "clk_uart_baud0";
 			status = "disabled";
 		};
@@ -71,7 +85,7 @@
 			compatible = "apple,s5l-uart", "samsung,s3c6400-uart";
 			reg = <0x2600000 0x1000>;
 			interrupts = <22>;
-			clocks = <&pmgr_gates 61>, <&osc24m>;
+			clocks = <&pmgr_gates 61>, <&uart_clk>;
 			clock-names = "uart", "clk_uart_baud0";
 			status = "disabled";
 		};
@@ -81,7 +95,7 @@
 			compatible = "apple,s5l-uart", "samsung,s3c6400-uart";
 			reg = <0x2700000 0x1000>;
 			interrupts = <23>;
-			clocks = <&pmgr_gates 62>, <&osc24m>;
+			clocks = <&pmgr_gates 62>, <&uart_clk>;
 			clock-names = "uart", "clk_uart_baud0";
 			status = "disabled";
 		};

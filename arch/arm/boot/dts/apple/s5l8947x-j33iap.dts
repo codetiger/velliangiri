@@ -52,6 +52,12 @@
 
 &gpio {
 	status = "okay";
+
+	/* The boot loader leaves RTS (pin 20) as a GPIO held high */
+	bt_uart_pins: bt-uart-pins {
+		pins = "PIN18", "PIN19", "PIN20", "PIN21";
+		apple,peripheral-function = <2>;
+	};
 };
 
 /*
@@ -133,15 +139,20 @@
 	/* TI MSP430 system / IR remote MCU */
 	mcu {
 		compatible = "apple,j33-mcu";
-		current-speed = <115200>;
+		current-speed = <250000>;
 	};
 };
 
 &uart2 {
 	status = "okay";
 
+	pinctrl-names = "default";
+	pinctrl-0 = <&bt_uart_pins>;
+
 	bluetooth {
 		compatible = "brcm,bcm4334-bt";
+		shutdown-gpios = <&gpio 104 GPIO_ACTIVE_HIGH>;
+		device-wakeup-gpios = <&gpio 105 GPIO_ACTIVE_HIGH>;
 	};
 };
 
