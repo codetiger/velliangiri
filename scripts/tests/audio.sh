@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# Audio engine: ALSA card, S/PDIF -> HDMI packet layer, WAV playback
+# Audio engine: ALSA card, I2S -> HDMI and S/PDIF -> optical, WAV playback
 #
 # Set WAV=<file> to play a file through wavplay; without it the playback check
 # is skipped.
 
 t_audio() {
-	section "Audio (S/PDIF -> HDMI / optical)"
+	section "Audio (I2S -> HDMI, S/PDIF -> optical)"
 	if ! bound "$AUD"; then
 		fail "audio driver not bound"
 		return
@@ -16,11 +16,14 @@ t_audio() {
 		fail "no S5L8947X ALSA card in /proc/asound/cards"
 		return
 	fi
-	if [ -c /dev/snd/pcmC0D0p ]; then
-		pass "PCM node /dev/snd/pcmC0D0p"
-	else
-		fail "PCM node /dev/snd/pcmC0D0p missing"
-	fi
+	for dev in 0:HDMI 1:optical; do
+		node=/dev/snd/pcmC0D${dev%%:*}p
+		if [ -c "$node" ]; then
+			pass "${dev#*:} PCM node $node"
+		else
+			fail "${dev#*:} PCM node $node missing"
+		fi
+	done
 
 	info "clock gates: $(clk_users "${AUD##*/}")"
 

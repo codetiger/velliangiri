@@ -73,7 +73,6 @@
 /* HDMI internal S/PDIF receiver (0x39730000) */
 #define HDMI_SPDIF_RX_CLK	0x30000
 #define HDMI_SPDIF_RX_OP	0x30004
-#define HDMI_SPDIF_RX_IRQ	0x3000c
 
 /* HDMI internal I2S receiver & subpacket mux (0x39740000) */
 #define HDMI_I2S_CLK_CON	0x40000
@@ -171,8 +170,7 @@ static u32 s5l8947x_hdmi_acr_cts(unsigned int sample_rate)
 	return (u32)div_u64(3564000000ULL + sample_rate / 2, sample_rate);
 }
 
-int s5l8947x_hdmi_audio_configure(unsigned int sample_rate, bool enable,
-				  bool spdif_source)
+int s5l8947x_hdmi_audio_configure(unsigned int sample_rate, bool enable)
 {
 	struct s5l8947x_display *d = g_s5l_display;
 	u32 n_val = 6144U, cts_val = s5l8947x_hdmi_acr_cts(sample_rate), con0;
@@ -182,16 +180,13 @@ int s5l8947x_hdmi_audio_configure(unsigned int sample_rate, bool enable,
 
 	if (!d)
 		return -ENODEV;
-	if (!sample_rate)
+	if (enable && !sample_rate)
 		return -EINVAL;
 
 	mutex_lock(&d->lock);
 	if (!enable) {
 		writel(0x00, d->hdmi + HDMI_ACR_CON);
-		if (spdif_source) {
-			writel(0x00, d->hdmi + HDMI_SPDIF_RX_OP);
-			writel(0x02, d->hdmi + HDMI_SPDIF_RX_CLK);
-		}
+		writel(0x00, d->hdmi + HDMI_I2S_CLK_CON);
 		writel(0x00, d->hdmi + HDMI_ASP_CON);
 		writel(0x00, d->hdmi + HDMI_AUI_CON);
 		con0 = readl(d->hdmi + HDMI_CON_0) & 0xffU;
@@ -211,42 +206,38 @@ int s5l8947x_hdmi_audio_configure(unsigned int sample_rate, bool enable,
 	s5l8947x_hdmi_write_bytes(d->hdmi, HDMI_ACR_CTS0, cts_val, 3);
 	writel(0x04, d->hdmi + HDMI_ACR_CON);
 
-	/* S/PDIF receiver: +0x00 = 1 run, +0x04 = 3 receive and feed the mux */
-	if (spdif_source) {
-		writel(0xff, d->hdmi + HDMI_SPDIF_RX_IRQ);
-		writel(1, d->hdmi + HDMI_SPDIF_RX_CLK);
-		writel(3, d->hdmi + HDMI_SPDIF_RX_OP);
-	} else {
-		writel(0, d->hdmi + HDMI_SPDIF_RX_OP);
-		writel(2, d->hdmi + HDMI_SPDIF_RX_CLK);
-	}
+	/* The internal S/PDIF receiver is not used: audio comes in over I2S */
+	writel(0, d->hdmi + HDMI_SPDIF_RX_OP);
+	writel(2, d->hdmi + HDMI_SPDIF_RX_CLK);
 
 	/*
-	 * Enable the HDMI 1.4 internal I2S receiver and subpacket mux.
-	 * CLK_CON=1 selects the I2S bit clock, which does not exist when the
-	 * mux is fed from the S/PDIF receiver: on that path CLK_CON must stay
-	 * 0 or the packetiser (and the ACR) see no audio clock at all.
+	 * Enable the HDMI 1.4 internal I2S receiver and subpacket mux. The
+	 * pin selection is the reset value (all 7s): the mainline Exynos
+	 * values leave the receiver without a clock. CON_2 must say basic
+	 * I2S; left-justified reads every sample one bit late, which turns
+	 * the audio into loud noise. Frames are 32 bit clocks at 46875 Hz
+	 * and 48 at 31250 Hz (the I2S master cannot divide 24 MHz further).
 	 */
-	writel(0x00, d->hdmi + HDMI_I2S_CLK_CON);
-	if (!spdif_source)
-		writel(0x01, d->hdmi + HDMI_I2S_CLK_CON);
+	writel(0x01, d->hdmi + HDMI_I2S_CLK_CON);
 	writel(readl(d->hdmi + HDMI_I2S_DSD_CON) | 0x01U, d->hdmi + HDMI_I2S_DSD_CON);
-	writel(0x56, d->hdmi + HDMI_I2S_PIN_SEL_0); /* SCLK=5, LRCK=6 */
-	writel(0x34, d->hdmi + HDMI_I2S_PIN_SEL_1); /* SDATA1=3, SDATA0=4 */
-	writel(0x12, d->hdmi + HDMI_I2S_PIN_SEL_2); /* SDATA3=1, SDATA2=2 */
-	writel(0x00, d->hdmi + HDMI_I2S_PIN_SEL_3); /* DSD=0 */
+	writel(0x77, d->hdmi + HDMI_I2S_PIN_SEL_0);
+	writel(0x77, d->hdmi + HDMI_I2S_PIN_SEL_1);
+	writel(0x77, d->hdmi + HDMI_I2S_PIN_SEL_2);
+	writel(0x07, d->hdmi + HDMI_I2S_PIN_SEL_3);
 	writel(0x00, d->hdmi + HDMI_I2S_CON_1);     /* Falling edge SCLK, low=L */
-	writel(0x04, d->hdmi + HDMI_I2S_CON_2);     /* MSB first, 32fs, 16-bit, basic I2S */
+	/* MSB first, 16-bit, basic I2S; [5:4] = 32fs or 48fs bit clocks */
+	writel(sample_rate == 31250 ? 0x14 : 0x04, d->hdmi + HDMI_I2S_CON_2);
 	writel(0x00, d->hdmi + HDMI_I2S_CH_ST_0);   /* Consumer LPCM */
 	writel(0x00, d->hdmi + HDMI_I2S_CH_ST_1);
 	writel(0x00, d->hdmi + HDMI_I2S_CH_ST_2);
-	writel((sample_rate == 44100) ? 0x00 : 0x02, d->hdmi + HDMI_I2S_CH_ST_3);
+	/* Sampling frequency code: 44.1, 32 or (nearest for 46875) 48 kHz */
+	writel(sample_rate == 44100 ? 0x00 : sample_rate == 31250 ? 0x03 : 0x02,
+	       d->hdmi + HDMI_I2S_CH_ST_3);
 	writel(0x02, d->hdmi + HDMI_I2S_CH_ST_4);   /* 16-bit word length */
 	writel(0x01, d->hdmi + HDMI_I2S_CH_ST_CON); /* Reload channel status */
 	writel(0x03, d->hdmi + HDMI_I2S_MUX_CH);    /* CH0 L/R: two channels */
 	writel(0x03, d->hdmi + HDMI_I2S_MUX_CUV);   /* Enable L+R CUV */
-	/* S/PDIF input: IN_DISABLE | AUD_SPDIF | CUV_SPDIF | MUX_EN; I2S: 0x07 */
-	writel(spdif_source ? 0x11 : 0x07, d->hdmi + HDMI_I2S_MUX_CON);
+	writel(0x77, d->hdmi + HDMI_I2S_MUX_CON);   /* I2S input, CUV from I2S, enabled */
 
 	/*
 	 * Program the CEA-861 Audio InfoFrame. The header is three byte-wide
@@ -321,7 +312,7 @@ static void s5l8947x_hpd_poll(struct work_struct *work)
 			writel(0x00, d->hdmi + HDMI_ACR_CON);
 			mutex_unlock(&d->lock);
 		} else if (d->audio_enabled) {
-			s5l8947x_hdmi_audio_configure(d->audio_rate, true, true);
+			s5l8947x_hdmi_audio_configure(d->audio_rate, true);
 			s5l8947x_hdmi_audio_arm(d->audio_rate);
 		}
 	}
@@ -477,7 +468,7 @@ static ssize_t hdmi_audio_store(struct device *dev,
 	else if (kstrtouint(buf, 0, &rate))
 		return -EINVAL;
 
-	ret = s5l8947x_hdmi_audio_configure(rate, rate != 0, true);
+	ret = s5l8947x_hdmi_audio_configure(rate, rate != 0);
 	if (ret < 0)
 		return ret;
 	if (rate)

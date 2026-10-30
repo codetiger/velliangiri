@@ -242,11 +242,12 @@
 		audio0: audio-controller@4190000 {
 			compatible = "apple,s5l8947x-audio";
 			reg = <0x4190000 0x1000>,
-			      <0x4194000 0x1000>;
-			reg-names = "i2s0", "spdif";
+			      <0x4194000 0x1000>,
+			      <0x4195000 0x1000>;
+			reg-names = "i2s0", "spdif", "i2s-master";
 			interrupts = <99 103>;
-			dmas = <&cdma 31 8>;
-			dma-names = "tx";
+			dmas = <&cdma 23 1>, <&cdma 31 8>;
+			dma-names = "hdmi", "optical";
 			clocks = <&pmgr_gates 37>, <&pmgr_gates 38>,
 				 <&pmgr_gates 39>, <&pmgr_gates 40>,
 				 <&pmgr_gates 41>, <&pmgr_gates 42>;

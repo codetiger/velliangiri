@@ -9,12 +9,11 @@
 #include <linux/types.h>
 
 #if IS_ENABLED(CONFIG_FB_S5L8947X_DISPLAY)
-int s5l8947x_hdmi_audio_configure(unsigned int sample_rate, bool enable,
-				 bool spdif_source);
+int s5l8947x_hdmi_audio_configure(unsigned int sample_rate, bool enable);
 void s5l8947x_hdmi_audio_arm(unsigned int sample_rate);
 #else
 static inline int s5l8947x_hdmi_audio_configure(unsigned int sample_rate,
-						bool enable, bool spdif_source)
+						bool enable)
 {
 	return 0;
 }
