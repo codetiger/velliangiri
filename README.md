@@ -30,7 +30,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | Hardware | Status & Details |
 |---|---|
 | **CPU & Core SoC** | Single-core Cortex-A9 up to 850 MHz, CPU frequency scaling (`212.5` / `425` / `850 MHz`), 512 KB PL310 L2 cache, `aic,1` interrupt controller, 24 MHz timer, 42-channel central DMA (`dmaengine`), hardware watchdog, clean reboot and standby power-off |
-| **Clocks, GPIO, I2C, PMU** | PMGR peripheral clock gates, 144-pin GPIO and pinctrl controller (with IRQs), 3x I2C controllers, Dialog I2C PMU power switches |
+| **Clocks, GPIO, I2C, PMU** | PMGR peripheral clock gates and audio oscillators, 144-pin GPIO and pinctrl controller (with IRQs), 3x I2C controllers, Dialog I2C PMU power switches |
 | **HDMI Video** | 720p60 framebuffer console (`simple-framebuffer` + `s5l8947x-display`), a logo boot splash drawn by the pre-kernel loader, 10-bit hardware gamma LUT, and memory-to-memory hardware scaler |
 | **Audio (HDMI & Optical)** | ALSA playback (`s5l8947x-audio`) on two PCM devices: HDMI over I2S (`pcmC0D0p`, verified clean with speech) and optical S/PDIF (`pcmC0D1p`), each fed by a cyclic DMA transfer with period interrupts, with HDMI hot-plug mute/unmute and a `wavplay` CLI player |
 | **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
@@ -47,7 +47,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 |---|---|
 | **3D GPU acceleration** | On hold. The PowerVR SGX543 power domain and clocks come up for bus telemetry, but there is no DRM/3D rendering driver. Graphics use the 720p CPU framebuffer. |
 | **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a CDC-ECM + CDC-ACM composite gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
-| **Audio sample rates** | The I2S and S/PDIF blocks are clocked from the 24 MHz crystal, so HDMI playback runs at `46,875 Hz` or `31,250 Hz` and optical at `46,875 Hz` instead of `48,000 Hz`. Use `wavplay` (which resamples automatically) or ALSA resampling. The optical output has not been checked on a receiver yet. |
+| **Audio sample rates** | HDMI plays `32`, `44.1` and `48 kHz` exactly. Optical is still clocked from the 24 MHz crystal and runs at `46,875 Hz`; use `wavplay` (which resamples automatically) or ALSA resampling there. The optical output has not been checked on a receiver yet. |
 | **Bluetooth** | The controller runs at 1.6 Mbaud rather than the stock 3 Mbaud (the UART clocks cannot produce 3 Mbaud), and pairing and connections through `bluetoothctl` have not been tested yet. |
 
 For exact register addresses, driver file paths, and per-block notes, see [progress.md](progress.md).
@@ -122,7 +122,7 @@ Drivers that apply across the SoC family are already named `s5l8940x` and parame
 |---|---|---|
 | **Interrupts & Timer** | `drivers/irqchip/irq-apple-aic1.c` | `aic,1` controller and 24 MHz local timer. Already includes `CONFIG_SMP` IPI support and per-CPU register windows for multi-core chips. |
 | **Watchdog & Reset** | `arch/arm/mach-apple/` | 24 MHz watchdog timer, clocksource, and system restart handler (`apple,s5l8940x-wdt-timer`). |
-| **Clocks (PMGR)** | `drivers/clk/clk-s5l8940x-pmgr.c` | Linear table of 32-bit peripheral clock gate registers (`0xf` to enable, bits `7:4` status). |
+| **Clocks (PMGR)** | `drivers/clk/clk-s5l8940x-pmgr.c` | Linear table of 32-bit peripheral clock gate registers (`0xf` to enable, bits `7:4` status), and the seven audio oscillators (rate set to the hertz). |
 | **CPU Frequency** | `drivers/cpufreq/s5l8947x-cpufreq.c` | PMGR performance state switching without disturbing peripheral baud clocks. |
 | **GPIO & Pinctrl** | `drivers/pinctrl/pinctrl-s5l8940x-gpio.c` | Banked pin controller and GPIO IRQ chip (`apple,npins` set in DT). |
 | **I2C** | `drivers/i2c/busses/i2c-s5l8940x.c` | Master controller for `i2c0`..`i2c2`. |
@@ -191,7 +191,7 @@ Contributions of any kind are welcome—whether that is a new board Device Tree,
 
 High-impact open tasks on `S5L8947X` right now (see [progress.md](progress.md) for details):
 - **USB OTG host mode** (role switching + OHCI companion controller at `0x36500000`) to allow plugging in external USB devices.
-- **Audio at exact 48 kHz**: clock the I2S master from the PMGR clock synthesizer instead of the 24 MHz crystal.
+- **Optical audio at exact rates**: clock the S/PDIF transmitter from PMGR audio oscillator 4 instead of the 24 MHz crystal.
 
 ### Guardrails
 
