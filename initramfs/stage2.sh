@@ -65,27 +65,29 @@ done
 
 # Provision BCM4334 Wi-Fi and Bluetooth firmware from on-device System (/dev/nand0p1)
 BT_REBIND=0
-# Patch carved at a fixed offset, so accept it only if it matches the known image
-BT_HCD_SHA256=1c685b097b5cff26cfd5b95db4336d2713af02102dbfced35f3aa03aa0cce154
+# The System volume carries firmware for several boards; this one's files carry its board name
+BOARD=monopoly
 if [ -b /dev/nand0p1 ] && { [ ! -s /lib/firmware/brcm/brcmfmac4334.bin ] || [ ! -s /lib/firmware/brcm/BCM4334B0.hcd ]; }; then
 	mkdir -p /mnt/system /lib/firmware/brcm
 	if mount -t hfsplus -o ro /dev/nand0p1 /mnt/system 2>/dev/null; then
 		WDIR=/mnt/system/usr/share/firmware/wifi/4334b1
-		if [ ! -s /lib/firmware/brcm/brcmfmac4334.bin ] && [ -r "$WDIR/monopoly.trx" ]; then
-			cp "$WDIR/monopoly.trx" /lib/firmware/brcm/brcmfmac4334.bin 2>/dev/null
-			cp "$WDIR/monopoly-u-st.txt" /lib/firmware/brcm/brcmfmac4334.txt 2>/dev/null
+		if [ ! -s /lib/firmware/brcm/brcmfmac4334.bin ] && [ -r "$WDIR/$BOARD.trx" ]; then
+			cp "$WDIR/$BOARD.trx" /lib/firmware/brcm/brcmfmac4334.bin 2>/dev/null
+			cp "$WDIR/$BOARD-u-st.txt" /lib/firmware/brcm/brcmfmac4334.txt 2>/dev/null
 			# No CLM blob: this firmware rejects a CLM download (-52) and brcmfmac then fails to attach
 			log_msg "nand0p1: provisioned BCM4334 Wi-Fi firmware and NVRAM"
 		fi
+		# The Bluetooth patches are embedded in a system tool; each names its board in the
+		# local name it sets, so pick the one patch naming this board
 		BTOOL=/mnt/system/usr/sbin/BlueTool
-		if [ ! -s /lib/firmware/brcm/BCM4334B0.hcd ] && [ -r "$BTOOL" ]; then
-			tail -c +1745938 "$BTOOL" 2>/dev/null | head -c 73221 >/lib/firmware/brcm/BCM4334B0.hcd.tmp
-			if [ "$(sha256sum /lib/firmware/brcm/BCM4334B0.hcd.tmp 2>/dev/null | cut -d' ' -f1)" = "$BT_HCD_SHA256" ]; then
+		if [ ! -s /lib/firmware/brcm/BCM4334B0.hcd ] && [ -r "$BTOOL" ] && command -v hcdcarve >/dev/null; then
+			if out=$(hcdcarve "$BTOOL" "MHz $BOARD " /lib/firmware/brcm/BCM4334B0.hcd.tmp 2>&1); then
 				mv /lib/firmware/brcm/BCM4334B0.hcd.tmp /lib/firmware/brcm/BCM4334B0.hcd
 				BT_REBIND=1
-				log_msg "nand0p1: provisioned BCM4334B0.hcd Bluetooth patch"
+				log_msg "nand0p1: provisioned BCM4334B0.hcd Bluetooth patch ($out)"
 			else
 				rm -f /lib/firmware/brcm/BCM4334B0.hcd.tmp
+				log_msg "nand0p1: no Bluetooth patch for this board ($out)"
 			fi
 		fi
 		umount /mnt/system 2>/dev/null || true
