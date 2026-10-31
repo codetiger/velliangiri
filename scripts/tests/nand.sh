@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: GPL-2.0-only
-# NAND (FMI0, managed NAND): read-only MTD, repeatable DMA reads, translation layer, volumes
+# NAND (FMI0, managed NAND): MTD, repeatable DMA reads, translation layer, volumes
 
 t_nand() {
-	section "NAND (FMI0, read-only MTD)"
+	section "NAND (FMI0, managed NAND MTD)"
 	dev=/sys/bus/platform/devices/31200000.nand-controller
 	if ! bound "$dev"; then
 		fail "FMI0 driver not bound"
@@ -28,10 +28,10 @@ t_nand() {
 	else
 		fail "unexpected geometry"
 	fi
-	if [ $(($(rd "$m/flags") & 0x400)) -eq 0 ]; then
-		pass "read-only (no MTD_WRITEABLE)"
+	if [ $(($(rd "$m/flags") & 0x400)) -ne 0 ]; then
+		pass "writeable (MTD_WRITEABLE)"
 	else
-		fail "device is writeable"
+		fail "device is not writeable"
 	fi
 
 	# Same 4 MiB block twice: DMA reads must be repeatable.

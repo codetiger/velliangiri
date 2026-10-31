@@ -39,13 +39,13 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2`); loads patch firmware at boot when extracted from your restore image; LE scanning verified with `btscan` |
 | **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`S5L8947X IR Remote`, `/dev/input/event*`) via the MSP430 system microcontroller on `uart1` |
 | **Hardware AES Engine** | CDMA AES crypto engine (`s5l8947x-aes` at `0x37801000`): `ecb(aes)` and `cbc(aes)` `skcipher` algorithms (128 / 192 / 256-bit keys) over CDMA channels 1 and 2, plus hardware device/group key operations (`s5l8947x_aes_hwkey_crypt()`) |
-| **Internal NAND & Volumes** | Managed NAND controller (`s5l8947x-fmi`, 8.9 GB, ~14 MB/s over CDMA) and read-only translation layer (`s5l8947x-ftl`) exposing `/dev/nand0`, `/dev/nand0p1` (`System`, 1.4 GB), and `/dev/nand0p2` (`Data`, 6.5 GB, volume and per-file `com.apple.system.cprotect` keys unwrapped from the reserved SLC key store and decrypted via hardware AES); both volumes mount read-only as `hfsplus` with transparent file decryption |
+| **Internal NAND & Volumes** | Managed NAND controller (`s5l8947x-fmi`, 8.9 GB, read/write/erase on `/dev/mtd0`, ~14 MB/s reads over CDMA) and read-only translation layer (`s5l8947x-ftl`) exposing `/dev/nand0`, `/dev/nand0p1` (`System`, 1.4 GB), and `/dev/nand0p2` (`Data`, 6.5 GB, volume and per-file `com.apple.system.cprotect` keys unwrapped from the reserved SLC key store and decrypted via hardware AES); both volumes mount read-only as `hfsplus` with transparent file decryption |
 
 ### What doesn't work yet (honest limitations)
 
 | Area | Current Limitation |
 |---|---|
-| **Internal NAND writes** | Both `/dev/nand0p1` (`System`) and decrypted `/dev/nand0p2` (`Data`, including class-4 per-file content protection) mount read-only as `hfsplus`; passcode-bound keybag classes (1–3) are not unwrapped, and NAND write/erase support is not enabled yet so the stock flash contents remain untouched. |
+| **FTL volume writes** | Raw NAND (`/dev/mtd0`) supports page/OOB reads, page/OOB writes, and block erase, but the FTL block layer (`s5l8947x-ftl`) is read-only so `/dev/nand0p1` (`System`) and decrypted `/dev/nand0p2` (`Data`) stay protected; passcode-bound keybag classes (1–3) are not unwrapped. |
 | **3D GPU acceleration** | On hold. The PowerVR SGX543 power domain and clocks come up for bus telemetry, but there is no DRM/3D rendering driver. Graphics use the 720p CPU framebuffer. |
 | **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a configfs CDC-ECM + CDC-ACM gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
 | **Audio sample rates** | The I2S and S/PDIF blocks are clocked from the 24 MHz crystal, so HDMI playback runs at `46,875 Hz` or `31,250 Hz` and optical at `46,875 Hz` instead of `48,000 Hz`. Use `wavplay` (which resamples automatically) or ALSA resampling. The optical output has not been checked on a receiver yet. |

@@ -363,13 +363,13 @@ diff --git a/drivers/mtd/devices/Kconfig b/drivers/mtd/devices/Kconfig
  	  serial flash memories.
  
 +config MTD_S5L8947X_FMI
-+	tristate "S5L8947X flash memory interface (managed NAND, read-only)"
++	tristate "S5L8947X flash memory interface (managed NAND)"
 +	depends on ARCH_APPLE_S5L || COMPILE_TEST
 +	depends on OF && HAS_DMA && DMA_ENGINE
 +	default ARCH_APPLE_S5L
 +	help
-+	  Read-only access to the managed NAND package behind the flash
-+	  memory interface (FMI) of the S5L8947X SoC. Pages are moved by the
++	  Access to the managed NAND package behind the flash memory
++	  interface (FMI) of the S5L8947X SoC. Pages are moved by the
 +	  central DMA controller; the package corrects its own errors and
 +	  retires its own bad blocks.
 +

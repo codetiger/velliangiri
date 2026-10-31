@@ -23,9 +23,7 @@
  * metadata; on the bus a logical page is 1 KiB of data, its metadata and the
  * other 3 KiB. With host configuration 3 the controller splits each logical
  * page into the data FIFO and the metadata FIFO, and two central DMA channels
- * drain them.
- *
- * This driver is read-only.
+ * drain them; page writes stream the logical page layout over PIO.
  */
 
 #include <linux/bitfield.h>
@@ -85,7 +83,8 @@
 #define FMI_S_TIMING_SLOW	0xffff	/* reset value: every interface phase at maximum */
 #define FMI_S_TIMING_RE_LOW	GENMASK(15, 12)	/* read enable low, clocks - 1 */
 #define FMI_S_TIMING_RE_HIGH	GENMASK(11, 8)	/* read enable high, clocks - 1 */
-#define FMI_S_TIMING_WRITE	GENMASK(7, 0)	/* write phases (left at maximum) */
+#define FMI_S_TIMING_WE_HIGH	GENMASK(7, 4)	/* write enable high, clocks - 1 */
+#define FMI_S_TIMING_WE_LOW	GENMASK(3, 0)	/* write enable low, clocks - 1 */
 
 /*
  * Interface clock. Stepping the read phases one clock at a time changes the
@@ -114,18 +113,24 @@
 #define MN_CMD_SET_FEATURE	0xef
 #define MN_CMD_CONFIRM		0xe7
 #define MN_CMD_READ		0x370a
+#define MN_CMD_PROGRAM		0x8a
+#define MN_CMD_PROG_CONFIRM	0x17
+#define MN_CMD_ERASE		0xd76a
 #define MN_CMD_OP_STATUS	0x7d77
+#define MN_CMD_NEXT_STATUS	0x79
 #define MN_CMD_DATA_OUT		0x7a
 #define MN_CMD_END		0x77
 
 #define MN_FEATURE_POWER	0x180
 #define MN_POWER_ASYNC		2	/* low power -> asynchronous */
+#define MN_FEATURE_CLEAR_ERR	0x3380	/* clear program/erase error lists */
 
 /* operation status */
+#define MN_ST_FAIL		BIT(0)	/* program or erase failed */
+#define MN_ST_GENERAL_ERROR	BIT(4)	/* sticky until a reset */
 #define MN_ST_OK		0x40
 #define MN_ST_REFRESH		0x42	/* data good, block should be refreshed */
 #define MN_ST_BLANK		0x49	/* erased page, reads as 0xff */
-#define MN_ST_GENERAL_ERROR	BIT(4)	/* sticky until a reset */
 
 /* parameter page */
 #define MN_PARAMS_SIZE		512
@@ -141,6 +146,9 @@
 #define MN_P_TREA		0xa1
 #define MN_P_TREH		0xa2
 #define MN_P_TRP		0xa6
+#define MN_P_TWC		0xa8
+#define MN_P_TWP		0xa9
+#define MN_P_TWH		0xaa
 
 #define FMI_LP_SIZE		4096
 #define FMI_LP_META		16
@@ -234,13 +242,12 @@ static u32 s5l_fmi_status_ready(struct s5l_fmi *fmi)
 	       (readl(fmi->host + FMI_H_STAT) & FMI_H_STAT_STATUS);
 }
 
-/* Operation status: 0x77 0x7d, then poll the status byte until ready. */
-static int s5l_fmi_op_status(struct s5l_fmi *fmi)
+static int s5l_fmi_poll_status(struct s5l_fmi *fmi, u32 cmds, u32 go)
 {
 	u32 v;
 	int st;
 
-	if (s5l_fmi_cmd(fmi, MN_CMD_OP_STATUS, FMI_S_GO_CMD1 | FMI_S_GO_CMD2, 0, 0, 0))
+	if (s5l_fmi_cmd(fmi, cmds, go, 0, 0, 0))
 		return -ETIMEDOUT;
 	s5l_fmi_quiesce(fmi);
 	writel(readl(fmi->seq + FMI_S_TIMING) & ~FMI_S_TIMING_NOPOLL, fmi->seq + FMI_S_TIMING);
@@ -259,6 +266,18 @@ static int s5l_fmi_op_status(struct s5l_fmi *fmi)
 	return st;
 }
 
+/* Operation status: 0x77 0x7d, then poll the status byte until ready. */
+static int s5l_fmi_op_status(struct s5l_fmi *fmi)
+{
+	return s5l_fmi_poll_status(fmi, MN_CMD_OP_STATUS, FMI_S_GO_CMD1 | FMI_S_GO_CMD2);
+}
+
+/* Next-operation status: 0x79, then poll the status byte until ready. */
+static int s5l_fmi_next_status(struct s5l_fmi *fmi)
+{
+	return s5l_fmi_poll_status(fmi, MN_CMD_NEXT_STATUS, FMI_S_GO_CMD1);
+}
+
 /* End a managed NAND operation and release the chip enable. */
 static void s5l_fmi_op_end(struct s5l_fmi *fmi)
 {
@@ -268,7 +287,7 @@ static void s5l_fmi_op_end(struct s5l_fmi *fmi)
 	s5l_fmi_quiesce(fmi);
 }
 
-/* PIO transfer of len bytes (a multiple of 4, at most one 2 KiB burst). */
+/* PIO transfer of len bytes (a multiple of 4, at most one 1 KiB sector). */
 static int s5l_fmi_pio(struct s5l_fmi *fmi, void *buf, unsigned int len, bool write)
 {
 	u32 *p = buf;
@@ -279,11 +298,12 @@ static int s5l_fmi_pio(struct s5l_fmi *fmi, void *buf, unsigned int len, bool wr
 	writel(FIELD_PREP(FMI_H_SHAPE_SIZE, len) | FIELD_PREP(FMI_H_SHAPE_COUNT, 1),
 	       fmi->host + FMI_H_SHAPE);
 	writel(write ? FMI_H_CMD_WRITE : FMI_H_CMD_START, fmi->host + FMI_H_CMD);
-	if (readl_poll_timeout(fmi->host + FMI_H_FIFO, v, v & FMI_H_FIFO_DATA, 2, FMI_POLL_US)) {
-		dev_err(fmi->dev, "PIO FIFO timeout (%08x)\n", v);
-		return -ETIMEDOUT;
-	}
 	for (i = 0; i < len / 4; i++) {
+		if (readl_poll_timeout(fmi->host + FMI_H_FIFO, v, v & FMI_H_FIFO_DATA,
+				       1, FMI_POLL_US)) {
+			dev_err(fmi->dev, "PIO FIFO timeout (%08x)\n", v);
+			return -ETIMEDOUT;
+		}
 		if (write)
 			writel(p[i], fmi->host + FMI_H_DATA);
 		else
@@ -389,34 +409,19 @@ static int s5l_fmi_dma_prep(struct s5l_fmi *fmi, struct dma_chan *chan, dma_addr
 	return 0;
 }
 
-/*
- * Read one page into fmi->buf (data, then lps * 16 bytes of metadata).
- * Returns the operation status byte or a negative error.
- */
-static int s5l_fmi_read_page(struct s5l_fmi *fmi, u32 row)
+static int s5l_fmi_xfer(struct s5l_fmi *fmi, u32 row)
 {
 	size_t meta_len = fmi->lps * FMI_LP_META;
-	u32 shape;
-	int st, ret;
 	unsigned int i;
+	u32 shape;
+	int ret;
 
-	s5l_fmi_ce(fmi, true);
-	s5l_fmi_quiesce(fmi);
-	ret = s5l_fmi_cmd(fmi, MN_CMD_READ, FMI_S_GO_CMD1 | FMI_S_GO_ADDR | FMI_S_GO_CMD2,
-			  row, 0, 4);
-	st = ret ? ret : s5l_fmi_op_status(fmi);
-	if (st < 0 || (st & MN_ST_GENERAL_ERROR))
-		goto end;
-
-	ret = s5l_fmi_cmd(fmi, MN_CMD_DATA_OUT, FMI_S_GO_CMD1, 0, 0, 0);
-	if (!ret)
-		ret = s5l_fmi_dma_prep(fmi, fmi->data_chan, fmi->buf_dma, fmi->page_size,
-				       &fmi->data_done);
+	ret = s5l_fmi_dma_prep(fmi, fmi->data_chan, fmi->buf_dma, fmi->page_size, &fmi->data_done);
 	if (!ret)
 		ret = s5l_fmi_dma_prep(fmi, fmi->meta_chan, fmi->buf_dma + fmi->page_size,
 				       meta_len, &fmi->meta_done);
 	if (ret)
-		goto abort;
+		goto out;
 
 	writel(1, fmi->ecc + FMI_E_SECT);
 	shape = FIELD_PREP(FMI_H_SHAPE_COUNT, FMI_LP_SIZE / FMI_SECTOR) |
@@ -445,13 +450,88 @@ static int s5l_fmi_read_page(struct s5l_fmi *fmi, u32 row)
 		dev_err_ratelimited(fmi->dev, "row %#x: DMA timeout\n", row);
 		ret = -ETIMEDOUT;
 	}
-abort:
+out:
 	if (ret) {
 		dmaengine_terminate_sync(fmi->data_chan);
 		dmaengine_terminate_sync(fmi->meta_chan);
-		st = ret;
 	}
+	return ret;
+}
+
+/*
+ * Read one page into fmi->buf (data, then lps * 16 bytes of metadata).
+ * Returns the operation status byte or a negative error.
+ */
+static int s5l_fmi_read_page(struct s5l_fmi *fmi, u32 row)
+{
+	int st, ret;
+
+	s5l_fmi_ce(fmi, true);
+	s5l_fmi_quiesce(fmi);
+	ret = s5l_fmi_cmd(fmi, MN_CMD_READ, FMI_S_GO_CMD1 | FMI_S_GO_ADDR | FMI_S_GO_CMD2,
+			  row, 0, 4);
+	st = ret ? ret : s5l_fmi_op_status(fmi);
+	if (st < 0 || (st & MN_ST_GENERAL_ERROR))
+		goto end;
+
+	ret = s5l_fmi_cmd(fmi, MN_CMD_DATA_OUT, FMI_S_GO_CMD1, 0, 0, 0);
+	if (!ret)
+		ret = s5l_fmi_xfer(fmi, row);
+	if (ret)
+		st = ret;
 end:
+	s5l_fmi_op_end(fmi);
+	return st;
+}
+
+static int s5l_fmi_write_lp(struct s5l_fmi *fmi, void *data, void *meta)
+{
+	unsigned int s;
+	int ret;
+
+	ret = s5l_fmi_pio(fmi, data, FMI_SECTOR, true);
+	if (!ret)
+		ret = s5l_fmi_pio(fmi, meta, FMI_LP_META, true);
+	for (s = 1; s < FMI_LP_SIZE / FMI_SECTOR && !ret; s++)
+		ret = s5l_fmi_pio(fmi, data + s * FMI_SECTOR, FMI_SECTOR, true);
+	return ret;
+}
+
+/*
+ * Program one page from fmi->buf (data, then lps * 16 bytes of metadata).
+ * Returns the operation status byte or a negative error.
+ */
+static int s5l_fmi_write_page(struct s5l_fmi *fmi, u32 row)
+{
+	unsigned int i;
+	int st, ret;
+
+	s5l_fmi_ce(fmi, true);
+	s5l_fmi_quiesce(fmi);
+	ret = s5l_fmi_cmd(fmi, MN_CMD_PROGRAM, FMI_S_GO_CMD1 | FMI_S_GO_ADDR, row, 0, 4);
+	for (i = 0; i < fmi->lps && !ret; i++)
+		ret = s5l_fmi_write_lp(fmi, fmi->buf + i * FMI_LP_SIZE,
+				       fmi->buf + fmi->page_size + i * FMI_LP_META);
+	if (!ret)
+		ret = s5l_fmi_cmd(fmi, MN_CMD_PROG_CONFIRM, FMI_S_GO_CMD1, 0, 0, 0);
+	st = ret ? ret : s5l_fmi_next_status(fmi);
+	writel(FMI_H_CMD_RESET, fmi->host + FMI_H_CMD);
+	s5l_fmi_ce(fmi, false);
+	s5l_fmi_quiesce(fmi);
+	return st;
+}
+
+static int s5l_fmi_erase_block(struct s5l_fmi *fmi, u32 row)
+{
+	int st, ret;
+
+	s5l_fmi_ce(fmi, true);
+	s5l_fmi_quiesce(fmi);
+	ret = s5l_fmi_cmd(fmi, MN_CMD_ERASE, FMI_S_GO_CMD1 | FMI_S_GO_ADDR | FMI_S_GO_CMD2,
+			  row, 0, 4);
+	st = ret ? ret : s5l_fmi_next_status(fmi);
+	if (st >= 0 && !(st & MN_ST_GENERAL_ERROR))
+		st = s5l_fmi_op_status(fmi);
 	s5l_fmi_op_end(fmi);
 	return st;
 }
@@ -559,6 +639,113 @@ static int s5l_fmi_mtd_read_oob(struct mtd_info *mtd, loff_t from, struct mtd_oo
 	return failed ? -EBADMSG : max_bitflips;
 }
 
+static int s5l_fmi_finish_op(struct s5l_fmi *fmi, u32 row, int st, const char *op)
+{
+	if (st < 0 || (st & MN_ST_GENERAL_ERROR)) {
+		dev_warn_ratelimited(fmi->dev, "row %#x: %s status %d, resetting the package\n",
+				     row, op, st);
+		s5l_fmi_recover(fmi);
+		return st < 0 ? st : -EIO;
+	}
+	if (st & MN_ST_FAIL) {
+		dev_err_ratelimited(fmi->dev, "row %#x: %s failed (status %#x)\n", row, op, st);
+		s5l_fmi_set_feature(fmi, MN_FEATURE_CLEAR_ERR, 1);
+		return -EIO;
+	}
+	return 0;
+}
+
+static int s5l_fmi_write_one(struct s5l_fmi *fmi, u64 page, bool slc)
+{
+	u32 row = s5l_fmi_row(fmi, page, slc);
+
+	return s5l_fmi_finish_op(fmi, row, s5l_fmi_write_page(fmi, row), "program");
+}
+
+static int s5l_fmi_erase_one(struct s5l_fmi *fmi, u64 page, bool slc)
+{
+	u32 row = s5l_fmi_row(fmi, page, slc);
+
+	return s5l_fmi_finish_op(fmi, row, s5l_fmi_erase_block(fmi, row), "erase");
+}
+
+static int s5l_fmi_mtd_write_oob(struct mtd_info *mtd, loff_t to, struct mtd_oob_ops *ops)
+{
+	struct s5l_fmi *fmi = mtd->priv;
+	u64 page = to >> mtd->writesize_shift;
+	size_t dlen = ops->datbuf ? ops->len : 0;
+	size_t olen = ops->oobbuf ? ops->ooblen : 0;
+	u32 ooboffs = ops->ooboffs;
+	int ret = 0;
+
+	ops->retlen = 0;
+	ops->oobretlen = 0;
+	if ((to & mtd->writesize_mask) || (dlen & mtd->writesize_mask))
+		return -EINVAL;
+	if (olen && ooboffs >= mtd->oobsize)
+		return -EINVAL;
+
+	mutex_lock(&fmi->lock);
+	while (dlen || olen) {
+		size_t n = 0;
+
+		if (page >= mtd_div_by_ws(mtd->size, mtd)) {
+			ret = -EINVAL;
+			break;
+		}
+		if (dlen)
+			memcpy(fmi->buf, ops->datbuf + ops->retlen, mtd->writesize);
+		else
+			memset(fmi->buf, 0xff, mtd->writesize);
+		memset(fmi->buf + fmi->page_size, 0xff, mtd->oobsize);
+		if (olen) {
+			n = min_t(size_t, olen, mtd->oobsize - ooboffs);
+			memcpy(fmi->buf + fmi->page_size + ooboffs,
+			       ops->oobbuf + ops->oobretlen, n);
+		}
+		ret = s5l_fmi_write_one(fmi, page, ops->mode == MTD_OPS_RAW);
+		if (ret)
+			break;
+		if (dlen) {
+			ops->retlen += mtd->writesize;
+			dlen -= mtd->writesize;
+		}
+		if (olen) {
+			ops->oobretlen += n;
+			olen -= n;
+			if (!dlen && olen)
+				ooboffs = 0;
+		}
+		page++;
+	}
+	mutex_unlock(&fmi->lock);
+	return ret;
+}
+
+static int s5l_fmi_mtd_erase(struct mtd_info *mtd, struct erase_info *instr)
+{
+	struct s5l_fmi *fmi = mtd->priv;
+	u64 addr = instr->addr;
+	u64 len = instr->len;
+	int ret = 0;
+
+	if ((addr & mtd->erasesize_mask) || (len & mtd->erasesize_mask))
+		return -EINVAL;
+
+	mutex_lock(&fmi->lock);
+	while (len) {
+		ret = s5l_fmi_erase_one(fmi, addr >> mtd->writesize_shift, false);
+		if (ret) {
+			instr->fail_addr = addr;
+			break;
+		}
+		addr += mtd->erasesize;
+		len -= mtd->erasesize;
+	}
+	mutex_unlock(&fmi->lock);
+	return ret;
+}
+
 /* The metadata is all free bytes: there is no ECC in the out-of-band area. */
 static int s5l_fmi_ooblayout_ecc(struct mtd_info *mtd, int section,
 				 struct mtd_oob_region *region)
@@ -597,19 +784,29 @@ static unsigned int s5l_fmi_clocks(unsigned int ns)
 	return max(1U, DIV_ROUND_UP(ns * 1000, FMI_CLK_PS));
 }
 
-/* Read phases from the package's own timings; write phases stay slowest. */
-static u32 s5l_fmi_read_timing(const u8 *p)
+/* Read and write phases from the package's own parameter page timings. */
+static u32 s5l_fmi_timing(const u8 *p)
 {
-	unsigned int low, high;
+	unsigned int rlow, rhigh, wlow, whigh;
 
-	low = s5l_fmi_clocks(max(p[MN_P_TREA] + FMI_READ_MARGIN_NS, (unsigned int)p[MN_P_TRP]));
-	high = s5l_fmi_clocks(p[MN_P_TREH]);
-	if ((low + high) * FMI_CLK_PS < p[MN_P_TRC] * 1000)
-		high = DIV_ROUND_UP(p[MN_P_TRC] * 1000, FMI_CLK_PS) - low;
-	low = min(low, 16U);
-	high = min(high, 16U);
-	return FIELD_PREP(FMI_S_TIMING_RE_LOW, low - 1) |
-	       FIELD_PREP(FMI_S_TIMING_RE_HIGH, high - 1) | FMI_S_TIMING_WRITE;
+	rlow = s5l_fmi_clocks(max(p[MN_P_TREA] + FMI_READ_MARGIN_NS, (unsigned int)p[MN_P_TRP]));
+	rhigh = s5l_fmi_clocks(p[MN_P_TREH]);
+	if ((rlow + rhigh) * FMI_CLK_PS < p[MN_P_TRC] * 1000)
+		rhigh = DIV_ROUND_UP(p[MN_P_TRC] * 1000, FMI_CLK_PS) - rlow;
+	rlow = min(rlow, 16U);
+	rhigh = min(rhigh, 16U);
+
+	wlow = s5l_fmi_clocks(p[MN_P_TWP]);
+	whigh = s5l_fmi_clocks(p[MN_P_TWH]);
+	if ((wlow + whigh) * FMI_CLK_PS < p[MN_P_TWC] * 1000)
+		whigh = DIV_ROUND_UP(p[MN_P_TWC] * 1000, FMI_CLK_PS) - wlow;
+	wlow = min(wlow, 16U);
+	whigh = min(whigh, 16U);
+
+	return FIELD_PREP(FMI_S_TIMING_RE_LOW, rlow - 1) |
+	       FIELD_PREP(FMI_S_TIMING_RE_HIGH, rhigh - 1) |
+	       FIELD_PREP(FMI_S_TIMING_WE_HIGH, whigh - 1) |
+	       FIELD_PREP(FMI_S_TIMING_WE_LOW, wlow - 1);
 }
 
 static int s5l_fmi_identify(struct s5l_fmi *fmi)
@@ -659,7 +856,7 @@ static int s5l_fmi_identify(struct s5l_fmi *fmi)
 		goto out;
 	}
 	fmi->lps = fmi->page_size / FMI_LP_SIZE;
-	fmi->timing = s5l_fmi_read_timing(p);
+	fmi->timing = s5l_fmi_timing(p);
 	dev_info(fmi->dev,
 		 "managed NAND %5ph: %u CAUs x %u blocks x %u pages x %u bytes, timing %#x\n",
 		 id + 3, fmi->caus, fmi->blocks, fmi->pages, fmi->page_size, fmi->timing);
@@ -786,7 +983,7 @@ static int s5l_fmi_probe(struct platform_device *pdev)
 	mtd->owner = THIS_MODULE;
 	mtd->name = dev_name(dev);
 	mtd->type = MTD_MLCNANDFLASH;
-	mtd->flags = MTD_NO_ERASE;	/* read-only: no MTD_WRITEABLE, no erase */
+	mtd->flags = MTD_CAP_NANDFLASH;
 	mtd->writesize = fmi->page_size;
 	mtd->writebufsize = fmi->page_size;
 	mtd->erasesize = fmi->page_size * fmi->pages;
@@ -797,7 +994,9 @@ static int s5l_fmi_probe(struct platform_device *pdev)
 	mtd->ecc_strength = 1;
 	mtd->bitflip_threshold = 1;
 	mtd_set_ooblayout(mtd, &s5l_fmi_ooblayout);
+	mtd->_erase = s5l_fmi_mtd_erase;
 	mtd->_read_oob = s5l_fmi_mtd_read_oob;
+	mtd->_write_oob = s5l_fmi_mtd_write_oob;
 
 	/* One erase region per CAU, so users can find a block's twin in each. */
 	regions = devm_kcalloc(dev, fmi->caus, sizeof(*regions), GFP_KERNEL);
@@ -842,5 +1041,5 @@ static struct platform_driver s5l_fmi_driver = {
 };
 module_platform_driver(s5l_fmi_driver);
 
-MODULE_DESCRIPTION("S5L8947X flash memory interface (managed NAND, read-only)");
+MODULE_DESCRIPTION("S5L8947X flash memory interface (managed NAND)");
 MODULE_LICENSE("GPL");

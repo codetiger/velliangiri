@@ -166,7 +166,6 @@ struct ftl {
 
 static LIST_HEAD(ftl_list);
 static DEFINE_MUTEX(ftl_list_lock);
-static atomic_t ftl_count = ATOMIC_INIT(0);
 
 static DEFINE_MUTEX(ftl_file_lock);
 static struct crypto_skcipher *ftl_file_tfm;
@@ -982,7 +981,7 @@ static void ftl_work(struct work_struct *work)
 		dev_err(&f->mtd->dev, "translation map failed: %d\n", ret);
 		return;
 	}
-	snprintf(base, sizeof(base), "nand%d", atomic_inc_return(&ftl_count) - 1);
+	snprintf(base, sizeof(base), "nand%d", f->mtd->index);
 	hdr = ftl_volume_header(f);
 	f->whole.size = hdr ? get_unaligned_le64(hdr + LV_MEDIA_SIZE) :
 			      (u64)f->nlba << FTL_LP_SHIFT;
