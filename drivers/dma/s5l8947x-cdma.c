@@ -9,18 +9,23 @@
  *     +0x08 / +0x0c        channel enable clear
  *   0x37000000 + n * 0x1000  channel n, 1..42 (one interrupt each)
  *     +0x00 CSR            command / status
- *     +0x04 DCR            request line, width, burst, direction
+ *     +0x04 DCR            bits 21:16 request line, bit 7 peripheral (always set),
+ *                          6:4 log2 of the burst in requests (1..32),
+ *                          3:2 log2 of the bytes per request, bit 1 memory to device
  *     +0x08 DAR            device address, 24-bit offset inside a peripheral window
  *     +0x0c DBR            zero
  *     +0x10 MAR            memory read-ahead pointer (not the transfer position)
  *     +0x14 CAR            segment the channel is working on, 0 when finished
  *     +0x18 ERR            error code
  *
- * A transfer is a list of 32-byte segments { next, control, address, length }
- * with next = 0 ending the list; pointing the last segment back at the first
- * makes a ring. Bit 9 of the segment control raises the channel interrupt when
- * the segment has been read (CSR bit 20). CSR bit 3 enables the interrupt for
- * the end of the list (CSR bit 19).
+ * A transfer is a list of 32-byte segments { next, control, address, length };
+ * the low nibble of the control is 3 for a memory segment and 0 for a stop
+ * entry. A one-shot list ends like the stock software's: its last segment
+ * carries control bits 9:8 and links to a stop entry, which ends the list
+ * without the error bit that next = 0 used to raise. Pointing the last segment
+ * back at the first makes a ring. Bit 9 of the segment control raises the
+ * channel interrupt when the segment has been read (CSR bit 20). CSR bit 3
+ * enables the interrupt for the end of the list (CSR bit 19).
  *
  * The status bits are write-1-to-clear, but every CSR write also replaces the
  * interrupt enables and the type field, so an acknowledge writes them back.
@@ -41,6 +46,7 @@
 #include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/log2.h>
 #include <linux/module.h>
 #include <linux/of.h>
 #include <linux/of_dma.h>
@@ -50,7 +56,7 @@
 #include "virt-dma.h"
 
 #define CDMA_NR_CHANNELS	42
-#define CDMA_NR_REQUESTS	32
+#define CDMA_NR_REQUESTS	64
 
 #define CDMA_ENABLE_SET(ch)	(((ch) >> 5) * 4)
 #define CDMA_ENABLE_CLR(ch)	(0x08 + ((ch) >> 5) * 4)
@@ -86,10 +92,9 @@
 
 #define CDMA_DCR_TO_DEV		BIT(1)
 #define CDMA_DCR_WIDTH		GENMASK(3, 2)	/* log2 of the bytes per request */
-#define CDMA_DCR_BURST		GENMASK(7, 6)
-#define CDMA_DCR_BURST_1	2
-#define CDMA_DCR_BURST_16	3
-#define CDMA_DCR_REQUEST	GENMASK(20, 16)
+#define CDMA_DCR_BURST		GENMASK(6, 4)	/* log2 of the words per burst, 1..32 */
+#define CDMA_DCR_PERIPH		BIT(7)		/* always set for a peripheral */
+#define CDMA_DCR_REQUEST	GENMASK(21, 16)
 
 #define CDMA_DEV_WINDOW_MASK	GENMASK(23, 0)
 
@@ -97,6 +102,8 @@ static const phys_addr_t s5l_cdma_windows[] = { 0x31000000, 0x34000000 };
 
 #define CDMA_SEG_CTL		(FIELD_PREP(GENMASK(25, 24), CDMA_TYPE) | 0x3)
 #define CDMA_SEG_CTL_IRQ	BIT(9)
+#define CDMA_SEG_CTL_LAST	(BIT(8) | CDMA_SEG_CTL_IRQ)	/* last segment of a list */
+#define CDMA_SEG_CTL_STOP	0	/* a segment with this control ends the list */
 #define CDMA_SEG_MAX		SZ_4K	/* longest segment tested on hardware */
 
 /* Microseconds to wait for the kick handshake and for an abort to land */
@@ -234,11 +241,13 @@ static irqreturn_t s5l_cdma_irq(int irq, void *data)
 		goto out;
 
 	/*
-	 * A list that ran to its end can also report an error, with ERR still
-	 * zero: the peripheral keeps requesting after the last word. Only an
-	 * error without completion is a failed transfer.
+	 * A list that ends in a stop entry reports done and the last segment's
+	 * interrupt without an error. Lists ended by next = 0 also raised the
+	 * error bit (ERR still zero) when the peripheral kept requesting, so an
+	 * error that comes with completion is still not treated as a failure.
 	 */
-	if ((status & CDMA_CSR_ERR) && !(status & CDMA_CSR_DONE)) {
+	if ((status & CDMA_CSR_ERR) &&
+	    !(status & (CDMA_CSR_DONE | CDMA_CSR_SEG))) {
 		dev_err_ratelimited(c->cdma->dev,
 				    "channel %u: transfer error %08x, csr %08x\n",
 				    c->id, readl(c->base + CDMA_ERR), csr);
@@ -249,7 +258,8 @@ static irqreturn_t s5l_cdma_irq(int irq, void *data)
 	} else if (d->cyclic) {
 		if (status & CDMA_CSR_SEG)
 			vchan_cyclic_callback(&d->vd);
-	} else if (status & CDMA_CSR_DONE) {
+	} else if (status & (CDMA_CSR_DONE | CDMA_CSR_SEG)) {
+		/* the last segment's interrupt, or the stop entry */
 		vchan_cookie_complete(&d->vd);
 		s5l_cdma_start_next(c);
 	}
@@ -346,21 +356,15 @@ static int s5l_cdma_dev_regs(struct s5l_cdma_chan *c,
 		return -EINVAL;
 	}
 
-	switch (maxburst) {
-	case 0:
-	case 1:
-		burst = CDMA_DCR_BURST_1;
-		break;
-	case 16:
-		burst = CDMA_DCR_BURST_16;
-		break;
-	default:
+	if (!maxburst)
+		maxburst = 1;
+	if (!is_power_of_2(maxburst) || maxburst > 32)
 		return -EINVAL;
-	}
+	burst = ilog2(maxburst);
 
 	*dcr = FIELD_PREP(CDMA_DCR_REQUEST, c->request) |
 	       FIELD_PREP(CDMA_DCR_BURST, burst) |
-	       FIELD_PREP(CDMA_DCR_WIDTH, width);
+	       FIELD_PREP(CDMA_DCR_WIDTH, width) | CDMA_DCR_PERIPH;
 	if (dir == DMA_MEM_TO_DEV)
 		*dcr |= CDMA_DCR_TO_DEV;
 	*dar = addr & CDMA_DEV_WINDOW_MASK;
@@ -442,7 +446,8 @@ s5l_cdma_prep_slave_sg(struct dma_chan *chan, struct scatterlist *sgl,
 	if (!nr_segs)
 		return NULL;
 
-	d = s5l_cdma_alloc_desc(c, nr_segs);
+	/* One more segment: the stop entry that ends the list */
+	d = s5l_cdma_alloc_desc(c, nr_segs + 1);
 	if (!d)
 		return NULL;
 	d->dcr = dcr;
@@ -450,7 +455,10 @@ s5l_cdma_prep_slave_sg(struct dma_chan *chan, struct scatterlist *sgl,
 	for_each_sg(sgl, sg, sg_len, i)
 		s5l_cdma_fill(d, &seg, sg_dma_address(sg), sg_dma_len(sg),
 			      false);
-	d->segs[nr_segs - 1].hw->next = 0;
+	d->segs[nr_segs - 1].hw->ctl |= CDMA_SEG_CTL_LAST;
+	d->segs[nr_segs - 1].hw->next = d->segs[nr_segs].phys;
+	d->segs[nr_segs].hw->ctl = CDMA_SEG_CTL_STOP;
+	d->segs[nr_segs].offset = d->len;
 
 	return vchan_tx_prep(&c->vc, &d->vd, flags);
 }
@@ -639,7 +647,7 @@ static int s5l_cdma_probe(struct platform_device *pdev)
 			      BIT(DMA_SLAVE_BUSWIDTH_4_BYTES);
 	dd->src_addr_widths = dd->dst_addr_widths;
 	dd->residue_granularity = DMA_RESIDUE_GRANULARITY_SEGMENT;
-	dd->max_burst = 16;
+	dd->max_burst = 32;
 	INIT_LIST_HEAD(&dd->channels);
 
 	for (i = 0; i < CDMA_NR_CHANNELS; i++) {
