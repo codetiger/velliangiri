@@ -2,12 +2,14 @@
 /*
  * WAV file player for the S5L8947X ALSA card (/bin/wavplay)
  *
- * Usage: wavplay [-d pcm-device] [-r 46875|31250] file.wav
+ * Usage: wavplay [-d pcm-device] [-r rate] file.wav
  *
  * Plays 8-bit and 16-bit PCM WAV files with any number of channels at any
- * sample rate. The audio engine only produces 46875 Hz and 31250 Hz S16
- * stereo, so the file is converted on the fly: the first two channels are used
- * (mono is duplicated) and the rate is converted by linear interpolation.
+ * sample rate. The audio engine plays S16 stereo at 32, 44.1 and 48 kHz on
+ * HDMI and 46875 Hz on optical, so the file is converted on the fly: the
+ * first two channels are used (mono is duplicated) and, when the device does
+ * not take the file's rate (or -r asks for another), the rate is converted by
+ * linear interpolation.
  *
  * The ALSA PCM is driven through the kernel ioctl interface directly so the
  * player builds statically without alsa-lib.
@@ -25,7 +27,6 @@
 #include <sound/asound.h>
 
 #define DEFAULT_PCM	"/dev/snd/pcmC0D0p"
-#define DEFAULT_RATE	46875U
 #define PERIOD_FRAMES	1024	/* multiples of the 256-frame DMA segment */
 #define BUFFER_FRAMES	8192
 
@@ -200,7 +201,7 @@ static void hw_interval_set(struct snd_pcm_hw_params *p, int param, unsigned int
 	iv->integer = 1;
 }
 
-static int pcm_setup(int fd, unsigned int rate)
+static int pcm_hw_params(int fd, unsigned int rate)
 {
 	struct snd_pcm_hw_params hw;
 	int i;
@@ -218,15 +219,39 @@ static int pcm_setup(int fd, unsigned int rate)
 	hw_interval_set(&hw, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, PERIOD_FRAMES);
 	hw_interval_set(&hw, SNDRV_PCM_HW_PARAM_BUFFER_SIZE, BUFFER_FRAMES);
 	hw.rmask = ~0U;
-	if (ioctl(fd, SNDRV_PCM_IOCTL_HW_PARAMS, &hw) < 0) {
-		perror("wavplay: SNDRV_PCM_IOCTL_HW_PARAMS");
-		return -1;
+	return ioctl(fd, SNDRV_PCM_IOCTL_HW_PARAMS, &hw);
+}
+
+/*
+ * Configure the PCM at 'rate', or with rate 0 at the first of the file's own
+ * rate and the device's standard rates that the device accepts. Returns the
+ * rate in use, 0 on failure.
+ */
+static unsigned int pcm_setup(int fd, unsigned int rate, unsigned int file_rate)
+{
+	const unsigned int tries[] = { file_rate, 48000, 44100, 32000, 46875 };
+	unsigned int i;
+
+	if (rate) {
+		if (pcm_hw_params(fd, rate) < 0) {
+			perror("wavplay: SNDRV_PCM_IOCTL_HW_PARAMS");
+			return 0;
+		}
+	} else {
+		for (i = 0; i < sizeof(tries) / sizeof(tries[0]); i++)
+			if (pcm_hw_params(fd, tries[i]) == 0)
+				break;
+		if (i == sizeof(tries) / sizeof(tries[0])) {
+			fprintf(stderr, "wavplay: the device takes none of the standard rates\n");
+			return 0;
+		}
+		rate = tries[i];
 	}
 	if (ioctl(fd, SNDRV_PCM_IOCTL_PREPARE) < 0) {
 		perror("wavplay: SNDRV_PCM_IOCTL_PREPARE");
-		return -1;
+		return 0;
 	}
-	return 0;
+	return rate;
 }
 
 /* Write one period, recovering from an underrun once. */
@@ -249,13 +274,13 @@ static int pcm_write(int fd, int16_t *buf, size_t frames)
 
 static void usage(const char *prog)
 {
-	fprintf(stderr, "usage: %s [-d pcm-device] [-r 46875|31250] file.wav\n", prog);
+	fprintf(stderr, "usage: %s [-d pcm-device] [-r rate] file.wav\n", prog);
 }
 
 int main(int argc, char **argv)
 {
 	const char *dev = DEFAULT_PCM;
-	unsigned int rate = DEFAULT_RATE;
+	unsigned int rate = 0;
 	int16_t period[PERIOD_FRAMES * 2];
 	struct wav w = { 0 };
 	uint8_t *file;
@@ -270,8 +295,8 @@ int main(int argc, char **argv)
 			break;
 		case 'r':
 			rate = strtoul(optarg, NULL, 10);
-			if (rate != 46875 && rate != 31250) {
-				fprintf(stderr, "wavplay: rate must be 46875 or 31250\n");
+			if (!rate) {
+				fprintf(stderr, "wavplay: bad rate '%s'\n", optarg);
 				return 2;
 			}
 			break;
@@ -292,17 +317,17 @@ int main(int argc, char **argv)
 		free(file);
 		return 2;
 	}
-	printf("%s: %u Hz, %u ch, %u-bit, %.2f s -> %u Hz stereo\n", argv[optind],
-	       w.rate, w.channels, w.bytes * 8, (double)w.frames / w.rate, rate);
-
 	fd = open(dev, O_WRONLY);
 	if (fd < 0) {
 		perror(dev);
 		free(file);
 		return 2;
 	}
-	if (pcm_setup(fd, rate))
+	rate = pcm_setup(fd, rate, w.rate);
+	if (!rate)
 		goto out;
+	printf("%s: %u Hz, %u ch, %u-bit, %.2f s -> %u Hz stereo\n", argv[optind],
+	       w.rate, w.channels, w.bytes * 8, (double)w.frames / w.rate, rate);
 
 	while (wav_render(&w, &pos, rate, period, PERIOD_FRAMES)) {
 		if (pcm_write(fd, period, PERIOD_FRAMES))
