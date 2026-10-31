@@ -161,19 +161,32 @@ static void s5l8947x_display_program_gamma(struct s5l8947x_display *d,
  * engine actually produces, not a nominal one: CTS = fTMDS * N / (128 * fs).
  * Writing the measured (MCTS) register is pointless, it is hardware-owned.
  */
+static u32 s5l8947x_hdmi_acr_n(unsigned int sample_rate)
+{
+	/* HDMI 1.4 recommended N for a 74.25 MHz TMDS clock */
+	switch (sample_rate) {
+	case 32000:
+		return 4096;
+	case 44100:
+		return 6272;
+	default:
+		return 6144;
+	}
+}
+
 static u32 s5l8947x_hdmi_acr_cts(unsigned int sample_rate)
 {
-	/*
-	 * CTS = fTMDS(74.25 MHz) * N(6144) / (128 * fs) = 3 564 000 000 / fs.
-	 * Integer only: the kernel does not do floating point.
-	 */
-	return (u32)div_u64(3564000000ULL + sample_rate / 2, sample_rate);
+	/* CTS = fTMDS(74.25 MHz) * N / (128 * fs), rounded */
+	u64 num = 74250000ULL * s5l8947x_hdmi_acr_n(sample_rate);
+	u64 den = 128ULL * sample_rate;
+
+	return (u32)div64_u64(num + den / 2, den);
 }
 
 int s5l8947x_hdmi_audio_configure(unsigned int sample_rate, bool enable)
 {
 	struct s5l8947x_display *d = g_s5l_display;
-	u32 n_val = 6144U, cts_val = s5l8947x_hdmi_acr_cts(sample_rate), con0;
+	u32 n_val = s5l8947x_hdmi_acr_n(sample_rate), cts_val = s5l8947x_hdmi_acr_cts(sample_rate), con0;
 	u8 aui[5] = { 0x01, 0x00, 0x00, 0x00, 0x00 };
 	u32 csum;
 	int i;
@@ -215,8 +228,7 @@ int s5l8947x_hdmi_audio_configure(unsigned int sample_rate, bool enable)
 	 * pin selection is the reset value (all 7s): the mainline Exynos
 	 * values leave the receiver without a clock. CON_2 must say basic
 	 * I2S; left-justified reads every sample one bit late, which turns
-	 * the audio into loud noise. Frames are 32 bit clocks at 46875 Hz
-	 * and 48 at 31250 Hz (the I2S master cannot divide 24 MHz further).
+	 * the audio into loud noise. Frames are 32 bit clocks.
 	 */
 	writel(0x01, d->hdmi + HDMI_I2S_CLK_CON);
 	writel(readl(d->hdmi + HDMI_I2S_DSD_CON) | 0x01U, d->hdmi + HDMI_I2S_DSD_CON);
@@ -225,13 +237,13 @@ int s5l8947x_hdmi_audio_configure(unsigned int sample_rate, bool enable)
 	writel(0x77, d->hdmi + HDMI_I2S_PIN_SEL_2);
 	writel(0x07, d->hdmi + HDMI_I2S_PIN_SEL_3);
 	writel(0x00, d->hdmi + HDMI_I2S_CON_1);     /* Falling edge SCLK, low=L */
-	/* MSB first, 16-bit, basic I2S; [5:4] = 32fs or 48fs bit clocks */
-	writel(sample_rate == 31250 ? 0x14 : 0x04, d->hdmi + HDMI_I2S_CON_2);
+	/* MSB first, 16-bit, basic I2S, 32fs bit clocks */
+	writel(0x04, d->hdmi + HDMI_I2S_CON_2);
 	writel(0x00, d->hdmi + HDMI_I2S_CH_ST_0);   /* Consumer LPCM */
 	writel(0x00, d->hdmi + HDMI_I2S_CH_ST_1);
 	writel(0x00, d->hdmi + HDMI_I2S_CH_ST_2);
-	/* Sampling frequency code: 44.1, 32 or (nearest for 46875) 48 kHz */
-	writel(sample_rate == 44100 ? 0x00 : sample_rate == 31250 ? 0x03 : 0x02,
+	/* Sampling frequency code: 44.1, 32 or 48 kHz */
+	writel(sample_rate == 44100 ? 0x00 : sample_rate == 32000 ? 0x03 : 0x02,
 	       d->hdmi + HDMI_I2S_CH_ST_3);
 	writel(0x02, d->hdmi + HDMI_I2S_CH_ST_4);   /* 16-bit word length */
 	writel(0x01, d->hdmi + HDMI_I2S_CH_ST_CON); /* Reload channel status */
@@ -281,7 +293,8 @@ void s5l8947x_hdmi_audio_arm(unsigned int sample_rate)
 	if (!d || !sample_rate)
 		return;
 	writel(0x00, d->hdmi + HDMI_ACR_CON);
-	s5l8947x_hdmi_write_bytes(d->hdmi, HDMI_ACR_N0, 6144U, 3);
+	s5l8947x_hdmi_write_bytes(d->hdmi, HDMI_ACR_N0,
+				  s5l8947x_hdmi_acr_n(sample_rate), 3);
 	s5l8947x_hdmi_write_bytes(d->hdmi, HDMI_ACR_CTS0,
 				  s5l8947x_hdmi_acr_cts(sample_rate), 3);
 	writel(0x04, d->hdmi + HDMI_ACR_CON);
