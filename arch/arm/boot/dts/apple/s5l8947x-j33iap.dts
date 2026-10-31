@@ -76,11 +76,16 @@
 	#address-cells = <1>;
 	#size-cells = <0>;
 
-	/* The firmware does not start without a MAC address in its NVRAM */
+	/*
+	 * The firmware does not start without a MAC address in its NVRAM.
+	 * Its built-in regulatory table takes ISO 3166 codes as they are, so
+	 * a country set through cfg80211 reaches it unmapped.
+	 */
 	wifi@2 {
 		compatible = "usba5c,bd1a";
 		reg = <2>;
 		local-mac-address = [02 10 5a 33 00 44];
+		brcm,ccode-map-trivial;
 	};
 };
 
