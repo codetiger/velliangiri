@@ -502,7 +502,7 @@ static void s5l8940x_gpio_irq_handler(struct irq_desc *desc)
 	struct s5l8940x_gpio_pinctrl *agp = gpiochip_get_data(gc);
 	struct irq_chip *parent_chip = irq_desc_get_chip(desc);
 	unsigned int group = 0, pinh;
-	u32 grps, en, sts;
+	u32 grps, dis, sts;
 	unsigned long flags;
 
 	chained_irq_enter(parent_chip, desc);
@@ -512,9 +512,14 @@ static void s5l8940x_gpio_irq_handler(struct irq_desc *desc)
 		if (!(grps & (1U << group)))
 			continue;
 
+		/*
+		 * The enable and disable registers both read back the
+		 * disabled pins of the group, and the status register
+		 * reports pending pins whether they are enabled or not.
+		 */
 		raw_spin_lock_irqsave(&agp->lock, flags);
-		en = readl(agp->base + REG_IRQ_ENABLE(group));
-		sts = readl(agp->base + REG_IRQ_STATUS(group)) & en;
+		dis = readl(agp->base + REG_IRQ_DISABLE(group));
+		sts = readl(agp->base + REG_IRQ_STATUS(group)) & ~dis;
 		raw_spin_unlock_irqrestore(&agp->lock, flags);
 
 		while (sts) {
