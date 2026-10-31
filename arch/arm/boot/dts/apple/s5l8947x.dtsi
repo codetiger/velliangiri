@@ -259,6 +259,14 @@
 			status = "disabled";
 		};
 
+		sha: crypto@200000 {
+			compatible = "apple,s5l8947x-sha";
+			reg = <0x200000 0x1000>;
+			interrupts = <38>;
+			clocks = <&pmgr_gates 46>;
+			status = "disabled";
+		};
+
 		/*
 		 * Flash memory interface, two channels.  Each has a host block
 		 * (transfer setup and the data / metadata FIFOs), a sequencer

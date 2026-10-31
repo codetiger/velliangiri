@@ -205,6 +205,10 @@
 	status = "okay";
 };
 
+&sha {
+	status = "okay";
+};
+
 /* NAND: one managed NAND package on FMI0, CE0; FMI1 is unpopulated */
 &fmi0 {
 	status = "okay";
