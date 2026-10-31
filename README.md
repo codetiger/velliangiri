@@ -49,7 +49,6 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a CDC-ECM + CDC-ACM composite gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
 | **Audio sample rates** | The I2S and S/PDIF blocks are clocked from the 24 MHz crystal, so HDMI playback runs at `46,875 Hz` or `31,250 Hz` and optical at `46,875 Hz` instead of `48,000 Hz`. Use `wavplay` (which resamples automatically) or ALSA resampling. The optical output has not been checked on a receiver yet. |
 | **Bluetooth** | The controller runs at 1.6 Mbaud rather than the stock 3 Mbaud (the UART clocks cannot produce 3 Mbaud), there is no host-wake interrupt yet, and `BlueZ` userspace is not in the small initramfs, so pairing and connections are untested. |
-| **Wireless without NAND** | The Wi-Fi firmware and Bluetooth patch cannot be redistributed and are copied from the device's own `System` volume at boot. Without it, Wi-Fi does not come up and Bluetooth runs on its ROM firmware. |
 
 For exact register addresses, driver file paths, and per-block notes, see [progress.md](progress.md).
 
@@ -64,7 +63,7 @@ For exact register addresses, driver file paths, and per-block notes, see [progr
 
 ### 2. Wi-Fi and Bluetooth firmware
 
-Nothing to do: the Broadcom firmware cannot be redistributed, so it is never part of the build. At boot, `stage2` mounts the device's own `System` volume (`/dev/nand0p1`) read-only and copies the Wi-Fi firmware, NVRAM, and Bluetooth patch into `/lib/firmware/brcm/` (the Bluetooth patch is carved out of a system tool by `hcdcarve`, which picks the one patch naming this board). The Ethernet, Wi-Fi, and Bluetooth addresses come from the factory system configuration on the same NAND (`/sys/block/nand0/{emac,wmac,bmac}`). Without a readable `System` volume, Wi-Fi does not come up and Bluetooth runs on its ROM firmware.
+Nothing to do: at boot, `stage2` mounts the device's own `System` volume (`/dev/nand0p1`) read-only and copies the Wi-Fi firmware, NVRAM, and Bluetooth patch into `/lib/firmware/brcm/` (the Bluetooth patch is carved out of a system tool by `hcdcarve`, which picks the one patch naming this board). The Ethernet, Wi-Fi, and Bluetooth addresses come from the factory system configuration on the same NAND (`/sys/block/nand0/{emac,wmac,bmac}`).
 
 *(Optional)* To make the device join your Wi-Fi network automatically at boot, place a standard `wpa_supplicant.conf` at `research/wpa_supplicant.conf` (or point `WIFI_CONF` at another file inside the repository) before building. On first boot it is saved to the `Data` volume, and from then on the saved copy is used. To install your SSH key, pass a public key file inside the repository, for example `SSH_PUBKEY=research/id_ed25519.pub ./scripts/velliangiri.sh all`.
 

@@ -28,10 +28,9 @@ Status of every hardware block, checked against the drivers in the tree and the 
 
 ### Wi-Fi known limits
 
-- The firmware is not in the image, so the first probe fails; `brcmfmac` attaches only after `stage2` has copied the firmware from `nand0p1` and re-probes the HSIC device (firmware up about 9 s after boot).
+- The first probe fails; `brcmfmac` attaches only after `stage2` has provisioned the firmware and re-probes the HSIC device (firmware up about 9 s after boot).
 - The board's CLM blob is rejected by this firmware (`clmload` -52, which aborts the attach), so it is not provisioned and the firmware's built-in regulatory data is used (NVRAM default `ccode=XZ`, regrev 20); it still covers 2.4 and 5 GHz and accepts ISO 3166 countries. The factory system configuration has a region entry (`Regn`), which is not used: it names a sales region rather than where the device is used.
 - HSIC runtime suspend stays off (USB default); enabling it needs the port's resume workaround.
-- The firmware is not distributable and is never in the image; it is copied from `nand0p1` at boot, so Wi-Fi needs a readable `System` volume.
 - `stage2` selects the board's firmware files by name (one variable for both radios); another board in the family needs its own name there.
 
 ### Bluetooth known limits
@@ -39,7 +38,6 @@ Status of every hardware block, checked against the drivers in the tree and the 
 - Not the stock 3 Mbaud: the UART's two clock sources measure about 51.3 MHz and 24 MHz, there is no fractional divider (the slot register does not latch), and 3,206,250 baud (51.3 MHz / 16) is not matched by the controller.
 - No host-wake interrupt, so no UART sleep. The stock hardware description routes host wake through PMU GPIO 7 (the PMU interrupts on GPIO 109); the PMU's event registers are not yet known.
 - No `bluetoothd`/BlueZ userland in the image; pairing and connections are untested.
-- The patch is carved at boot from a system tool on `nand0p1`; without a readable `System` volume the controller runs its ROM firmware.
 
 ### Central DMA known limits
 
@@ -56,6 +54,8 @@ Status of every hardware block, checked against the drivers in the tree and the 
 
 - The system keybag is unlocked with an empty passcode; on a device with a passcode set, classes 1–3 stay locked (`/sys/block/nand0/keybag` reports it). Keybags of a type with bit 30 set use another hardware key and are not supported.
 - Seen once (2026-10-31, about 11 minutes after boot, first NAND read after roughly 10 minutes idle under the `ondemand` governor): every page read timed out waiting for the CDMA completion while the FMI transfer itself finished. Package resets did not clear it; switching the governor to `performance` did, and reads then worked at all three CPU speeds. A repeat of the same idle period on a fresh boot read cleanly, so the trigger is unknown.
+- The FTL takes the lowest-numbered free superblock and garbage-collects the one with the fewest valid pages; it keeps no erase counts, so there is no wear levelling. Discard (TRIM) is not supported.
+- Files created from Linux get no protection class: they are stored under the volume key only. `decmpfs`-compressed files are read-only (opening one for writing returns `EOPNOTSUPP`).
 - `s5l8947x-fmi` polls the controller status registers for command completion rather than using FMI interrupts; `FMI1` (`0x31300000`) is unpopulated on `j33iap`.
 
 ## Partly implemented
