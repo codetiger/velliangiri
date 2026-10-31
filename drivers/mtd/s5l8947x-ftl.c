@@ -79,7 +79,9 @@
 #define FTL_TOC_WRITE_PAGES	2
 #define FTL_MAX_CAUS		8
 #define FTL_MAX_LPS		16
-#define FTL_GC_LOW_SB		2
+#define FTL_GC_LOW_SB		2	/* collect garbage at or below this many free superblocks */
+#define FTL_GC_RESERVE		1	/* free superblocks only garbage collection may open */
+#define FTL_GC_PASSES		8	/* collections per new superblock, at most */
 #define FTL_UNMAPPED		U32_MAX
 
 #define LV_UUID			0x10
@@ -199,6 +201,7 @@ struct ftl {
 	u32 *l2p;		/* lba -> page * lps + logical page */
 	struct ftl_sb *sbs;
 	u32 free_sbs;
+	u32 next_free;		/* where the search for a free superblock starts */
 	u32 next_gen;
 	u16 next_seq;
 
@@ -207,12 +210,14 @@ struct ftl {
 	u8 *dec;		/* decrypted/encrypted 4 KiB logical block */
 	u32 cached;		/* page number in the cache, or FTL_UNMAPPED */
 
+	bool in_gc;		/* garbage collection is copying: it may use the reserve */
 	u32 wsb_block;		/* active open superblock for writes, or 0 */
 	u32 wsb_gen;
 	u16 wsb_first_seq;
 	u32 wsb_idx;
 	u32 wsb_total;
 	u32 *wsb_lbas;
+	u32 *wsb_gens;		/* generation each logical page was written with */
 	u8 *wbuf_data;
 	u8 *wbuf_oob;
 	u32 wbuf_lbas[FTL_MAX_LPS];
@@ -288,19 +293,24 @@ static int ftl_write_page(struct ftl *f, u32 page, const u8 *data, const u8 *oob
 static int ftl_erase_sb(struct ftl *f, u32 block)
 {
 	u32 c;
-	int ret;
+	int ret = 0, err;
 
+	/* Erase every member even if one fails, so no CAU keeps stale data */
 	for (c = 0; c < f->caus; c++) {
 		struct erase_info instr = {
 			.addr = (loff_t)ftl_page(f, c, block, 0) * f->mtd->writesize,
 			.len = f->mtd->erasesize,
 		};
 
-		ret = mtd_erase(f->mtd, &instr);
-		if (ret) {
-			f->sbs[block].state = FTL_SB_BAD;
-			return ret;
-		}
+		err = mtd_erase(f->mtd, &instr);
+		if (err && !ret)
+			ret = err;
+	}
+	if (ret) {
+		dev_warn(&f->mtd->dev, "superblock %u failed to erase, retired\n", block);
+		f->sbs[block].state = FTL_SB_BAD;
+		f->sbs[block].valid_lps = 0;
+		return ret;
 	}
 	if (f->cached != FTL_UNMAPPED &&
 	    ((f->cached / f->pages) % f->blocks) == block)
@@ -330,6 +340,7 @@ static int ftl_read_slc(struct ftl *f, u32 page, u8 *data, size_t len)
 
 struct ftl_build {
 	u64 *keys;		/* rank of the copy in l2p */
+	u32 open_gen;		/* newest generation in the last superblock without a table */
 	u8 *toc;		/* table of contents data */
 	u32 members[FTL_MAX_CAUS];
 	u32 nmembers;
@@ -480,6 +491,7 @@ static int ftl_build_open(struct ftl *f, struct ftl_build *b, u32 block)
 		if (!any)
 			break;	/* first blank page: the rest is unwritten */
 	}
+	b->open_gen = sb_gen;
 	for (idx = 0; idx < n && !ret; idx++) {
 		if (ent[2 * idx] == FTL_UNMAPPED)
 			continue;
@@ -491,10 +503,57 @@ static int ftl_build_open(struct ftl *f, struct ftl_build *b, u32 block)
 	return ret;
 }
 
+/*
+ * Keep writing into the newest superblock a previous session left open,
+ * instead of opening a fresh one each boot and stranding the rest of it.
+ * Its logical pages are read back so the table written when it fills
+ * describes all of them, each with the generation it was written with.
+ */
+static void ftl_resume_open(struct ftl *f, u32 block)
+{
+	u32 total = f->pages * f->lps * f->caus;
+	u32 data_lps = total - FTL_TOC_WRITE_PAGES * f->lps;
+	u32 idx, lp, page;
+	u16 first_seq = 0;
+	bool any;
+
+	for (idx = 0; idx < data_lps; idx += f->lps) {
+		ftl_wsb_pos(f, block, idx, &page, &lp);
+		if (ftl_read_page(f, page, NULL, f->oob))
+			return;
+		any = false;
+		for (lp = 0; lp < f->lps; lp++) {
+			const u8 *m = f->oob + lp * FTL_META;
+
+			if (m[0] == 0xff)
+				continue;
+			if (!any && !idx)
+				first_seq = get_unaligned_le16(m + 2);
+			any = true;
+			f->wsb_lbas[idx + lp] = m[0] == FTL_T_DATA ?
+						get_unaligned_le32(m + 8) : FTL_UNMAPPED;
+			f->wsb_gens[idx + lp] = get_unaligned_le32(m + 4);
+		}
+		if (!any)
+			break;
+	}
+	if (!idx || idx >= data_lps)
+		return;
+	f->wsb_block = block;
+	f->wsb_idx = idx;
+	f->wsb_total = total;
+	f->wsb_first_seq = first_seq;
+	f->wsb_gen = f->next_gen++;
+	f->next_seq = 0;
+	dev_info(&f->mtd->dev, "resuming open superblock %u at %u of %u logical pages\n",
+		 block, idx, data_lps);
+}
+
 static int ftl_build(struct ftl *f)
 {
 	struct ftl_build b = {};
-	u32 block, c, page, lp, mapped = 0, tocs = 0, open = 0;
+	u32 block, c, page, lp, mapped = 0, tocs = 0, open = 0, newest = 0, gen;
+	u32 resume = 0, resume_gen = 0;
 	unsigned long start = jiffies;
 	int ret = 0;
 
@@ -541,6 +600,7 @@ static int ftl_build(struct ftl *f)
 		}
 		f->sbs[block].members = members_mask;
 		b.total = f->pages * f->lps * b.nmembers;
+		gen = b.max_gen;
 
 		/* The table, if any, ends the superblock; its first record describes it. */
 		ftl_pos(f, &b, block, b.total - f->lps, &page, &lp);
@@ -555,7 +615,14 @@ static int ftl_build(struct ftl *f)
 			f->sbs[block].state = (first_type == FTL_T_DATA) ?
 					      FTL_SB_OPEN : FTL_SB_SPECIAL;
 			open++;
+			if (first_type == FTL_T_DATA && b.nmembers == f->caus &&
+			    (!resume || b.open_gen >= resume_gen)) {
+				resume = block;
+				resume_gen = b.open_gen;
+			}
 		}
+		if (b.max_gen > gen)
+			newest = block;
 		cond_resched();
 	}
 
@@ -571,9 +638,13 @@ static int ftl_build(struct ftl *f)
 	}
 	f->next_gen = b.max_gen + 1;
 	f->next_seq = 0;
+	/* Continue the rotation after the most recently written superblock */
+	f->next_free = newest + 1;
+	if (resume)
+		ftl_resume_open(f, resume);
 	dev_info(&f->mtd->dev,
-		 "translation map: %u blocks mapped, %u tables, %u open, %u free superblocks, next gen %u, %u ms\n",
-		 mapped, tocs, open, f->free_sbs, f->next_gen,
+		 "translation map: %u blocks mapped, %u tables, %u open, %u free superblocks, next gen %u, next free from %u, %u ms\n",
+		 mapped, tocs, open, f->free_sbs, f->next_gen, f->next_free,
 		 jiffies_to_msecs(jiffies - start));
 out:
 	kvfree(b.toc);
@@ -700,6 +771,7 @@ static int ftl_close_wsb(struct ftl *f)
 				      f->next_seq++, f->wsb_gen, FTL_UNMAPPED,
 				      f->wsb_gen);
 			f->wsb_lbas[f->wsb_idx + lp] = FTL_UNMAPPED;
+			f->wsb_gens[f->wsb_idx + lp] = f->wsb_gen;
 		}
 		ftl_wsb_pos(f, f->wsb_block, f->wsb_idx, &page, &lp);
 		ret = ftl_write_page(f, page, f->wbuf_data, f->wbuf_oob);
@@ -712,20 +784,23 @@ static int ftl_close_wsb(struct ftl *f)
 	if (!toc)
 		return -ENOMEM;
 
+	/* One record per run of consecutive blocks written with one generation */
 	while (i < data_lps && (run + 1) * 16 <= toc_pages * f->mtd->writesize) {
 		u32 lba = f->wsb_lbas[i];
+		u32 gen = f->wsb_gens[i];
 		u32 cnt = 1;
 		u8 *r = toc + run * 16;
 
 		if (lba < f->nlba) {
 			while (i + cnt < data_lps &&
-			       f->wsb_lbas[i + cnt] == lba + cnt)
+			       f->wsb_lbas[i + cnt] == lba + cnt &&
+			       f->wsb_gens[i + cnt] == gen)
 				cnt++;
 		} else {
 			lba = f->nlba;
 		}
 		put_unaligned_le32(i, r);
-		put_unaligned_le32(f->wsb_gen, r + 4);
+		put_unaligned_le32(gen, r + 4);
 		put_unaligned_le32(lba, r + 8);
 		put_unaligned_le32(cnt, r + 12);
 		i += cnt;
@@ -777,6 +852,7 @@ static int ftl_commit_wbuf(struct ftl *f)
 		u32 lba = f->wbuf_lbas[i];
 
 		f->wsb_lbas[f->wsb_idx + i] = lba;
+		f->wsb_gens[f->wsb_idx + i] = f->wsb_gen;
 		if (lba < f->nlba)
 			ftl_map_update(f, lba, page * f->lps + i);
 	}
@@ -818,12 +894,18 @@ static int ftl_flush_wbuf(struct ftl *f)
 	return 0;
 }
 
+/*
+ * Take free superblocks in rotation rather than lowest first, so erases spread
+ * over the whole disk instead of wearing out the first free blocks.
+ */
 static int ftl_open_free_sb(struct ftl *f)
 {
-	u32 b;
+	u32 i, b, n = f->data_blocks - 1;
 
-	for (b = 1; b < f->data_blocks; b++) {
+	for (i = 0; i < n; i++) {
+		b = 1 + (f->next_free - 1 + i) % n;
 		if (f->sbs[b].state == FTL_SB_FREE) {
+			f->next_free = b + 1;
 			f->sbs[b].state = FTL_SB_OPEN;
 			f->sbs[b].valid_lps = 0;
 			f->free_sbs--;
@@ -843,13 +925,27 @@ static int ftl_stage_raw(struct ftl *f, u32 lba, const void *raw_lp);
 
 static int ftl_gc(struct ftl *f)
 {
-	u32 b, victim = 0, best_valid = U32_MAX, lba;
+	u32 b, victim = 0, best_valid = U32_MAX, lba, room;
 	u8 *buf;
 	int ret;
 
+	/* Live blocks are copied into the open superblock, or a fresh one */
+	if (f->wsb_block)
+		room = f->wsb_total - FTL_TOC_WRITE_PAGES * f->lps - f->wsb_idx -
+		       f->wbuf_count;
+	else
+		room = f->free_sbs ?
+		       f->pages * f->lps * f->caus - FTL_TOC_WRITE_PAGES * f->lps : 0;
+
+	/*
+	 * Superblocks left open (a session that ended before filling the one it
+	 * wrote to) are never written to again, so reclaim them like closed ones.
+	 */
 	for (b = 1; b < f->data_blocks; b++) {
-		if (f->sbs[b].state == FTL_SB_TOC &&
-		    f->sbs[b].valid_lps < best_valid) {
+		if ((f->sbs[b].state == FTL_SB_TOC ||
+		     (f->sbs[b].state == FTL_SB_OPEN && b != f->wsb_block)) &&
+		    f->sbs[b].valid_lps < best_valid &&
+		    (!f->sbs[b].valid_lps || f->sbs[b].valid_lps + f->lps <= room)) {
 			victim = b;
 			best_valid = f->sbs[b].valid_lps;
 			if (!best_valid)
@@ -858,6 +954,8 @@ static int ftl_gc(struct ftl *f)
 	}
 	if (!victim)
 		return -ENOSPC;
+	dev_info(&f->mtd->dev, "gc: reclaiming %s superblock %u (%u valid blocks)\n",
+		 f->sbs[victim].state == FTL_SB_OPEN ? "open" : "closed", victim, best_valid);
 	if (!best_valid)
 		return ftl_erase_sb(f, victim);
 
@@ -870,6 +968,8 @@ static int ftl_gc(struct ftl *f)
 	buf = kmalloc(FTL_LP_SIZE, GFP_NOIO);
 	if (!buf)
 		return -ENOMEM;
+
+	f->in_gc = true;
 
 	for (lba = 0; lba < f->nlba && f->sbs[victim].valid_lps > 0; lba++) {
 		u32 phys = f->l2p[lba];
@@ -889,8 +989,36 @@ static int ftl_gc(struct ftl *f)
 	if (!ret)
 		ret = ftl_erase_sb(f, victim);
 out:
+	f->in_gc = false;
 	kfree(buf);
 	return ret;
+}
+
+/*
+ * Open a superblock for new writes. Garbage collection runs first when free
+ * superblocks run low, and ordinary writes never take the last FTL_GC_RESERVE
+ * of them: collection needs somewhere to copy live data to, and a superblock
+ * that fails to erase is lost from the pool.
+ */
+static int ftl_open_for_write(struct ftl *f)
+{
+	int pass, ret;
+
+	if (f->in_gc)
+		return ftl_open_free_sb(f);
+	for (pass = 0; pass < FTL_GC_PASSES && !f->wsb_block &&
+	     f->free_sbs <= FTL_GC_LOW_SB; pass++) {
+		ret = ftl_gc(f);
+		if (ret == -ENOSPC || ret == -ENOMEM)
+			break;
+	}
+	if (f->wsb_block)
+		return 0;
+	if (f->free_sbs <= FTL_GC_RESERVE) {
+		dev_warn_ratelimited(&f->mtd->dev, "no free superblocks for writing\n");
+		return -ENOSPC;
+	}
+	return ftl_open_free_sb(f);
 }
 
 static int ftl_stage_raw(struct ftl *f, u32 lba, const void *raw_lp)
@@ -907,13 +1035,14 @@ static int ftl_stage_raw(struct ftl *f, u32 lba, const void *raw_lp)
 	}
 
 	if (!f->wsb_block) {
-		if (f->free_sbs <= FTL_GC_LOW_SB) {
-			ret = ftl_gc(f);
-			if (ret && !f->free_sbs)
-				return ret;
-		}
+		ret = ftl_open_for_write(f);
+		if (ret)
+			return ret;
+	} else if (!f->in_gc && !f->wbuf_count && f->free_sbs <= FTL_GC_LOW_SB) {
+		/* Low on free superblocks: collect into the open one while it has room */
+		ftl_gc(f);
 		if (!f->wsb_block) {
-			ret = ftl_open_free_sb(f);
+			ret = ftl_open_for_write(f);
 			if (ret)
 				return ret;
 		}
@@ -2307,16 +2436,18 @@ static void ftl_notify_add(struct mtd_info *mtd)
 	f->l2p = vmalloc(array_size(f->nlba, sizeof(*f->l2p)));
 	f->sbs = kcalloc(f->blocks, sizeof(*f->sbs), GFP_KERNEL);
 	f->wsb_lbas = kmalloc_array(sb_lps, sizeof(*f->wsb_lbas), GFP_KERNEL);
+	f->wsb_gens = kmalloc_array(sb_lps, sizeof(*f->wsb_gens), GFP_KERNEL);
 	f->page = kmalloc(mtd->writesize, GFP_KERNEL);
 	f->oob = kmalloc(mtd->oobsize, GFP_KERNEL);
 	f->wbuf_data = kmalloc(mtd->writesize, GFP_KERNEL);
 	f->wbuf_oob = kmalloc(mtd->oobsize, GFP_KERNEL);
 	f->dec = kmalloc(FTL_LP_SIZE, GFP_KERNEL);
-	if (!f->l2p || !f->sbs || !f->wsb_lbas || !f->page || !f->oob ||
+	if (!f->l2p || !f->sbs || !f->wsb_lbas || !f->wsb_gens || !f->page || !f->oob ||
 	    !f->wbuf_data || !f->wbuf_oob || !f->dec) {
 		vfree(f->l2p);
 		kfree(f->sbs);
 		kfree(f->wsb_lbas);
+		kfree(f->wsb_gens);
 		kfree(f->page);
 		kfree(f->oob);
 		kfree(f->wbuf_data);
@@ -2349,6 +2480,7 @@ static void ftl_free(struct ftl *f)
 	vfree(f->l2p);
 	kfree(f->sbs);
 	kfree(f->wsb_lbas);
+	kfree(f->wsb_gens);
 	kfree(f->page);
 	kfree(f->oob);
 	kfree_sensitive(f->wbuf_data);
