@@ -1170,8 +1170,9 @@ static void ftl_set_dt_mac(const char *compat, const char *propname,
 		return;
 	/*
 	 * Unflattened properties point into the read-only flattened tree, so
-	 * replace the property instead of writing its value in place. The
-	 * old property moves to the node's dead list, so neither is freed.
+	 * replace the property instead of writing its value in place, adding
+	 * it when the tree has none. A replaced property moves to the node's
+	 * dead list, so neither is freed.
 	 */
 	prop = kzalloc(sizeof(*prop) + ETH_ALEN, GFP_KERNEL);
 	if (!prop)

@@ -79,6 +79,18 @@ t_wireless() {
 		return
 	fi
 	out=$(timeout 20 btscan 5 "${hci#hci}" 2>&1)
+
+	# The kernel applies the factory address from the DT (btbcm default-address list)
+	bmac=$(cat /sys/block/nand0/bmac 2>/dev/null)
+	addr=$(echo "$out" | sed -n 's/^hci[0-9]* address //p')
+	if [ -z "$bmac" ]; then
+		skip "no factory Bluetooth address in the system config; controller address $addr"
+	elif [ "$addr" = "$bmac" ]; then
+		pass "controller uses the factory address $addr"
+	else
+		fail "controller address ${addr:-unknown}, factory address $bmac"
+	fi
+
 	n=$(echo "$out" | sed -n 's/^\([0-9]*\) advertisers.*/\1/p')
 	if [ -n "$n" ] && [ "$n" -gt 0 ]; then
 		pass "LE scan heard $n advertisers"

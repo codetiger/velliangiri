@@ -41,7 +41,6 @@
 #define OP_READ_BD_ADDR		0x1009
 #define OP_LE_SET_SCAN_PARAM	0x200b
 #define OP_LE_SET_SCAN_ENABLE	0x200c
-#define OP_BCM_WRITE_BD_ADDR	0xfc01
 
 #define MAX_DEVS		64
 
@@ -200,21 +199,6 @@ int main(int argc, char **argv)
 	if (setsockopt(fd, SOL_HCI, HCI_FILTER, &flt, sizeof(flt)) < 0) {
 		perror("btscan: filter");
 		return 2;
-	}
-
-	{
-		FILE *fp = fopen("/sys/block/nand0/bmac", "r");
-		unsigned int m[6];
-
-		if (fp) {
-			if (fscanf(fp, "%02x:%02x:%02x:%02x:%02x:%02x",
-				   &m[0], &m[1], &m[2], &m[3], &m[4], &m[5]) == 6) {
-				for (i = 0; i < 6; i++)
-					bdaddr[i] = (uint8_t)m[5 - i];
-				hci_cmd(fd, OP_BCM_WRITE_BD_ADDR, bdaddr, 6, NULL, 0);
-			}
-			fclose(fp);
-		}
 	}
 
 	if (hci_cmd(fd, OP_READ_BD_ADDR, NULL, 0, bdaddr, sizeof(bdaddr)) == 0) {

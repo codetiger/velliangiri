@@ -153,7 +153,6 @@
 		compatible = "brcm,bcm4334-bt";
 		shutdown-gpios = <&gpio 104 GPIO_ACTIVE_HIGH>;
 		device-wakeup-gpios = <&gpio 105 GPIO_ACTIVE_HIGH>;
-		local-bd-address = [33 00 33 5a 10 02];
 	};
 };
 
