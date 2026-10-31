@@ -35,8 +35,8 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **Audio (HDMI & Optical)** | ALSA playback (`s5l8947x-audio`) on two PCM devices: HDMI over I2S (`pcmC0D0p`, verified clean with speech) and optical S/PDIF (`pcmC0D1p`), each fed by a cyclic DMA transfer with period interrupts, with HDMI hot-plug mute/unmute and a `wavplay` CLI player |
 | **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
 | **USB Networking & Console** | Micro-USB port runs in USB device mode (`dwc2`), providing a virtual Ethernet link (`usb0` at `10.55.0.2`, SSH enabled) and a USB serial console (`/dev/ttyGS0`) |
-| **Wi-Fi (2.4 & 5 GHz)** | Broadcom BCM4334 over internal HSIC USB host (`ehci-platform` + custom PHY handshake); scans and joins WPA2 networks via `wpa_supplicant` and the built-in `wifi` helper (requires firmware extracted from your own restore image) |
-| **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2`); loads patch firmware at boot when extracted from your restore image; LE scanning verified with `btscan` |
+| **Wi-Fi (2.4 & 5 GHz)** | Broadcom BCM4334 over internal HSIC USB host (`ehci-platform` + custom PHY handshake); scans and joins WPA2 networks via `wpa_supplicant` and the built-in `wifi` helper; firmware, NVRAM, and the factory MAC address are read from the device's own NAND at boot |
+| **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2`); patch firmware is read from the device's own NAND at boot; LE scanning verified with `btscan` |
 | **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`S5L8947X IR Remote`, `/dev/input/event*`) via the MSP430 system microcontroller on `uart1` |
 | **Hardware AES Engine** | CDMA AES crypto engine (`s5l8947x-aes` at `0x37801000`): `ecb(aes)` and `cbc(aes)` `skcipher` algorithms (128 / 192 / 256-bit keys) over CDMA channels 1 and 2, plus hardware device/group key operations (`s5l8947x_aes_hwkey_crypt()`) |
 | **Internal NAND & Volumes** | Managed NAND controller (`s5l8947x-fmi`, 8.9 GB, read/write/erase on `/dev/mtd0`, ~14 MB/s reads over CDMA) and read-write translation layer (`s5l8947x-ftl`) exposing `/dev/nand0`, `/dev/nand0p1` (`System`, 1.4 GB), and `/dev/nand0p2` (`Data`, 6.5 GB, volume and per-file `com.apple.system.cprotect` class-4 keys unwrapped from the reserved SLC key store); both volumes mount read-write as `hfsplus` with journal verification/replay, transparent file encryption/decryption, and clean unmount handling |
@@ -62,19 +62,9 @@ For exact register addresses, driver file paths, and per-block notes, see [progr
 - **On your computer:** Docker (the build runs inside a reproducible Debian cross-compile container on Linux or macOS).
 - **For the device:** A Micro-USB cable and a way to load and jump to a raw binary payload in RAM over USB.
 
-### 2. Optional: Extract Wi-Fi and Bluetooth firmware
+### 2. Wi-Fi and Bluetooth firmware
 
-The Broadcom Wi-Fi and Bluetooth firmware files cannot be redistributed in this repository. If you want wireless support, extract them locally from your own copy of the device's stock restore image:
-
-```bash
-# From the restore image (a local zip, or a URL read with HTTP range requests)
-./scripts/velliangiri.sh firmware --image <path-or-url-to-restore-image> --key <72-hex-digit-key>
-
-# Or from the root filesystem disk image itself
-./scripts/velliangiri.sh firmware --rootfs <disk-image> [--key <72-hex-digit-key>]
-```
-
-The key is only needed for an encrypted disk image; it can also be kept in `research/firmware/rootfs.key` or passed as `FIRMWARE_KEY`. The extractor verifies every file by SHA-256 and places them in `research/firmware/` (which is git-ignored). When you build the rootfs, the build script automatically bundles them into `/lib/firmware/brcm/`. Without them, Wi-Fi does not come up and Bluetooth runs on its ROM firmware.
+Nothing to do: the Broadcom firmware cannot be redistributed, so it is never part of the build. At boot, `stage2` mounts the device's own `System` volume (`/dev/nand0p1`) read-only and copies the Wi-Fi firmware, NVRAM, and Bluetooth patch into `/lib/firmware/brcm/` (the Bluetooth patch is accepted only if its SHA-256 matches). The Ethernet, Wi-Fi, and Bluetooth addresses come from the factory system configuration on the same NAND (`/sys/block/nand0/{emac,wmac,bmac}`). Without a readable `System` volume, Wi-Fi does not come up and Bluetooth runs on its ROM firmware.
 
 *(Optional)* To make the device join your Wi-Fi network automatically at boot, place a standard `wpa_supplicant.conf` at `research/wpa_supplicant.conf` before building. You can also pass `SSH_PUBKEY=/path/to/id_ed25519.pub` to install your SSH key.
 
@@ -188,7 +178,6 @@ Instead of storing a full kernel source tree, this repository holds only the fil
 | `drivers/`, `sound/`, `include/` | Clean-room kernel drivers in their standard mainline paths |
 | `scripts/patches/` | 8 small, self-contained patches to mainline Linux 6.12 files |
 | `scripts/boot/` | Position-independent entry stub, pre-kernel C loader, HDMI init, boot splash and its generator |
-| `scripts/extract-firmware.py` | Rebuilds the Wi-Fi and Bluetooth firmware from your own restore image (`velliangiri.sh firmware`) |
 | `scripts/tests/` | On-device hardware test suite (`hwtest`) |
 | `scripts/tools/` | Userspace MMIO/I2C diagnostic tools (`peek`, `i2cpoke`, `wavplay`, `btscan`, `l2bench`, `jitterseed`) |
 | `config/` | Kernel configuration fragments layered on `multi_v7_defconfig` |

@@ -1,6 +1,6 @@
 # Driver Progress (`S5L8947X` / `j33iap`)
 
-Status of every hardware block, checked against the drivers in the tree and the enabled nodes in `s5l8947x-j33iap.dts`. Last reviewed 2026-10-31 (`hwtest`: 73 passed, 0 failed).
+Status of every hardware block, checked against the drivers in the tree and the enabled nodes in `s5l8947x-j33iap.dts`. Last reviewed 2026-10-31 (`hwtest`: 75 passed, 0 failed, 2 skipped).
 
 ## Done
 
@@ -19,8 +19,8 @@ Status of every hardware block, checked against the drivers in the tree and the 
 | GPIO controller (144 pins, 18 ports) | `0x3fa00000` | `drivers/pinctrl/pinctrl-s5l8940x-gpio.c`, IRQ 119; drives the HSIC handshake lines (GPIO 113 out, 128 in) and Bluetooth control lines (GPIO 104, 105) |
 | Display pipe, HDMI 720p, scaler, gamma | `0x3a200000`, `0x39600000`, `0x39700000`, `0x39200000` | `drivers/video/fbdev/s5l8947x-display.c`; the pre-kernel loader (`scripts/boot/hdmi-720p.h`) brings up 720p60 scanout and draws the boot splash from `logo.svg` (polygon tables generated at build time by `scripts/boot/gen-splash.py`, rasterized by `splash.c`) |
 | System / IR remote MCU (UART1) | `0x32600000` | `drivers/input/misc/s5l8947x-mcu.c`; button input, firmware query (`03.07`), break, raw commands (`hwtest mcu` 3/3), and standby power-off on halt |
-| Wi-Fi (BCM4334, HSIC) | EHCI port 2 | mainline `brcmfmac` USB, patched by `scripts/patches/0007-*` (boot loader `bd1a`, NVRAM packed into the TRX, optional CLM blob). Firmware 6.53.3 from user-supplied `.bin` + `.txt`, MAC from the DT. `wlan0` scans 2.4 and 5 GHz and joins WPA2-PSK networks with `wpa_supplicant` and the `wifi` helper (5 GHz, 135 Mbit/s, DHCP lease, routed traffic; `hwtest wireless` 5/5). `wireless-regdb` installed; optional build-time `wpa_supplicant.conf` is joined at boot. |
-| Bluetooth (BCM4334, UART2) | `0x32700000` | mainline `hci_uart_bcm` (`brcm,bcm4334-bt` over `serdev`); patch firmware from the user's restore image is loaded at boot (HCI 4.1, revision 2393, LE), repeated rebinds clean. Verified on the radio with `btscan` (raw HCI socket, no Bluetooth userland needed; `hwtest wireless` 3/3). |
+| Wi-Fi (BCM4334, HSIC) | EHCI port 2 | mainline `brcmfmac` USB, patched by `scripts/patches/0007-*` (boot loader `bd1a`, NVRAM packed into the TRX, optional CLM blob). Firmware 6.53.3 and NVRAM copied at boot from the on-device `System` volume (`nand0p1`); factory MAC from the NAND system configuration, applied to the DT by `s5l8947x-ftl`. `wlan0` scans 2.4 and 5 GHz and joins WPA2-PSK networks with `wpa_supplicant` and the `wifi` helper (5 GHz, 135 Mbit/s, DHCP lease, routed traffic; `hwtest wireless` 5/5). `wireless-regdb` installed; optional build-time `wpa_supplicant.conf` is joined at boot. |
+| Bluetooth (BCM4334, UART2) | `0x32700000` | mainline `hci_uart_bcm` (`brcm,bcm4334-bt` over `serdev`); patch firmware carved at boot from the on-device `System` volume (SHA-256 checked) is loaded (HCI 4.1, revision 2393, LE), repeated rebinds clean. Verified on the radio with `btscan` (raw HCI socket, no Bluetooth userland needed; `hwtest wireless` 3/3). |
 | Central DMA (42 channels) | `0x37000000`, `0x37800000` | `drivers/dma/s5l8947x-cdma.c`, `dmaengine` provider (`dmas = <&cdma channel request>`): slave scatter-gather (both directions) and cyclic transfers, per-channel interrupts (end of list, and per segment for cyclic periods), segment-granularity residue. Serves audio playback (channels 23, 31), managed NAND page/metadata transfers (channels 5, 6), and the hardware AES engine (channels 1, 2). |
 | Audio: I2S -> HDMI, S/PDIF -> optical | `0x34190000`, `0x34194000`, `0x34195000` | `sound/arm/s5l8947x-audio.c`, two PCMs fed by cyclic `dmaengine` transfers (period interrupts, position from the DMA residue). PCM 0 (HDMI, `pcmC0D0p`): I2S0 as a slave of the I2S clock master, CDMA channel 23, 46 875 / 31 250 Hz; the slave raises DMA requests with a FIFO threshold set in its TX control register. PCM 1 (optical, `pcmC0D1p`): S/PDIF at 46 875 Hz with one word per channel, CDMA channel 31. HDMI packet layer in `s5l8947x-display.c` (I2S receiver in basic I2S format, reset pin selection, ACR from the produced rate, valid AUI; `hdmi_audio` accepts `off`). Speech is clean over HDMI at both rates (`hwtest audio` 5/5). Hot-plug loss mutes the packets and replug re-announces. `wavplay` plays WAV files (resampled to 46 875 Hz; `-d /dev/snd/pcmC0D1p` for optical). |
 | Hardware crypto (CDMA AES engine) | `0x37800000`, `0x37801000` | `drivers/crypto/s5l8947x-aes.c`, `ecb(aes)` and `cbc(aes)` `skcipher` algorithms (128 / 192 / 256-bit keys, priority 300) fed by CDMA channels 1 (input) and 2 (output), plus `s5l8947x_aes_hwkey_crypt()` for the SoC's built-in hardware keys (`S5L8947X_AES_KEY_DEVICE`, `GROUP0`, `GROUP1`), with a FIPS-197 CBC self-test at probe. 16 KiB transfers, self-test passes at probe, and the hardware device key unwraps the NAND volume and per-file key store in ~8 ms (`hwtest probe` 8/8). |
@@ -28,14 +28,15 @@ Status of every hardware block, checked against the drivers in the tree and the 
 
 ### Wi-Fi known limits
 
-- The MAC is a locally administered placeholder from the DT; the real one is in OTP or system configuration.
-- The board's CLM blob is rejected by this firmware (`clmload` -52), so the firmware's built-in regulatory data is used; it still covers 2.4 and 5 GHz.
+- The factory MAC is applied after the NAND system configuration is read, so `brcmfmac` attaches only after `stage2` provisions the firmware and re-probes the HSIC device.
+- The board's CLM blob is rejected by this firmware (`clmload` -52, which aborts the attach), so it is not provisioned and the firmware's built-in regulatory data is used; it still covers 2.4 and 5 GHz.
 - HSIC runtime suspend stays off (USB default); enabling it needs the port's resume workaround.
-- The firmware is not distributable; `./scripts/velliangiri.sh firmware` extracts it (and the Bluetooth patch) from the user's own restore image into `research/firmware/`.
+- The firmware is not distributable and is never in the image; it is copied from `nand0p1` at boot, so Wi-Fi needs a readable `System` volume.
 
 ### Bluetooth known limits
 
-- The address is the controller default (the stock system sets it from system config).
+- The factory address is in the DT (`local-bd-address`, from the NAND system configuration), but `hci_uart_bcm` applies it only when the controller reports a known default address, and `43:34:43:34:1f:ac` is not in `btbcm`'s list; `btscan` sets it with a vendor command instead.
+- The Bluetooth patch is carved from a fixed offset in a `System` file, valid only for the 12H1006 system software (rejected by its SHA-256 otherwise).
 - Stays at 115200 baud: with integer divisors the 51.3 MHz clock reaches 460800 accurately but not the stock 3 Mbaud.
 - No host-wake interrupt, so no UART sleep.
 - No `bluetoothd`/BlueZ userland in the image; pairing and connections are untested.
@@ -72,6 +73,6 @@ Status of every hardware block, checked against the drivers in the tree and the 
 
 ## Suggested order
 
-1. Wi-Fi and Bluetooth: read the real MAC and Bluetooth addresses instead of placeholders.
+1. Bluetooth: have the kernel apply the factory address (add this controller's default to `btbcm`'s list).
 2. Add host mode to the OTG port.
 3. Audio at exact 48 / 44.1 kHz: clock the I2S master from the PMGR NCO (channel 0) and verify the optical output on a receiver.

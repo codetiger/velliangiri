@@ -19,7 +19,7 @@ t_wireless() {
 		fi
 
 		if [ ! -f /lib/firmware/brcm/brcmfmac4334.bin ]; then
-			skip "brcmfmac4334.bin not installed; firmware download not attempted"
+			skip "brcmfmac4334.bin not provisioned from nand0p1; firmware download not attempted"
 		else
 			wl=$(ls -d /sys/class/net/*/wireless 2>/dev/null | head -n 1)
 			if [ -n "$wl" ]; then

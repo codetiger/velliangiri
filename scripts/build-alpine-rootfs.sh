@@ -64,33 +64,9 @@ cp "${ROOT}"/scripts/tests/*.sh "${TEST_DIR}/"
 chmod 755 "${TEST_DIR}/hwtest.sh"
 ln -sf /usr/share/velliangiri/tests/hwtest.sh "${STAGE_DIR}/bin/hwtest"
 
-# Wi-Fi firmware is not distributable: install it only when
-# brcmfmac4334.bin (firmware) and .txt (NVRAM) are in the git-ignored
-# WIFI_FW_DIR ('velliangiri.sh firmware' extracts them). A .clm_blob is installed too if present, but this board's
-# firmware has its regulatory data built in and rejects a CLM download.
-WIFI_FW_DIR="${WIFI_FW_DIR:-${ROOT}/research/firmware/wifi}"
-if [ -f "${WIFI_FW_DIR}/brcmfmac4334.bin" ]; then
-	echo "[rootfs] Installing Wi-Fi firmware from ${WIFI_FW_DIR} ..."
-	mkdir -p "${STAGE_DIR}/lib/firmware/brcm"
-	for f in brcmfmac4334.bin brcmfmac4334.txt brcmfmac4334.clm_blob; do
-		[ -f "${WIFI_FW_DIR}/${f}" ] && cp "${WIFI_FW_DIR}/${f}" "${STAGE_DIR}/lib/firmware/brcm/"
-	done
-else
-	echo "[rootfs] No Wi-Fi firmware in ${WIFI_FW_DIR}; brcmfmac will not load"
-	echo "[rootfs]   (run './scripts/velliangiri.sh firmware' to extract it)"
-fi
-
-# Bluetooth patch firmware is not distributable either: install
-# BCM4334B0.hcd from the git-ignored BT_FW_DIR when present. Without it the
-# controller runs its ROM firmware.
-BT_FW_DIR="${BT_FW_DIR:-${ROOT}/research/firmware/bt}"
-if [ -f "${BT_FW_DIR}/BCM4334B0.hcd" ]; then
-	echo "[rootfs] Installing Bluetooth patch firmware from ${BT_FW_DIR} ..."
-	mkdir -p "${STAGE_DIR}/lib/firmware/brcm"
-	cp "${BT_FW_DIR}/BCM4334B0.hcd" "${STAGE_DIR}/lib/firmware/brcm/"
-else
-	echo "[rootfs] No Bluetooth patch in ${BT_FW_DIR}; the controller runs its ROM firmware"
-fi
+# Wi-Fi and Bluetooth firmware are never part of the image: stage2.sh
+# provisions them at boot from the on-device System volume (/dev/nand0p1).
+mkdir -p "${STAGE_DIR}/lib/firmware/brcm"
 
 # Install initramfs boot and DHCP scripts
 echo "[rootfs] Installing initramfs boot scripts ..."
