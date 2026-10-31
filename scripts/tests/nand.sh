@@ -123,6 +123,14 @@ t_nand() {
 				fail "system keybag classes 1-3 not all unlocked"
 				info "$(echo "$kb" | tr '\n' ';')"
 			fi
+			# stage2 caches the firmware it copied from nand0p1 so later boots skip that
+			fc="$mnt/linux/lib/firmware/brcm"
+			if [ -s "$fc/brcmfmac4334.bin" ] && [ -s "$fc/brcmfmac4334.txt" ] && [ -s "$fc/BCM4334B0.hcd" ]; then
+				pass "wireless firmware cached on nand0p2 (/linux/lib/firmware/brcm)"
+			else
+				fail "wireless firmware cache on nand0p2 incomplete"
+				info "$(ls "$fc" 2>&1 | tr '\n' ' ')"
+			fi
 			tf="$mnt/.hwtest-rw-$$"
 			if echo "velliangiri-rw-ok" > "$tf" 2>/dev/null && sync && [ "$(cat "$tf" 2>/dev/null)" = "velliangiri-rw-ok" ] && rm -f "$tf" 2>/dev/null && sync; then
 				pass "nand0p2 read-write file create, sync, verify, and remove"

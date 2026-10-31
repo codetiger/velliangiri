@@ -56,6 +56,41 @@ fi
 ) &
 log_msg "CDC-ACM console getty active on /dev/ttyGS0"
 
+FW=/lib/firmware/brcm
+FW_FILES="brcmfmac4334.bin brcmfmac4334.txt BCM4334B0.hcd"
+BT_REBIND=0
+# The System volume carries firmware for several boards; this one's files carry its board name
+BOARD=monopoly
+
+# Copy the BCM4334 Wi-Fi firmware, NVRAM and Bluetooth patch out of the on-device
+# System volume (/dev/nand0p1): its files are compressed, and the Bluetooth patch is
+# embedded in a system tool
+provision_from_system() {
+	mkdir -p /mnt/system "$FW"
+	mount -t hfsplus -o ro /dev/nand0p1 /mnt/system 2>/dev/null || return
+	WDIR=/mnt/system/usr/share/firmware/wifi/4334b1
+	if [ ! -s "$FW/brcmfmac4334.bin" ] && [ -r "$WDIR/$BOARD.trx" ]; then
+		cp "$WDIR/$BOARD.trx" "$FW/brcmfmac4334.bin" 2>/dev/null
+		cp "$WDIR/$BOARD-u-st.txt" "$FW/brcmfmac4334.txt" 2>/dev/null
+		# No CLM blob: this firmware rejects a CLM download (-52) and brcmfmac then fails to attach
+		log_msg "nand0p1: provisioned BCM4334 Wi-Fi firmware and NVRAM"
+	fi
+	# Each Bluetooth patch names its board in the local name it sets, so pick the
+	# one patch naming this board
+	BTOOL=/mnt/system/usr/sbin/BlueTool
+	if [ ! -s "$FW/BCM4334B0.hcd" ] && [ -r "$BTOOL" ] && command -v hcdcarve >/dev/null; then
+		if out=$(hcdcarve "$BTOOL" "MHz $BOARD " "$FW/BCM4334B0.hcd.tmp" 2>&1); then
+			mv "$FW/BCM4334B0.hcd.tmp" "$FW/BCM4334B0.hcd"
+			BT_REBIND=1
+			log_msg "nand0p1: provisioned BCM4334B0.hcd Bluetooth patch ($out)"
+		else
+			rm -f "$FW/BCM4334B0.hcd.tmp"
+			log_msg "nand0p1: no Bluetooth patch for this board ($out)"
+		fi
+	fi
+	umount /mnt/system 2>/dev/null || true
+}
+
 # Wait briefly for the NAND translation layer (/dev/nand0p1) to finish probing
 n=0
 while [ ! -b /dev/nand0p1 ] && [ "$n" -lt 20 ]; do
@@ -63,41 +98,13 @@ while [ ! -b /dev/nand0p1 ] && [ "$n" -lt 20 ]; do
 	sleep 1
 done
 
-# Provision BCM4334 Wi-Fi and Bluetooth firmware from on-device System (/dev/nand0p1)
-BT_REBIND=0
-# The System volume carries firmware for several boards; this one's files carry its board name
-BOARD=monopoly
-if [ -b /dev/nand0p1 ] && { [ ! -s /lib/firmware/brcm/brcmfmac4334.bin ] || [ ! -s /lib/firmware/brcm/BCM4334B0.hcd ]; }; then
-	mkdir -p /mnt/system /lib/firmware/brcm
-	if mount -t hfsplus -o ro /dev/nand0p1 /mnt/system 2>/dev/null; then
-		WDIR=/mnt/system/usr/share/firmware/wifi/4334b1
-		if [ ! -s /lib/firmware/brcm/brcmfmac4334.bin ] && [ -r "$WDIR/$BOARD.trx" ]; then
-			cp "$WDIR/$BOARD.trx" /lib/firmware/brcm/brcmfmac4334.bin 2>/dev/null
-			cp "$WDIR/$BOARD-u-st.txt" /lib/firmware/brcm/brcmfmac4334.txt 2>/dev/null
-			# No CLM blob: this firmware rejects a CLM download (-52) and brcmfmac then fails to attach
-			log_msg "nand0p1: provisioned BCM4334 Wi-Fi firmware and NVRAM"
-		fi
-		# The Bluetooth patches are embedded in a system tool; each names its board in the
-		# local name it sets, so pick the one patch naming this board
-		BTOOL=/mnt/system/usr/sbin/BlueTool
-		if [ ! -s /lib/firmware/brcm/BCM4334B0.hcd ] && [ -r "$BTOOL" ] && command -v hcdcarve >/dev/null; then
-			if out=$(hcdcarve "$BTOOL" "MHz $BOARD " /lib/firmware/brcm/BCM4334B0.hcd.tmp 2>&1); then
-				mv /lib/firmware/brcm/BCM4334B0.hcd.tmp /lib/firmware/brcm/BCM4334B0.hcd
-				BT_REBIND=1
-				log_msg "nand0p1: provisioned BCM4334B0.hcd Bluetooth patch ($out)"
-			else
-				rm -f /lib/firmware/brcm/BCM4334B0.hcd.tmp
-				log_msg "nand0p1: no Bluetooth patch for this board ($out)"
-			fi
-		fi
-		umount /mnt/system 2>/dev/null || true
-	fi
-fi
-
-# Load or seed persistent SSH host key and Wi-Fi credentials on Data (/dev/nand0p2)
+# Data (/dev/nand0p2) holds the system keybag, a cache of the firmware above, the
+# persistent SSH host key and Wi-Fi credentials
+DATA=0
 if [ -b /dev/nand0p2 ]; then
 	mkdir -p /mnt/data
 	if mount -t hfsplus -o rw /dev/nand0p2 /mnt/data 2>/dev/null; then
+		DATA=1
 		# Hand the system keybag to the FTL so files of protection classes 1-3 decrypt
 		if [ -s /mnt/data/keybags/systembag.kb ] && [ -w /sys/block/nand0/keybag ]; then
 			if cat /mnt/data/keybags/systembag.kb >/sys/block/nand0/keybag 2>/dev/null; then
@@ -106,29 +113,64 @@ if [ -b /dev/nand0p2 ]; then
 				log_msg "nand0p2: system keybag rejected"
 			fi
 		fi
-		PDIR=/mnt/data/linux/etc
-		if [ -s "$PDIR/dropbear/dropbear_ed25519_host_key" ]; then
-			mkdir -p /etc/dropbear
-			cp "$PDIR/dropbear/dropbear_ed25519_host_key" /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null
-			chmod 600 /etc/dropbear/dropbear_ed25519_host_key
-		elif [ -s /etc/dropbear/dropbear_ed25519_host_key ]; then
-			mkdir -p "$PDIR/dropbear"
-			cp /etc/dropbear/dropbear_ed25519_host_key "$PDIR/dropbear/dropbear_ed25519_host_key" 2>/dev/null
-		fi
-		if [ -s "$PDIR/wpa_supplicant/wpa_supplicant.conf" ]; then
-			mkdir -p /etc/wpa_supplicant
-			cp "$PDIR/wpa_supplicant/wpa_supplicant.conf" /etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null
-			chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
-			log_msg "nand0p2: loaded persistent wpa_supplicant.conf"
-		elif [ -s /etc/wpa_supplicant/wpa_supplicant.conf ]; then
-			mkdir -p "$PDIR/wpa_supplicant"
-			cp /etc/wpa_supplicant/wpa_supplicant.conf "$PDIR/wpa_supplicant/wpa_supplicant.conf" 2>/dev/null
-			chmod 600 "$PDIR/wpa_supplicant/wpa_supplicant.conf" 2>/dev/null
-			log_msg "nand0p2: seeded persistent wpa_supplicant.conf"
-		fi
-		sync
-		umount /mnt/data 2>/dev/null || true
 	fi
+fi
+PDIR=/mnt/data/linux/etc
+FWCACHE=/mnt/data/linux/lib/firmware/brcm
+
+# Firmware: use the copy cached on Data, so later boots skip mounting System,
+# inflating its compressed files and carving the Bluetooth patch
+if [ "$DATA" = 1 ] && [ -d "$FWCACHE" ]; then
+	mkdir -p "$FW"
+	got=""
+	for f in $FW_FILES; do
+		if [ ! -s "$FW/$f" ] && [ -s "$FWCACHE/$f" ] && cp "$FWCACHE/$f" "$FW/$f.tmp" 2>/dev/null; then
+			mv "$FW/$f.tmp" "$FW/$f"
+			got="$got $f"
+		fi
+	done
+	case "$got" in *BCM4334B0.hcd*) BT_REBIND=1 ;; esac
+	[ -n "$got" ] && log_msg "nand0p2: firmware from cache:$got"
+fi
+missing=0
+for f in $FW_FILES; do
+	[ -s "$FW/$f" ] || missing=1
+done
+if [ "$missing" = 1 ] && [ -b /dev/nand0p1 ]; then
+	provision_from_system
+	if [ "$DATA" = 1 ]; then
+		mkdir -p "$FWCACHE"
+		for f in $FW_FILES; do
+			if [ -s "$FW/$f" ] && [ ! -s "$FWCACHE/$f" ] && cp "$FW/$f" "$FWCACHE/$f.tmp" 2>/dev/null; then
+				mv "$FWCACHE/$f.tmp" "$FWCACHE/$f"
+				log_msg "nand0p2: cached $f"
+			fi
+		done
+	fi
+fi
+
+if [ "$DATA" = 1 ]; then
+	if [ -s "$PDIR/dropbear/dropbear_ed25519_host_key" ]; then
+		mkdir -p /etc/dropbear
+		cp "$PDIR/dropbear/dropbear_ed25519_host_key" /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null
+		chmod 600 /etc/dropbear/dropbear_ed25519_host_key
+	elif [ -s /etc/dropbear/dropbear_ed25519_host_key ]; then
+		mkdir -p "$PDIR/dropbear"
+		cp /etc/dropbear/dropbear_ed25519_host_key "$PDIR/dropbear/dropbear_ed25519_host_key" 2>/dev/null
+	fi
+	if [ -s "$PDIR/wpa_supplicant/wpa_supplicant.conf" ]; then
+		mkdir -p /etc/wpa_supplicant
+		cp "$PDIR/wpa_supplicant/wpa_supplicant.conf" /etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null
+		chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
+		log_msg "nand0p2: loaded persistent wpa_supplicant.conf"
+	elif [ -s /etc/wpa_supplicant/wpa_supplicant.conf ]; then
+		mkdir -p "$PDIR/wpa_supplicant"
+		cp /etc/wpa_supplicant/wpa_supplicant.conf "$PDIR/wpa_supplicant/wpa_supplicant.conf" 2>/dev/null
+		chmod 600 "$PDIR/wpa_supplicant/wpa_supplicant.conf" 2>/dev/null
+		log_msg "nand0p2: seeded persistent wpa_supplicant.conf"
+	fi
+	sync
+	umount /mnt/data 2>/dev/null || true
 fi
 
 # Start Dropbear SSH server on port 22 in background
@@ -169,6 +211,16 @@ if [ "$BT_REBIND" = 1 ] || [ -n "$(cat /sys/block/nand0/bmac 2>/dev/null)" ]; th
 		echo "${sdev##*/}" >/sys/bus/serial/drivers/hci_uart_bcm/unbind 2>/dev/null || true
 		echo "${sdev##*/}" >/sys/bus/serial/drivers/hci_uart_bcm/bind 2>/dev/null || true
 	done
+fi
+
+# D-Bus system bus and bluetoothd (bluetoothctl for pairing and connections)
+if [ -x /usr/lib/bluetooth/bluetoothd ] && [ -x /usr/bin/dbus-daemon ]; then
+	mkdir -p /run/dbus /var/lib/bluetooth
+	dbus-uuidgen --ensure 2>/dev/null
+	if dbus-daemon --system 2>/dev/null; then
+		/usr/lib/bluetooth/bluetoothd >/dev/null 2>&1 &
+		log_msg "dbus and bluetoothd started"
+	fi
 fi
 
 # Join Wi-Fi in background when a network is configured
