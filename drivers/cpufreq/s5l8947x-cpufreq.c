@@ -178,7 +178,7 @@ static int s5l8947x_cpufreq_init(struct cpufreq_policy *policy)
 
 static struct cpufreq_driver s5l8947x_cpufreq_driver = {
 	.name		= "s5l8947x-cpufreq",
-	.flags		= CPUFREQ_NEED_INITIAL_FREQ_CHECK,
+	.flags		= CPUFREQ_NEED_INITIAL_FREQ_CHECK | CPUFREQ_IS_COOLING_DEV,
 	.verify		= cpufreq_generic_frequency_table_verify,
 	.target_index	= s5l8947x_cpufreq_target_index,
 	.get		= s5l8947x_cpufreq_get,

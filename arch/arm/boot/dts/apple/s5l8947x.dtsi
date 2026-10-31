@@ -20,6 +20,7 @@
 			device_type = "cpu";
 			compatible = "arm,cortex-a9";
 			reg = <0>;
+			#cooling-cells = <2>;
 		};
 	};
 
