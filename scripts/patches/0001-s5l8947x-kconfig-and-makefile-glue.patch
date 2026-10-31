@@ -16,8 +16,8 @@ existing Apple drivers.
  drivers/clk/Makefile                |  1 +
  drivers/cpufreq/Kconfig.arm         |  8 ++++++++
  drivers/cpufreq/Makefile            |  1 +
- drivers/crypto/Kconfig              | 12 ++++++++++++
- drivers/crypto/Makefile             |  1 +
+ drivers/crypto/Kconfig              | 23 +++++++++++++++++++++++
+ drivers/crypto/Makefile             |  2 ++
  drivers/dma/Kconfig                 | 12 ++++++++++++
  drivers/dma/Makefile                |  1 +
  drivers/hwmon/Kconfig               |  8 ++++++++
@@ -50,7 +50,7 @@ existing Apple drivers.
  drivers/video/fbdev/Makefile        |  1 +
  sound/arm/Kconfig                   | 12 ++++++++++++
  sound/arm/Makefile                  |  2 ++
- 41 files changed, 221 insertions(+), 2 deletions(-)
+ 41 files changed, 233 insertions(+), 2 deletions(-)
 
 diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
 index cc8becc..f8c2184 100644
@@ -140,7 +140,7 @@ index 0f18403..65a6fed 100644
 diff --git a/drivers/crypto/Kconfig b/drivers/crypto/Kconfig
 --- a/drivers/crypto/Kconfig
 +++ b/drivers/crypto/Kconfig
-@@ -345,6 +345,18 @@
+@@ -345,6 +345,29 @@
  
  endif # CRYPTO_DEV_OMAP
  
@@ -156,17 +156,29 @@ diff --git a/drivers/crypto/Kconfig b/drivers/crypto/Kconfig
 +	  S5L8947X SoC: ecb(aes) and cbc(aes) with user keys, and an
 +	  in-kernel interface to the hardware keys held by the engine.
 +
++config CRYPTO_DEV_S5L8947X_SHA
++	tristate "S5L8947X SHA-2 engine"
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
++	depends on OF
++	select CRYPTO_HASH
++	default ARCH_APPLE_S5L
++	help
++	  The SHA engine of the S5L8947X SoC, offered as sha224, sha256,
++	  sha384 and sha512. It is faster than software for SHA-384 and
++	  SHA-512.
++
  config CRYPTO_DEV_SAHARA
  	tristate "Support for SAHARA crypto accelerator"
  	depends on ARCH_MXC && OF
 diff --git a/drivers/crypto/Makefile b/drivers/crypto/Makefile
 --- a/drivers/crypto/Makefile
 +++ b/drivers/crypto/Makefile
-@@ -37,6 +37,7 @@
+@@ -37,6 +37,8 @@
  obj-$(CONFIG_CRYPTO_DEV_ROCKCHIP) += rockchip/
  obj-$(CONFIG_CRYPTO_DEV_S5P) += s5p-sss.o
  obj-$(CONFIG_CRYPTO_DEV_SA2UL) += sa2ul.o
 +obj-$(CONFIG_CRYPTO_DEV_S5L8947X_AES) += s5l8947x-aes.o
++obj-$(CONFIG_CRYPTO_DEV_S5L8947X_SHA) += s5l8947x-sha.o
  obj-$(CONFIG_CRYPTO_DEV_SAHARA) += sahara.o
  obj-$(CONFIG_CRYPTO_DEV_SL3516) += gemini/
  obj-y += stm32/
