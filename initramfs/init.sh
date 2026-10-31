@@ -30,10 +30,12 @@ blip()   { b_i=0; while [ $b_i -lt 1700 ]; do b_i=$((b_i+1)); done; }
 
 msg "stage1 starting"
 
-# Seed system clock from build timestamp before starting TLS/SSH services
+# The kernel sets the clock from the PMU RTC when that has been set since
+# power-up; otherwise, or if it is older than the image, use the build
+# timestamp so TLS/SSH services start with a plausible date.
 if [ -r /etc/build-date ]; then
 	read -r BUILD_EPOCH < /etc/build-date || true
-	if [ -n "$BUILD_EPOCH" ]; then
+	if [ -n "$BUILD_EPOCH" ] && [ "$(date -u +%s)" -lt "$BUILD_EPOCH" ]; then
 		date -u -s "@$BUILD_EPOCH" >/dev/null 2>&1 || true
 	fi
 fi
