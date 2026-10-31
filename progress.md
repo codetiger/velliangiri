@@ -1,6 +1,6 @@
 # Driver Progress (`S5L8947X` / `j33iap`)
 
-Status of every hardware block, checked against the drivers in the tree and the enabled nodes in `s5l8947x-j33iap.dts`. Last reviewed 2026-10-31 (`hwtest`: 87 passed, 0 failed, 2 skipped).
+Status of every hardware block, checked against the drivers in the tree and the enabled nodes in `s5l8947x-j33iap.dts`. Last reviewed 2026-10-31 (`hwtest`: 96 passed, 0 failed, 2 skipped).
 
 ## Done
 
@@ -14,6 +14,7 @@ Status of every hardware block, checked against the drivers in the tree and the 
 | I2C 0/1/2 | `0x33200000`..`0x33400000` | `drivers/i2c/busses/i2c-s5l8940x.c` |
 | Power management unit, power switches and PMU interrupts | I2C0 `0x74`, interrupt on GPIO 109 | `drivers/mfd/apple-pmu-i2c.c`, `drivers/regulator/apple-pmu-pwrsw.c`. The PMU is an interrupt controller (`regmap-irq`): 48 events latched in six read-to-clear registers from `0x01` (buttons, charger, RTC, its GPIO inputs: GPIOs 0..7 are events 16..23, GPIOs 8..9 events 40..41), masks from `0x0c`, and an active-low line on SoC GPIO 109. Bluetooth host wake uses event 22 (PMU GPIO 6). |
 | Real-time clock (in the PMU) | I2C0 `0x74` | `drivers/rtc/rtc-apple-pmu.c` (`rtc0`): wall time is the PMU seconds counter at `0x4c` (runs from PMU power-up, kept across reboots and DFU) plus a calendar offset in PMU scratch registers `0x84`..`0x87` (fraction at `0x95`..`0x96`, kept at zero), the same layout the stock OS uses. Setting the time rewrites the offset; while the offset is zero (after power loss) the clock reports itself invalid. The alarm compares the counter with `0x46`, is armed by bit 6 of `0x4a` and raises PMU event 32 (`wakealarm`). The kernel sets the system clock from it at boot; `init.sh` falls back to the image build date only when the clock is older than that (`hwtest rtc` 4/4, time kept across a reboot). |
+| Temperature sensors and thermal zone (PMU ADC) | I2C0 `0x74` | `drivers/hwmon/apple-pmu-hwmon.c` (hwmon `apple_pmu`): the PMU's 12-bit ADC (channel and start in `0x30`, result in `0x31`..`0x32`, done on PMU event 13) reads the board's four 10 kOhm thermistors through a 50 uA source (`temp1` SoC, `temp2` Wi-Fi, `temp3` power supply, `temp4` NAND, labels from the DT) and the PMU junction temperature (`temp5`, calibrated from `0x43`..`0x44`). Thermal zone `soc-thermal` on `temp1` throttles the CPU through `s5l8947x-cpufreq` (now a cooling device) above 70 C and shuts down at 95 C (`hwtest thermal` 9/9; about 38 to 41 C at idle). |
 | 10/100 Ethernet | `0x3b000000` | `drivers/net/ethernet/apple/s5l_fe.c` |
 | USB 2.0 device mode and PHY | `0x36000000`, `0x36100000` | `drivers/phy/phy-apple-s5l-usb.c` + mainline `dwc2` (`scripts/patches/0005-*`) |
 | USB 2.0 host (EHCI) on the HSIC port | `0x36400000` | mainline `ehci-platform`; host PHY in `drivers/phy/phy-apple-s5l-usb.c` (HSIC tuning, INCRx, port reset release, host-ready/device-ready handshake, device ready after 42 and 57 ms on two measured boots) |
@@ -45,6 +46,11 @@ Status of every hardware block, checked against the drivers in the tree and the 
 - Nothing sets the clock automatically: the image runs no NTP client, so the time has to be set once after power-up (`date -s`, then `hwclock -w`). With the clock set, the kernel keeps it in step from then on (`CONFIG_RTC_SYSTOHC`) only while the system clock is synchronised.
 - The alarm fires and is reported, but waking the board from MCU standby with it is untested.
 
+### Thermal known limits
+
+- The trip points (70 C passive, 95 C critical on the SoC-side board thermistor) are estimates: the stock software sets none for this board. The thermistor sits on the board next to the SoC, not in the die, and lags the die temperature.
+- The board has no SoC die sensor (its device tree has none), and the PMU's battery and calibration inputs (`tbat`, `tcal`) are fixed resistors on this board, so they are not exposed.
+
 ### Central DMA known limits
 
 - The device-address register holds only 24 bits; the upper address window comes from the channel's hardware wiring rather than a register. Two peripheral FIFO windows are measured and accepted by `s5l8947x-cdma`: `0x34000000` (audio, memory to device) and `0x31000000` (NAND FIFOs on channels 5–8, device to memory), while channels 1 and 2 are driven directly by `s5l8947x-aes`. Other peripheral clients (UART1/2, SHA, display) are still refused until their FIFO windows are verified.
@@ -74,15 +80,8 @@ Status of every hardware block, checked against the drivers in the tree and the 
 | USB OTG port host mode (`0x36100000`) | Device mode on `dwc2`; EHCI host serves only the internal HSIC port | `dr_mode` is `peripheral`; host on the OTG port needs a role switch. The OHCI companion (`0x36500000`, IRQ 13) is not described, so full/low-speed devices are unsupported. |
 | System MCU (`0x32600000`) | Button input, firmware query, break, raw commands (`hwtest mcu` 3/3), standby on halt | Reset-to-recovery trigger and wake source are not wired (the MCU line, GPIO 2, is unused). |
 
-## Not started
-
-| Block | Address | Notes |
-|---|---|---|
-| Temperature sensors (PMU ADC) | I2C0 `0x74`, registers `0x30`..`0x33`, `0x43`..`0x44` | Four 10 kOhm thermistors (SoC, Wi-Fi, power supply, NAND) and the PMU junction temperature, read through the PMU's 12-bit ADC. |
-
 ## Suggested order
 
-1. Temperature sensors on the PMU ADC (`hwmon`), with a thermal zone on the SoC thermistor.
-2. NAND: reproduce the one-off CDMA completion timeout (stress reads across `ondemand` frequency changes) and make `s5l8947x-fmi` recover from it.
-3. Add host mode to the OTG port.
-4. Optical audio at exact rates: clock the S/PDIF transmitter from PMGR oscillator 4 and verify it on a receiver.
+1. NAND: reproduce the one-off CDMA completion timeout (stress reads across `ondemand` frequency changes) and make `s5l8947x-fmi` recover from it.
+2. Add host mode to the OTG port.
+3. Optical audio at exact rates: clock the S/PDIF transmitter from PMGR oscillator 4 and verify it on a receiver.
