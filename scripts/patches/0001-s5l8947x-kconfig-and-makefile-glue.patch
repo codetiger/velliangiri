@@ -40,13 +40,15 @@ existing Apple drivers.
  drivers/pinctrl/Makefile            |  1 +
  drivers/regulator/Kconfig           |  8 ++++++++
  drivers/regulator/Makefile          |  1 +
+ drivers/rtc/Kconfig                 |  9 +++++++++
+ drivers/rtc/Makefile                |  1 +
  drivers/soc/apple/Kconfig           | 11 ++++++++++-
  drivers/soc/apple/Makefile          |  2 ++
  drivers/video/fbdev/Kconfig         |  9 +++++++++
  drivers/video/fbdev/Makefile        |  1 +
  sound/arm/Kconfig                   | 12 ++++++++++++
  sound/arm/Makefile                  |  2 ++
- 37 files changed, 202 insertions(+), 2 deletions(-)
+ 39 files changed, 212 insertions(+), 2 deletions(-)
 
 diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
 index cc8becc..f8c2184 100644
@@ -512,6 +514,36 @@ index 3d5a803..48006b8 100644
 +obj-$(CONFIG_REGULATOR_APPLE_PMU_PWRSW)	+= apple-pmu-pwrsw.o
  
  ccflags-$(CONFIG_REGULATOR_DEBUG) += -DDEBUG
+diff --git a/drivers/rtc/Kconfig b/drivers/rtc/Kconfig
+--- a/drivers/rtc/Kconfig
++++ b/drivers/rtc/Kconfig
+@@ -1175,6 +1175,15 @@
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called "rtc-da9063".
+ 
++config RTC_DRV_APPLE_PMU
++	tristate "Dialog D1815 PMU RTC"
++	depends on MFD_APPLE_PMU_I2C
++	default MFD_APPLE_PMU_I2C
++	help
++	  Real-time clock and alarm of the Dialog D1815 power management
++	  unit on S5L8947X boards: a seconds counter that runs while the
++	  board has power, plus a calendar offset kept in PMU registers.
++
+ config RTC_DRV_EFI
+ 	tristate "EFI RTC"
+ 	depends on EFI && !X86
+diff --git a/drivers/rtc/Makefile b/drivers/rtc/Makefile
+--- a/drivers/rtc/Makefile
++++ b/drivers/rtc/Makefile
+@@ -45,6 +45,7 @@
+ obj-$(CONFIG_RTC_DRV_DA9052)	+= rtc-da9052.o
+ obj-$(CONFIG_RTC_DRV_DA9055)	+= rtc-da9055.o
+ obj-$(CONFIG_RTC_DRV_DA9063)	+= rtc-da9063.o
++obj-$(CONFIG_RTC_DRV_APPLE_PMU)	+= rtc-apple-pmu.o
+ obj-$(CONFIG_RTC_DRV_DIGICOLOR)	+= rtc-digicolor.o
+ obj-$(CONFIG_RTC_DRV_DS1216)	+= rtc-ds1216.o
+ obj-$(CONFIG_RTC_DRV_DS1286)	+= rtc-ds1286.o
 diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
 index 6388cbe..6d72f9e 100644
 --- a/drivers/soc/apple/Kconfig
