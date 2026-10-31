@@ -23,7 +23,7 @@ This project is built for two groups of people:
 
 ## Hardware Support (`S5L8947X` / `j33iap`)
 
-Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) in about 20 seconds and exposes the internal NAND volumes (`/dev/nand0p1` and `/dev/nand0p2`) with full read-write HFS+ and hardware AES support, without modifying the device's internal flash storage unless you explicitly mount and write to a volume.
+Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) in about 20 seconds and exposes the internal NAND volumes (`/dev/nand0p1` and `/dev/nand0p2`) with full read-write HFS+ and hardware AES support. Nothing is installed to the device, but the internal flash is not left untouched: at every boot `stage2` mounts `System` read-only to copy the wireless firmware and mounts `Data` read-write to keep the SSH host key and Wi-Fi settings under `/linux/etc` there.
 
 ### What works
 
@@ -35,11 +35,11 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **Audio (HDMI & Optical)** | ALSA playback (`s5l8947x-audio`) on two PCM devices: HDMI over I2S (`pcmC0D0p`, verified clean with speech) and optical S/PDIF (`pcmC0D1p`), each fed by a cyclic DMA transfer with period interrupts, with HDMI hot-plug mute/unmute and a `wavplay` CLI player |
 | **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
 | **USB Networking & Console** | Micro-USB port runs in USB device mode (`dwc2`), providing a virtual Ethernet link (`usb0` at `10.55.0.2`, SSH enabled) and a USB serial console (`/dev/ttyGS0`) |
-| **Wi-Fi (2.4 & 5 GHz)** | Broadcom BCM4334 over internal HSIC USB host (`ehci-platform` + custom PHY handshake); scans and joins WPA2 networks via `wpa_supplicant` and the built-in `wifi` helper; firmware, NVRAM, and the factory MAC address are read from the device's own NAND at boot |
-| **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2`); patch firmware is read from the device's own NAND at boot; LE scanning verified with `btscan` |
+| **Wi-Fi (2.4 & 5 GHz)** | Broadcom BCM4334 over internal HSIC USB host (`ehci-platform` + custom PHY handshake); scans and joins WPA2 networks via `wpa_supplicant` and the built-in `wifi` helper; firmware, NVRAM, and the factory MAC address are read from the device's own NAND at boot; the regulatory country can be set with `iw reg set` or `country=` in `wpa_supplicant.conf` |
+| **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2`); patch firmware and the factory device address are read from the device's own NAND at boot; LE scanning verified with `btscan` |
 | **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`S5L8947X IR Remote`, `/dev/input/event*`) via the MSP430 system microcontroller on `uart1` |
 | **Hardware AES Engine** | CDMA AES crypto engine (`s5l8947x-aes` at `0x37801000`): `ecb(aes)` and `cbc(aes)` `skcipher` algorithms (128 / 192 / 256-bit keys) over CDMA channels 1 and 2, plus hardware device/group key operations (`s5l8947x_aes_hwkey_crypt()`) |
-| **Internal NAND & Volumes** | Managed NAND controller (`s5l8947x-fmi`, 8.9 GB, read/write/erase on `/dev/mtd0`, ~14 MB/s reads over CDMA) and read-write translation layer (`s5l8947x-ftl`) exposing `/dev/nand0`, `/dev/nand0p1` (`System`, 1.4 GB), and `/dev/nand0p2` (`Data`, 6.5 GB, volume and per-file `com.apple.system.cprotect` class-4 keys unwrapped from the reserved SLC key store); both volumes mount read-write as `hfsplus` with journal verification/replay, transparent file encryption/decryption, and clean unmount handling |
+| **Internal NAND & Volumes** | Managed NAND controller (`s5l8947x-fmi`, 8.9 GB, read/write/erase on `/dev/mtd0`, ~17 MiB/s reads over CDMA) and read-write translation layer (`s5l8947x-ftl`) exposing `/dev/nand0`, `/dev/nand0p1` (`System`, 1.4 GB), and `/dev/nand0p2` (`Data`, 6.5 GB, volume and per-file `com.apple.system.cprotect` class-4 keys unwrapped from the reserved SLC key store); both volumes mount read-write as `hfsplus` with journal verification/replay, transparent file encryption/decryption, and clean unmount handling |
 
 ### What doesn't work yet (honest limitations)
 
@@ -47,9 +47,10 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 |---|---|
 | **Passcode-bound keybag classes** | Unauthenticated volume and class-4 per-file keys (`com.apple.system.cprotect`, 7,117 of 7,297 files on `nand0p2`) are unwrapped for read and write, while passcode-bound keybag classes (1–3, 180 files) are not unwrapped. |
 | **3D GPU acceleration** | On hold. The PowerVR SGX543 power domain and clocks come up for bus telemetry, but there is no DRM/3D rendering driver. Graphics use the 720p CPU framebuffer. |
-| **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a configfs CDC-ECM + CDC-ACM gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
+| **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a CDC-ECM + CDC-ACM composite gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
 | **Audio sample rates** | The I2S and S/PDIF blocks are clocked from the 24 MHz crystal, so HDMI playback runs at `46,875 Hz` or `31,250 Hz` and optical at `46,875 Hz` instead of `48,000 Hz`. Use `wavplay` (which resamples automatically) or ALSA resampling. The optical output has not been checked on a receiver yet. |
-| **Wi-Fi / BT factory addresses** | Wi-Fi uses a locally administered MAC address from the Device Tree, and Bluetooth runs at 115,200 baud with its default controller address (`BlueZ` userspace is not pre-installed in the small initramfs). |
+| **Bluetooth** | The controller runs at 115,200 baud, and `BlueZ` userspace is not in the small initramfs, so pairing and connections are untested. |
+| **Wireless without NAND** | The Wi-Fi firmware and Bluetooth patch cannot be redistributed and are copied from the device's own `System` volume at boot. Without it, Wi-Fi does not come up and Bluetooth runs on its ROM firmware. |
 
 For exact register addresses, driver file paths, and per-block notes, see [progress.md](progress.md).
 
@@ -64,9 +65,9 @@ For exact register addresses, driver file paths, and per-block notes, see [progr
 
 ### 2. Wi-Fi and Bluetooth firmware
 
-Nothing to do: the Broadcom firmware cannot be redistributed, so it is never part of the build. At boot, `stage2` mounts the device's own `System` volume (`/dev/nand0p1`) read-only and copies the Wi-Fi firmware, NVRAM, and Bluetooth patch into `/lib/firmware/brcm/` (the Bluetooth patch is accepted only if its SHA-256 matches). The Ethernet, Wi-Fi, and Bluetooth addresses come from the factory system configuration on the same NAND (`/sys/block/nand0/{emac,wmac,bmac}`). Without a readable `System` volume, Wi-Fi does not come up and Bluetooth runs on its ROM firmware.
+Nothing to do: the Broadcom firmware cannot be redistributed, so it is never part of the build. At boot, `stage2` mounts the device's own `System` volume (`/dev/nand0p1`) read-only and copies the Wi-Fi firmware, NVRAM, and Bluetooth patch into `/lib/firmware/brcm/` (the Bluetooth patch is carved out of a system tool by `hcdcarve`, which picks the one patch naming this board). The Ethernet, Wi-Fi, and Bluetooth addresses come from the factory system configuration on the same NAND (`/sys/block/nand0/{emac,wmac,bmac}`). Without a readable `System` volume, Wi-Fi does not come up and Bluetooth runs on its ROM firmware.
 
-*(Optional)* To make the device join your Wi-Fi network automatically at boot, place a standard `wpa_supplicant.conf` at `research/wpa_supplicant.conf` before building. You can also pass `SSH_PUBKEY=/path/to/id_ed25519.pub` to install your SSH key.
+*(Optional)* To make the device join your Wi-Fi network automatically at boot, place a standard `wpa_supplicant.conf` at `research/wpa_supplicant.conf` (or point `WIFI_CONF` at another file inside the repository) before building. On first boot it is saved to the `Data` volume, and from then on the saved copy is used. To install your SSH key, pass a public key file inside the repository, for example `SSH_PUBKEY=research/id_ed25519.pub ./scripts/velliangiri.sh all`.
 
 ### 3. Build the bootable bundle
 
@@ -157,9 +158,9 @@ If you have another device with a serial console (or USB / framebuffer output) a
    - Update the MMIO base addresses, IRQ numbers, and clock gate indices for your chip. Start with just `aic`, `wdt`, `uart0` (or `usb0` for USB gadget console/network), and `simple-framebuffer`.
 3. **Use the built-in hardware exploration tools:**
    - Once the initramfs boots to a shell over serial or USB, the image includes static diagnostic utilities compiled from `scripts/tools/`:
-     - `peek <phys-addr> [width] [value]` — read or write MMIO registers directly from userspace.
-     - `i2cpoke` — scan I2C buses and inspect PMU registers.
-     - `l2bench` — verify cache and memory bandwidth.
+     - `peek <phys-addr> [count]` / `peek -w <phys-addr> <value>` — read or write 32-bit MMIO registers from userspace.
+     - `i2cpoke <bus> scan` / `i2cpoke <bus> <addr> <reg> [count]` — scan I2C buses and read or write device registers.
+     - `l2bench` — measure L1, L2 and DRAM latency to confirm the caches are on.
 4. **Enable peripherals incrementally:**
    - Turn on `gpio`, `i2c`, `pmu`, `usb_phy`, `cdma`, `aes`, `fmi0`, `display_pipe`, and `audio` nodes one by one in your board's `.dts`, adding compatible strings or small register-offset tables to the existing drivers where your chip differs.
 
@@ -176,10 +177,10 @@ Instead of storing a full kernel source tree, this repository holds only the fil
 | `arch/arm/boot/dts/apple/` | SoC (`.dtsi`) and board (`.dts`) Device Trees |
 | `arch/arm/mach-apple/` | Machine init, CPU clock calibration, watchdog clocksource & reset |
 | `drivers/`, `sound/`, `include/` | Clean-room kernel drivers in their standard mainline paths |
-| `scripts/patches/` | 8 small, self-contained patches to mainline Linux 6.12 files |
+| `scripts/patches/` | 9 small, self-contained patches to mainline Linux 6.12 files |
 | `scripts/boot/` | Position-independent entry stub, pre-kernel C loader, HDMI init, boot splash and its generator |
 | `scripts/tests/` | On-device hardware test suite (`hwtest`) |
-| `scripts/tools/` | Userspace MMIO/I2C diagnostic tools (`peek`, `i2cpoke`, `wavplay`, `btscan`, `l2bench`, `jitterseed`) |
+| `scripts/tools/` | Userspace tools built into the image: diagnostics (`peek`, `i2cpoke`, `l2bench`), `wavplay`, `btscan`, the Bluetooth patch carver `hcdcarve`, and the early entropy seeder `jitterseed` |
 | `config/` | Kernel configuration fragments layered on `multi_v7_defconfig` |
 | `initramfs/` | Init scripts, USB gadget / SSH setup, and the `wifi` helper |
 
@@ -191,7 +192,6 @@ Contributions of any kind are welcome—whether that is a new board Device Tree,
 
 High-impact open tasks on `S5L8947X` right now (see [progress.md](progress.md) for details):
 - **USB OTG host mode** (role switching + OHCI companion controller at `0x36500000`) to allow plugging in external USB devices.
-- **OTP / system config reader** to populate the factory Wi-Fi and Bluetooth MAC addresses automatically.
 - **Audio at exact 48 kHz**: clock the I2S master from the PMGR clock synthesizer instead of the 24 MHz crystal.
 
 ### Guardrails
