@@ -23,7 +23,7 @@ This project is built for two groups of people:
 
 ## Hardware Support (`S5L8947X` / `j33iap`)
 
-Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) in about 20 seconds and exposes the internal NAND volumes (`/dev/nand0p1` and `/dev/nand0p2`) with full read-write HFS+ and hardware AES support. Nothing is installed to the device, but the internal flash is not left untouched: at every boot `stage2` mounts `System` read-only to copy the wireless firmware and mounts `Data` read-write to load its system keybag (which unlocks protected files) and to keep the SSH host key and Wi-Fi settings under `/linux/etc` there.
+Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) in about 20 seconds and exposes the internal NAND volumes (`/dev/nand0p1` and `/dev/nand0p2`) with full read-write HFS+ and hardware AES support. Nothing is installed to the device, but the internal flash is not left untouched: at every boot `stage2` mounts `Data` read-write to load its system keybag (which unlocks protected files) and to keep the SSH host key, Wi-Fi settings and a cache of the wireless firmware under `/linux` there; `System` is mounted read-only only on the first boot, to copy that firmware.
 
 ### What works
 
@@ -36,7 +36,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
 | **USB Networking & Console** | Micro-USB port runs in USB device mode (`dwc2`), providing a virtual Ethernet link (`usb0` at `10.55.0.2`, SSH enabled) and a USB serial console (`/dev/ttyGS0`) |
 | **Wi-Fi (2.4 & 5 GHz)** | Broadcom BCM4334 over internal HSIC USB host (`ehci-platform` + custom PHY handshake); scans and joins WPA2 networks via `wpa_supplicant` and the built-in `wifi` helper; firmware, NVRAM, and the factory MAC address are read from the device's own NAND at boot; the regulatory country can be set with `iw reg set` or `country=` in `wpa_supplicant.conf` |
-| **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2` at 1.6 Mbaud); patch firmware and the factory device address are read from the device's own NAND at boot; LE scanning verified with `btscan` |
+| **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2` at 1.6 Mbaud); patch firmware and the factory device address are read from the device's own NAND at boot; LE scanning verified with `btscan`; BlueZ (`bluetoothd`, `bluetoothctl`) runs at boot and discovers nearby devices |
 | **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`S5L8947X IR Remote`, `/dev/input/event*`) via the MSP430 system microcontroller on `uart1` |
 | **Hardware AES Engine** | CDMA AES crypto engine (`s5l8947x-aes` at `0x37801000`): `ecb(aes)` and `cbc(aes)` `skcipher` algorithms (128 / 192 / 256-bit keys) over CDMA channels 1 and 2, plus hardware device/group key operations (`s5l8947x_aes_hwkey_crypt()`) |
 | **Internal NAND & Volumes** | Managed NAND controller (`s5l8947x-fmi`, 8.9 GB, read/write/erase on `/dev/mtd0`, ~17 MiB/s reads over CDMA) and read-write translation layer (`s5l8947x-ftl`) exposing `/dev/nand0`, `/dev/nand0p1` (`System`, 1.4 GB), and `/dev/nand0p2` (`Data`, 6.5 GB, volume key and per-file `com.apple.system.cprotect` keys of all four protection classes, from the reserved SLC key store and the system keybag); both volumes mount read-write as `hfsplus` with journal verification/replay, transparent file encryption/decryption, and clean unmount handling |
@@ -48,7 +48,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **3D GPU acceleration** | On hold. The PowerVR SGX543 power domain and clocks come up for bus telemetry, but there is no DRM/3D rendering driver. Graphics use the 720p CPU framebuffer. |
 | **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a CDC-ECM + CDC-ACM composite gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
 | **Audio sample rates** | The I2S and S/PDIF blocks are clocked from the 24 MHz crystal, so HDMI playback runs at `46,875 Hz` or `31,250 Hz` and optical at `46,875 Hz` instead of `48,000 Hz`. Use `wavplay` (which resamples automatically) or ALSA resampling. The optical output has not been checked on a receiver yet. |
-| **Bluetooth** | The controller runs at 1.6 Mbaud rather than the stock 3 Mbaud (the UART clocks cannot produce 3 Mbaud), there is no host-wake interrupt yet, and `BlueZ` userspace is not in the small initramfs, so pairing and connections are untested. |
+| **Bluetooth** | The controller runs at 1.6 Mbaud rather than the stock 3 Mbaud (the UART clocks cannot produce 3 Mbaud), there is no host-wake interrupt yet, and pairing and connections through `bluetoothctl` have not been tested yet. |
 
 For exact register addresses, driver file paths, and per-block notes, see [progress.md](progress.md).
 
@@ -63,7 +63,7 @@ For exact register addresses, driver file paths, and per-block notes, see [progr
 
 ### 2. Wi-Fi and Bluetooth firmware
 
-Nothing to do: at boot, `stage2` mounts the device's own `System` volume (`/dev/nand0p1`) read-only and copies the Wi-Fi firmware, NVRAM, and Bluetooth patch into `/lib/firmware/brcm/` (the Bluetooth patch is carved out of a system tool by `hcdcarve`, which picks the one patch naming this board). The Ethernet, Wi-Fi, and Bluetooth addresses come from the factory system configuration on the same NAND (`/sys/block/nand0/{emac,wmac,bmac}`).
+Nothing to do: on the first boot, `stage2` mounts the device's own `System` volume (`/dev/nand0p1`) read-only and copies the Wi-Fi firmware, NVRAM, and Bluetooth patch into `/lib/firmware/brcm/` (the Bluetooth patch is carved out of a system tool by `hcdcarve`, which picks the one patch naming this board). It keeps a copy on `Data` (`/linux/lib/firmware/brcm`), and later boots load the firmware from there; delete that folder to provision again from `System`. The Ethernet, Wi-Fi, and Bluetooth addresses come from the factory system configuration on the same NAND (`/sys/block/nand0/{emac,wmac,bmac}`).
 
 *(Optional)* To make the device join your Wi-Fi network automatically at boot, place a standard `wpa_supplicant.conf` at `research/wpa_supplicant.conf` (or point `WIFI_CONF` at another file inside the repository) before building. On first boot it is saved to the `Data` volume, and from then on the saved copy is used. To install your SSH key, pass a public key file inside the repository, for example `SSH_PUBKEY=research/id_ed25519.pub ./scripts/velliangiri.sh all`.
 
