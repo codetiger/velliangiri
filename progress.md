@@ -1,6 +1,6 @@
 # Driver Progress (`S5L8947X` / `j33iap`)
 
-Status of every hardware block, checked against the drivers in the tree and the enabled nodes in `s5l8947x-j33iap.dts`. Last reviewed 2026-10-31 (`hwtest`: 83 passed, 0 failed, 2 skipped).
+Status of every hardware block, checked against the drivers in the tree and the enabled nodes in `s5l8947x-j33iap.dts`. Last reviewed 2026-10-31 (`hwtest`: 87 passed, 0 failed, 2 skipped).
 
 ## Done
 
@@ -13,6 +13,7 @@ Status of every hardware block, checked against the drivers in the tree and the 
 | CPU frequency (212.5 / 425 / 850 MHz) | `0x3f100000` | `drivers/cpufreq/s5l8947x-cpufreq.c`; every state keeps the peripheral divider, so the 51.3 MHz UART clock does not change with the CPU speed |
 | I2C 0/1/2 | `0x33200000`..`0x33400000` | `drivers/i2c/busses/i2c-s5l8940x.c` |
 | Power management unit, power switches and PMU interrupts | I2C0 `0x74`, interrupt on GPIO 109 | `drivers/mfd/apple-pmu-i2c.c`, `drivers/regulator/apple-pmu-pwrsw.c`. The PMU is an interrupt controller (`regmap-irq`): 48 events latched in six read-to-clear registers from `0x01` (buttons, charger, RTC, its GPIO inputs: GPIOs 0..7 are events 16..23, GPIOs 8..9 events 40..41), masks from `0x0c`, and an active-low line on SoC GPIO 109. Bluetooth host wake uses event 22 (PMU GPIO 6). |
+| Real-time clock (in the PMU) | I2C0 `0x74` | `drivers/rtc/rtc-apple-pmu.c` (`rtc0`): wall time is the PMU seconds counter at `0x4c` (runs from PMU power-up, kept across reboots and DFU) plus a calendar offset in PMU scratch registers `0x84`..`0x87` (fraction at `0x95`..`0x96`, kept at zero), the same layout the stock OS uses. Setting the time rewrites the offset; while the offset is zero (after power loss) the clock reports itself invalid. The alarm compares the counter with `0x46`, is armed by bit 6 of `0x4a` and raises PMU event 32 (`wakealarm`). The kernel sets the system clock from it at boot; `init.sh` falls back to the image build date only when the clock is older than that (`hwtest rtc` 4/4, time kept across a reboot). |
 | 10/100 Ethernet | `0x3b000000` | `drivers/net/ethernet/apple/s5l_fe.c` |
 | USB 2.0 device mode and PHY | `0x36000000`, `0x36100000` | `drivers/phy/phy-apple-s5l-usb.c` + mainline `dwc2` (`scripts/patches/0005-*`) |
 | USB 2.0 host (EHCI) on the HSIC port | `0x36400000` | mainline `ehci-platform`; host PHY in `drivers/phy/phy-apple-s5l-usb.c` (HSIC tuning, INCRx, port reset release, host-ready/device-ready handshake, device ready after 42 and 57 ms on two measured boots) |
@@ -38,6 +39,11 @@ Status of every hardware block, checked against the drivers in the tree and the 
 - Not the stock 3 Mbaud: the UART's two clock sources measure about 51.3 MHz and 24 MHz, there is no fractional divider (the slot register does not latch), and 3,206,250 baud (51.3 MHz / 16) is not matched by the controller.
 - This controller firmware sets extra high bits in the LE advertising report type, so the kernel logs "unknown advertising packet type" for some reports and drops them.
 - Pairing and connections are untested (needs a device to pair with), and pairings are not yet kept across reboots (`/var/lib/bluetooth` is in RAM).
+
+### RTC known limits
+
+- Nothing sets the clock automatically: the image runs no NTP client, so the time has to be set once after power-up (`date -s`, then `hwclock -w`). With the clock set, the kernel keeps it in step from then on (`CONFIG_RTC_SYSTOHC`) only while the system clock is synchronised.
+- The alarm fires and is reported, but waking the board from MCU standby with it is untested.
 
 ### Central DMA known limits
 
@@ -72,10 +78,11 @@ Status of every hardware block, checked against the drivers in the tree and the 
 
 | Block | Address | Notes |
 |---|---|---|
-| SD/MMC, SPI, RTC, thermal, hardware RNG | — | Not investigated; `CONFIG_MMC` is off. |
+| Temperature sensors (PMU ADC) | I2C0 `0x74`, registers `0x30`..`0x33`, `0x43`..`0x44` | Four 10 kOhm thermistors (SoC, Wi-Fi, power supply, NAND) and the PMU junction temperature, read through the PMU's 12-bit ADC. |
 
 ## Suggested order
 
-1. NAND: reproduce the one-off CDMA completion timeout (stress reads across `ondemand` frequency changes) and make `s5l8947x-fmi` recover from it.
-2. Add host mode to the OTG port.
-3. Optical audio at exact rates: clock the S/PDIF transmitter from PMGR oscillator 4 and verify it on a receiver.
+1. Temperature sensors on the PMU ADC (`hwmon`), with a thermal zone on the SoC thermistor.
+2. NAND: reproduce the one-off CDMA completion timeout (stress reads across `ondemand` frequency changes) and make `s5l8947x-fmi` recover from it.
+3. Add host mode to the OTG port.
+4. Optical audio at exact rates: clock the S/PDIF transmitter from PMGR oscillator 4 and verify it on a receiver.

@@ -30,7 +30,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | Hardware | Status & Details |
 |---|---|
 | **CPU & Core SoC** | Single-core Cortex-A9 up to 850 MHz, CPU frequency scaling (`212.5` / `425` / `850 MHz`), 512 KB PL310 L2 cache, `aic,1` interrupt controller, 24 MHz timer, 42-channel central DMA (`dmaengine`), hardware watchdog, clean reboot and standby power-off |
-| **Clocks, GPIO, I2C, PMU** | PMGR peripheral clock gates and audio oscillators, 144-pin GPIO and pinctrl controller (with IRQs), 3x I2C controllers, Dialog I2C PMU power switches |
+| **Clocks, GPIO, I2C, PMU** | PMGR peripheral clock gates and audio oscillators, 144-pin GPIO and pinctrl controller (with IRQs), 3x I2C controllers, Dialog I2C PMU power switches and real-time clock (with alarm) |
 | **HDMI Video** | 720p60 framebuffer console (`simple-framebuffer` + `s5l8947x-display`), a logo boot splash drawn by the pre-kernel loader, 10-bit hardware gamma LUT, and memory-to-memory hardware scaler |
 | **Audio (HDMI & Optical)** | ALSA playback (`s5l8947x-audio`) on two PCM devices: HDMI over I2S (`pcmC0D0p`, verified clean with speech) and optical S/PDIF (`pcmC0D1p`), each fed by a cyclic DMA transfer with period interrupts, with HDMI hot-plug mute/unmute and a `wavplay` CLI player |
 | **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
@@ -127,6 +127,7 @@ Drivers that apply across the SoC family are already named `s5l8940x` and parame
 | **GPIO & Pinctrl** | `drivers/pinctrl/pinctrl-s5l8940x-gpio.c` | Banked pin controller and GPIO IRQ chip (`apple,npins` set in DT). |
 | **I2C** | `drivers/i2c/busses/i2c-s5l8940x.c` | Master controller for `i2c0`..`i2c2`. |
 | **PMU & Regulators** | `drivers/mfd/apple-pmu-i2c.c`<br>`drivers/regulator/apple-pmu-pwrsw.c` | Dialog I2C PMU (`D1815` / `D1974` / `D2045`) regmap MFD with its event interrupts (used for Bluetooth host wake) and GPIO-backed power switches. |
+| **Real-time clock** | `drivers/rtc/rtc-apple-pmu.c` | PMU seconds counter plus a calendar offset in PMU registers, with an alarm on PMU event 32. |
 | **USB 2.0 PHY** | `drivers/phy/phy-apple-s5l-usb.c` | OTG device PHY (paired with mainline `dwc2`) and EHCI HSIC host PHY with GPIO ready handshaking. |
 | **UART** | `scripts/patches/0002-*.patch` | Hooks `ARCH_APPLE_S5L` into mainline `samsung_tty.c` (`apple,s5l-uart`). |
 | **Display & HDMI** | `drivers/video/fbdev/s5l8947x-display.c` | `rgbout` display pipe, 10-bit gamma LUTs, M2M hardware scaler, and HDMI 1.4 transmitter. |
