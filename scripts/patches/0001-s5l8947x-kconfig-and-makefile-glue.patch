@@ -16,6 +16,10 @@ existing Apple drivers.
  drivers/clk/Makefile                |  1 +
  drivers/cpufreq/Kconfig.arm         |  8 ++++++++
  drivers/cpufreq/Makefile            |  1 +
+ drivers/crypto/Kconfig              | 12 ++++++++++++
+ drivers/crypto/Makefile             |  1 +
+ drivers/dma/Kconfig                 | 12 ++++++++++++
+ drivers/dma/Makefile                |  1 +
  drivers/i2c/busses/Kconfig          |  8 ++++++++
  drivers/i2c/busses/Makefile         |  1 +
  drivers/input/misc/Kconfig          | 10 ++++++++++
@@ -24,6 +28,10 @@ existing Apple drivers.
  drivers/irqchip/Makefile            |  1 +
  drivers/mfd/Kconfig                 | 11 +++++++++++
  drivers/mfd/Makefile                |  1 +
+ drivers/mtd/Kconfig                 | 15 +++++++++++++++
+ drivers/mtd/Makefile                |  1 +
+ drivers/mtd/devices/Kconfig         | 11 +++++++++++
+ drivers/mtd/devices/Makefile        |  1 +
  drivers/net/ethernet/apple/Kconfig  | 11 ++++++++++-
  drivers/net/ethernet/apple/Makefile |  1 +
  drivers/phy/Kconfig                 |  9 +++++++++
@@ -36,9 +44,9 @@ existing Apple drivers.
  drivers/soc/apple/Makefile          |  2 ++
  drivers/video/fbdev/Kconfig         |  9 +++++++++
  drivers/video/fbdev/Makefile        |  1 +
- sound/arm/Kconfig                   | 11 +++++++++++
+ sound/arm/Kconfig                   | 12 ++++++++++++
  sound/arm/Makefile                  |  2 ++
- 29 files changed, 148 insertions(+), 2 deletions(-)
+ 37 files changed, 202 insertions(+), 2 deletions(-)
 
 diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
 index cc8becc..f8c2184 100644
@@ -125,6 +133,74 @@ index 0f18403..65a6fed 100644
  obj-$(CONFIG_SPARC_US2E_CPUFREQ)	+= sparc-us2e-cpufreq.o
  obj-$(CONFIG_SPARC_US3_CPUFREQ)		+= sparc-us3-cpufreq.o
 +obj-$(CONFIG_ARM_S5L8947X_CPUFREQ)	+= s5l8947x-cpufreq.o
+diff --git a/drivers/crypto/Kconfig b/drivers/crypto/Kconfig
+--- a/drivers/crypto/Kconfig
++++ b/drivers/crypto/Kconfig
+@@ -345,6 +345,18 @@
+ 
+ endif # CRYPTO_DEV_OMAP
+ 
++config CRYPTO_DEV_S5L8947X_AES
++	tristate "S5L8947X AES engine"
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
++	depends on OF && HAS_DMA && S5L8947X_CDMA
++	select CRYPTO_SKCIPHER
++	select CRYPTO_LIB_AES
++	default ARCH_APPLE_S5L
++	help
++	  The memory-to-memory AES engine in the central DMA block of the
++	  S5L8947X SoC: ecb(aes) and cbc(aes) with user keys, and an
++	  in-kernel interface to the hardware keys held by the engine.
++
+ config CRYPTO_DEV_SAHARA
+ 	tristate "Support for SAHARA crypto accelerator"
+ 	depends on ARCH_MXC && OF
+diff --git a/drivers/crypto/Makefile b/drivers/crypto/Makefile
+--- a/drivers/crypto/Makefile
++++ b/drivers/crypto/Makefile
+@@ -37,6 +37,7 @@
+ obj-$(CONFIG_CRYPTO_DEV_ROCKCHIP) += rockchip/
+ obj-$(CONFIG_CRYPTO_DEV_S5P) += s5p-sss.o
+ obj-$(CONFIG_CRYPTO_DEV_SA2UL) += sa2ul.o
++obj-$(CONFIG_CRYPTO_DEV_S5L8947X_AES) += s5l8947x-aes.o
+ obj-$(CONFIG_CRYPTO_DEV_SAHARA) += sahara.o
+ obj-$(CONFIG_CRYPTO_DEV_SL3516) += gemini/
+ obj-y += stm32/
+diff --git a/drivers/dma/Kconfig b/drivers/dma/Kconfig
+index d9ec1e6..8c00ece 100644
+--- a/drivers/dma/Kconfig
++++ b/drivers/dma/Kconfig
+@@ -564,6 +564,18 @@ config PLX_DMA
+ 	  These are exposed via extra functions on the switch's
+ 	  upstream port. Each function exposes one DMA channel.
+ 
++config S5L8947X_CDMA
++	tristate "S5L8947X central DMA controller"
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
++	depends on OF
++	select DMA_ENGINE
++	select DMA_VIRTUAL_CHANNELS
++	default ARCH_APPLE_S5L
++	help
++	  Support for the central DMA controller (CDMA) of the S5L8947X SoC.
++	  It moves data between memory and on-chip peripheral FIFOs for
++	  audio, managed NAND, and the hardware AES engine.
++
+ config STE_DMA40
+ 	bool "ST-Ericsson DMA40 support"
+ 	depends on ARCH_U8500
+diff --git a/drivers/dma/Makefile b/drivers/dma/Makefile
+index ad6a03c..78888e8 100644
+--- a/drivers/dma/Makefile
++++ b/drivers/dma/Makefile
+@@ -71,6 +71,7 @@ obj-$(CONFIG_PPC_BESTCOMM) += bestcomm/
+ obj-$(CONFIG_PXA_DMA) += pxa_dma.o
+ obj-$(CONFIG_RENESAS_DMA) += sh/
+ obj-$(CONFIG_SF_PDMA) += sf-pdma/
++obj-$(CONFIG_S5L8947X_CDMA) += s5l8947x-cdma.o
+ obj-$(CONFIG_STE_DMA40) += ste_dma40.o ste_dma40_ll.o
+ obj-$(CONFIG_SPRD_DMA) += sprd-dma.o
+ obj-$(CONFIG_TXX9_DMAC) += txx9dmac.o
 diff --git a/drivers/i2c/busses/Kconfig b/drivers/i2c/busses/Kconfig
 index 0e679cc..7ea443b 100644
 --- a/drivers/i2c/busses/Kconfig
@@ -243,6 +319,74 @@ index 2a9f91e..d0c0fa2 100644
  obj-$(CONFIG_MFD_RSMU_I2C)	+= rsmu_i2c.o rsmu_core.o
  obj-$(CONFIG_MFD_RSMU_SPI)	+= rsmu_spi.o rsmu_core.o
 +obj-$(CONFIG_MFD_APPLE_PMU_I2C)	+= apple-pmu-i2c.o
+diff --git a/drivers/mtd/Kconfig b/drivers/mtd/Kconfig
+--- a/drivers/mtd/Kconfig
++++ b/drivers/mtd/Kconfig
+@@ -150,6 +150,21 @@
+ 	  This enables read only access to SmartMedia formatted NAND
+ 	  flash. You can mount it with FAT file system.
+ 
++config MTD_S5L8947X_FTL
++	tristate "S5L8947X managed NAND translation layer (read-only)"
++	depends on MTD && BLOCK
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
++	select CRYPTO_SKCIPHER
++	select CRYPTO_CBC
++	select CRYPTO_AES
++	select CRYPTO_LIB_SHA1
++	default ARCH_APPLE_S5L
++	help
++	  Read-only block devices for the managed NAND of S5L8947X devices as
++	  written by the stock firmware: the logical disk behind its
++	  translation layer (nandN) and each volume of its volume map
++	  (nandNpM), which can then be mounted, for example with hfsplus.
++
+ config SM_FTL
+ 	tristate "SmartMedia/xD new translation layer"
+ 	depends on BLOCK
+diff --git a/drivers/mtd/Makefile b/drivers/mtd/Makefile
+--- a/drivers/mtd/Makefile
++++ b/drivers/mtd/Makefile
+@@ -19,6 +19,7 @@
+ obj-$(CONFIG_RFD_FTL)		+= rfd_ftl.o
+ obj-$(CONFIG_SSFDC)		+= ssfdc.o
+ obj-$(CONFIG_SM_FTL)		+= sm_ftl.o
++obj-$(CONFIG_MTD_S5L8947X_FTL)	+= s5l8947x-ftl.o
+ obj-$(CONFIG_MTD_OOPS)		+= mtdoops.o
+ obj-$(CONFIG_MTD_PSTORE)	+= mtdpstore.o
+ obj-$(CONFIG_MTD_SWAP)		+= mtdswap.o
+diff --git a/drivers/mtd/devices/Kconfig b/drivers/mtd/devices/Kconfig
+--- a/drivers/mtd/devices/Kconfig
++++ b/drivers/mtd/devices/Kconfig
+@@ -120,6 +120,17 @@
+ 	  registered by bcma as platform devices. This enables driver for
+ 	  serial flash memories.
+ 
++config MTD_S5L8947X_FMI
++	tristate "S5L8947X flash memory interface (managed NAND, read-only)"
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
++	depends on OF && HAS_DMA && DMA_ENGINE
++	default ARCH_APPLE_S5L
++	help
++	  Read-only access to the managed NAND package behind the flash
++	  memory interface (FMI) of the S5L8947X SoC. Pages are moved by the
++	  central DMA controller; the package corrects its own errors and
++	  retires its own bad blocks.
++
+ config MTD_SLRAM
+ 	tristate "Uncached system RAM"
+ 	help
+diff --git a/drivers/mtd/devices/Makefile b/drivers/mtd/devices/Makefile
+--- a/drivers/mtd/devices/Makefile
++++ b/drivers/mtd/devices/Makefile
+@@ -4,6 +4,7 @@
+ #
+ 
+ obj-$(CONFIG_MTD_DOCG3)		+= docg3.o
++obj-$(CONFIG_MTD_S5L8947X_FMI)	+= s5l8947x-fmi.o
+ obj-$(CONFIG_MTD_SLRAM)		+= slram.o
+ obj-$(CONFIG_MTD_PHRAM)		+= phram.o
+ obj-$(CONFIG_MTD_PMC551)	+= pmc551.o
 diff --git a/drivers/net/ethernet/apple/Kconfig b/drivers/net/ethernet/apple/Kconfig
 index a4176d2..487dafd 100644
 --- a/drivers/net/ethernet/apple/Kconfig
@@ -432,10 +576,10 @@ index b3d12f9..0cd2e04 100644
  obj-$(CONFIG_FB_VIRTUAL)          += vfb.o
 +obj-$(CONFIG_FB_S5L8947X_DISPLAY) += s5l8947x-display.o
 diff --git a/sound/arm/Kconfig b/sound/arm/Kconfig
-index dea2c66..756290b 100644
+index dea2c66..8175dcb 100644
 --- a/sound/arm/Kconfig
 +++ b/sound/arm/Kconfig
-@@ -28,6 +28,17 @@ config SND_PXA2XX_AC97
+@@ -28,6 +28,18 @@ config SND_PXA2XX_AC97
  	  Say Y or M if you want to support any AC97 codec attached to
  	  the PXA2xx AC97 interface.
  
@@ -444,6 +588,7 @@ index dea2c66..756290b 100644
 +	depends on ARCH_APPLE_S5L || COMPILE_TEST
 +	depends on OF && COMMON_CLK
 +	depends on FB_S5L8947X_DISPLAY || !FB_S5L8947X_DISPLAY
++	depends on DMA_ENGINE
 +	select SND_PCM
 +	default ARCH_APPLE_S5L
 +	help

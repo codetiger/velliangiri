@@ -45,7 +45,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 
 | Area | Current Limitation |
 |---|---|
-| **Internal NAND writes** | Both `/dev/nand0p1` (`System`) and decrypted `/dev/nand0p2` (`Data`, including class-4 per-file content protection) mount read-only as `hfsplus`; NAND write/erase support is not enabled yet so the stock flash contents remain untouched. |
+| **Internal NAND writes** | Both `/dev/nand0p1` (`System`) and decrypted `/dev/nand0p2` (`Data`, including class-4 per-file content protection) mount read-only as `hfsplus`; passcode-bound keybag classes (1–3) are not unwrapped, and NAND write/erase support is not enabled yet so the stock flash contents remain untouched. |
 | **3D GPU acceleration** | On hold. The PowerVR SGX543 power domain and clocks come up for bus telemetry, but there is no DRM/3D rendering driver. Graphics use the 720p CPU framebuffer. |
 | **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a configfs CDC-ECM + CDC-ACM gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
 | **Audio sample rates** | The I2S and S/PDIF blocks are clocked from the 24 MHz crystal, so HDMI playback runs at `46,875 Hz` or `31,250 Hz` and optical at `46,875 Hz` instead of `48,000 Hz`. Use `wavplay` (which resamples automatically) or ALSA resampling. The optical output has not been checked on a receiver yet. |
@@ -90,7 +90,7 @@ This builds the Docker container, assembles the Alpine 3.21 `armhf` initramfs, f
 out/boot-bundle-s5l8947x-j33iap.bin
 ```
 
-You can also run individual build stages with `./scripts/velliangiri.sh rootfs | kernel | bundle`, or open an interactive cross-compile shell with `./scripts/velliangiri.sh shell`.
+You can also run individual build stages with `./scripts/velliangiri.sh rootfs | kernel | bundle | clean`, or open an interactive cross-compile shell with `./scripts/velliangiri.sh shell`.
 
 ### 4. Boot and connect
 
@@ -143,7 +143,7 @@ Drivers that apply across the SoC family are already named `s5l8940x` and parame
 | **Central DMA** | `drivers/dma/s5l8947x-cdma.c` | 42-channel `dmaengine` provider: slave scatter-gather (both directions, audio `0x34000000` and NAND `0x31000000` windows) and cyclic transfers with per-channel interrupts. |
 | **Audio** | `sound/arm/s5l8947x-audio.c` | I2S (HDMI) and S/PDIF (optical) transmitters, each fed by a cyclic DMA transfer. |
 | **CDMA AES Engine** | `drivers/crypto/s5l8947x-aes.c`<br>`include/linux/s5l8947x-aes.h` | `ecb(aes)` and `cbc(aes)` `skcipher` algorithms over CDMA channels 1 and 2, plus `s5l8947x_aes_hwkey_crypt()` for the hardware device and group keys. |
-| **Managed NAND & FTL** | `drivers/mtd/devices/s5l8947x-fmi.c`<br>`drivers/mtd/s5l8947x-ftl.c` | Managed NAND controller (`FMI0`), translation layer (`/dev/nand0`), key-store unwrapping, and encrypted volume + per-file decryption (`/dev/nand0p1`, `/dev/nand0p2`). |
+| **Managed NAND & FTL** | `drivers/mtd/devices/s5l8947x-fmi.c`<br>`drivers/mtd/s5l8947x-ftl.c`<br>`scripts/patches/0008-*.patch` | Managed NAND controller (`FMI0`), translation layer (`/dev/nand0`), key-store unwrapping, and encrypted volume + per-file `hfsplus` decryption (`/dev/nand0p1`, `/dev/nand0p2`). |
 
 ### How the boot bundle works (`scripts/boot/`)
 
@@ -171,7 +171,7 @@ If you have another device with a serial console (or USB / framebuffer output) a
      - `i2cpoke` — scan I2C buses and inspect PMU registers.
      - `l2bench` — verify cache and memory bandwidth.
 4. **Enable peripherals incrementally:**
-   - Turn on `gpio`, `i2c`, `pmu`, `usb_phy`, `display_pipe`, and `audio` nodes one by one in your board's `.dts`, adding compatible strings or small register-offset tables to the existing drivers where your chip differs.
+   - Turn on `gpio`, `i2c`, `pmu`, `usb_phy`, `cdma`, `aes`, `fmi0`, `display_pipe`, and `audio` nodes one by one in your board's `.dts`, adding compatible strings or small register-offset tables to the existing drivers where your chip differs.
 
 If you are working on bringing up a related device, feel free to open an issue with your SoC and board details.
 
@@ -186,7 +186,7 @@ Instead of storing a full kernel source tree, this repository holds only the fil
 | `arch/arm/boot/dts/apple/` | SoC (`.dtsi`) and board (`.dts`) Device Trees |
 | `arch/arm/mach-apple/` | Machine init, CPU clock calibration, watchdog clocksource & reset |
 | `drivers/`, `sound/`, `include/` | Clean-room kernel drivers in their standard mainline paths |
-| `scripts/patches/` | 12 small, self-contained patches to mainline Linux 6.12 files |
+| `scripts/patches/` | 8 small, self-contained patches to mainline Linux 6.12 files |
 | `scripts/boot/` | Position-independent entry stub, pre-kernel C loader, HDMI init, boot splash and its generator |
 | `scripts/extract-firmware.py` | Rebuilds the Wi-Fi and Bluetooth firmware from your own restore image (`velliangiri.sh firmware`) |
 | `scripts/tests/` | On-device hardware test suite (`hwtest`) |

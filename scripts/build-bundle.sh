@@ -35,7 +35,7 @@ CFLAGS_BOOT=(-march=armv7-a -marm -mfloat-abi=soft -ffreestanding -fno-builtin -
 python3 "${BOOT_SRC}/gen-splash.py" "${ROOT}/logo.svg" > "${BOOT_BUILD}/splash-data.h"
 "${CC}" "${CFLAGS_BOOT[@]}" -I"${BOOT_BUILD}" -c "${BOOT_SRC}/splash.c" -o "${BOOT_BUILD}/splash.o"
 
-"${LD}" -T "${BOOT_SRC}/boot-loader.ld" \
+"${LD}" -z noexecstack -T "${BOOT_SRC}/boot-loader.ld" \
 	"${BOOT_BUILD}/boot-start.o" \
 	"${BOOT_BUILD}/boot-loader.o" \
 	"${BOOT_BUILD}/pmgr-init.o" \
@@ -71,7 +71,7 @@ echo "[bundle] Compiling position-independent entry stub (BUNDLE_SIZE=${INNER_SI
 	-DPAYLOAD_PATH="\"${INNER}\"" \
 	-DBUNDLE_SIZE="${INNER_SIZE}" \
 	-c "${BOOT_SRC}/entry-stub.S" -o "${BOOT_BUILD}/entry-stub.o"
-"${LD}" -T "${BOOT_SRC}/entry-stub.ld" "${BOOT_BUILD}/entry-stub.o" -o "${BOOT_BUILD}/entry-stub.elf"
+"${LD}" -z noexecstack -T "${BOOT_SRC}/entry-stub.ld" "${BOOT_BUILD}/entry-stub.o" -o "${BOOT_BUILD}/entry-stub.elf"
 "${OBJCOPY}" -O binary "${BOOT_BUILD}/entry-stub.elf" "${BUNDLE_OUT}"
 cp "${BOOT_BUILD}/boot-loader.bin" "${OUT}/boot-loader.bin"
 

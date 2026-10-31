@@ -9,6 +9,7 @@
 #   ./scripts/velliangiri.sh bundle         # Pack self-relocating boot bundle
 #   ./scripts/velliangiri.sh firmware ...   # Extract Wi-Fi/Bluetooth firmware from your restore image
 #   ./scripts/velliangiri.sh all            # Run rootfs + kernel + bundle
+#   ./scripts/velliangiri.sh clean          # Clean build outputs (preserves downloaded tarballs)
 #   ./scripts/velliangiri.sh check          # Run clean-room guardrail verification
 #   ./scripts/velliangiri.sh shell          # Open interactive shell in build container
 
@@ -75,6 +76,13 @@ case "${CMD}" in
 			bash scripts/build-bundle.sh
 		'
 		;;
+	clean)
+		echo "[velliangiri] Cleaning build outputs and staging directories ..."
+		rm -rf "${ROOT}/out" \
+			"${ROOT}/build/boot" \
+			"${ROOT}/build/rootfs-stage" \
+			"${ROOT}/build/initramfs-s5l8947x.cpio"
+		;;
 	check)
 		bash "${ROOT}/scripts/check-no-proprietary.sh" --all
 		;;
@@ -82,7 +90,7 @@ case "${CMD}" in
 		docker_run -it /bin/bash
 		;;
 	*)
-		echo "Usage: $0 {all|image|rootfs|kernel|bundle|firmware|check|shell}" >&2
+		echo "Usage: $0 {all|image|rootfs|kernel|bundle|firmware|clean|check|shell}" >&2
 		exit 1
 		;;
 esac

@@ -5,8 +5,8 @@ t_nand() {
 	section "NAND (FMI0, read-only MTD)"
 	dev=/sys/bus/platform/devices/31200000.nand-controller
 	if ! bound "$dev"; then
-		modprobe s5l8947x-fmi 2>/dev/null
-		bound "$dev" || { fail "FMI0 driver not bound (module s5l8947x-fmi not loaded?)"; return; }
+		fail "FMI0 driver not bound"
+		return
 	fi
 	pass "driver bound"
 	info "$(dmesg 2>/dev/null | grep -m1 'managed NAND' | sed 's/^\[[^]]*\] *//')"

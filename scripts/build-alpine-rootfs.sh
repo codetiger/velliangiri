@@ -167,5 +167,6 @@ echo "[rootfs] Packing uncompressed cpio archive -> ${OUT_CPIO} ..."
 
 python3 "${ROOT}/scripts/cpio-owners.py" "${OUT_CPIO}"
 cp "${OUT_CPIO}" "${ROOT}/out/initramfs-s5l8947x.cpio"
+rm -rf "${STAGE_DIR}" "${APK_WORK}"
 
 echo "[rootfs] Ready: ${OUT_CPIO} ($(du -h "${OUT_CPIO}" | awk '{print $1}'))"
