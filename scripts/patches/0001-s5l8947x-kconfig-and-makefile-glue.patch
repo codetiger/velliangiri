@@ -20,6 +20,8 @@ existing Apple drivers.
  drivers/crypto/Makefile             |  1 +
  drivers/dma/Kconfig                 | 12 ++++++++++++
  drivers/dma/Makefile                |  1 +
+ drivers/hwmon/Kconfig               |  8 ++++++++
+ drivers/hwmon/Makefile              |  1 +
  drivers/i2c/busses/Kconfig          |  8 ++++++++
  drivers/i2c/busses/Makefile         |  1 +
  drivers/input/misc/Kconfig          | 10 ++++++++++
@@ -48,7 +50,7 @@ existing Apple drivers.
  drivers/video/fbdev/Makefile        |  1 +
  sound/arm/Kconfig                   | 12 ++++++++++++
  sound/arm/Makefile                  |  2 ++
- 39 files changed, 212 insertions(+), 2 deletions(-)
+ 41 files changed, 221 insertions(+), 2 deletions(-)
 
 diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
 index cc8becc..f8c2184 100644
@@ -203,6 +205,35 @@ index ad6a03c..78888e8 100644
  obj-$(CONFIG_STE_DMA40) += ste_dma40.o ste_dma40_ll.o
  obj-$(CONFIG_SPRD_DMA) += sprd-dma.o
  obj-$(CONFIG_TXX9_DMAC) += txx9dmac.o
+diff --git a/drivers/hwmon/Kconfig b/drivers/hwmon/Kconfig
+--- a/drivers/hwmon/Kconfig
++++ b/drivers/hwmon/Kconfig
+@@ -590,6 +590,14 @@
+ 	  This driver can also be built as a module. If so, the module
+ 	  will be called da9055-hwmon.
+ 
++config SENSORS_APPLE_PMU
++	tristate "Dialog D1815 PMU temperature sensors"
++	depends on MFD_APPLE_PMU_I2C
++	default MFD_APPLE_PMU_I2C
++	help
++	  Board thermistors and the junction temperature measured by the
++	  ADC of the Dialog D1815 power management unit on S5L8947X boards.
++
+ config SENSORS_I5K_AMB
+ 	tristate "FB-DIMM AMB temperature sensor on Intel 5000 series chipsets"
+ 	depends on PCI
+diff --git a/drivers/hwmon/Makefile b/drivers/hwmon/Makefile
+--- a/drivers/hwmon/Makefile
++++ b/drivers/hwmon/Makefile
+@@ -66,6 +66,7 @@
+ obj-$(CONFIG_SENSORS_CROS_EC)	+= cros_ec_hwmon.o
+ obj-$(CONFIG_SENSORS_DA9052_ADC)+= da9052-hwmon.o
+ obj-$(CONFIG_SENSORS_DA9055)+= da9055-hwmon.o
++obj-$(CONFIG_SENSORS_APPLE_PMU)	+= apple-pmu-hwmon.o
+ obj-$(CONFIG_SENSORS_DELL_SMM)	+= dell-smm-hwmon.o
+ obj-$(CONFIG_SENSORS_DME1737)	+= dme1737.o
+ obj-$(CONFIG_SENSORS_DRIVETEMP)	+= drivetemp.o
 diff --git a/drivers/i2c/busses/Kconfig b/drivers/i2c/busses/Kconfig
 index 0e679cc..7ea443b 100644
 --- a/drivers/i2c/busses/Kconfig
