@@ -78,6 +78,11 @@ t_nand() {
 	else
 		fail "FTL block devices marked read-only"
 	fi
+	if [ -n "$(rd /sys/block/nand0/emac)" ] && [ -n "$(rd /sys/block/nand0/wmac)" ] && [ -n "$(rd /sys/block/nand0/bmac)" ]; then
+		pass "system config read (serial $(rd /sys/block/nand0/serial), emac $(rd /sys/block/nand0/emac), wmac $(rd /sys/block/nand0/wmac), bmac $(rd /sys/block/nand0/bmac))"
+	else
+		fail "system config MAC addresses missing on /sys/block/nand0"
+	fi
 
 	mnt=/tmp/hwtest-nand0p1
 	mkdir -p "$mnt"
@@ -87,6 +92,11 @@ t_nand() {
 			pass "nand0p1 mounts read-write ($n entries in /)"
 		else
 			fail "nand0p1 mounted but not rw or root looks empty"
+		fi
+		if [ "$(head -c 4 "$mnt/usr/share/firmware/wifi/4334b1/monopoly.trx" 2>/dev/null | hexdump -v -e '4/1 "%02x"')" = "48445230" ]; then
+			pass "nand0p1 decmpfs compressed files inflate transparently"
+		else
+			fail "nand0p1 decmpfs compressed file did not inflate to HDR0"
 		fi
 		umount "$mnt"
 	else

@@ -34,10 +34,31 @@ stop() {
 	ip addr flush dev "$IFACE" 2>/dev/null
 }
 
+apply_mac() {
+	WMAC=$(cat /sys/block/nand0/wmac 2>/dev/null)
+	if [ -n "$WMAC" ] && [ "$(cat "/sys/class/net/$IFACE/address" 2>/dev/null)" != "$WMAC" ]; then
+		ip link set "$IFACE" down 2>/dev/null || true
+		ip link set "$IFACE" address "$WMAC" 2>/dev/null || true
+	fi
+}
+
+persist_conf() {
+	[ -b /dev/nand0p2 ] || return 0
+	mkdir -p /mnt/data
+	if mount -t hfsplus -o rw /dev/nand0p2 /mnt/data 2>/dev/null; then
+		mkdir -p /mnt/data/linux/etc/wpa_supplicant
+		cp "$CONF" /mnt/data/linux/etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null || true
+		chmod 600 /mnt/data/linux/etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null || true
+		sync
+		umount /mnt/data 2>/dev/null || true
+	fi
+}
+
 start() {
 	[ -f "$CONF" ] || die "no $CONF; use 'wifi connect SSID [PSK]'"
 	wait_iface
 	stop
+	apply_mac
 	ip link set "$IFACE" up || die "cannot bring $IFACE up"
 	wpa_supplicant -B -i "$IFACE" -c "$CONF" -P "$WPA_PID" ||
 		die "wpa_supplicant failed to start"
@@ -49,6 +70,7 @@ case "$1" in
 	scan)
 		wait_iface
 		if ! ip link show "$IFACE" | grep -q '<.*UP'; then
+			apply_mac
 			ip link set "$IFACE" up
 			# A scan issued while the interface is still coming up can spin
 			sleep 2
@@ -76,6 +98,7 @@ case "$1" in
 		} > "$CONF.new" || die "cannot write $CONF"
 		chmod 600 "$CONF.new"
 		mv "$CONF.new" "$CONF"
+		persist_conf
 		start
 		echo "wifi: joining '$2'; 'wifi status' shows the lease"
 		;;

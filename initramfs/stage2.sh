@@ -56,6 +56,71 @@ fi
 ) &
 log_msg "CDC-ACM console getty active on /dev/ttyGS0"
 
+# Wait briefly for the NAND translation layer (/dev/nand0p1) to finish probing
+n=0
+while [ ! -b /dev/nand0p1 ] && [ "$n" -lt 20 ]; do
+	n=$((n + 1))
+	sleep 1
+done
+
+# Provision BCM4334 Wi-Fi and Bluetooth firmware from on-device System (/dev/nand0p1)
+BT_REBIND=0
+# Patch carved at a fixed offset, so accept it only if it matches the known image
+BT_HCD_SHA256=1c685b097b5cff26cfd5b95db4336d2713af02102dbfced35f3aa03aa0cce154
+if [ -b /dev/nand0p1 ] && { [ ! -s /lib/firmware/brcm/brcmfmac4334.bin ] || [ ! -s /lib/firmware/brcm/BCM4334B0.hcd ]; }; then
+	mkdir -p /mnt/system /lib/firmware/brcm
+	if mount -t hfsplus -o ro /dev/nand0p1 /mnt/system 2>/dev/null; then
+		WDIR=/mnt/system/usr/share/firmware/wifi/4334b1
+		if [ ! -s /lib/firmware/brcm/brcmfmac4334.bin ] && [ -r "$WDIR/monopoly.trx" ]; then
+			cp "$WDIR/monopoly.trx" /lib/firmware/brcm/brcmfmac4334.bin 2>/dev/null
+			cp "$WDIR/monopoly-u-st.txt" /lib/firmware/brcm/brcmfmac4334.txt 2>/dev/null
+			# No CLM blob: this firmware rejects a CLM download (-52) and brcmfmac then fails to attach
+			log_msg "nand0p1: provisioned BCM4334 Wi-Fi firmware and NVRAM"
+		fi
+		BTOOL=/mnt/system/usr/sbin/BlueTool
+		if [ ! -s /lib/firmware/brcm/BCM4334B0.hcd ] && [ -r "$BTOOL" ]; then
+			tail -c +1745938 "$BTOOL" 2>/dev/null | head -c 73221 >/lib/firmware/brcm/BCM4334B0.hcd.tmp
+			if [ "$(sha256sum /lib/firmware/brcm/BCM4334B0.hcd.tmp 2>/dev/null | cut -d' ' -f1)" = "$BT_HCD_SHA256" ]; then
+				mv /lib/firmware/brcm/BCM4334B0.hcd.tmp /lib/firmware/brcm/BCM4334B0.hcd
+				BT_REBIND=1
+				log_msg "nand0p1: provisioned BCM4334B0.hcd Bluetooth patch"
+			else
+				rm -f /lib/firmware/brcm/BCM4334B0.hcd.tmp
+			fi
+		fi
+		umount /mnt/system 2>/dev/null || true
+	fi
+fi
+
+# Load or seed persistent SSH host key and Wi-Fi credentials on Data (/dev/nand0p2)
+if [ -b /dev/nand0p2 ]; then
+	mkdir -p /mnt/data
+	if mount -t hfsplus -o rw /dev/nand0p2 /mnt/data 2>/dev/null; then
+		PDIR=/mnt/data/linux/etc
+		if [ -s "$PDIR/dropbear/dropbear_ed25519_host_key" ]; then
+			mkdir -p /etc/dropbear
+			cp "$PDIR/dropbear/dropbear_ed25519_host_key" /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null
+			chmod 600 /etc/dropbear/dropbear_ed25519_host_key
+		elif [ -s /etc/dropbear/dropbear_ed25519_host_key ]; then
+			mkdir -p "$PDIR/dropbear"
+			cp /etc/dropbear/dropbear_ed25519_host_key "$PDIR/dropbear/dropbear_ed25519_host_key" 2>/dev/null
+		fi
+		if [ -s "$PDIR/wpa_supplicant/wpa_supplicant.conf" ]; then
+			mkdir -p /etc/wpa_supplicant
+			cp "$PDIR/wpa_supplicant/wpa_supplicant.conf" /etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null
+			chmod 600 /etc/wpa_supplicant/wpa_supplicant.conf
+			log_msg "nand0p2: loaded persistent wpa_supplicant.conf"
+		elif [ -s /etc/wpa_supplicant/wpa_supplicant.conf ]; then
+			mkdir -p "$PDIR/wpa_supplicant"
+			cp /etc/wpa_supplicant/wpa_supplicant.conf "$PDIR/wpa_supplicant/wpa_supplicant.conf" 2>/dev/null
+			chmod 600 "$PDIR/wpa_supplicant/wpa_supplicant.conf" 2>/dev/null
+			log_msg "nand0p2: seeded persistent wpa_supplicant.conf"
+		fi
+		sync
+		umount /mnt/data 2>/dev/null || true
+	fi
+fi
+
 # Start Dropbear SSH server on port 22 in background
 mkdir -p /etc/dropbear
 if [ -x /usr/sbin/dropbear ]; then
@@ -65,12 +130,38 @@ fi
 
 # Bring up Fast Ethernet (eth0) via DHCP in background
 if [ -d /sys/class/net/eth0 ] || ip link show eth0 >/dev/null 2>&1; then
+	EMAC=$(cat /sys/block/nand0/emac 2>/dev/null)
+	if [ -n "$EMAC" ]; then
+		ip link set eth0 down 2>/dev/null || true
+		ip link set eth0 address "$EMAC" 2>/dev/null || true
+	fi
 	ip link set eth0 up 2>/dev/null || true
 	udhcpc -i eth0 -b -s /etc/udhcpc/default.script -p /run/udhcpc.eth0.pid >/dev/null 2>&1 &
 	log_msg "eth0 link up; udhcpc started in background"
 fi
 
-# Join Wi-Fi in background when a network was configured at build time
+# Rebind wireless drivers if firmware or factory MAC was provisioned from NAND after initial probe
+if [ -s /lib/firmware/brcm/brcmfmac4334.bin ] && [ ! -d /sys/class/net/wlan0 ]; then
+	for udev in /sys/bus/usb/devices/*; do
+		[ "$(cat "$udev/idVendor" 2>/dev/null)" = "0a5c" ] || continue
+		uif="$udev:1.0"
+		if [ -z "$(cat "$udev/bConfigurationValue" 2>/dev/null)" ]; then
+			# A failed firmware load leaves the device unconfigured; configuring it re-probes brcmfmac
+			echo 1 >"$udev/bConfigurationValue" 2>/dev/null || true
+		elif [ -e "$uif" ] && [ ! -e "$uif/driver" ]; then
+			echo "${uif##*/}" >/sys/bus/usb/drivers/brcmfmac/bind 2>/dev/null || true
+		fi
+	done
+fi
+if [ "$BT_REBIND" = 1 ] || [ -n "$(cat /sys/block/nand0/bmac 2>/dev/null)" ]; then
+	for sdev in /sys/bus/serial/drivers/hci_uart_bcm/serial*-*; do
+		[ -e "$sdev" ] || continue
+		echo "${sdev##*/}" >/sys/bus/serial/drivers/hci_uart_bcm/unbind 2>/dev/null || true
+		echo "${sdev##*/}" >/sys/bus/serial/drivers/hci_uart_bcm/bind 2>/dev/null || true
+	done
+fi
+
+# Join Wi-Fi in background when a network is configured
 if [ -f /etc/wpa_supplicant/wpa_supplicant.conf ] && [ -x /bin/wifi ]; then
 	/bin/wifi up >/dev/kmsg 2>&1 &
 	log_msg "wlan0: wpa_supplicant and udhcpc starting in background"

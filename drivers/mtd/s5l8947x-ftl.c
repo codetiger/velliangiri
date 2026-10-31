@@ -42,7 +42,9 @@
  * encrypted per 4 KiB logical block with AES-256-CBC and a 4-word Galois LFSR
  * (0x80000061) IV seeded from the block's lba on nand0; their 32-byte keys
  * are unwrapped from the key store in the reserved SLC blocks at the top of
- * each CAU using the hardware device key.
+ * each CAU using the hardware device key. Factory board identity and MAC
+ * addresses (SCfg) are also read from the reserved SLC blocks and exposed on
+ * /sys/block/nand0/{serial,model,emac,wmac,bmac}.
  */
 
 #include <crypto/aes.h>
@@ -50,9 +52,11 @@
 #include <crypto/skcipher.h>
 #include <linux/blk-mq.h>
 #include <linux/blkdev.h>
+#include <linux/etherdevice.h>
 #include <linux/log2.h>
 #include <linux/module.h>
 #include <linux/mtd/mtd.h>
+#include <linux/of.h>
 #include <linux/s5l8947x-aes.h>
 #include <linux/scatterlist.h>
 #include <linux/slab.h>
@@ -115,6 +119,20 @@
 #define CP_CLASS_OPEN		4
 #define CP_V4_HEADER_LEN	36
 #define CP_WRAP_LEN		40
+
+#define SCFG_HDR_LEN		0x80
+#define SCFG_HDR_VERSION	0x20
+#define SCFG_HDR_COPY_VER	0x28
+#define SCFG_MAGIC		0x53436667
+#define SCFG_COUNT		0x14
+#define SCFG_ENTRIES		0x18
+#define SCFG_ENTRY_SIZE		0x14
+#define SCFG_TAG_CNTB		0x434e5442
+#define SCFG_TAG_SRNM		0x53724e6d
+#define SCFG_TAG_MODN		0x4d6f6423
+#define SCFG_TAG_EMAC		0x454d6163
+#define SCFG_TAG_WMAC		0x574d6163
+#define SCFG_TAG_BMAC		0x424d6163
 
 static const u8 lv_magic[2][16] = {
 	{ 0x6a, 0x90, 0x88, 0xcf, 0x8a, 0xfd, 0x63, 0x0a,
@@ -198,6 +216,12 @@ struct ftl {
 	struct ftl_disk whole;
 	struct ftl_disk vols[LV_MAX_VOLUMES];
 	unsigned int nvols;
+
+	char serial[17];
+	char model[17];
+	u8 emac[ETH_ALEN];
+	u8 wmac[ETH_ALEN];
+	u8 bmac[ETH_ALEN];
 };
 
 static LIST_HEAD(ftl_list);
@@ -1008,6 +1032,70 @@ static const struct block_device_operations ftl_fops = {
 	.owner = THIS_MODULE,
 };
 
+static ssize_t serial_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ftl_disk *d = dev_to_disk(dev)->private_data;
+
+	return sysfs_emit(buf, "%s\n", d->ftl->serial);
+}
+static DEVICE_ATTR_RO(serial);
+
+static ssize_t model_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ftl_disk *d = dev_to_disk(dev)->private_data;
+
+	return sysfs_emit(buf, "%s\n", d->ftl->model);
+}
+static DEVICE_ATTR_RO(model);
+
+static ssize_t emac_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ftl_disk *d = dev_to_disk(dev)->private_data;
+
+	if (!is_valid_ether_addr(d->ftl->emac))
+		return sysfs_emit(buf, "\n");
+	return sysfs_emit(buf, "%pM\n", d->ftl->emac);
+}
+static DEVICE_ATTR_RO(emac);
+
+static ssize_t wmac_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ftl_disk *d = dev_to_disk(dev)->private_data;
+
+	if (!is_valid_ether_addr(d->ftl->wmac))
+		return sysfs_emit(buf, "\n");
+	return sysfs_emit(buf, "%pM\n", d->ftl->wmac);
+}
+static DEVICE_ATTR_RO(wmac);
+
+static ssize_t bmac_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct ftl_disk *d = dev_to_disk(dev)->private_data;
+
+	if (!is_valid_ether_addr(d->ftl->bmac))
+		return sysfs_emit(buf, "\n");
+	return sysfs_emit(buf, "%pM\n", d->ftl->bmac);
+}
+static DEVICE_ATTR_RO(bmac);
+
+static struct attribute *ftl_attrs[] = {
+	&dev_attr_serial.attr,
+	&dev_attr_model.attr,
+	&dev_attr_emac.attr,
+	&dev_attr_wmac.attr,
+	&dev_attr_bmac.attr,
+	NULL,
+};
+
+static const struct attribute_group ftl_attr_group = {
+	.attrs = ftl_attrs,
+};
+
+static const struct attribute_group *ftl_attr_groups[] = {
+	&ftl_attr_group,
+	NULL,
+};
+
 static int ftl_add_disk(struct ftl *f, struct ftl_disk *d, const char *name, bool ro)
 {
 	struct queue_limits lim = {
@@ -1043,7 +1131,8 @@ static int ftl_add_disk(struct ftl *f, struct ftl_disk *d, const char *name, boo
 	set_capacity(d->disk, d->size >> SECTOR_SHIFT);
 	set_disk_ro(d->disk, ro);
 
-	ret = add_disk(d->disk);
+	ret = device_add_disk(&f->mtd->dev, d->disk,
+			      d == &f->whole ? ftl_attr_groups : NULL);
 	if (ret) {
 		put_disk(d->disk);
 		d->disk = NULL;
@@ -1067,7 +1156,149 @@ static void ftl_del_disk(struct ftl_disk *d)
 	d->disk = NULL;
 }
 
-/* --- key store and volume map --- */
+/* --- system configuration, key store and volume map --- */
+
+static void ftl_set_dt_mac(const char *compat, const char *propname,
+			   const u8 *mac, bool reverse)
+{
+	struct device_node *np = of_find_compatible_node(NULL, NULL, compat);
+	struct property *prop;
+	u8 *dst;
+	int i;
+
+	if (!np)
+		return;
+	/*
+	 * Unflattened properties point into the read-only flattened tree, so
+	 * replace the property instead of writing its value in place. The
+	 * old property moves to the node's dead list, so neither is freed.
+	 */
+	prop = kzalloc(sizeof(*prop) + ETH_ALEN, GFP_KERNEL);
+	if (!prop)
+		goto out;
+	prop->name = kstrdup(propname, GFP_KERNEL);
+	if (!prop->name) {
+		kfree(prop);
+		goto out;
+	}
+	dst = (u8 *)(prop + 1);
+	if (reverse) {
+		for (i = 0; i < ETH_ALEN; i++)
+			dst[i] = mac[ETH_ALEN - 1 - i];
+	} else {
+		ether_addr_copy(dst, mac);
+	}
+	prop->value = dst;
+	prop->length = ETH_ALEN;
+	if (of_update_property(np, prop)) {
+		kfree(prop->name);
+		kfree(prop);
+	}
+out:
+	of_node_put(np);
+}
+
+static void ftl_copy_ascii(char *dst, size_t dst_size, const u8 *src, u32 len)
+{
+	size_t i, max = min_t(size_t, len, dst_size - 1);
+
+	for (i = 0; i < max && src[i] >= 0x20 && src[i] < 0x7f; i++)
+		dst[i] = src[i];
+	dst[i] = '\0';
+}
+
+static void ftl_read_syscfg(struct ftl *f)
+{
+	u32 start = f->blocks > KS_RESERVED_BLOCKS ? f->blocks - KS_RESERVED_BLOCKS : 0;
+	u32 scfg_max = f->mtd->writesize - SCFG_HDR_LEN;
+	u8 *buf, *best = NULL;
+	u32 cau, blk, best_ver = 0;
+	u32 count, i;
+
+	if (f->mtd->writesize <= SCFG_HDR_LEN + SCFG_ENTRIES)
+		return;
+	buf = kmalloc(f->mtd->writesize, GFP_KERNEL);
+	best = kmalloc(scfg_max, GFP_KERNEL);
+	if (!buf || !best)
+		goto out;
+
+	for (cau = 0; cau < f->caus; cau++) {
+		for (blk = start; blk < f->blocks; blk++) {
+			u32 ver;
+
+			if (ftl_read_slc(f, ftl_page(f, cau, blk, 0), buf,
+					 f->mtd->writesize) ||
+			    get_unaligned_le32(buf + SCFG_HDR_VERSION) != 1 ||
+			    get_unaligned_le32(buf + SCFG_HDR_LEN) != SCFG_MAGIC)
+				continue;
+			ver = get_unaligned_le32(buf + SCFG_HDR_COPY_VER);
+			if (!best_ver || ver >= best_ver) {
+				memcpy(best, buf + SCFG_HDR_LEN, scfg_max);
+				best_ver = ver ? ver : 1;
+			}
+		}
+	}
+	if (!best_ver)
+		goto out;
+
+	count = get_unaligned_le32(best + SCFG_COUNT);
+	count = min_t(u32, count, (scfg_max - SCFG_ENTRIES) / SCFG_ENTRY_SIZE);
+	for (i = 0; i < count; i++) {
+		const u8 *e = best + SCFG_ENTRIES + i * SCFG_ENTRY_SIZE;
+		u32 tag = get_unaligned_le32(e);
+		const u8 *val = e + 4;
+		u32 vlen = 16;
+
+		if (tag == SCFG_TAG_CNTB) {
+			u32 voff = get_unaligned_le32(e + 12);
+
+			tag = get_unaligned_le32(e + 4);
+			vlen = get_unaligned_le32(e + 8);
+			if (voff >= scfg_max || vlen > scfg_max - voff)
+				continue;
+			val = best + voff;
+		}
+		switch (tag) {
+		case SCFG_TAG_SRNM:
+			ftl_copy_ascii(f->serial, sizeof(f->serial), val, vlen);
+			break;
+		case SCFG_TAG_MODN:
+			ftl_copy_ascii(f->model, sizeof(f->model), val, vlen);
+			break;
+		case SCFG_TAG_EMAC:
+			if (vlen >= ETH_ALEN && is_valid_ether_addr(val))
+				ether_addr_copy(f->emac, val);
+			break;
+		case SCFG_TAG_WMAC:
+			if (vlen >= ETH_ALEN && is_valid_ether_addr(val))
+				ether_addr_copy(f->wmac, val);
+			break;
+		case SCFG_TAG_BMAC:
+			if (vlen >= ETH_ALEN && is_valid_ether_addr(val))
+				ether_addr_copy(f->bmac, val);
+			break;
+		}
+	}
+
+	if (is_valid_ether_addr(f->emac))
+		ftl_set_dt_mac("apple,s5l8947x-ethernet", "local-mac-address",
+			       f->emac, false);
+	if (is_valid_ether_addr(f->wmac))
+		ftl_set_dt_mac("usba5c,bd1a", "local-mac-address",
+			       f->wmac, false);
+	if (is_valid_ether_addr(f->bmac))
+		ftl_set_dt_mac("brcm,bcm4334-bt", "local-bd-address",
+			       f->bmac, true);
+
+	dev_info(&f->mtd->dev,
+		 "system config: serial %s, model %s, emac %pM, wmac %pM, bmac %pM\n",
+		 f->serial[0] ? f->serial : "-",
+		 f->model[0] ? f->model : "-",
+		 f->emac, f->wmac, f->bmac);
+out:
+	kfree(best);
+	kfree(buf);
+}
 
 static bool ftl_read_keystore(struct ftl *f, u8 *store)
 {
@@ -1541,6 +1772,7 @@ static void ftl_work(struct work_struct *work)
 	u8 *hdr;
 	int ret;
 
+	ftl_read_syscfg(f);
 	ret = ftl_build(f);
 	if (ret) {
 		dev_err(&f->mtd->dev, "translation map failed: %d\n", ret);
