@@ -158,6 +158,12 @@
 		compatible = "brcm,bcm4334-bt";
 		shutdown-gpios = <&gpio 104 GPIO_ACTIVE_HIGH>;
 		device-wakeup-gpios = <&gpio 105 GPIO_ACTIVE_HIGH>;
+		/*
+		 * The UART clocks are about 51.3 MHz and 24 MHz with integer
+		 * divisors only, so the stock 3 Mbaud is out of reach; 51.3 MHz / 32
+		 * is matched by the controller within about 0.2%.
+		 */
+		max-speed = <1603125>;
 	};
 };
 
