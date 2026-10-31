@@ -99,4 +99,21 @@ t_wireless() {
 		fail "LE scan heard no advertisers"
 		info "$(echo "$out" | tail -n 2 | tr '\n' ' ')"
 	fi
+
+	# BlueZ: stage2 starts the D-Bus system bus and bluetoothd, which powers the adapter
+	if ! command -v bluetoothctl >/dev/null; then
+		skip "bluetoothctl not installed"
+		return
+	fi
+	if ! pidof bluetoothd >/dev/null; then
+		fail "bluetoothd not running"
+		return
+	fi
+	show=$(timeout 10 bluetoothctl show 2>&1)
+	if echo "$show" | grep -q 'Powered: yes'; then
+		pass "bluetoothd manages the adapter ($(echo "$show" | sed -n 's/^Controller \([0-9A-F:]*\).*/\1/p'), powered)"
+	else
+		fail "bluetoothd does not report a powered adapter"
+		info "$(echo "$show" | head -n 3 | tr '\n' ' ')"
+	fi
 }

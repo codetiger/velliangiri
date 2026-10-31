@@ -39,7 +39,20 @@ bin/busybox.dynamic-removed
 # libssl/libcrypto (wpa_supplicant links them)
 sbin/eapol_test
 usr/lib/crda
-usr/share/dbus-1
+usr/share/dbus-1/system-services
 usr/lib/libnl-idiag*
 usr/lib/libnl-nf*
 usr/lib/libnl-xfrm*
+
+# Bluetooth: keep bluetoothd, bluetoothctl and the D-Bus system bus they talk
+# over; drop the mesh daemon, Python/introspection helpers and D-Bus test tools
+usr/lib/bluetooth/bluetooth-meshd
+etc/bluetooth/mesh-main.conf
+usr/bin/bluez-simple-agent
+usr/bin/bluemoon
+usr/bin/dbus-test-tool
+usr/bin/gdbus
+usr/lib/girepository-1.0
+usr/lib/libgirepository*
+usr/lib/modules-load.d
+usr/share/xml

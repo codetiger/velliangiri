@@ -32,13 +32,14 @@ rm -rf "${STAGE_DIR}"
 mkdir -p "${STAGE_DIR}"
 tar --no-same-owner --no-same-permissions -xzf "${DL_DIR}/${TARBALL}" -C "${STAGE_DIR}"
 
-# Install APK packages (dropbear, nfs-utils, busybox-static, Wi-Fi tools) via pure-Python resolver
+# Install APK packages (dropbear, nfs-utils, busybox-static, Wi-Fi and Bluetooth tools) via pure-Python resolver
 echo "[rootfs] Resolving and unpacking Alpine armhf packages ..."
 python3 "${ROOT}/scripts/apk-unpack.py" \
 	--repo "${REPO_MAIN}" \
 	--dest "${APK_WORK}" \
 	--rootfs "${STAGE_DIR}" \
-	dropbear dropbear-scp nfs-utils busybox-static iw wpa_supplicant wireless-regdb
+	dropbear dropbear-scp nfs-utils busybox-static iw wpa_supplicant wireless-regdb \
+	bluez dbus
 
 (
 	cd "${APK_WORK}"
@@ -86,6 +87,12 @@ if [ -f "${WIFI_CONF}" ]; then
 	cp "${WIFI_CONF}" "${STAGE_DIR}/etc/wpa_supplicant/wpa_supplicant.conf"
 	chmod 600 "${STAGE_DIR}/etc/wpa_supplicant/wpa_supplicant.conf"
 fi
+
+# D-Bus system bus account for bluetoothd (package install scripts are not run)
+grep -q '^messagebus:' "${STAGE_DIR}/etc/group" || echo 'messagebus:x:101:messagebus' >>"${STAGE_DIR}/etc/group"
+grep -q '^messagebus:' "${STAGE_DIR}/etc/passwd" ||
+	echo 'messagebus:x:100:101:messagebus:/var/run/dbus:/sbin/nologin' >>"${STAGE_DIR}/etc/passwd"
+grep -q '^messagebus:' "${STAGE_DIR}/etc/shadow" 2>/dev/null || echo 'messagebus:!::0:::::' >>"${STAGE_DIR}/etc/shadow"
 
 # Record build timestamp for early clock initialization
 date -u +%s > "${STAGE_DIR}/etc/build-date"
