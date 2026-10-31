@@ -118,6 +118,12 @@
 			mask = <0x02>;
 			enable = <0x02>;
 		};
+
+		/* Seconds counter at 0x4c, alarm event 32 */
+		rtc {
+			compatible = "apple,pmu-d1815-rtc";
+			interrupts-extended = <&pmu 32 IRQ_TYPE_EDGE_RISING>;
+		};
 	};
 };
 
