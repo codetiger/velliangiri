@@ -5,6 +5,7 @@
 
 /dts-v1/;
 
+#include <dt-bindings/thermal/thermal.h>
 #include "s5l8947x.dtsi"
 
 / {
@@ -124,6 +125,14 @@
 			compatible = "apple,pmu-d1815-rtc";
 			interrupts-extended = <&pmu 32 IRQ_TYPE_EDGE_RISING>;
 		};
+
+		/* ADC: thermistors on channels 11..14 and the junction; done = event 13 */
+		pmu_adc: adc {
+			compatible = "apple,pmu-d1815-adc";
+			interrupts-extended = <&pmu 13 IRQ_TYPE_EDGE_RISING>;
+			#thermal-sensor-cells = <1>;
+			apple,thermistor-labels = "SoC", "Wi-Fi", "Power supply", "NAND";
+		};
 	};
 };
 
@@ -204,4 +213,36 @@
 /* PowerVR SGX543 GPU (master block only; per-core registers hang the bus) */
 &sgx0 {
 	status = "okay";
+};
+
+/ {
+	thermal-zones {
+		/* Board thermistor next to the SoC (temp1) */
+		soc-thermal {
+			polling-delay-passive = <1000>;
+			polling-delay = <5000>;
+			thermal-sensors = <&pmu_adc 0>;
+
+			trips {
+				soc_passive: soc-passive {
+					temperature = <70000>;
+					hysteresis = <5000>;
+					type = "passive";
+				};
+
+				soc-critical {
+					temperature = <95000>;
+					hysteresis = <2000>;
+					type = "critical";
+				};
+			};
+
+			cooling-maps {
+				map0 {
+					trip = <&soc_passive>;
+					cooling-device = <&cpu0 THERMAL_NO_LIMIT THERMAL_NO_LIMIT>;
+				};
+			};
+		};
+	};
 };
