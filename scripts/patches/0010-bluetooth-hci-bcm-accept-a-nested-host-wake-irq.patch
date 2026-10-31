@@ -1,0 +1,40 @@
+Bluetooth: hci_bcm: accept a threaded host-wake interrupt
+
+On the S5L8947X board the BCM4334 host-wake line goes to a GPIO input of
+the I2C power management unit, so the interrupt comes from a regmap-irq
+chip whose interrupts are nested in its threaded handler. Such an
+interrupt cannot take a hard-IRQ-only handler: devm_request_irq() fails,
+hci_bcm then leaves runtime PM and the controller's UART sleep mode off,
+and nothing reports why.
+
+Request it with devm_request_any_context_irq(), which uses a threaded
+handler where the interrupt is nested. bcm_host_wake() only takes and
+drops a runtime PM reference, so it is safe in either context.
+---
+ drivers/bluetooth/hci_bcm.c | 13 +++++++------
+ 1 file changed, 7 insertions(+), 6 deletions(-)
+
+diff --git a/drivers/bluetooth/hci_bcm.c b/drivers/bluetooth/hci_bcm.c
+--- a/drivers/bluetooth/hci_bcm.c
++++ b/drivers/bluetooth/hci_bcm.c
+@@ -348,14 +348,15 @@
+ 		goto unlock;
+ 	}
+
+-	err = devm_request_irq(bdev->dev, bdev->irq, bcm_host_wake,
+-			       bdev->irq_active_low ? IRQF_TRIGGER_FALLING :
+-						      IRQF_TRIGGER_RISING,
+-			       "host_wake", bdev);
+-	if (err) {
++	err = devm_request_any_context_irq(bdev->dev, bdev->irq, bcm_host_wake,
++					   bdev->irq_active_low ? IRQF_TRIGGER_FALLING :
++								  IRQF_TRIGGER_RISING,
++					   "host_wake", bdev);
++	if (err < 0) {
+ 		bdev->irq = err;
+ 		goto unlock;
+ 	}
++	err = 0;
+
+ 	bdev->irq_acquired = true;
+
