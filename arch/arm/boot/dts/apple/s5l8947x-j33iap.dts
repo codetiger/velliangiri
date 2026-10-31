@@ -95,6 +95,11 @@
 	pmu: pmu@74 {
 		compatible = "apple,pmu-d1815", "apple,d1815-pmu", "apple,pmu-i2c";
 		reg = <0x74>;
+		/* Event interrupt: active low on SoC GPIO 109 */
+		interrupt-parent = <&gpio>;
+		interrupts = <109 IRQ_TYPE_LEVEL_LOW>;
+		interrupt-controller;
+		#interrupt-cells = <2>;
 		#address-cells = <1>;
 		#size-cells = <0>;
 
@@ -158,6 +163,9 @@
 		compatible = "brcm,bcm4334-bt";
 		shutdown-gpios = <&gpio 104 GPIO_ACTIVE_HIGH>;
 		device-wakeup-gpios = <&gpio 105 GPIO_ACTIVE_HIGH>;
+		/* Host wake: D1815 GPIO 6 (reg 0x56, input), PMU event 22 */
+		interrupts-extended = <&pmu 22 IRQ_TYPE_EDGE_RISING>;
+		interrupt-names = "host-wakeup";
 		/*
 		 * The UART clocks are about 51.3 MHz and 24 MHz with integer
 		 * divisors only, so the stock 3 Mbaud is out of reach; 51.3 MHz / 32

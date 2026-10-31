@@ -100,6 +100,14 @@ t_wireless() {
 		info "$(echo "$out" | tail -n 2 | tr '\n' ' ')"
 	fi
 
+	# Host wake comes through the PMU's interrupt controller (PMU GPIO 6);
+	# with it, hci_bcm lets the controller sleep when the link is idle
+	if grep -q ' host_wake$' /proc/interrupts; then
+		pass "host-wake interrupt registered ($(grep ' host_wake$' /proc/interrupts | awk '{print $2}') wakes), runtime PM $(cat /sys/bus/serial/drivers/hci_uart_bcm/serial*-*/power/runtime_status 2>/dev/null | head -n 1)"
+	else
+		fail "no host-wake interrupt (PMU interrupt controller or hci_bcm)"
+	fi
+
 	# BlueZ: stage2 starts the D-Bus system bus and bluetoothd, which powers the adapter
 	if ! command -v bluetoothctl >/dev/null; then
 		skip "bluetoothctl not installed"
