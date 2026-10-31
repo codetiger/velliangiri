@@ -327,7 +327,7 @@ diff --git a/drivers/mtd/Kconfig b/drivers/mtd/Kconfig
  	  flash. You can mount it with FAT file system.
  
 +config MTD_S5L8947X_FTL
-+	tristate "S5L8947X managed NAND translation layer (read-only)"
++	tristate "S5L8947X managed NAND translation layer"
 +	depends on MTD && BLOCK
 +	depends on ARCH_APPLE_S5L || COMPILE_TEST
 +	select CRYPTO_SKCIPHER
@@ -336,8 +336,8 @@ diff --git a/drivers/mtd/Kconfig b/drivers/mtd/Kconfig
 +	select CRYPTO_LIB_SHA1
 +	default ARCH_APPLE_S5L
 +	help
-+	  Read-only block devices for the managed NAND of S5L8947X devices as
-+	  written by the stock firmware: the logical disk behind its
++	  Block devices for the managed NAND of S5L8947X devices as
++	  formatted by the stock firmware: the logical disk behind its
 +	  translation layer (nandN) and each volume of its volume map
 +	  (nandNpM), which can then be mounted, for example with hfsplus.
 +

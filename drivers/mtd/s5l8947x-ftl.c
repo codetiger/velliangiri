@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Read-only translation layer for the managed NAND of S5L8947X devices, as
- * written by the stock firmware, and its volume map.
+ * Read-write translation layer for the managed NAND of S5L8947X devices, as
+ * formatted by the stock firmware, and its volume map.
  *
  * The NAND is reached through an MTD whose pages hold several 4 KiB logical
  * pages, each with a 16-byte metadata record in the out-of-band area, and
@@ -11,7 +11,7 @@
  *   metadata    u8 type, u8 flags, u16 sequence, u32 generation, u32 lba,
  *               u32 generation first written; (generation, sequence) is a
  *               48-bit write counter and lba counts 4 KiB logical blocks.
- *               Type 0x01 is data, 0x1c a table of contents.
+ *               Type 0x01 is data, 0x02 is padding, 0x1c a table of contents.
  *
  *   superblock  block b of every CAU whose block has page 0 programmed,
  *               written page by page, then CAU by CAU, then logical page.
@@ -36,13 +36,13 @@
  * 0x800 (volume << 12 | chunk; 0xfnnn is the header or free). The disk is cut
  * into 1024 power-of-two chunks; map index i is disk chunk i.
  *
- * The whole logical disk is exposed as nand0 and each volume as nand0pN,
- * all read-only. Volumes are separate disks, not partitions, because their
- * chunks need not be contiguous on the logical disk. Volumes with attribute
- * bit 48 set are encrypted per 4 KiB logical block with AES-256-CBC and a
- * 4-word Galois LFSR (0x80000061) IV seeded from the block's lba on nand0;
- * their 32-byte keys are unwrapped from the key store in the reserved SLC
- * blocks at the top of each CAU using the hardware device key.
+ * The whole logical disk is exposed as nand0 and each volume as nand0pN.
+ * Volumes are separate disks, not partitions, because their chunks need not
+ * be contiguous on the logical disk. Volumes with attribute bit 48 set are
+ * encrypted per 4 KiB logical block with AES-256-CBC and a 4-word Galois LFSR
+ * (0x80000061) IV seeded from the block's lba on nand0; their 32-byte keys
+ * are unwrapped from the key store in the reserved SLC blocks at the top of
+ * each CAU using the hardware device key.
  */
 
 #include <crypto/aes.h>
@@ -64,10 +64,15 @@
 #define FTL_LP_SIZE		BIT(FTL_LP_SHIFT)
 #define FTL_META		16
 #define FTL_T_DATA		0x01
+#define FTL_T_PAD		0x02
 #define FTL_T_TOC		0x1c
 #define FTL_F_GC		BIT(0)
+#define FTL_F_TOC_STD		0x08
 #define FTL_TOC_MAX_PAGES	4
+#define FTL_TOC_WRITE_PAGES	2
 #define FTL_MAX_CAUS		8
+#define FTL_MAX_LPS		16
+#define FTL_GC_LOW_SB		2
 #define FTL_UNMAPPED		U32_MAX
 
 #define LV_UUID			0x10
@@ -127,6 +132,20 @@ static const u8 ftl_fkey_seed[AES_BLOCK_SIZE] = {
 	[0 ... AES_BLOCK_SIZE - 1] = 0x01,
 };
 
+enum ftl_sb_state {
+	FTL_SB_BAD = 0,
+	FTL_SB_FREE,
+	FTL_SB_OPEN,
+	FTL_SB_TOC,
+	FTL_SB_SPECIAL,
+};
+
+struct ftl_sb {
+	u8 state;
+	u8 members;
+	u16 valid_lps;
+};
+
 struct ftl;
 
 struct ftl_disk {
@@ -138,25 +157,42 @@ struct ftl_disk {
 	unsigned int nchunks;
 	struct crypto_skcipher *tfm;
 	struct skcipher_request *req;
+	bool ro;
 };
 
 struct ftl {
 	struct mtd_info *mtd;
 	struct list_head node;
 	struct work_struct work;
-	struct mutex lock;	/* the MTD and the page cache */
+	struct mutex lock;	/* the MTD, page cache, and write staging buffer */
 
 	u32 caus;
 	u32 blocks;		/* per CAU */
+	u32 data_blocks;	/* excluding reserved SLC blocks at top of CAU */
 	u32 pages;		/* per block */
 	u32 lps;		/* logical pages per page */
 	u32 nlba;		/* map entries */
 	u32 *l2p;		/* lba -> page * lps + logical page */
+	struct ftl_sb *sbs;
+	u32 free_sbs;
+	u32 next_gen;
+	u16 next_seq;
 
 	u8 *page;		/* cached page data */
 	u8 *oob;
-	u8 *dec;		/* decrypted 4 KiB logical block */
+	u8 *dec;		/* decrypted/encrypted 4 KiB logical block */
 	u32 cached;		/* page number in the cache, or FTL_UNMAPPED */
+
+	u32 wsb_block;		/* active open superblock for writes, or 0 */
+	u32 wsb_gen;
+	u16 wsb_first_seq;
+	u32 wsb_idx;
+	u32 wsb_total;
+	u32 *wsb_lbas;
+	u8 *wbuf_data;
+	u8 *wbuf_oob;
+	u32 wbuf_lbas[FTL_MAX_LPS];
+	u32 wbuf_count;
 
 	unsigned int chunk_shift;
 	struct ftl_disk whole;
@@ -174,7 +210,7 @@ static u8 *ftl_file_buf;
 static u8 ftl_file_master_key[AES_KEYSIZE_256];
 static bool ftl_file_master_valid;
 
-/* --- reading the MTD --- */
+/* --- reading and writing the MTD --- */
 
 static u32 ftl_page(struct ftl *f, u32 cau, u32 block, u32 page)
 {
@@ -195,6 +231,48 @@ static int ftl_read_page(struct ftl *f, u32 page, u8 *data, u8 *oob)
 
 	ret = mtd_read_oob(f->mtd, (loff_t)page * f->mtd->writesize, &ops);
 	return ret == -EUCLEAN ? 0 : ret;
+}
+
+static int ftl_write_page(struct ftl *f, u32 page, const u8 *data, const u8 *oob)
+{
+	struct mtd_oob_ops ops = {
+		.mode = MTD_OPS_PLACE_OOB,
+		.len = f->mtd->writesize,
+		.datbuf = (u8 *)data,
+		.ooblen = f->mtd->oobsize,
+		.oobbuf = (u8 *)oob,
+	};
+
+	if (f->cached == page)
+		f->cached = FTL_UNMAPPED;
+	return mtd_write_oob(f->mtd, (loff_t)page * f->mtd->writesize, &ops);
+}
+
+static int ftl_erase_sb(struct ftl *f, u32 block)
+{
+	u32 c;
+	int ret;
+
+	for (c = 0; c < f->caus; c++) {
+		struct erase_info instr = {
+			.addr = (loff_t)ftl_page(f, c, block, 0) * f->mtd->writesize,
+			.len = f->mtd->erasesize,
+		};
+
+		ret = mtd_erase(f->mtd, &instr);
+		if (ret) {
+			f->sbs[block].state = FTL_SB_BAD;
+			return ret;
+		}
+	}
+	if (f->cached != FTL_UNMAPPED &&
+	    ((f->cached / f->pages) % f->blocks) == block)
+		f->cached = FTL_UNMAPPED;
+	f->sbs[block].state = FTL_SB_FREE;
+	f->sbs[block].members = GENMASK(f->caus - 1, 0);
+	f->sbs[block].valid_lps = 0;
+	f->free_sbs++;
+	return 0;
 }
 
 /* Read len bytes from an SLC-programmed reserved block page. */
@@ -219,6 +297,7 @@ struct ftl_build {
 	u32 members[FTL_MAX_CAUS];
 	u32 nmembers;
 	u32 total;		/* logical pages in the superblock */
+	u32 max_gen;
 };
 
 /* Position in a superblock's write order to (page number, logical page). */
@@ -232,6 +311,15 @@ static void ftl_pos(struct ftl *f, struct ftl_build *b, u32 block, u32 idx,
 			 idx / per_page);
 }
 
+static void ftl_wsb_pos(struct ftl *f, u32 block, u32 idx, u32 *page, u32 *lp)
+{
+	u32 per_page = f->lps * f->caus;
+	u32 cau = (idx / f->lps) % f->caus;
+
+	*lp = idx % f->lps;
+	*page = ftl_page(f, cau, block, idx / per_page);
+}
+
 static void ftl_apply(struct ftl *f, struct ftl_build *b, u32 lba, u64 key, u32 phys)
 {
 	if (lba >= f->nlba)
@@ -239,6 +327,26 @@ static void ftl_apply(struct ftl *f, struct ftl_build *b, u32 lba, u64 key, u32 
 	if (f->l2p[lba] == FTL_UNMAPPED || key > b->keys[lba]) {
 		b->keys[lba] = key;
 		f->l2p[lba] = phys;
+	}
+}
+
+static void ftl_map_update(struct ftl *f, u32 lba, u32 new_phys)
+{
+	u32 old_phys, blk;
+
+	if (lba >= f->nlba)
+		return;
+	old_phys = f->l2p[lba];
+	if (old_phys != FTL_UNMAPPED) {
+		blk = ((old_phys / f->lps) / f->pages) % f->blocks;
+		if (blk < f->blocks && f->sbs[blk].valid_lps > 0)
+			f->sbs[blk].valid_lps--;
+	}
+	f->l2p[lba] = new_phys;
+	if (new_phys != FTL_UNMAPPED) {
+		blk = ((new_phys / f->lps) / f->pages) % f->blocks;
+		if (blk < f->blocks)
+			f->sbs[blk].valid_lps++;
 	}
 }
 
@@ -260,6 +368,8 @@ static int ftl_build_toc(struct ftl *f, struct ftl_build *b, u32 block, const u8
 	if (!toc_lps || toc_lps % f->lps || toc_lps > FTL_TOC_MAX_PAGES * f->lps ||
 	    toc_lps >= b->total)
 		return -EINVAL;
+	if (sb_gen != U32_MAX && sb_gen > b->max_gen)
+		b->max_gen = sb_gen;
 	for (i = 0; i < toc_lps / f->lps; i++) {
 		ftl_pos(f, b, block, b->total - toc_lps + i * f->lps, &page, &lp);
 		ret = ftl_read_page(f, page, b->toc + i * f->mtd->writesize, f->oob);
@@ -279,6 +389,8 @@ static int ftl_build_toc(struct ftl *f, struct ftl_build *b, u32 block, const u8
 			break;
 		if (gc)
 			gen = sb_gen;
+		if (gen != U32_MAX && gen > b->max_gen)
+			b->max_gen = gen;
 		for (j = 0; j < cnt; j++, idx++) {
 			ftl_pos(f, b, block, idx, &page, &lp);
 			ftl_apply(f, b, lba + j, ftl_key(gen, sb_gen, sb_seq, idx),
@@ -316,6 +428,8 @@ static int ftl_build_open(struct ftl *f, struct ftl_build *b, u32 block)
 			if (m[0] == 0xff)
 				continue;
 			any = true;
+			if (gen != U32_MAX && gen > b->max_gen)
+				b->max_gen = gen;
 			if (m[0] != FTL_T_DATA)
 				continue;
 			ent[2 * (idx + lp)] = get_unaligned_le32(m + 8);
@@ -354,47 +468,83 @@ static int ftl_build(struct ftl *f)
 		goto out;
 	}
 
-	/* Block 0 of the first CAU holds the boot pages, not translated data. */
-	for (block = 1; block < f->blocks; block++) {
+	/* Block 0 holds boot pages; top KS_RESERVED_BLOCKS hold SLC special data. */
+	for (block = 1; block < f->data_blocks; block++) {
+		u32 erased = 0;
+		u8 members_mask = 0;
+		u8 first_type = 0xff;
+		bool bad = false;
+
 		b.nmembers = 0;
 		for (c = 0; c < f->caus; c++) {
 			ret = ftl_read_page(f, ftl_page(f, c, block, 0), NULL, f->oob);
-			if (!ret && f->oob[0] != 0xff)
+			if (!ret && f->oob[0] != 0xff) {
+				if (!b.nmembers)
+					first_type = f->oob[0];
 				b.members[b.nmembers++] = c;
-			else if (ret && ret != -EBADMSG)
+				members_mask |= BIT(c);
+			} else if (!ret && f->oob[0] == 0xff) {
+				erased++;
+			} else if (ret == -EBADMSG) {
+				bad = true;
+			} else if (ret) {
 				goto out;
+			}
 		}
 		ret = 0;
-		if (!b.nmembers)
+		if (!b.nmembers) {
+			if (!bad && erased == f->caus) {
+				f->sbs[block].state = FTL_SB_FREE;
+				f->sbs[block].members = GENMASK(f->caus - 1, 0);
+				f->free_sbs++;
+			} else {
+				f->sbs[block].state = FTL_SB_BAD;
+			}
 			continue;
+		}
+		f->sbs[block].members = members_mask;
 		b.total = f->pages * f->lps * b.nmembers;
 
 		/* The table, if any, ends the superblock; its first record describes it. */
 		ftl_pos(f, &b, block, b.total - f->lps, &page, &lp);
 		ret = ftl_read_page(f, page, NULL, f->oob);
 		if (!ret && f->oob[0] == FTL_T_TOC && !ftl_build_toc(f, &b, block, f->oob)) {
+			f->sbs[block].state = FTL_SB_TOC;
 			tocs++;
 		} else {
 			ret = ftl_build_open(f, &b, block);
 			if (ret)
 				goto out;
+			f->sbs[block].state = (first_type == FTL_T_DATA) ?
+					      FTL_SB_OPEN : FTL_SB_SPECIAL;
 			open++;
 		}
 		cond_resched();
 	}
 
-	for (block = 0; block < f->nlba; block++)
-		mapped += f->l2p[block] != FTL_UNMAPPED;
+	for (block = 0; block < f->nlba; block++) {
+		u32 phys = f->l2p[block];
+
+		if (phys == FTL_UNMAPPED)
+			continue;
+		mapped++;
+		c = ((phys / f->lps) / f->pages) % f->blocks;
+		if (c < f->blocks)
+			f->sbs[c].valid_lps++;
+	}
+	f->next_gen = b.max_gen + 1;
+	f->next_seq = 0;
 	dev_info(&f->mtd->dev,
-		 "translation map: %u blocks mapped, %u tables, %u open superblocks, %u ms\n",
-		 mapped, tocs, open, jiffies_to_msecs(jiffies - start));
+		 "translation map: %u blocks mapped, %u tables, %u open, %u free superblocks, next gen %u, %u ms\n",
+		 mapped, tocs, open, f->free_sbs, f->next_gen,
+		 jiffies_to_msecs(jiffies - start));
 out:
 	kvfree(b.toc);
 	vfree(b.keys);
 	return ret;
 }
 
-/* --- reading logical blocks --- */
+/* --- reading and writing logical blocks --- */
 
 static void ftl_block_iv(u32 lba, __le32 iv[4])
 {
@@ -423,13 +573,36 @@ static int ftl_decrypt(struct skcipher_request *req, const void *src, void *dst,
 	return crypto_wait_req(crypto_skcipher_decrypt(req), &wait);
 }
 
+static int ftl_encrypt(struct skcipher_request *req, const void *src, void *dst,
+		       size_t len, void *iv)
+{
+	DECLARE_CRYPTO_WAIT(wait);
+	struct scatterlist sg_src, sg_dst;
+
+	sg_init_one(&sg_src, src, len);
+	sg_init_one(&sg_dst, dst, len);
+	skcipher_request_set_callback(req,
+				      CRYPTO_TFM_REQ_MAY_SLEEP |
+				      CRYPTO_TFM_REQ_MAY_BACKLOG,
+				      crypto_req_done, &wait);
+	skcipher_request_set_crypt(req, &sg_src, &sg_dst, len, iv);
+	return crypto_wait_req(crypto_skcipher_encrypt(req), &wait);
+}
+
 /* Copy n bytes at offset off of logical block lba. Caller holds f->lock. */
 static int ftl_copy(struct ftl *f, struct ftl_disk *d, u32 lba,
 		    unsigned int off, void *dst, unsigned int n)
 {
-	u32 phys, page;
+	u32 phys, page, i;
 	u8 *src;
 	int ret;
+
+	for (i = f->wbuf_count; i > 0; i--) {
+		if (f->wbuf_lbas[i - 1] == lba) {
+			src = f->wbuf_data + (i - 1) * FTL_LP_SIZE;
+			goto decrypt;
+		}
+	}
 
 	phys = lba < f->nlba ? f->l2p[lba] : FTL_UNMAPPED;
 	if (phys == FTL_UNMAPPED) {
@@ -445,6 +618,7 @@ static int ftl_copy(struct ftl *f, struct ftl_disk *d, u32 lba,
 		f->cached = page;
 	}
 	src = f->page + (phys % f->lps) * FTL_LP_SIZE;
+decrypt:
 	if (d && d->req) {
 		__le32 iv[4];
 
@@ -456,6 +630,298 @@ static int ftl_copy(struct ftl *f, struct ftl_disk *d, u32 lba,
 	}
 	memcpy(dst, src + off, n);
 	return 0;
+}
+
+static void ftl_fill_meta(u8 *m, u8 type, u8 flags, u16 seq, u32 gen,
+			  u32 lba, u32 word3)
+{
+	m[0] = type;
+	m[1] = flags;
+	put_unaligned_le16(seq, m + 2);
+	put_unaligned_le32(gen, m + 4);
+	put_unaligned_le32(lba, m + 8);
+	put_unaligned_le32(word3, m + 12);
+}
+
+static int ftl_close_wsb(struct ftl *f)
+{
+	u32 toc_pages = FTL_TOC_WRITE_PAGES;
+	u32 toc_lps = toc_pages * f->lps;
+	u32 data_lps = f->wsb_total - toc_lps;
+	u32 i = 0, run = 0, page, lp;
+	u8 *toc;
+	int ret = 0;
+
+	if (!f->wsb_block)
+		return 0;
+
+	/* Pad any remaining data pages up to data_lps so the TOC sits at the end. */
+	memset(f->wbuf_data, 0xff, f->mtd->writesize);
+	while (f->wsb_idx < data_lps) {
+		for (lp = 0; lp < f->lps; lp++) {
+			ftl_fill_meta(f->wbuf_oob + lp * FTL_META, FTL_T_PAD, 0,
+				      f->next_seq++, f->wsb_gen, FTL_UNMAPPED,
+				      f->wsb_gen);
+			f->wsb_lbas[f->wsb_idx + lp] = FTL_UNMAPPED;
+		}
+		ftl_wsb_pos(f, f->wsb_block, f->wsb_idx, &page, &lp);
+		ret = ftl_write_page(f, page, f->wbuf_data, f->wbuf_oob);
+		if (ret)
+			return ret;
+		f->wsb_idx += f->lps;
+	}
+
+	toc = kvzalloc(toc_pages * f->mtd->writesize, GFP_NOIO);
+	if (!toc)
+		return -ENOMEM;
+
+	while (i < data_lps && (run + 1) * 16 <= toc_pages * f->mtd->writesize) {
+		u32 lba = f->wsb_lbas[i];
+		u32 cnt = 1;
+		u8 *r = toc + run * 16;
+
+		if (lba < f->nlba) {
+			while (i + cnt < data_lps &&
+			       f->wsb_lbas[i + cnt] == lba + cnt)
+				cnt++;
+		} else {
+			lba = f->nlba;
+		}
+		put_unaligned_le32(i, r);
+		put_unaligned_le32(f->wsb_gen, r + 4);
+		put_unaligned_le32(lba, r + 8);
+		put_unaligned_le32(cnt, r + 12);
+		i += cnt;
+		run++;
+	}
+
+	for (i = 0; i < toc_pages; i++) {
+		for (lp = 0; lp < f->lps; lp++)
+			ftl_fill_meta(f->wbuf_oob + lp * FTL_META, FTL_T_TOC,
+				      FTL_F_TOC_STD, f->wsb_first_seq,
+				      f->wsb_gen, f->wsb_total,
+				      0xffff0000U | toc_lps);
+		ftl_wsb_pos(f, f->wsb_block, data_lps + i * f->lps, &page, &lp);
+		ret = ftl_write_page(f, page, toc + i * f->mtd->writesize,
+				     f->wbuf_oob);
+		if (ret)
+			break;
+	}
+	kvfree(toc);
+	if (!ret) {
+		f->sbs[f->wsb_block].state = FTL_SB_TOC;
+		f->wsb_block = 0;
+		f->wsb_idx = 0;
+	}
+	return ret;
+}
+
+static int ftl_commit_wbuf(struct ftl *f)
+{
+	u32 page, lp, i;
+	int ret;
+
+	if (!f->wbuf_count)
+		return 0;
+	for (i = f->wbuf_count; i < f->lps; i++) {
+		memset(f->wbuf_data + i * FTL_LP_SIZE, 0xff, FTL_LP_SIZE);
+		ftl_fill_meta(f->wbuf_oob + i * FTL_META, FTL_T_PAD, 0,
+			      f->next_seq++, f->wsb_gen, FTL_UNMAPPED,
+			      f->wsb_gen);
+		f->wbuf_lbas[i] = FTL_UNMAPPED;
+	}
+
+	ftl_wsb_pos(f, f->wsb_block, f->wsb_idx, &page, &lp);
+	ret = ftl_write_page(f, page, f->wbuf_data, f->wbuf_oob);
+	if (ret)
+		return ret;
+
+	for (i = 0; i < f->lps; i++) {
+		u32 lba = f->wbuf_lbas[i];
+
+		f->wsb_lbas[f->wsb_idx + i] = lba;
+		if (lba < f->nlba)
+			ftl_map_update(f, lba, page * f->lps + i);
+	}
+	f->wsb_idx += f->lps;
+	f->wbuf_count = 0;
+	if (!f->next_seq)
+		f->wsb_gen = f->next_gen++;
+
+	if (f->wsb_idx >= f->wsb_total - FTL_TOC_WRITE_PAGES * f->lps)
+		return ftl_close_wsb(f);
+	return 0;
+}
+
+/* Flush any staged writes to NAND; ensure page 0 of every CAU in wsb is written. */
+static int ftl_flush_wbuf(struct ftl *f)
+{
+	int ret;
+
+	if (f->wbuf_count) {
+		ret = ftl_commit_wbuf(f);
+		if (ret)
+			return ret;
+	}
+	while (f->wsb_block && f->wsb_idx > 0 &&
+	       f->wsb_idx < f->caus * f->lps) {
+		f->wbuf_count = 0;
+		memset(f->wbuf_data, 0xff, f->mtd->writesize);
+		for (u32 i = 0; i < f->lps; i++) {
+			ftl_fill_meta(f->wbuf_oob + i * FTL_META, FTL_T_PAD, 0,
+				      f->next_seq++, f->wsb_gen, FTL_UNMAPPED,
+				      f->wsb_gen);
+			f->wbuf_lbas[i] = FTL_UNMAPPED;
+		}
+		f->wbuf_count = f->lps;
+		ret = ftl_commit_wbuf(f);
+		if (ret)
+			return ret;
+	}
+	return 0;
+}
+
+static int ftl_open_free_sb(struct ftl *f)
+{
+	u32 b;
+
+	for (b = 1; b < f->data_blocks; b++) {
+		if (f->sbs[b].state == FTL_SB_FREE) {
+			f->sbs[b].state = FTL_SB_OPEN;
+			f->sbs[b].valid_lps = 0;
+			f->free_sbs--;
+			f->wsb_block = b;
+			f->wsb_gen = f->next_gen++;
+			f->next_seq = 0;
+			f->wsb_first_seq = 0;
+			f->wsb_idx = 0;
+			f->wsb_total = f->pages * f->lps * f->caus;
+			return 0;
+		}
+	}
+	return -ENOSPC;
+}
+
+static int ftl_stage_raw(struct ftl *f, u32 lba, const void *raw_lp);
+
+static int ftl_gc(struct ftl *f)
+{
+	u32 b, victim = 0, best_valid = U32_MAX, lba;
+	u8 *buf;
+	int ret;
+
+	for (b = 1; b < f->data_blocks; b++) {
+		if (f->sbs[b].state == FTL_SB_TOC &&
+		    f->sbs[b].valid_lps < best_valid) {
+			victim = b;
+			best_valid = f->sbs[b].valid_lps;
+			if (!best_valid)
+				break;
+		}
+	}
+	if (!victim)
+		return -ENOSPC;
+	if (!best_valid)
+		return ftl_erase_sb(f, victim);
+
+	if (!f->wsb_block) {
+		ret = ftl_open_free_sb(f);
+		if (ret)
+			return ret;
+	}
+
+	buf = kmalloc(FTL_LP_SIZE, GFP_NOIO);
+	if (!buf)
+		return -ENOMEM;
+
+	for (lba = 0; lba < f->nlba && f->sbs[victim].valid_lps > 0; lba++) {
+		u32 phys = f->l2p[lba];
+
+		if (phys == FTL_UNMAPPED)
+			continue;
+		if ((((phys / f->lps) / f->pages) % f->blocks) != victim)
+			continue;
+		ret = ftl_copy(f, NULL, lba, 0, buf, FTL_LP_SIZE);
+		if (ret)
+			goto out;
+		ret = ftl_stage_raw(f, lba, buf);
+		if (ret)
+			goto out;
+	}
+	ret = ftl_flush_wbuf(f);
+	if (!ret)
+		ret = ftl_erase_sb(f, victim);
+out:
+	kfree(buf);
+	return ret;
+}
+
+static int ftl_stage_raw(struct ftl *f, u32 lba, const void *raw_lp)
+{
+	u32 i, slot;
+	u16 seq;
+	int ret;
+
+	for (i = 0; i < f->wbuf_count; i++) {
+		if (f->wbuf_lbas[i] == lba) {
+			memcpy(f->wbuf_data + i * FTL_LP_SIZE, raw_lp, FTL_LP_SIZE);
+			return 0;
+		}
+	}
+
+	if (!f->wsb_block) {
+		if (f->free_sbs <= FTL_GC_LOW_SB) {
+			ret = ftl_gc(f);
+			if (ret && !f->free_sbs)
+				return ret;
+		}
+		if (!f->wsb_block) {
+			ret = ftl_open_free_sb(f);
+			if (ret)
+				return ret;
+		}
+	}
+
+	slot = f->wbuf_count++;
+	seq = f->next_seq++;
+	if (!f->wsb_idx && !slot)
+		f->wsb_first_seq = seq;
+	memcpy(f->wbuf_data + slot * FTL_LP_SIZE, raw_lp, FTL_LP_SIZE);
+	ftl_fill_meta(f->wbuf_oob + slot * FTL_META, FTL_T_DATA, 0, seq,
+		      f->wsb_gen, lba, f->wsb_gen);
+	f->wbuf_lbas[slot] = lba;
+
+	if (f->wbuf_count == f->lps)
+		return ftl_commit_wbuf(f);
+	return 0;
+}
+
+/* Write n bytes at offset off of logical block lba. Caller holds f->lock. */
+static int ftl_write(struct ftl *f, struct ftl_disk *d, u32 lba,
+		     unsigned int off, const void *src, unsigned int n)
+{
+	const void *raw = src;
+	int ret;
+
+	if (lba >= f->nlba)
+		return -EIO;
+	if (off != 0 || n != FTL_LP_SIZE) {
+		ret = ftl_copy(f, d, lba, 0, f->dec, FTL_LP_SIZE);
+		if (ret)
+			return ret;
+		memcpy(f->dec + off, src, n);
+		raw = f->dec;
+	}
+	if (d && d->req) {
+		__le32 iv[4];
+
+		ftl_block_iv(lba, iv);
+		ret = ftl_encrypt(d->req, raw, f->dec, FTL_LP_SIZE, iv);
+		if (ret)
+			return ret;
+		raw = f->dec;
+	}
+	return ftl_stage_raw(f, lba, raw);
 }
 
 /* Byte offset on a disk to byte offset on the logical disk. */
@@ -474,35 +940,59 @@ static blk_status_t ftl_queue_rq(struct blk_mq_hw_ctx *hctx, const struct blk_mq
 	struct request *rq = bd->rq;
 	struct ftl *f = d->ftl;
 	u64 pos = (u64)blk_rq_pos(rq) << SECTOR_SHIFT;
+	enum req_op op = req_op(rq);
 	struct req_iterator iter;
 	blk_status_t status = BLK_STS_OK;
 	struct bio_vec bv;
 
 	blk_mq_start_request(rq);
-	if (req_op(rq) != REQ_OP_READ) {
+	if (op == REQ_OP_FLUSH) {
+		mutex_lock(&f->lock);
+		if (ftl_flush_wbuf(f))
+			status = BLK_STS_IOERR;
+		mutex_unlock(&f->lock);
+		goto out;
+	}
+	if (op != REQ_OP_READ && op != REQ_OP_WRITE) {
 		status = BLK_STS_NOTSUPP;
+		goto out;
+	}
+	if (op == REQ_OP_WRITE && d->ro) {
+		status = BLK_STS_IOERR;
 		goto out;
 	}
 
 	mutex_lock(&f->lock);
 	rq_for_each_segment(bv, rq, iter) {
-		u8 *dst = bvec_kmap_local(&bv);
+		u8 *buf = bvec_kmap_local(&bv);
 		unsigned int done = 0;
 
 		while (done < bv.bv_len && status == BLK_STS_OK) {
 			u64 at = ftl_disk_offset(d, pos);
 			unsigned int off = at & (FTL_LP_SIZE - 1);
 			unsigned int n = min_t(unsigned int, bv.bv_len - done, FTL_LP_SIZE - off);
+			int err;
 
-			if (pos + n > d->size ||
-			    ftl_copy(f, d, at >> FTL_LP_SHIFT, off, dst + done, n))
+			if (pos + n > d->size) {
+				status = BLK_STS_IOERR;
+				break;
+			}
+			if (op == REQ_OP_WRITE)
+				err = ftl_write(f, d, at >> FTL_LP_SHIFT, off, buf + done, n);
+			else
+				err = ftl_copy(f, d, at >> FTL_LP_SHIFT, off, buf + done, n);
+			if (err)
 				status = BLK_STS_IOERR;
 			done += n;
 			pos += n;
 		}
-		kunmap_local(dst);
+		kunmap_local(buf);
 		if (status != BLK_STS_OK)
 			break;
+	}
+	if (status == BLK_STS_OK && op == REQ_OP_WRITE && (rq->cmd_flags & REQ_FUA)) {
+		if (ftl_flush_wbuf(f))
+			status = BLK_STS_IOERR;
 	}
 	mutex_unlock(&f->lock);
 out:
@@ -518,16 +1008,18 @@ static const struct block_device_operations ftl_fops = {
 	.owner = THIS_MODULE,
 };
 
-static int ftl_add_disk(struct ftl *f, struct ftl_disk *d, const char *name)
+static int ftl_add_disk(struct ftl *f, struct ftl_disk *d, const char *name, bool ro)
 {
 	struct queue_limits lim = {
 		.logical_block_size = FTL_LP_SIZE,
 		.physical_block_size = FTL_LP_SIZE,
 		.max_hw_sectors = 256,
+		.features = ro ? 0 : (BLK_FEAT_WRITE_CACHE | BLK_FEAT_FUA),
 	};
 	int ret;
 
 	d->ftl = f;
+	d->ro = ro;
 	d->tag_set.ops = &ftl_mq_ops;
 	d->tag_set.nr_hw_queues = 1;
 	d->tag_set.queue_depth = 16;
@@ -549,7 +1041,7 @@ static int ftl_add_disk(struct ftl *f, struct ftl_disk *d, const char *name)
 	d->disk->flags |= GENHD_FL_NO_PART;
 	strscpy(d->disk->disk_name, name, sizeof(d->disk->disk_name));
 	set_capacity(d->disk, d->size >> SECTOR_SHIFT);
-	set_disk_ro(d->disk, true);
+	set_disk_ro(d->disk, ro);
 
 	ret = add_disk(d->disk);
 	if (ret) {
@@ -819,6 +1311,75 @@ out:
 }
 EXPORT_SYMBOL_GPL(s5l8947x_file_block_decrypt);
 
+int s5l8947x_file_block_encrypt(struct block_device *bdev, u64 blocknr,
+				const u8 fkey[32], const u8 iv_key[16],
+				u64 file_off, const void *src)
+{
+	struct ftl_disk *d = bdev ? bdev->bd_disk->private_data : NULL;
+	struct crypto_aes_ctx aes;
+	u8 iv[AES_BLOCK_SIZE];
+	__le32 lfsr[4];
+	struct ftl *f;
+	u64 pos, at;
+	int ret;
+
+	if (!d || !d->ftl || d->ro || (file_off & (FTL_LP_SIZE - 1)))
+		return -EINVAL;
+	f = d->ftl;
+	pos = blocknr << FTL_LP_SHIFT;
+	if (pos + FTL_LP_SIZE > d->size)
+		return -EIO;
+	ret = aes_expandkey(&aes, iv_key, AES_KEYSIZE_128);
+	if (ret)
+		return ret;
+
+	mutex_lock(&ftl_file_lock);
+	if (!ftl_file_tfm) {
+		struct crypto_skcipher *tfm = crypto_alloc_skcipher("cbc(aes)", 0, 0);
+
+		if (IS_ERR(tfm)) {
+			ret = PTR_ERR(tfm);
+			goto out;
+		}
+		ftl_file_tfm = tfm;
+	}
+	if (!ftl_file_req) {
+		ftl_file_req = skcipher_request_alloc(ftl_file_tfm, GFP_KERNEL);
+		if (!ftl_file_req) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
+	if (!ftl_file_buf) {
+		ftl_file_buf = kmalloc(FTL_LP_SIZE, GFP_KERNEL);
+		if (!ftl_file_buf) {
+			ret = -ENOMEM;
+			goto out;
+		}
+	}
+
+	ret = crypto_skcipher_setkey(ftl_file_tfm, fkey, AES_KEYSIZE_256);
+	if (!ret) {
+		ftl_block_iv((u32)file_off, lfsr);
+		aes_encrypt(&aes, iv, (const u8 *)lfsr);
+		ret = ftl_encrypt(ftl_file_req, src, ftl_file_buf,
+				  FTL_LP_SIZE, iv);
+	}
+	if (!ret) {
+		at = ftl_disk_offset(d, pos);
+		mutex_lock(&f->lock);
+		ret = ftl_write(f, NULL, at >> FTL_LP_SHIFT, 0, ftl_file_buf,
+				FTL_LP_SIZE);
+		mutex_unlock(&f->lock);
+	}
+out:
+	mutex_unlock(&ftl_file_lock);
+	memzero_explicit(&aes, sizeof(aes));
+	memzero_explicit(iv, sizeof(iv));
+	return ret;
+}
+EXPORT_SYMBOL_GPL(s5l8947x_file_block_encrypt);
+
 static int ftl_setup_cipher(struct ftl_disk *d, const u8 *uuid, const u8 *locker, u32 nkeys)
 {
 	u32 i;
@@ -899,6 +1460,7 @@ static void ftl_volumes(struct ftl *f, const u8 *hdr, const char *base)
 		u64 attr = get_unaligned_le64(r + LV_R_ATTR);
 		char label[LV_R_NAME_LEN + 1], name[DISK_NAME_LEN];
 		unsigned int k, found = 0;
+		bool ro;
 
 		for (k = 0; k < LV_R_NAME_LEN; k++) {
 			u16 ch = get_unaligned_le16(r + LV_R_NAME + 2 * k);
@@ -934,8 +1496,10 @@ static void ftl_volumes(struct ftl *f, const u8 *hdr, const char *base)
 		    ftl_setup_cipher(d, r + LV_R_UUID, locker, nkeys))
 			dev_warn(&f->mtd->dev, "volume %u (%s): encryption key unavailable\n",
 				 i, label);
+		ro = !(f->mtd->flags & MTD_WRITEABLE) ||
+		     ((attr & LV_ATTR_ENCRYPTED) && !d->req);
 		snprintf(name, sizeof(name), "%sp%u", base, i + 1);
-		if (ftl_add_disk(f, d, name)) {
+		if (ftl_add_disk(f, d, name, ro)) {
 			skcipher_request_free(d->req);
 			crypto_free_skcipher(d->tfm);
 			kfree(d->chunks);
@@ -958,9 +1522,9 @@ static bool ftl_usable(struct mtd_info *mtd)
 	u32 lps = mtd->writesize >> FTL_LP_SHIFT;
 	int i;
 
-	if (mtd->type != MTD_MLCNANDFLASH || !lps || mtd->writesize % FTL_LP_SIZE ||
-	    mtd->oobsize != lps * FTL_META || !mtd->numeraseregions ||
-	    mtd->numeraseregions > FTL_MAX_CAUS)
+	if (mtd->type != MTD_MLCNANDFLASH || !lps || lps > FTL_MAX_LPS ||
+	    mtd->writesize % FTL_LP_SIZE || mtd->oobsize != lps * FTL_META ||
+	    !mtd->numeraseregions || mtd->numeraseregions > FTL_MAX_CAUS)
 		return false;
 	for (i = 0; i < mtd->numeraseregions; i++)
 		if (mtd->eraseregions[i].erasesize != mtd->erasesize ||
@@ -973,6 +1537,7 @@ static void ftl_work(struct work_struct *work)
 {
 	struct ftl *f = container_of(work, struct ftl, work);
 	char base[DISK_NAME_LEN];
+	bool ro = !(f->mtd->flags & MTD_WRITEABLE);
 	u8 *hdr;
 	int ret;
 
@@ -985,7 +1550,7 @@ static void ftl_work(struct work_struct *work)
 	hdr = ftl_volume_header(f);
 	f->whole.size = hdr ? get_unaligned_le64(hdr + LV_MEDIA_SIZE) :
 			      (u64)f->nlba << FTL_LP_SHIFT;
-	if (!ftl_add_disk(f, &f->whole, base) && hdr)
+	if (!ftl_add_disk(f, &f->whole, base, ro) && hdr)
 		ftl_volumes(f, hdr, base);
 	kfree(hdr);
 }
@@ -993,6 +1558,7 @@ static void ftl_work(struct work_struct *work)
 static void ftl_notify_add(struct mtd_info *mtd)
 {
 	struct ftl *f;
+	u32 sb_lps;
 
 	if (!ftl_usable(mtd))
 		return;
@@ -1002,19 +1568,31 @@ static void ftl_notify_add(struct mtd_info *mtd)
 	f->mtd = mtd;
 	f->caus = mtd->numeraseregions;
 	f->blocks = mtd->eraseregions[0].numblocks;
+	f->data_blocks = f->blocks > KS_RESERVED_BLOCKS ?
+			 f->blocks - KS_RESERVED_BLOCKS : f->blocks;
 	f->pages = mtd->erasesize / mtd->writesize;
 	f->lps = mtd->writesize >> FTL_LP_SHIFT;
 	f->nlba = f->caus * f->blocks * f->pages * f->lps;
+	sb_lps = f->caus * f->pages * f->lps;
 	f->cached = FTL_UNMAPPED;
 	mutex_init(&f->lock);
 	f->l2p = vmalloc(array_size(f->nlba, sizeof(*f->l2p)));
+	f->sbs = kcalloc(f->blocks, sizeof(*f->sbs), GFP_KERNEL);
+	f->wsb_lbas = kmalloc_array(sb_lps, sizeof(*f->wsb_lbas), GFP_KERNEL);
 	f->page = kmalloc(mtd->writesize, GFP_KERNEL);
 	f->oob = kmalloc(mtd->oobsize, GFP_KERNEL);
+	f->wbuf_data = kmalloc(mtd->writesize, GFP_KERNEL);
+	f->wbuf_oob = kmalloc(mtd->oobsize, GFP_KERNEL);
 	f->dec = kmalloc(FTL_LP_SIZE, GFP_KERNEL);
-	if (!f->l2p || !f->page || !f->oob || !f->dec) {
+	if (!f->l2p || !f->sbs || !f->wsb_lbas || !f->page || !f->oob ||
+	    !f->wbuf_data || !f->wbuf_oob || !f->dec) {
 		vfree(f->l2p);
+		kfree(f->sbs);
+		kfree(f->wsb_lbas);
 		kfree(f->page);
 		kfree(f->oob);
+		kfree(f->wbuf_data);
+		kfree(f->wbuf_oob);
 		kfree(f->dec);
 		kfree(f);
 		return;
@@ -1036,10 +1614,17 @@ static void ftl_free(struct ftl *f)
 	for (i = 0; i < f->nvols; i++)
 		ftl_del_disk(&f->vols[i]);
 	ftl_del_disk(&f->whole);
+	mutex_lock(&f->lock);
+	ftl_flush_wbuf(f);
+	mutex_unlock(&f->lock);
 	__put_mtd_device(f->mtd);
 	vfree(f->l2p);
+	kfree(f->sbs);
+	kfree(f->wsb_lbas);
 	kfree(f->page);
 	kfree(f->oob);
+	kfree_sensitive(f->wbuf_data);
+	kfree(f->wbuf_oob);
 	kfree_sensitive(f->dec);
 	kfree(f);
 }
@@ -1081,5 +1666,5 @@ static void __exit ftl_exit(void)
 
 module_init(ftl_init);
 module_exit(ftl_exit);
-MODULE_DESCRIPTION("S5L8947X managed NAND translation layer and volume map (read-only)");
+MODULE_DESCRIPTION("S5L8947X managed NAND translation layer and volume map");
 MODULE_LICENSE("GPL");

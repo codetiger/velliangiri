@@ -73,36 +73,48 @@ t_nand() {
 		return
 	fi
 	pass "volume map read"
+	if [ "$(rd /sys/block/nand0/ro)" = 0 ] && [ "$(rd /sys/block/nand0p1/ro)" = 0 ]; then
+		pass "FTL block devices writable (ro=0)"
+	else
+		fail "FTL block devices marked read-only"
+	fi
 
 	mnt=/tmp/hwtest-nand0p1
 	mkdir -p "$mnt"
-	if mount -t hfsplus -o ro /dev/nand0p1 "$mnt" 2>/dev/null; then
+	if mount -t hfsplus /dev/nand0p1 "$mnt" 2>/dev/null; then
 		n=$(ls "$mnt" | wc -l)
-		if [ "$n" -gt 0 ] && [ -d "$mnt/System" ]; then
-			pass "nand0p1 mounts read-only ($n entries in /)"
+		if [ "$n" -gt 0 ] && [ -d "$mnt/System" ] && grep -q "$mnt hfsplus rw" /proc/mounts; then
+			pass "nand0p1 mounts read-write ($n entries in /)"
 		else
-			fail "nand0p1 mounted but its root looks empty"
+			fail "nand0p1 mounted but not rw or root looks empty"
 		fi
 		umount "$mnt"
 	else
-		fail "nand0p1 does not mount as hfsplus"
+		fail "nand0p1 does not mount read-write as hfsplus"
 	fi
 	if [ -b /dev/nand0p2 ]; then
-		if mount -t hfsplus -o ro /dev/nand0p2 "$mnt" 2>/dev/null; then
+		if mount -t hfsplus /dev/nand0p2 "$mnt" 2>/dev/null; then
 			n=$(ls "$mnt" | wc -l)
-			if [ "$n" -gt 0 ] && [ -d "$mnt/mobile" ]; then
-				pass "nand0p2 decrypted and mounts read-only ($n entries in /)"
+			if [ "$n" -gt 0 ] && [ -d "$mnt/mobile" ] && grep -q "$mnt hfsplus rw" /proc/mounts; then
+				pass "nand0p2 decrypted and mounts read-write ($n entries in /)"
 			else
-				fail "nand0p2 mounted but its root looks empty"
+				fail "nand0p2 mounted but not rw or root looks empty"
 			fi
 			if [ -f "$mnt/logs/lockdownd.log" ] && grep -q 'Starting Up' "$mnt/logs/lockdownd.log" 2>/dev/null; then
 				pass "nand0p2 per-file content protection decrypted"
 			else
 				fail "nand0p2 per-file content protection did not decrypt plaintext"
 			fi
+			tf="$mnt/.hwtest-rw-$$"
+			if echo "velliangiri-rw-ok" > "$tf" 2>/dev/null && sync && [ "$(cat "$tf" 2>/dev/null)" = "velliangiri-rw-ok" ] && rm -f "$tf" 2>/dev/null && sync; then
+				pass "nand0p2 read-write file create, sync, verify, and remove"
+			else
+				rm -f "$tf" 2>/dev/null
+				fail "nand0p2 read-write file test failed"
+			fi
 			umount "$mnt"
 		else
-			fail "nand0p2 does not mount as hfsplus"
+			fail "nand0p2 does not mount read-write as hfsplus"
 		fi
 	fi
 	rmdir "$mnt" 2>/dev/null

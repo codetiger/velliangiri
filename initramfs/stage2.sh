@@ -2,16 +2,31 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # Stage 2 service bring-up for S5L8947X (j33iap)
 
-trap 'sync; reboot -f' TERM
-trap 'sync; halt -f' USR1
-trap 'sync; poweroff -f' USR2
-
 export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root USER=root LOGNAME=root SHELL=/bin/sh
 
 log_msg() {
 	echo "[velliangiri] $*" >/dev/kmsg 2>/dev/null || echo "[velliangiri] $*"
 }
+
+clean_shutdown() {
+	log_msg "syncing and unmounting NAND filesystems before $1..."
+	sync
+	if [ -r /proc/mounts ]; then
+		awk '$1 ~ /^\/dev\/nand/ || $3 == "hfsplus" { print $2 }' /proc/mounts | sort -r | while read -r mp; do
+			if ! umount "$mp" 2>/dev/null; then
+				mount -o remount,ro "$mp" 2>/dev/null || true
+				umount -l "$mp" 2>/dev/null || true
+			fi
+		done
+	fi
+	sync
+	"$1" -f
+}
+
+trap 'clean_shutdown reboot' TERM INT
+trap 'clean_shutdown halt' USR1
+trap 'clean_shutdown poweroff' USR2
 
 log_msg "stage2 starting on $(uname -sr)"
 hostname -F /etc/hostname 2>/dev/null || hostname velliangiri 2>/dev/null || true

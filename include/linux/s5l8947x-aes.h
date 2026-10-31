@@ -37,6 +37,9 @@ int s5l8947x_file_key_unwrap(const void *attr, size_t len, u8 fkey[32], u8 iv_ke
 int s5l8947x_file_block_decrypt(struct block_device *bdev, u64 blocknr,
 				const u8 fkey[32], const u8 iv_key[16],
 				u64 file_off, void *dst);
+int s5l8947x_file_block_encrypt(struct block_device *bdev, u64 blocknr,
+				const u8 fkey[32], const u8 iv_key[16],
+				u64 file_off, const void *src);
 #else
 static inline int s5l8947x_file_key_unwrap(const void *attr, size_t len,
 					   u8 fkey[32], u8 iv_key[16])
@@ -46,6 +49,12 @@ static inline int s5l8947x_file_key_unwrap(const void *attr, size_t len,
 static inline int s5l8947x_file_block_decrypt(struct block_device *bdev, u64 blocknr,
 					      const u8 fkey[32], const u8 iv_key[16],
 					      u64 file_off, void *dst)
+{
+	return -ENODEV;
+}
+static inline int s5l8947x_file_block_encrypt(struct block_device *bdev, u64 blocknr,
+					      const u8 fkey[32], const u8 iv_key[16],
+					      u64 file_off, const void *src)
 {
 	return -ENODEV;
 }

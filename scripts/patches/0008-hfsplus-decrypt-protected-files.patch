@@ -1,15 +1,15 @@
-hfsplus: decrypt per-file protected regular files on S5L8947X volumes
+hfsplus: support S5L8947X per-file encryption and journaled RW mounts
 
-When opening a regular file on an HFS+ volume, check for a content-protection
-extended attribute and unwrap its per-file AES-256 key through the S5L8947X
-key store helper when available. Decrypt 4 KiB data fork blocks in
-hfsplus_read_folio() using the unwrapped per-file key and IV key.
+When opening or writing a regular file on an HFS+ volume, check for a
+content-protection extended attribute and unwrap its per-file AES-256 key
+through the S5L8947X key store helper when available. Decrypt 4 KiB data
+fork blocks in hfsplus_read_folio() and encrypt dirty blocks in
+hfsplus_writepages() using the unwrapped per-file key and IV key.
+
+Validate and replay HFS+ journals on mount so journaled volumes mount
+read-write cleanly without forcing read-only, and mark volumes cleanly
+unmounted on both unmount and read-only remount.
 ---
- fs/hfsplus/hfsplus_fs.h |  3 ++
- fs/hfsplus/inode.c      | 68 ++++++++++++++++++++++++++++++++++++++++-
- fs/hfsplus/super.c      |  5 +++
- 3 files changed, 75 insertions(+), 1 deletion(-)
-
 diff --git a/fs/hfsplus/hfsplus_fs.h b/fs/hfsplus/hfsplus_fs.h
 --- a/fs/hfsplus/hfsplus_fs.h
 +++ b/fs/hfsplus/hfsplus_fs.h
@@ -23,19 +23,97 @@ diff --git a/fs/hfsplus/hfsplus_fs.h b/fs/hfsplus/hfsplus_fs.h
  
  	struct inode vfs_inode;
  };
+diff --git a/fs/hfsplus/hfsplus_raw.h b/fs/hfsplus/hfsplus_raw.h
+--- a/fs/hfsplus/hfsplus_raw.h
++++ b/fs/hfsplus/hfsplus_raw.h
+@@ -146,7 +146,49 @@
+ #define HFSPLUS_VOL_JOURNALED		(1 << 13)
+ #define HFSPLUS_VOL_SOFTLOCK		(1 << 15)
+ #define HFSPLUS_VOL_UNUSED_NODE_FIX	(1 << 31)
++
++/* HFS+ Journal structures */
++#define HFSPLUS_JIB_IN_FS		(1 << 0)
++#define HFSPLUS_JIB_NEED_INIT		(1 << 1)
++
++struct hfsplus_journal_info_block {
++	__be32 flags;
++	__be32 device_signature[8];
++	__be64 offset;
++	__be64 size;
++	__be32 reserved[32];
++} __packed;
++
++#define HFSPLUS_JOURNAL_MAGIC		0x4a4e4c78
++#define HFSPLUS_JOURNAL_ENDIAN		0x12345678
++
++struct hfsplus_journal_header {
++	__le32 magic;
++	__le32 endian;
++	__le64 start;
++	__le64 end;
++	__le64 size;
++	__le32 blhdr_size;
++	__le32 checksum;
++	__le32 jhdr_size;
++	__le32 sequence_num;
++} __packed;
++
++struct hfsplus_block_info {
++	__le64 bnum;
++	__le32 bsize;
++	__le32 next;
++} __packed;
+ 
++struct hfsplus_block_list_header {
++	__le16 max_blocks;
++	__le16 num_blocks;
++	__le32 bytes_used;
++	__le32 checksum;
++	__le32 flags;
++	struct hfsplus_block_info binfo[];
++} __packed;
++
+ /* HFS+ BTree node descriptor */
+ struct hfs_bnode_desc {
+ 	__be32 next;
 diff --git a/fs/hfsplus/inode.c b/fs/hfsplus/inode.c
 --- a/fs/hfsplus/inode.c
 +++ b/fs/hfsplus/inode.c
-@@ -18,6 +18,7 @@
+@@ -18,14 +18,87 @@
  #include <linux/cred.h>
  #include <linux/uio.h>
  #include <linux/fileattr.h>
++#include <linux/writeback.h>
 +#include <linux/s5l8947x-aes.h>
  
  #include "hfsplus_fs.h"
  #include "hfsplus_raw.h"
-@@ -25,7 +26,54 @@
+ #include "xattr.h"
  
++static void hfsplus_init_file_crypt(struct inode *inode)
++{
++	struct hfsplus_inode_info *hip = HFSPLUS_I(inode);
++	u8 attr[128];
++	ssize_t res;
++
++	if (!S_ISREG(inode->i_mode) || HFSPLUS_IS_RSRC(inode) ||
++	    hip->file_crypt)
++		return;
++
++	res = __hfsplus_getxattr(inode, "com.apple.system.cprotect",
++				 attr, sizeof(attr));
++	if (res > 0) {
++		if (!s5l8947x_file_key_unwrap(attr, res, hip->file_key,
++					      hip->file_iv_key))
++			hip->file_crypt = 1;
++		else
++			hip->file_crypt = -2;
++	} else {
++		hip->file_crypt = -1;
++	}
++	memzero_explicit(attr, sizeof(attr));
++}
++
  static int hfsplus_read_folio(struct file *file, struct folio *folio)
  {
 -	return block_read_full_folio(folio, hfsplus_get_block);
@@ -90,7 +168,132 @@ diff --git a/fs/hfsplus/inode.c b/fs/hfsplus/inode.c
  }
  
  static void hfsplus_write_failed(struct address_space *mapping, loff_t to)
-@@ -234,11 +282,28 @@
+@@ -41,11 +114,36 @@
+ int hfsplus_write_begin(struct file *file, struct address_space *mapping,
+ 		loff_t pos, unsigned len, struct folio **foliop, void **fsdata)
+ {
++	struct inode *inode = mapping->host;
++	struct hfsplus_inode_info *hip = HFSPLUS_I(inode);
+ 	int ret;
++
++	hfsplus_init_file_crypt(inode);
++	if (hip->file_crypt == -2)
++		return -EACCES;
++
++	if (hip->file_crypt == 1 && inode->i_sb->s_blocksize == PAGE_SIZE) {
++		loff_t isize = i_size_read(inode);
++
++		if ((hip->phys_size & (PAGE_SIZE - 1)) && pos > hip->phys_size) {
++			struct folio *f = read_mapping_folio(mapping,
++					hip->phys_size >> PAGE_SHIFT, file);
++			if (IS_ERR(f))
++				return PTR_ERR(f);
++			folio_put(f);
++		}
++		if ((pos & ~(loff_t)(PAGE_SIZE - 1)) < isize) {
++			struct folio *f = read_mapping_folio(mapping,
++					pos >> PAGE_SHIFT, file);
++			if (IS_ERR(f))
++				return PTR_ERR(f);
++			folio_put(f);
++		}
++	}
+ 
+ 	ret = cont_write_begin(file, mapping, pos, len, foliop, fsdata,
+ 				hfsplus_get_block,
+-				&HFSPLUS_I(mapping->host)->phys_size);
++				&hip->phys_size);
+ 	if (unlikely(ret))
+ 		hfsplus_write_failed(mapping, pos + len);
+ 
+@@ -126,6 +224,9 @@
+ 	size_t count = iov_iter_count(iter);
+ 	ssize_t ret;
+ 
++	if (HFSPLUS_I(inode)->file_crypt > 0)
++		return 0;
++
+ 	ret = blockdev_direct_IO(iocb, inode, iter, hfsplus_get_block);
+ 
+ 	/*
+@@ -141,11 +242,76 @@
+ 	}
+ 
+ 	return ret;
++}
++
++static int hfsplus_crypt_writepage(struct folio *folio,
++				   struct writeback_control *wbc, void *data)
++{
++	struct inode *inode = folio->mapping->host;
++	struct hfsplus_inode_info *hip = HFSPLUS_I(inode);
++	struct super_block *sb = inode->i_sb;
++	struct buffer_head *bh = folio_buffers(folio);
++	struct buffer_head map_bh = {};
++	loff_t i_size = i_size_read(inode);
++	loff_t pos = folio_pos(folio);
++	sector_t blocknr;
++	const u8 *src;
++	int err;
++
++	if (pos >= i_size) {
++		if (bh)
++			clear_buffer_dirty(bh);
++		folio_unlock(folio);
++		return 0;
++	}
++
++	if (pos + PAGE_SIZE > i_size)
++		folio_zero_segment(folio, i_size - pos, PAGE_SIZE);
++
++	if (bh && buffer_mapped(bh)) {
++		blocknr = bh->b_blocknr;
++	} else {
++		map_bh.b_size = PAGE_SIZE;
++		err = hfsplus_get_block(inode, folio->index, &map_bh, 1);
++		if (err || !buffer_mapped(&map_bh)) {
++			folio_redirty_for_writepage(wbc, folio);
++			folio_unlock(folio);
++			return err ? err : -EIO;
++		}
++		blocknr = map_bh.b_blocknr;
++		if (bh) {
++			bh->b_bdev = map_bh.b_bdev;
++			bh->b_blocknr = blocknr;
++			set_buffer_mapped(bh);
++		}
++	}
++
++	if (bh) {
++		clear_buffer_dirty(bh);
++		set_buffer_uptodate(bh);
++	}
++
++	folio_start_writeback(folio);
++	src = kmap_local_folio(folio, 0);
++	err = s5l8947x_file_block_encrypt(sb->s_bdev, blocknr, hip->file_key,
++					  hip->file_iv_key, pos, src);
++	kunmap_local(src);
++	folio_unlock(folio);
++	folio_end_writeback(folio);
++	if (err)
++		mapping_set_error(folio->mapping, err);
++	return err;
+ }
+ 
+ static int hfsplus_writepages(struct address_space *mapping,
+ 			      struct writeback_control *wbc)
+ {
++	struct inode *inode = mapping->host;
++	struct hfsplus_inode_info *hip = HFSPLUS_I(inode);
++
++	if (hip->file_crypt == 1 && inode->i_sb->s_blocksize == PAGE_SIZE)
++		return write_cache_pages(mapping, wbc, hfsplus_crypt_writepage,
++					 NULL);
+ 	return mpage_writepages(mapping, wbc, hfsplus_get_block);
+ }
+ 
+@@ -234,11 +400,17 @@
  
  static int hfsplus_file_open(struct inode *inode, struct file *file)
  {
@@ -102,29 +305,28 @@ diff --git a/fs/hfsplus/inode.c b/fs/hfsplus/inode.c
  		return -EOVERFLOW;
 -	atomic_inc(&HFSPLUS_I(inode)->opencnt);
 +	hip = HFSPLUS_I(inode);
-+	if (S_ISREG(inode->i_mode) && !HFSPLUS_IS_RSRC(inode) && !hip->file_crypt) {
-+		u8 attr[128];
-+		ssize_t res;
-+
-+		res = __hfsplus_getxattr(inode, "com.apple.system.cprotect",
-+					 attr, sizeof(attr));
-+		if (res > 0 &&
-+		    !s5l8947x_file_key_unwrap(attr, res, hip->file_key,
-+					      hip->file_iv_key))
-+			hip->file_crypt = 1;
-+		else
-+			hip->file_crypt = -1;
-+		memzero_explicit(attr, sizeof(attr));
-+	}
++	hfsplus_init_file_crypt(inode);
++	if ((file->f_mode & FMODE_WRITE) && hip->file_crypt == -2)
++		return -EACCES;
 +	atomic_inc(&hip->opencnt);
  	return 0;
  }
  
-@@ -426,6 +491,7 @@
+@@ -273,6 +445,9 @@
+ 
+ 	if ((attr->ia_valid & ATTR_SIZE) &&
+ 	    attr->ia_size != i_size_read(inode)) {
++		hfsplus_init_file_crypt(inode);
++		if (HFSPLUS_I(inode)->file_crypt == -2)
++			return -EACCES;
+ 		inode_dio_wait(inode);
+ 		if (attr->ia_size > inode->i_size) {
+ 			error = generic_cont_expand_simple(inode,
+@@ -426,6 +601,7 @@
  	hip->cached_start = 0;
  	hip->cached_blocks = 0;
  	hip->phys_size = 0;
-+	hip->file_crypt = 0;
++	hip->file_crypt = -1;
  	hip->fs_blocks = 0;
  	hip->rsrc_inode = NULL;
  	if (S_ISDIR(inode->i_mode)) {
@@ -150,3 +352,369 @@ diff --git a/fs/hfsplus/super.c b/fs/hfsplus/super.c
  	clear_inode(inode);
  	if (HFSPLUS_IS_RSRC(inode)) {
  		HFSPLUS_I(HFSPLUS_I(inode)->rsrc_inode)->rsrc_inode = NULL;
+@@ -350,7 +355,267 @@
+ 
+ 	return 0;
+ }
++
++static int hfsplus_jnl_io(struct super_block *sb, u64 byte_off,
++			  struct page *page, unsigned int len, blk_opf_t opf)
++{
++	struct hfsplus_sb_info *sbi = HFSPLUS_SB(sb);
++	struct bio *bio;
++	int ret;
++
++	bio = bio_alloc(sb->s_bdev, 1, opf, GFP_NOIO);
++	bio->bi_iter.bi_sector = sbi->part_start +
++				 (byte_off >> HFSPLUS_SECTOR_SHIFT);
++	if (bio_add_page(bio, page, len, 0) != len) {
++		bio_put(bio);
++		return -EIO;
++	}
++	ret = submit_bio_wait(bio);
++	bio_put(bio);
++	return ret < 0 ? ret : 0;
++}
++
++static u32 hfsplus_jnl_cksum(const u8 *ptr, unsigned int len)
++{
++	u32 cksum = 0;
++	unsigned int i;
++
++	for (i = 0; i < len; i++)
++		cksum = (cksum << 8) ^ (cksum + ptr[i]);
++	return ~cksum;
++}
++
++static int hfsplus_handle_journal(struct super_block *sb, bool allow_write,
++				  bool allow_replay)
++{
++	struct hfsplus_sb_info *sbi = HFSPLUS_SB(sb);
++	struct hfsplus_vh *vhdr = sbi->s_vhdr;
++	struct page *page_hdr = NULL, *page_jnl = NULL, *page_disk = NULL;
++	struct hfsplus_journal_info_block *jib;
++	struct hfsplus_journal_header *jhdr;
++	u32 jib_block, jib_flags, blhdr_size, jhdr_size, saved_cksum, calc_cksum;
++	u64 total_bytes, jib_off, j_off, j_size, start, end, size, pos;
++	unsigned int replayed = 0, dirty_blocks = 0, max_steps, steps = 0;
++	int err = -EINVAL;
++
++	if (!(vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_JOURNALED)))
++		return 0;
++
++	jib_block = be32_to_cpu((__force __be32)vhdr->reserved);
++	if (!jib_block || jib_block >= sbi->total_blocks)
++		return -EINVAL;
++
++	total_bytes = (u64)sbi->total_blocks << sbi->alloc_blksz_shift;
++	jib_off = (u64)jib_block << sbi->alloc_blksz_shift;
++	if (jib_off + PAGE_SIZE > total_bytes)
++		return -EINVAL;
++
++	page_hdr = alloc_page(GFP_KERNEL);
++	page_jnl = alloc_page(GFP_KERNEL);
++	page_disk = alloc_page(GFP_KERNEL);
++	if (!page_hdr || !page_jnl || !page_disk) {
++		err = -ENOMEM;
++		goto out;
++	}
++
++	err = hfsplus_jnl_io(sb, jib_off, page_hdr, PAGE_SIZE, REQ_OP_READ);
++	if (err)
++		goto out;
++
++	jib = page_address(page_hdr);
++	jib_flags = be32_to_cpu(jib->flags);
++	if (!(jib_flags & HFSPLUS_JIB_IN_FS) ||
++	    (jib_flags & HFSPLUS_JIB_NEED_INIT)) {
++		err = -EINVAL;
++		goto out;
++	}
++
++	j_off = be64_to_cpu(jib->offset);
++	j_size = be64_to_cpu(jib->size);
++	if (!j_off || (j_off & (PAGE_SIZE - 1)) || j_size < 2 * PAGE_SIZE ||
++	    j_off + j_size > total_bytes) {
++		err = -EINVAL;
++		goto out;
++	}
+ 
++	err = hfsplus_jnl_io(sb, j_off, page_hdr, PAGE_SIZE, REQ_OP_READ);
++	if (err)
++		goto out;
++
++	jhdr = page_address(page_hdr);
++	if (le32_to_cpu(jhdr->magic) != HFSPLUS_JOURNAL_MAGIC ||
++	    le32_to_cpu(jhdr->endian) != HFSPLUS_JOURNAL_ENDIAN) {
++		err = -EINVAL;
++		goto out;
++	}
++
++	start = le64_to_cpu(jhdr->start);
++	end = le64_to_cpu(jhdr->end);
++	size = le64_to_cpu(jhdr->size);
++	blhdr_size = le32_to_cpu(jhdr->blhdr_size);
++	jhdr_size = le32_to_cpu(jhdr->jhdr_size);
++	saved_cksum = le32_to_cpu(jhdr->checksum);
++
++	if (jhdr_size != PAGE_SIZE || blhdr_size != PAGE_SIZE ||
++	    size != j_size || start < jhdr_size || start >= size ||
++	    end < jhdr_size || end >= size ||
++	    (start & (jhdr_size - 1)) || (end & (jhdr_size - 1))) {
++		err = -EINVAL;
++		goto out;
++	}
++
++	jhdr->checksum = 0;
++	calc_cksum = hfsplus_jnl_cksum((const u8 *)jhdr,
++			offsetof(struct hfsplus_journal_header, sequence_num));
++	jhdr->checksum = cpu_to_le32(saved_cksum);
++	if (calc_cksum != saved_cksum) {
++		err = -EINVAL;
++		goto out;
++	}
++
++	pos = start;
++	max_steps = size >> PAGE_SHIFT;
++	while (pos != end) {
++		struct hfsplus_block_list_header *blhdr;
++		u16 num_blocks, i;
++		u32 bytes_used;
++		u64 data_pos;
++
++		if (++steps > max_steps) {
++			err = -EINVAL;
++			goto out;
++		}
++
++		err = hfsplus_jnl_io(sb, j_off + pos, page_hdr, jhdr_size,
++				     REQ_OP_READ);
++		if (err)
++			goto out;
++
++		blhdr = page_address(page_hdr);
++		saved_cksum = le32_to_cpu(blhdr->checksum);
++		blhdr->checksum = 0;
++		calc_cksum = hfsplus_jnl_cksum((const u8 *)blhdr, 32);
++		blhdr->checksum = cpu_to_le32(saved_cksum);
++		if (calc_cksum != saved_cksum) {
++			err = -EINVAL;
++			goto out;
++		}
++
++		num_blocks = le16_to_cpu(blhdr->num_blocks);
++		bytes_used = le32_to_cpu(blhdr->bytes_used);
++		if (num_blocks < 1 ||
++		    (u32)(num_blocks + 1) * sizeof(struct hfsplus_block_info) >
++		    blhdr_size ||
++		    bytes_used < blhdr_size ||
++		    (bytes_used & (jhdr_size - 1)) ||
++		    bytes_used > size - jhdr_size) {
++			err = -EINVAL;
++			goto out;
++		}
++
++		data_pos = pos + blhdr_size;
++		if (data_pos >= size)
++			data_pos -= size - jhdr_size;
++
++		for (i = 1; i < num_blocks; i++) {
++			u64 bnum = le64_to_cpu(blhdr->binfo[i].bnum);
++			u32 bsize = le32_to_cpu(blhdr->binfo[i].bsize);
++			u32 sub;
++
++			if (!bsize || (bsize & (jhdr_size - 1)) ||
++			    bsize > size - jhdr_size) {
++				err = -EINVAL;
++				goto out;
++			}
++
++			for (sub = 0; sub < bsize; sub += jhdr_size) {
++				if (bnum != ~0ULL) {
++					u64 disk_off = (bnum << PAGE_SHIFT) + sub;
++
++					if (disk_off + jhdr_size > total_bytes) {
++						err = -EINVAL;
++						goto out;
++					}
++					err = hfsplus_jnl_io(sb,
++							j_off + data_pos,
++							page_jnl, jhdr_size,
++							REQ_OP_READ);
++					if (err)
++						goto out;
++					err = hfsplus_jnl_io(sb, disk_off,
++							page_disk, jhdr_size,
++							REQ_OP_READ);
++					if (err)
++						goto out;
++
++					if (memcmp(page_address(page_jnl),
++						   page_address(page_disk),
++						   jhdr_size)) {
++						dirty_blocks++;
++						if (allow_write && allow_replay) {
++							err = hfsplus_jnl_io(sb,
++								disk_off,
++								page_jnl,
++								jhdr_size,
++								REQ_OP_WRITE |
++								REQ_SYNC);
++							if (err)
++								goto out;
++							if (disk_off == 0)
++								memcpy(sbi->s_vhdr_buf,
++								       page_address(page_jnl),
++								       hfsplus_min_io_size(sb));
++							replayed++;
++						}
++					}
++				}
++				data_pos += jhdr_size;
++				if (data_pos >= size)
++					data_pos -= size - jhdr_size;
++			}
++		}
++
++		pos += bytes_used;
++		if (pos >= size)
++			pos -= size - jhdr_size;
++	}
++
++	if (dirty_blocks && (!allow_write || !allow_replay)) {
++		err = -EROFS;
++		goto out;
++	}
++
++	if (allow_write && start != end) {
++		err = hfsplus_jnl_io(sb, j_off, page_hdr, jhdr_size,
++				     REQ_OP_READ);
++		if (err)
++			goto out;
++		jhdr = page_address(page_hdr);
++		jhdr->start = jhdr->end;
++		jhdr->checksum = 0;
++		calc_cksum = hfsplus_jnl_cksum((const u8 *)jhdr,
++			offsetof(struct hfsplus_journal_header, sequence_num));
++		jhdr->checksum = cpu_to_le32(calc_cksum);
++		err = hfsplus_jnl_io(sb, j_off, page_hdr, jhdr_size,
++				     REQ_OP_WRITE | REQ_SYNC);
++		if (err)
++			goto out;
++		pr_info("journal verified (%u blocks replayed)\n", replayed);
++	}
++
++	vhdr->attributes |= cpu_to_be32(HFSPLUS_VOL_UNMNT);
++	vhdr->attributes &= cpu_to_be32(~HFSPLUS_VOL_INCNSTNT);
++	err = 0;
++out:
++	if (page_disk)
++		__free_page(page_disk);
++	if (page_jnl)
++		__free_page(page_jnl);
++	if (page_hdr)
++		__free_page(page_hdr);
++	return err;
++}
++
+ static int hfsplus_remount(struct super_block *sb, int *flags, char *data)
+ {
+ 	sync_filesystem(sb);
+@@ -359,26 +624,51 @@
+ 	if (!(*flags & SB_RDONLY)) {
+ 		struct hfsplus_vh *vhdr = HFSPLUS_SB(sb)->s_vhdr;
+ 		int force = 0;
++		bool jnl_clean = false;
+ 
+ 		if (!hfsplus_parse_options_remount(data, &force))
+ 			return -EINVAL;
+ 
+-		if (!(vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_UNMNT))) {
+-			pr_warn("filesystem was not cleanly unmounted, running fsck.hfsplus is recommended.  leaving read-only.\n");
+-			sb->s_flags |= SB_RDONLY;
+-			*flags |= SB_RDONLY;
+-		} else if (force) {
++		if (vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_JOURNALED))
++			jnl_clean = !hfsplus_handle_journal(sb, true, false);
++
++		if (force) {
+ 			/* nothing */
+ 		} else if (vhdr->attributes &
+ 				cpu_to_be32(HFSPLUS_VOL_SOFTLOCK)) {
+ 			pr_warn("filesystem is marked locked, leaving read-only.\n");
+ 			sb->s_flags |= SB_RDONLY;
+ 			*flags |= SB_RDONLY;
+-		} else if (vhdr->attributes &
+-				cpu_to_be32(HFSPLUS_VOL_JOURNALED)) {
++		} else if (!(vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_UNMNT))) {
++			pr_warn("filesystem was not cleanly unmounted, running fsck.hfsplus is recommended.  leaving read-only.\n");
++			sb->s_flags |= SB_RDONLY;
++			*flags |= SB_RDONLY;
++		} else if ((vhdr->attributes &
++				cpu_to_be32(HFSPLUS_VOL_JOURNALED)) &&
++			   !jnl_clean) {
+ 			pr_warn("filesystem is marked journaled, leaving read-only.\n");
+ 			sb->s_flags |= SB_RDONLY;
+ 			*flags |= SB_RDONLY;
++		}
++
++		if (!(*flags & SB_RDONLY)) {
++			vhdr->last_mount_vers = cpu_to_be32(HFSP_MOUNT_VERSION);
++			vhdr->modify_date = hfsp_now2mt();
++			be32_add_cpu(&vhdr->write_count, 1);
++			vhdr->attributes &= cpu_to_be32(~HFSPLUS_VOL_UNMNT);
++			vhdr->attributes |= cpu_to_be32(HFSPLUS_VOL_INCNSTNT);
++			hfsplus_sync_fs(sb, 1);
++		}
++	} else {
++		struct hfsplus_sb_info *sbi = HFSPLUS_SB(sb);
++		struct hfsplus_vh *vhdr = sbi->s_vhdr;
++
++		cancel_delayed_work_sync(&sbi->sync_work);
++		if (vhdr) {
++			vhdr->modify_date = hfsp_now2mt();
++			vhdr->attributes |= cpu_to_be32(HFSPLUS_VOL_UNMNT);
++			vhdr->attributes &= cpu_to_be32(~HFSPLUS_VOL_INCNSTNT);
++			hfsplus_sync_fs(sb, 1);
+ 		}
+ 	}
+ 	return 0;
+@@ -406,6 +696,7 @@
+ 	struct qstr str;
+ 	struct nls_table *nls = NULL;
+ 	u64 last_fs_block, last_fs_page;
++	bool jnl_clean = false;
+ 	int err;
+ 
+ 	err = -ENOMEM;
+@@ -450,6 +741,8 @@
+ 		goto out_free_vhdr;
+ 	}
+ 	sbi->total_blocks = be32_to_cpu(vhdr->total_blocks);
++	if (vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_JOURNALED))
++		jnl_clean = !hfsplus_handle_journal(sb, !sb_rdonly(sb), true);
+ 	sbi->free_blocks = be32_to_cpu(vhdr->free_blocks);
+ 	sbi->next_cnid = be32_to_cpu(vhdr->next_cnid);
+ 	sbi->file_count = be32_to_cpu(vhdr->file_count);
+@@ -478,16 +771,16 @@
+ 	sb->s_op = &hfsplus_sops;
+ 	sb->s_maxbytes = MAX_LFS_FILESIZE;
+ 
+-	if (!(vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_UNMNT))) {
+-		pr_warn("Filesystem was not cleanly unmounted, running fsck.hfsplus is recommended.  mounting read-only.\n");
+-		sb->s_flags |= SB_RDONLY;
+-	} else if (test_and_clear_bit(HFSPLUS_SB_FORCE, &sbi->flags)) {
++	if (test_and_clear_bit(HFSPLUS_SB_FORCE, &sbi->flags)) {
+ 		/* nothing */
+ 	} else if (vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_SOFTLOCK)) {
+ 		pr_warn("Filesystem is marked locked, mounting read-only.\n");
+ 		sb->s_flags |= SB_RDONLY;
++	} else if (!(vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_UNMNT))) {
++		pr_warn("Filesystem was not cleanly unmounted, running fsck.hfsplus is recommended.  mounting read-only.\n");
++		sb->s_flags |= SB_RDONLY;
+ 	} else if ((vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_JOURNALED)) &&
+-			!sb_rdonly(sb)) {
++			!sb_rdonly(sb) && !jnl_clean) {
+ 		pr_warn("write access to a journaled filesystem is not supported, use the force option at your own risk, mounting read-only.\n");
+ 		sb->s_flags |= SB_RDONLY;
+ 	}
