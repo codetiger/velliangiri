@@ -115,6 +115,14 @@ t_nand() {
 			else
 				fail "nand0p2 per-file content protection did not decrypt plaintext"
 			fi
+			# stage2 hands the system keybag over at boot; it holds the class 1-3 keys
+			kb=$(cat /sys/block/nand0/keybag 2>/dev/null)
+			if [ "$(echo "$kb" | grep -c '^class [123] unlocked')" = 3 ]; then
+				pass "system keybag unlocked protection classes 1-3"
+			else
+				fail "system keybag classes 1-3 not all unlocked"
+				info "$(echo "$kb" | tr '\n' ';')"
+			fi
 			tf="$mnt/.hwtest-rw-$$"
 			if echo "velliangiri-rw-ok" > "$tf" 2>/dev/null && sync && [ "$(cat "$tf" 2>/dev/null)" = "velliangiri-rw-ok" ] && rm -f "$tf" 2>/dev/null && sync; then
 				pass "nand0p2 read-write file create, sync, verify, and remove"

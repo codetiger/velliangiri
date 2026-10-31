@@ -98,6 +98,14 @@ fi
 if [ -b /dev/nand0p2 ]; then
 	mkdir -p /mnt/data
 	if mount -t hfsplus -o rw /dev/nand0p2 /mnt/data 2>/dev/null; then
+		# Hand the system keybag to the FTL so files of protection classes 1-3 decrypt
+		if [ -s /mnt/data/keybags/systembag.kb ] && [ -w /sys/block/nand0/keybag ]; then
+			if cat /mnt/data/keybags/systembag.kb >/sys/block/nand0/keybag 2>/dev/null; then
+				log_msg "nand0p2: system keybag loaded ($(grep -c ' unlocked' /sys/block/nand0/keybag) of 4 classes unlocked)"
+			else
+				log_msg "nand0p2: system keybag rejected"
+			fi
+		fi
 		PDIR=/mnt/data/linux/etc
 		if [ -s "$PDIR/dropbear/dropbear_ed25519_host_key" ]; then
 			mkdir -p /etc/dropbear

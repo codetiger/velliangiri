@@ -48,6 +48,8 @@
  */
 
 #include <crypto/aes.h>
+#include <crypto/algapi.h>
+#include <crypto/hash.h>
 #include <crypto/sha1.h>
 #include <crypto/skcipher.h>
 #include <linux/blk-mq.h>
@@ -56,6 +58,7 @@
 #include <linux/log2.h>
 #include <linux/module.h>
 #include <linux/mtd/mtd.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/s5l8947x-aes.h>
 #include <linux/scatterlist.h>
@@ -113,10 +116,13 @@
 #define KS_K_RECORDS		0x20
 #define KS_K_RECORD_SIZE	0x30
 #define KS_FKEY_WRAP_LEN	40
+#define KS_L_BAG		0x42414731
 
 #define RFC3394_IV		0xa6a6a6a6a6a6a6a6ULL
 #define CP_V4_VERSION		4
+#define CP_CLASS_FIRST		1
 #define CP_CLASS_OPEN		4
+#define CP_CLASSES		(CP_CLASS_OPEN + 1)
 #define CP_V4_HEADER_LEN	36
 #define CP_WRAP_LEN		40
 
@@ -233,6 +239,13 @@ static struct skcipher_request *ftl_file_req;
 static u8 *ftl_file_buf;
 static u8 ftl_file_master_key[AES_KEYSIZE_256];
 static bool ftl_file_master_valid;
+/* system keybag: payload key from the key store, class keys it unlocks */
+static DEFINE_MUTEX(ftl_keybag_lock);
+static u8 ftl_bag_key[AES_KEYSIZE_256];
+static bool ftl_bag_valid;
+static u8 ftl_class_key[CP_CLASS_OPEN][AES_KEYSIZE_256];
+static unsigned long ftl_class_valid;
+static atomic_t ftl_class_files[CP_CLASSES];
 
 /* --- reading and writing the MTD --- */
 
@@ -1078,12 +1091,478 @@ static ssize_t bmac_show(struct device *dev, struct device_attribute *attr, char
 }
 static DEVICE_ATTR_RO(bmac);
 
+/*
+ * System keybag (/sys/block/nand0/keybag)
+ *
+ * The keys of protection classes 1-3 sit in the system keybag file on the
+ * Data volume, a binary property list holding an IV and a payload that is
+ * AES-256-CBC encrypted with the last 32 bytes of the key store's bag
+ * locker. The payload is a property list whose "KeyBagKeys" data is a
+ * tag/length/value stream ("DATA", then "SIGN"); inside "DATA" each class
+ * entry starts with a "UUID" tag and carries "CLAS", "WRAP" and "WPKY".
+ * A class key is unwrapped in the order it was wrapped: with WRAP bit 1
+ * (passcode) by RFC 3394 under the passcode key, then with WRAP bit 0
+ * (device) by AES-CBC under the device-derived key. This box has no
+ * passcode, so the passcode key is derived from an empty one; a class whose
+ * key fails the RFC 3394 integrity check stays locked. Userspace writes the
+ * file in; reading lists each class as unlocked or locked and how many
+ * files have used its key.
+ */
+#define KB_TAG(a, b, c, d)	((a) << 24 | (b) << 16 | (c) << 8 | (d))
+#define KB_DATA			KB_TAG('D', 'A', 'T', 'A')
+#define KB_UUID			KB_TAG('U', 'U', 'I', 'D')
+#define KB_CLAS			KB_TAG('C', 'L', 'A', 'S')
+#define KB_WRAP			KB_TAG('W', 'R', 'A', 'P')
+#define KB_WPKY			KB_TAG('W', 'P', 'K', 'Y')
+#define KB_WRAP_DEVICE		1
+#define KB_MAX_SIZE		SZ_16K
+
+struct ftl_bplist {
+	const u8 *buf;
+	size_t len;
+	u8 off_size, ref_size;
+	u64 nobjs, table;
+};
+
+static u64 ftl_be(const u8 *p, unsigned int n)
+{
+	u64 v = 0;
+
+	while (n--)
+		v = v << 8 | *p++;
+	return v;
+}
+
+/* Offset of object @idx, or 0 when it is out of range. */
+static size_t ftl_bplist_obj(const struct ftl_bplist *bp, u64 idx)
+{
+	u64 at = bp->table + idx * bp->off_size, off;
+
+	if (idx >= bp->nobjs || at + bp->off_size > bp->len - 32)
+		return 0;
+	off = ftl_be(bp->buf + at, bp->off_size);
+	return off >= 8 && off < bp->len - 32 ? off : 0;
+}
+
+/* Marker type of the object at @off and its payload; 0 when malformed. */
+static u8 ftl_bplist_item(const struct ftl_bplist *bp, size_t off,
+			  const u8 **data, u64 *count)
+{
+	u8 m = bp->buf[off], type = m >> 4;
+	size_t p = off + 1;
+
+	*count = m & 0xf;
+	if (*count == 0xf) {
+		u8 im = bp->buf[p], n;
+
+		if (p >= bp->len - 32 || im >> 4 != 1 || (im & 0xf) > 3)
+			return 0;
+		n = 1 << (im & 0xf);
+		if (p + 1 + n > bp->len - 32)
+			return 0;
+		*count = ftl_be(bp->buf + p + 1, n);
+		p += 1 + n;
+	}
+	*data = bp->buf + p;
+	if (*count > bp->len - 32 - p)
+		return 0;
+	return type;
+}
+
+/*
+ * Find the data value stored under @key in the top-level dictionary of a
+ * binary property list.
+ */
+static const u8 *ftl_bplist_data(const u8 *buf, size_t len, const char *key,
+				 u64 *dlen)
+{
+	struct ftl_bplist bp = { .buf = buf, .len = len };
+	const u8 *t = buf + len - 32, *refs, *k, *v;
+	size_t klen = strlen(key), off;
+	u64 n, i, cnt;
+
+	if (len < 8 + 32 || memcmp(buf, "bplist00", 8))
+		return NULL;
+	bp.off_size = t[6];
+	bp.ref_size = t[7];
+	bp.nobjs = ftl_be(t + 8, 8);
+	bp.table = ftl_be(t + 24, 8);
+	if (!bp.off_size || bp.off_size > 8 || !bp.ref_size || bp.ref_size > 8 ||
+	    bp.table >= len - 32)
+		return NULL;
+
+	off = ftl_bplist_obj(&bp, ftl_be(t + 16, 8));
+	if (!off || ftl_bplist_item(&bp, off, &refs, &n) != 0xd ||
+	    2 * n * bp.ref_size > len - 32 - (refs - buf))
+		return NULL;
+	for (i = 0; i < n; i++) {
+		off = ftl_bplist_obj(&bp, ftl_be(refs + i * bp.ref_size, bp.ref_size));
+		if (!off || ftl_bplist_item(&bp, off, &k, &cnt) != 0x5 ||
+		    cnt != klen || memcmp(k, key, klen))
+			continue;
+		off = ftl_bplist_obj(&bp, ftl_be(refs + (n + i) * bp.ref_size,
+						 bp.ref_size));
+		if (!off || ftl_bplist_item(&bp, off, &v, &cnt) != 0x4)
+			return NULL;
+		*dlen = cnt;
+		return v;
+	}
+	return NULL;
+}
+
+static int ftl_rfc3394_unwrap(const u8 *kek, unsigned int kek_len,
+			      const u8 in[CP_WRAP_LEN], u8 out[AES_KEYSIZE_256]);
+
+#define KB_VERS			KB_TAG('V', 'E', 'R', 'S')
+#define KB_TYPE			KB_TAG('T', 'Y', 'P', 'E')
+#define KB_SALT			KB_TAG('S', 'A', 'L', 'T')
+#define KB_ITER			KB_TAG('I', 'T', 'E', 'R')
+#define KB_WRAP_PASSCODE	2
+#define KB_TYPE_SEP_KEY		BIT(30)
+#define KB_MAX_CLASSES		16
+#define KB_MAX_ITER		10000000
+#define KB_TANGLE_SIZE		SZ_4K
+
+struct ftl_kb_class {
+	u32 class, wrap, wpky_len;
+	const u8 *wpky;
+};
+
+struct ftl_kb {
+	u32 vers, type, iter, salt_len, nclasses;
+	const u8 *salt;
+	struct ftl_kb_class c[KB_MAX_CLASSES];
+};
+
+/* Split a decrypted "DATA" stream into the bag header and its class entries. */
+static int ftl_keybag_parse(const u8 *p, u32 len, struct ftl_kb *kb)
+{
+	struct ftl_kb_class *c = NULL;
+	bool first = true;
+	u32 off = 0;
+
+	memset(kb, 0, sizeof(*kb));
+	while (off + 8 <= len) {
+		u32 tag = get_unaligned_be32(p + off);
+		u32 n = get_unaligned_be32(p + off + 4);
+		const u8 *v = p + off + 8;
+
+		if (n > len - off - 8)
+			return -EBADMSG;
+		if (tag == KB_UUID) {
+			/* the first UUID names the bag, the rest start class entries */
+			if (!first) {
+				if (kb->nclasses == KB_MAX_CLASSES)
+					break;
+				c = &kb->c[kb->nclasses++];
+			}
+			first = false;
+		} else if (c) {
+			if (tag == KB_CLAS && n == 4)
+				c->class = get_unaligned_be32(v);
+			else if (tag == KB_WRAP && n == 4)
+				c->wrap = get_unaligned_be32(v);
+			else if (tag == KB_WPKY) {
+				c->wpky = v;
+				c->wpky_len = n;
+			}
+		} else if (n == 4 && tag == KB_VERS) {
+			kb->vers = get_unaligned_be32(v);
+		} else if (n == 4 && tag == KB_TYPE) {
+			kb->type = get_unaligned_be32(v);
+		} else if (n == 4 && tag == KB_ITER) {
+			kb->iter = get_unaligned_be32(v);
+		} else if (tag == KB_SALT) {
+			kb->salt = v;
+			kb->salt_len = n;
+		}
+		off += 8 + n;
+	}
+	return 0;
+}
+
+/*
+ * Passcode key of a bag with an empty passcode: PBKDF2-HMAC-SHA1 over the
+ * bag salt with one iteration, then tangled with the hardware device key.
+ * Each round fills 4 KiB with the key, every 32-byte copy XORed word by word
+ * with a running counter, encrypts it with AES-CBC under the device key (the
+ * IV chaining across rounds) and XORs up to 128 output blocks (one per
+ * remaining iteration) back into the key. Bag version 1 restarts the counter
+ * at 1 every round.
+ */
+static int ftl_keybag_passcode_key(const struct ftl_kb *kb, u8 key[AES_KEYSIZE_256])
+{
+	u8 dummy = 0, iv[AES_BLOCK_SIZE] = {}, hmac[SHA1_DIGEST_SIZE], base[AES_KEYSIZE_256];
+	const unsigned int per_round = KB_TANGLE_SIZE / AES_KEYSIZE_256;
+	struct crypto_shash *tfm;
+	u8 *in = NULL, *out = NULL, *msg = NULL;
+	u32 counter = 1, left = kb->iter, i, j, n;
+	int ret;
+
+	if (kb->type & KB_TYPE_SEP_KEY)
+		return -EOPNOTSUPP;
+	if (!kb->salt || !kb->iter || kb->iter > KB_MAX_ITER || kb->salt_len > 64)
+		return -EINVAL;
+
+	tfm = crypto_alloc_shash("hmac(sha1)", 0, 0);
+	if (IS_ERR(tfm))
+		return PTR_ERR(tfm);
+	msg = kmalloc(kb->salt_len + 4, GFP_KERNEL);
+	in = kmalloc(KB_TANGLE_SIZE, GFP_KERNEL);
+	out = kmalloc(KB_TANGLE_SIZE, GFP_KERNEL);
+	ret = -ENOMEM;
+	if (!msg || !in || !out)
+		goto out;
+
+	/* PBKDF2 with one iteration: T(i) = HMAC(passcode, salt || be32(i)) */
+	ret = crypto_shash_setkey(tfm, &dummy, 0);
+	if (ret)
+		goto out;
+	memcpy(msg, kb->salt, kb->salt_len);
+	for (i = 0; i * SHA1_DIGEST_SIZE < AES_KEYSIZE_256; i++) {
+		put_unaligned_be32(i + 1, msg + kb->salt_len);
+		ret = crypto_shash_tfm_digest(tfm, msg, kb->salt_len + 4, hmac);
+		if (ret)
+			goto out;
+		memcpy(key + i * SHA1_DIGEST_SIZE, hmac,
+		       min_t(u32, SHA1_DIGEST_SIZE, AES_KEYSIZE_256 - i * SHA1_DIGEST_SIZE));
+	}
+
+	/* version 1 refills from the evolving key; later ones from the PBKDF2 output */
+	memcpy(base, key, sizeof(base));
+	while (left) {
+		const u8 *src = kb->vers == 1 ? key : base;
+
+		if (kb->vers == 1)
+			counter = 1;
+		for (i = 0; i < per_round; i++, counter++)
+			for (j = 0; j < AES_KEYSIZE_256; j += 4)
+				put_unaligned_le32(get_unaligned_le32(src + j) ^ counter,
+						   in + i * AES_KEYSIZE_256 + j);
+		ret = s5l8947x_aes_hwkey_crypt(S5L8947X_AES_KEY_DEVICE, true, iv,
+					       in, out, KB_TANGLE_SIZE);
+		if (ret)
+			goto out;
+		memcpy(iv, out + KB_TANGLE_SIZE - AES_BLOCK_SIZE, AES_BLOCK_SIZE);
+		n = min(left, per_round);
+		for (i = 0; i < n; i++)
+			crypto_xor(key, out + i * AES_KEYSIZE_256, AES_KEYSIZE_256);
+		left -= n;
+		cond_resched();
+	}
+	ret = 0;
+out:
+	if (ret)
+		memzero_explicit(key, AES_KEYSIZE_256);
+	memzero_explicit(hmac, sizeof(hmac));
+	memzero_explicit(base, sizeof(base));
+	kfree_sensitive(in);
+	kfree_sensitive(out);
+	kfree_sensitive(msg);
+	crypto_free_shash(tfm);
+	return ret;
+}
+
+/* Unwrap the class keys found in a decrypted "DATA" stream. */
+static int ftl_keybag_classes(const u8 *p, u32 len, const u8 dev_key[16])
+{
+	struct crypto_skcipher *tfm = NULL;
+	struct skcipher_request *req = NULL;
+	u8 pkey[AES_KEYSIZE_256];
+	bool have_pkey = false;
+	struct ftl_kb *kb;
+	int unlocked = 0, ret;
+	u8 *key = NULL;
+	u32 i;
+
+	kb = kmalloc(sizeof(*kb), GFP_KERNEL);
+	key = kmalloc(AES_KEYSIZE_256 + 8, GFP_KERNEL);
+	if (!kb || !key) {
+		unlocked = -ENOMEM;
+		goto out;
+	}
+	ret = ftl_keybag_parse(p, len, kb);
+	if (ret) {
+		unlocked = ret;
+		goto out;
+	}
+	pr_info("s5l8947x-ftl: keybag version %u, type %#x, %u iterations, %u classes\n",
+		kb->vers, kb->type, kb->iter, kb->nclasses);
+
+	tfm = crypto_alloc_skcipher("cbc(aes)", 0, 0);
+	if (IS_ERR(tfm)) {
+		unlocked = PTR_ERR(tfm);
+		tfm = NULL;
+		goto out;
+	}
+	req = skcipher_request_alloc(tfm, GFP_KERNEL);
+	if (!req || crypto_skcipher_setkey(tfm, dev_key, 16)) {
+		unlocked = -ENOMEM;
+		goto out;
+	}
+
+	for (i = 0; i < kb->nclasses; i++) {
+		const struct ftl_kb_class *c = &kb->c[i];
+		u8 iv[AES_BLOCK_SIZE] = {};
+		u32 klen = c->wpky_len;
+		const char *why = NULL;
+
+		if (c->class < CP_CLASS_FIRST || c->class >= CP_CLASS_OPEN)
+			continue;
+		if (test_bit(c->class, &ftl_class_valid))
+			continue;
+		if (!c->wpky || !(c->wrap & (KB_WRAP_DEVICE | KB_WRAP_PASSCODE)) ||
+		    c->wrap & ~(KB_WRAP_DEVICE | KB_WRAP_PASSCODE)) {
+			why = "unsupported wrap";
+			goto report;
+		}
+		if (c->wrap & KB_WRAP_PASSCODE) {
+			if (klen != CP_WRAP_LEN) {
+				why = "bad wrapped key";
+				goto report;
+			}
+			if (!have_pkey) {
+				ret = ftl_keybag_passcode_key(kb, pkey);
+				if (ret) {
+					why = "no passcode key";
+					goto report;
+				}
+				have_pkey = true;
+			}
+			/* fails its integrity check unless the passcode is empty */
+			if (ftl_rfc3394_unwrap(pkey, sizeof(pkey), c->wpky, key)) {
+				why = "passcode set";
+				goto report;
+			}
+			klen = AES_KEYSIZE_256;
+		} else {
+			if (klen != AES_KEYSIZE_256) {
+				why = "bad wrapped key";
+				goto report;
+			}
+			memcpy(key, c->wpky, klen);
+		}
+		if ((c->wrap & KB_WRAP_DEVICE) &&
+		    ftl_decrypt(req, key, key, AES_KEYSIZE_256, iv)) {
+			why = "device unwrap failed";
+			goto report;
+		}
+		memcpy(ftl_class_key[c->class], key, AES_KEYSIZE_256);
+		smp_wmb();
+		set_bit(c->class, &ftl_class_valid);
+		unlocked++;
+report:
+		pr_info("s5l8947x-ftl: keybag class %u wrap %u: %s%s%s\n", c->class, c->wrap,
+			why ? "locked (" : "unlocked", why ?: "", why ? ")" : "");
+		memzero_explicit(key, AES_KEYSIZE_256 + 8);
+	}
+out:
+	memzero_explicit(pkey, sizeof(pkey));
+	skcipher_request_free(req);
+	crypto_free_skcipher(tfm);
+	kfree_sensitive(key);
+	kfree(kb);
+	return unlocked;
+}
+
+static int ftl_keybag_load(const u8 *file, size_t len)
+{
+	struct crypto_skcipher *tfm = NULL;
+	struct skcipher_request *req = NULL;
+	u8 iv[AES_BLOCK_SIZE], dev_key[16];
+	const u8 *v, *keys;
+	u64 vlen, plen, klen;
+	u8 *plain = NULL;
+	u32 off, n;
+	int ret;
+
+	if (!ftl_bag_valid)
+		return -ENOKEY;
+	v = ftl_bplist_data(file, len, "_MKBIV", &vlen);
+	if (!v || vlen != AES_BLOCK_SIZE)
+		return -EINVAL;
+	memcpy(iv, v, sizeof(iv));
+	v = ftl_bplist_data(file, len, "_MKBPAYLOAD", &plen);
+	if (!v || !plen || plen % AES_BLOCK_SIZE)
+		return -EINVAL;
+
+	plain = kmalloc(plen, GFP_KERNEL);
+	tfm = crypto_alloc_skcipher("cbc(aes)", 0, 0);
+	if (IS_ERR(tfm)) {
+		ret = PTR_ERR(tfm);
+		tfm = NULL;
+		goto out;
+	}
+	req = skcipher_request_alloc(tfm, GFP_KERNEL);
+	ret = -ENOMEM;
+	if (!plain || !req)
+		goto out;
+	ret = crypto_skcipher_setkey(tfm, ftl_bag_key, sizeof(ftl_bag_key)) ?:
+	      ftl_decrypt(req, v, plain, plen, iv);
+	if (ret)
+		goto out;
+
+	/* strip the padding, then find the class key stream */
+	n = plain[plen - 1];
+	ret = -EBADMSG;
+	if (!n || n > AES_BLOCK_SIZE)
+		goto out;
+	keys = ftl_bplist_data(plain, plen - n, "KeyBagKeys", &klen);
+	if (!keys || klen < 8 || get_unaligned_be32(keys) != KB_DATA)
+		goto out;
+	off = get_unaligned_be32(keys + 4);
+	if (off > klen - 8)
+		goto out;
+
+	ret = s5l8947x_aes_hwkey_crypt(S5L8947X_AES_KEY_DEVICE, true, NULL,
+				       ftl_fkey_seed, dev_key, sizeof(dev_key));
+	if (!ret)
+		ret = ftl_keybag_classes(keys + 8, off, dev_key);
+	memzero_explicit(dev_key, sizeof(dev_key));
+out:
+	skcipher_request_free(req);
+	crypto_free_skcipher(tfm);
+	kfree_sensitive(plain);
+	return ret;
+}
+
+static ssize_t keybag_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	unsigned int class;
+	int n = 0;
+
+	for (class = CP_CLASS_FIRST; class <= CP_CLASS_OPEN; class++) {
+		bool open = class == CP_CLASS_OPEN ? ftl_file_master_valid :
+			    test_bit(class, &ftl_class_valid);
+
+		n += sysfs_emit_at(buf, n, "class %u %s, %d files\n", class,
+				   open ? "unlocked" : "locked",
+				   atomic_read(&ftl_class_files[class]));
+	}
+	return n;
+}
+
+static ssize_t keybag_store(struct device *dev, struct device_attribute *attr,
+			    const char *buf, size_t count)
+{
+	int ret;
+
+	if (!count || count > KB_MAX_SIZE)
+		return -EINVAL;
+	mutex_lock(&ftl_keybag_lock);
+	ret = ftl_keybag_load(buf, count);
+	mutex_unlock(&ftl_keybag_lock);
+	return ret < 0 ? ret : count;
+}
+static DEVICE_ATTR_RW(keybag);
+
 static struct attribute *ftl_attrs[] = {
 	&dev_attr_serial.attr,
 	&dev_attr_model.attr,
 	&dev_attr_emac.attr,
 	&dev_attr_wmac.attr,
 	&dev_attr_bmac.attr,
+	&dev_attr_keybag.attr,
 	NULL,
 };
 
@@ -1427,6 +1906,11 @@ static u8 *ftl_unwrap_keys(struct ftl *f, const u8 *hdr, u32 *nkeys)
 			    !ftl_rfc3394_unwrap(wkey, sizeof(wkey), store + off + 8,
 						ftl_file_master_key))
 				ftl_file_master_valid = true;
+		} else if (tag == KS_L_BAG && len >= AES_KEYSIZE_256) {
+			/* the system keybag's payload key ends the locker */
+			memcpy(ftl_bag_key, store + off + 8 + len - AES_KEYSIZE_256,
+			       AES_KEYSIZE_256);
+			ftl_bag_valid = true;
 		}
 		off += 8 + len;
 	}
@@ -1442,21 +1926,32 @@ int s5l8947x_file_key_unwrap(const void *attr, size_t len, u8 fkey[32], u8 iv_ke
 {
 	u32 digest[SHA1_DIGEST_WORDS], ws[SHA1_WORKSPACE_WORDS];
 	u8 blk[SHA1_BLOCK_SIZE] = {};
-	const u8 *p = attr;
+	const u8 *p = attr, *kek;
+	u32 class;
 	int i, ret;
 
-	if (!ftl_file_master_valid)
-		return -ENOKEY;
 	if (len < CP_V4_HEADER_LEN + CP_WRAP_LEN)
 		return -EINVAL;
+	class = get_unaligned_le32(p + 8) & 0x1f;
 	if (get_unaligned_le16(p) != CP_V4_VERSION ||
-	    (get_unaligned_le32(p + 8) & 0x1f) != CP_CLASS_OPEN ||
+	    class < CP_CLASS_FIRST || class > CP_CLASS_OPEN ||
 	    get_unaligned_le32(p + 12) != CP_WRAP_LEN)
 		return -EOPNOTSUPP;
-	ret = ftl_rfc3394_unwrap(ftl_file_master_key, sizeof(ftl_file_master_key),
-				 p + CP_V4_HEADER_LEN, fkey);
+	if (class == CP_CLASS_OPEN) {
+		if (!ftl_file_master_valid)
+			return -ENOKEY;
+		kek = ftl_file_master_key;
+	} else {
+		/* class keys are set once by the keybag load and never change */
+		if (!test_bit(class, &ftl_class_valid))
+			return -ENOKEY;
+		smp_rmb();
+		kek = ftl_class_key[class];
+	}
+	ret = ftl_rfc3394_unwrap(kek, AES_KEYSIZE_256, p + CP_V4_HEADER_LEN, fkey);
 	if (ret)
 		return ret;
+	atomic_inc(&ftl_class_files[class]);
 
 	memcpy(blk, fkey, AES_KEYSIZE_256);
 	blk[AES_KEYSIZE_256] = 0x80;
@@ -1895,6 +2390,8 @@ static void __exit ftl_exit(void)
 	kfree_sensitive(ftl_file_buf);
 	memzero_explicit(ftl_file_master_key, sizeof(ftl_file_master_key));
 	ftl_file_master_valid = false;
+	memzero_explicit(ftl_bag_key, sizeof(ftl_bag_key));
+	memzero_explicit(ftl_class_key, sizeof(ftl_class_key));
 }
 
 module_init(ftl_init);
