@@ -23,7 +23,7 @@ This project is built for two groups of people:
 
 ## Hardware Support (`S5L8947X` / `j33iap`)
 
-Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) in about 20 seconds and exposes the internal NAND volumes (`/dev/nand0p1` and `/dev/nand0p2`) with full read-write HFS+ and hardware AES support. Nothing is installed to the device, but the internal flash is not left untouched: at every boot `stage2` mounts `System` read-only to copy the wireless firmware and mounts `Data` read-write to keep the SSH host key and Wi-Fi settings under `/linux/etc` there.
+Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) in about 20 seconds and exposes the internal NAND volumes (`/dev/nand0p1` and `/dev/nand0p2`) with full read-write HFS+ and hardware AES support. Nothing is installed to the device, but the internal flash is not left untouched: at every boot `stage2` mounts `System` read-only to copy the wireless firmware and mounts `Data` read-write to load its system keybag (which unlocks protected files) and to keep the SSH host key and Wi-Fi settings under `/linux/etc` there.
 
 ### What works
 
@@ -36,20 +36,19 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
 | **USB Networking & Console** | Micro-USB port runs in USB device mode (`dwc2`), providing a virtual Ethernet link (`usb0` at `10.55.0.2`, SSH enabled) and a USB serial console (`/dev/ttyGS0`) |
 | **Wi-Fi (2.4 & 5 GHz)** | Broadcom BCM4334 over internal HSIC USB host (`ehci-platform` + custom PHY handshake); scans and joins WPA2 networks via `wpa_supplicant` and the built-in `wifi` helper; firmware, NVRAM, and the factory MAC address are read from the device's own NAND at boot; the regulatory country can be set with `iw reg set` or `country=` in `wpa_supplicant.conf` |
-| **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2`); patch firmware and the factory device address are read from the device's own NAND at boot; LE scanning verified with `btscan` |
+| **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2` at 1.6 Mbaud); patch firmware and the factory device address are read from the device's own NAND at boot; LE scanning verified with `btscan` |
 | **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`S5L8947X IR Remote`, `/dev/input/event*`) via the MSP430 system microcontroller on `uart1` |
 | **Hardware AES Engine** | CDMA AES crypto engine (`s5l8947x-aes` at `0x37801000`): `ecb(aes)` and `cbc(aes)` `skcipher` algorithms (128 / 192 / 256-bit keys) over CDMA channels 1 and 2, plus hardware device/group key operations (`s5l8947x_aes_hwkey_crypt()`) |
-| **Internal NAND & Volumes** | Managed NAND controller (`s5l8947x-fmi`, 8.9 GB, read/write/erase on `/dev/mtd0`, ~17 MiB/s reads over CDMA) and read-write translation layer (`s5l8947x-ftl`) exposing `/dev/nand0`, `/dev/nand0p1` (`System`, 1.4 GB), and `/dev/nand0p2` (`Data`, 6.5 GB, volume and per-file `com.apple.system.cprotect` class-4 keys unwrapped from the reserved SLC key store); both volumes mount read-write as `hfsplus` with journal verification/replay, transparent file encryption/decryption, and clean unmount handling |
+| **Internal NAND & Volumes** | Managed NAND controller (`s5l8947x-fmi`, 8.9 GB, read/write/erase on `/dev/mtd0`, ~17 MiB/s reads over CDMA) and read-write translation layer (`s5l8947x-ftl`) exposing `/dev/nand0`, `/dev/nand0p1` (`System`, 1.4 GB), and `/dev/nand0p2` (`Data`, 6.5 GB, volume key and per-file `com.apple.system.cprotect` keys of all four protection classes, from the reserved SLC key store and the system keybag); both volumes mount read-write as `hfsplus` with journal verification/replay, transparent file encryption/decryption, and clean unmount handling |
 
 ### What doesn't work yet (honest limitations)
 
 | Area | Current Limitation |
 |---|---|
-| **Passcode-bound keybag classes** | Unauthenticated volume and class-4 per-file keys (`com.apple.system.cprotect`, 7,117 of 7,297 files on `nand0p2`) are unwrapped for read and write, while passcode-bound keybag classes (1–3, 180 files) are not unwrapped. |
 | **3D GPU acceleration** | On hold. The PowerVR SGX543 power domain and clocks come up for bus telemetry, but there is no DRM/3D rendering driver. Graphics use the 720p CPU framebuffer. |
 | **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a CDC-ECM + CDC-ACM composite gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
 | **Audio sample rates** | The I2S and S/PDIF blocks are clocked from the 24 MHz crystal, so HDMI playback runs at `46,875 Hz` or `31,250 Hz` and optical at `46,875 Hz` instead of `48,000 Hz`. Use `wavplay` (which resamples automatically) or ALSA resampling. The optical output has not been checked on a receiver yet. |
-| **Bluetooth** | The controller runs at 115,200 baud, and `BlueZ` userspace is not in the small initramfs, so pairing and connections are untested. |
+| **Bluetooth** | The controller runs at 1.6 Mbaud rather than the stock 3 Mbaud (the UART clocks cannot produce 3 Mbaud), there is no host-wake interrupt yet, and `BlueZ` userspace is not in the small initramfs, so pairing and connections are untested. |
 | **Wireless without NAND** | The Wi-Fi firmware and Bluetooth patch cannot be redistributed and are copied from the device's own `System` volume at boot. Without it, Wi-Fi does not come up and Bluetooth runs on its ROM firmware. |
 
 For exact register addresses, driver file paths, and per-block notes, see [progress.md](progress.md).
@@ -102,6 +101,7 @@ hwtest                       # Run the automated on-device hardware test suite
 hwtest -i display audio      # Run interactive display and audio checks
 mount -t hfsplus /dev/nand0p1 /mnt        # Mount the System volume read-write (-o ro for read-only)
 mount -t hfsplus /dev/nand0p2 /mnt        # Mount the decrypted Data volume read-write (-o ro for read-only)
+cat /sys/block/nand0/keybag  # Show which file-protection classes are unlocked
 wifi scan                    # Scan for 2.4 GHz and 5 GHz Wi-Fi networks
 wifi connect "MySSID" "PSK"  # Connect to WPA2 Wi-Fi and obtain a DHCP lease
 wifi status                  # Check Wi-Fi link speed and IP address
@@ -134,7 +134,7 @@ Drivers that apply across the SoC family are already named `s5l8940x` and parame
 | **Central DMA** | `drivers/dma/s5l8947x-cdma.c` | 42-channel `dmaengine` provider: slave scatter-gather (both directions, audio `0x34000000` and NAND `0x31000000` windows) and cyclic transfers with per-channel interrupts. |
 | **Audio** | `sound/arm/s5l8947x-audio.c` | I2S (HDMI) and S/PDIF (optical) transmitters, each fed by a cyclic DMA transfer. |
 | **CDMA AES Engine** | `drivers/crypto/s5l8947x-aes.c`<br>`include/linux/s5l8947x-aes.h` | `ecb(aes)` and `cbc(aes)` `skcipher` algorithms over CDMA channels 1 and 2, plus `s5l8947x_aes_hwkey_crypt()` for the hardware device and group keys. |
-| **Managed NAND & FTL** | `drivers/mtd/devices/s5l8947x-fmi.c`<br>`drivers/mtd/s5l8947x-ftl.c`<br>`scripts/patches/0008-*.patch` | Managed NAND controller (`FMI0`), read-write translation layer (`/dev/nand0`), key-store unwrapping, and encrypted volume + per-file `hfsplus` read/write encryption and journal handling (`/dev/nand0p1`, `/dev/nand0p2`). |
+| **Managed NAND & FTL** | `drivers/mtd/devices/s5l8947x-fmi.c`<br>`drivers/mtd/s5l8947x-ftl.c`<br>`scripts/patches/0008-*.patch` | Managed NAND controller (`FMI0`), read-write translation layer (`/dev/nand0`), key-store and system keybag unwrapping, factory system configuration (MAC addresses into the DT), and encrypted volume + per-file `hfsplus` read/write encryption and journal handling (`/dev/nand0p1`, `/dev/nand0p2`). |
 
 ### How the boot bundle works (`scripts/boot/`)
 
@@ -193,6 +193,7 @@ Contributions of any kind are welcome—whether that is a new board Device Tree,
 High-impact open tasks on `S5L8947X` right now (see [progress.md](progress.md) for details):
 - **USB OTG host mode** (role switching + OHCI companion controller at `0x36500000`) to allow plugging in external USB devices.
 - **Audio at exact 48 kHz**: clock the I2S master from the PMGR clock synthesizer instead of the 24 MHz crystal.
+- **PMU interrupts**: decode the PMU's event registers to wire Bluetooth and Wi-Fi host wake and the PMU button events.
 
 ### Guardrails
 
