@@ -18,12 +18,11 @@
  *        +0x10 TXDATA one word per channel sample
  *   S/PDIF +0x00 CLKCON power, +0x04 CON format, +0x0c CSTAS, +0x10 DATA
  *
- * Everything is clocked from the 24 MHz reference, so the frame rates are
- * 24 MHz divisions: HDMI runs at 46875 Hz (32-bit frames, BCLK / 16) or 31250
- * Hz (48-bit frames), optical at 46875 Hz (MCLK / 512). The hardware cannot
- * produce 48000 from this reference, and pretending it does would make the
- * HDMI ACR announce a rate that is not being sent. Applications that need
- * another rate must resample.
+ * The I2S master runs from its master clock, a PMGR oscillator ("mclk") set to
+ * 256 * fs: it divides it by 8 into the bit clock of 32-bit frames, so HDMI
+ * plays 32, 44.1 and 48 kHz exactly. The optical output still runs from the
+ * 24 MHz reference at 46875 Hz (MCLK / 512); applications that need another
+ * rate there must resample.
  *
  * Each output is fed through the dmaengine API by the central DMA with a
  * cyclic transfer of 32-bit words, one per FIFO request, from a coherent ring
@@ -55,11 +54,12 @@
 #define I2S_TXDATA		0x10
 
 #define I2S_CTL_ENABLE		0x00000015U	/* enable, as the block expects */
+#define I2S_CTL_ENABLE_MCLK	0x00000001U	/* enable, clocked from mclk */
 #define I2S_CTL_RESET		0x00000040U	/* self-clearing soft reset */
 #define I2S_CTL_STOP		0x00000034U
 #define I2S_TXCON_BASE		0x03000001U	/* always set, 16-bit samples */
-#define I2S_TXCON_46875		0x00000700U	/* BCLK = 24 MHz / 16, 32-bit frame */
-#define I2S_TXCON_31250		0x00000708U	/* BCLK = 24 MHz / 16, 48-bit frame */
+#define I2S_TXCON_BCLK_DIV8	0x00000300U	/* BCLK = mclk / 8, 32-bit frame */
+#define I2S_MCLK_FS		256U
 #define I2S_TXCON_SLAVE		0x00100018U	/* clocks from the master */
 #define I2S_TXCOM_RUN		0x01f80006U	/* TX enabled */
 /* TX enabled with a DMA request threshold ([18:14]); without it no requests */
@@ -81,8 +81,7 @@
 #define AUDIO_DMA_BURST		1
 #define AUDIO_FRAME_BYTES	8	/* L, R */
 
-#define AUDIO_RATE_HIGH		46875U
-#define AUDIO_RATE_LOW		31250U
+#define AUDIO_RATE_OPTICAL	46875U
 
 enum s5l8947x_output {
 	AUDIO_HDMI,
@@ -116,17 +115,19 @@ struct s5l8947x_audio {
 	void __iomem *i2s;		/* I2S0, data */
 	void __iomem *i2s_master;	/* bit and frame clocks */
 	void __iomem *spdif;
+	struct clk *mclk;		/* I2S master clock */
+	bool mclk_on;
 	bool hdmi_enable;
 
 	struct s5l8947x_stream streams[AUDIO_NUM_OUTPUTS];
 };
 
 static const unsigned int s5l8947x_hdmi_rates[] = {
-	AUDIO_RATE_HIGH, AUDIO_RATE_LOW,
+	32000, 44100, 48000,
 };
 
 static const unsigned int s5l8947x_optical_rates[] = {
-	AUDIO_RATE_HIGH,
+	AUDIO_RATE_OPTICAL,
 };
 
 static const struct snd_pcm_hw_constraint_list s5l8947x_rate_constraints[] = {
@@ -144,8 +145,8 @@ static const struct snd_pcm_hardware s5l8947x_pcm_hw = {
 	.info			= SNDRV_PCM_INFO_INTERLEAVED,
 	.formats		= SNDRV_PCM_FMTBIT_S16_LE,
 	.rates			= SNDRV_PCM_RATE_KNOT,
-	.rate_min		= AUDIO_RATE_LOW,
-	.rate_max		= AUDIO_RATE_HIGH,
+	.rate_min		= 32000,
+	.rate_max		= 48000,
 	.channels_min		= 2,
 	.channels_max		= 2,
 	.buffer_bytes_max	= 64 * 1024,
@@ -155,13 +156,37 @@ static const struct snd_pcm_hardware s5l8947x_pcm_hw = {
 	.periods_max		= 32,
 };
 
+static void s5l8947x_mclk_off(struct s5l8947x_audio *aud)
+{
+	if (aud->mclk_on) {
+		clk_disable_unprepare(aud->mclk);
+		aud->mclk_on = false;
+	}
+}
+
+static int s5l8947x_mclk_on(struct s5l8947x_audio *aud, unsigned int rate)
+{
+	int ret;
+
+	/* The oscillator only takes a new rate while it is stopped */
+	s5l8947x_mclk_off(aud);
+	ret = clk_set_rate(aud->mclk, (unsigned long)rate * I2S_MCLK_FS);
+	if (ret)
+		return ret;
+	ret = clk_prepare_enable(aud->mclk);
+	if (ret)
+		return ret;
+	aud->mclk_on = true;
+	return 0;
+}
+
 static int s5l8947x_engine_config(struct s5l8947x_stream *st)
 {
 	struct s5l8947x_audio *aud = st->aud;
-	u32 clk;
+	int ret;
 
 	if (st->out == AUDIO_OPTICAL) {
-		if (st->rate != AUDIO_RATE_HIGH)
+		if (st->rate != AUDIO_RATE_OPTICAL)
 			return -EINVAL;
 		writel(0, aud->spdif + SPDIF_CLKCON);
 		writel(SPDIF_CON_SW_RESET, aud->spdif + SPDIF_CON);
@@ -170,16 +195,9 @@ static int s5l8947x_engine_config(struct s5l8947x_stream *st)
 		return 0;
 	}
 
-	switch (st->rate) {
-	case AUDIO_RATE_HIGH:
-		clk = I2S_TXCON_46875;
-		break;
-	case AUDIO_RATE_LOW:
-		clk = I2S_TXCON_31250;
-		break;
-	default:
-		return -EINVAL;
-	}
+	ret = s5l8947x_mclk_on(aud, st->rate);
+	if (ret)
+		return ret;
 
 	/*
 	 * The master's clocks must be running before the slave is reset: a
@@ -188,8 +206,8 @@ static int s5l8947x_engine_config(struct s5l8947x_stream *st)
 	 */
 	writel(I2S_CTL_RESET, aud->i2s_master + I2S_CTL);
 	writel(0, aud->i2s_master + I2S_TXCOM);
-	writel(I2S_TXCON_BASE | clk, aud->i2s_master + I2S_TXCON);
-	writel(I2S_CTL_ENABLE, aud->i2s_master + I2S_CTL);
+	writel(I2S_TXCON_BASE | I2S_TXCON_BCLK_DIV8, aud->i2s_master + I2S_TXCON);
+	writel(I2S_CTL_ENABLE_MCLK, aud->i2s_master + I2S_CTL);
 	writel(I2S_TXCOM_RUN, aud->i2s_master + I2S_TXCOM);
 
 	writel(I2S_CTL_RESET, aud->i2s + I2S_CTL);
@@ -378,6 +396,8 @@ static int s5l8947x_pcm_close(struct snd_pcm_substream *substream)
 	s5l8947x_dma_halt(st);
 	dmaengine_synchronize(st->dma);
 	s5l8947x_engine_stop(st);
+	if (st->out == AUDIO_HDMI)
+		s5l8947x_mclk_off(st->aud);
 	st->substream = NULL;
 	if (st->out == AUDIO_HDMI && st->aud->hdmi_enable)
 		s5l8947x_hdmi_audio_configure(st->rate, false);
@@ -538,6 +558,17 @@ static void __iomem *s5l8947x_map(struct platform_device *pdev,
 	return base;
 }
 
+static const char * const s5l8947x_gate_names[] = {
+	"i2s-master", "i2s0", "i2s1", "i2s2", "i2s3", "spdif",
+};
+
+#define AUDIO_NUM_GATES		ARRAY_SIZE(s5l8947x_gate_names)
+
+static void s5l8947x_gates_disable(void *gates)
+{
+	clk_bulk_disable_unprepare(AUDIO_NUM_GATES, gates);
+}
+
 static int s5l8947x_audio_probe(struct platform_device *pdev)
 {
 	static const char * const dma_names[AUDIO_NUM_OUTPUTS] = {
@@ -551,7 +582,7 @@ static int s5l8947x_audio_probe(struct platform_device *pdev)
 	phys_addr_t phys[AUDIO_NUM_OUTPUTS];
 	struct s5l8947x_audio *aud;
 	struct snd_card *card;
-	struct clk_bulk_data *clks;
+	struct clk_bulk_data *gates;
 	struct snd_pcm *pcm;
 	unsigned int i;
 	int ret;
@@ -579,9 +610,28 @@ static int s5l8947x_audio_probe(struct platform_device *pdev)
 	if (ret)
 		goto err_free_card;
 
-	ret = devm_clk_bulk_get_all_enable(&pdev->dev, &clks);
+	gates = devm_kcalloc(&pdev->dev, AUDIO_NUM_GATES, sizeof(*gates),
+			     GFP_KERNEL);
+	if (!gates) {
+		ret = -ENOMEM;
+		goto err_free_card;
+	}
+	for (i = 0; i < AUDIO_NUM_GATES; i++)
+		gates[i].id = s5l8947x_gate_names[i];
+	ret = devm_clk_bulk_get(&pdev->dev, AUDIO_NUM_GATES, gates);
+	if (!ret)
+		ret = clk_bulk_prepare_enable(AUDIO_NUM_GATES, gates);
+	if (!ret)
+		ret = devm_add_action_or_reset(&pdev->dev,
+					       s5l8947x_gates_disable, gates);
 	if (ret) {
 		dev_err_probe(&pdev->dev, ret, "failed to enable clocks\n");
+		goto err_free_card;
+	}
+	aud->mclk = devm_clk_get(&pdev->dev, "mclk");
+	if (IS_ERR(aud->mclk)) {
+		ret = dev_err_probe(&pdev->dev, PTR_ERR(aud->mclk),
+				    "failed to get the I2S master clock\n");
 		goto err_free_card;
 	}
 
@@ -590,7 +640,7 @@ static int s5l8947x_audio_probe(struct platform_device *pdev)
 
 		st->aud = aud;
 		st->out = i;
-		st->rate = AUDIO_RATE_HIGH;
+		st->rate = i == AUDIO_HDMI ? 48000 : AUDIO_RATE_OPTICAL;
 		st->fifo_phys = phys[i] + (i == AUDIO_HDMI ? I2S_TXDATA : SPDIF_DATA);
 		st->dma = dma_request_chan(&pdev->dev, dma_names[i]);
 		if (IS_ERR(st->dma)) {
@@ -630,9 +680,9 @@ static int s5l8947x_audio_probe(struct platform_device *pdev)
 		goto err_release_dma;
 
 	dev_info(&pdev->dev,
-		 "registered '%s': pcm0 I2S -> HDMI (%u/%u Hz, DMA %s), pcm1 S/PDIF -> optical (%u Hz, DMA %s)\n",
-		 card->shortname, AUDIO_RATE_HIGH, AUDIO_RATE_LOW,
-		 dma_chan_name(aud->streams[AUDIO_HDMI].dma), AUDIO_RATE_HIGH,
+		 "registered '%s': pcm0 I2S -> HDMI (32/44.1/48 kHz, DMA %s), pcm1 S/PDIF -> optical (%u Hz, DMA %s)\n",
+		 card->shortname,
+		 dma_chan_name(aud->streams[AUDIO_HDMI].dma), AUDIO_RATE_OPTICAL,
 		 dma_chan_name(aud->streams[AUDIO_OPTICAL].dma));
 	return 0;
 
