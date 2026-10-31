@@ -36,7 +36,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
 | **USB Networking & Console** | Micro-USB port runs in USB device mode (`dwc2`), providing a virtual Ethernet link (`usb0` at `10.55.0.2`, SSH enabled) and a USB serial console (`/dev/ttyGS0`) |
 | **Wi-Fi (2.4 & 5 GHz)** | Broadcom BCM4334 over internal HSIC USB host (`ehci-platform` + custom PHY handshake); scans and joins WPA2 networks via `wpa_supplicant` and the built-in `wifi` helper; firmware, NVRAM, and the factory MAC address are read from the device's own NAND at boot; the regulatory country can be set with `iw reg set` or `country=` in `wpa_supplicant.conf` |
-| **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2` at 1.6 Mbaud); patch firmware and the factory device address are read from the device's own NAND at boot; LE scanning verified with `btscan`; BlueZ (`bluetoothd`, `bluetoothctl`) runs at boot and discovers nearby devices |
+| **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2` at 1.6 Mbaud); patch firmware and the factory device address are read from the device's own NAND at boot; LE scanning verified with `btscan`; BlueZ (`bluetoothd`, `bluetoothctl`) runs at boot and discovers nearby devices; the controller sleeps when idle and wakes the host through the PMU's host-wake interrupt |
 | **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`S5L8947X IR Remote`, `/dev/input/event*`) via the MSP430 system microcontroller on `uart1` |
 | **Hardware AES Engine** | CDMA AES crypto engine (`s5l8947x-aes` at `0x37801000`): `ecb(aes)` and `cbc(aes)` `skcipher` algorithms (128 / 192 / 256-bit keys) over CDMA channels 1 and 2, plus hardware device/group key operations (`s5l8947x_aes_hwkey_crypt()`) |
 | **Internal NAND & Volumes** | Managed NAND controller (`s5l8947x-fmi`, 8.9 GB, read/write/erase on `/dev/mtd0`, ~17 MiB/s reads over CDMA) and read-write translation layer (`s5l8947x-ftl`) exposing `/dev/nand0`, `/dev/nand0p1` (`System`, 1.4 GB), and `/dev/nand0p2` (`Data`, 6.5 GB, volume key and per-file `com.apple.system.cprotect` keys of all four protection classes, from the reserved SLC key store and the system keybag); both volumes mount read-write as `hfsplus` with journal verification/replay, transparent file encryption/decryption, and clean unmount handling |
@@ -48,7 +48,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **3D GPU acceleration** | On hold. The PowerVR SGX543 power domain and clocks come up for bus telemetry, but there is no DRM/3D rendering driver. Graphics use the 720p CPU framebuffer. |
 | **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a CDC-ECM + CDC-ACM composite gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
 | **Audio sample rates** | The I2S and S/PDIF blocks are clocked from the 24 MHz crystal, so HDMI playback runs at `46,875 Hz` or `31,250 Hz` and optical at `46,875 Hz` instead of `48,000 Hz`. Use `wavplay` (which resamples automatically) or ALSA resampling. The optical output has not been checked on a receiver yet. |
-| **Bluetooth** | The controller runs at 1.6 Mbaud rather than the stock 3 Mbaud (the UART clocks cannot produce 3 Mbaud), there is no host-wake interrupt yet, and pairing and connections through `bluetoothctl` have not been tested yet. |
+| **Bluetooth** | The controller runs at 1.6 Mbaud rather than the stock 3 Mbaud (the UART clocks cannot produce 3 Mbaud), and pairing and connections through `bluetoothctl` have not been tested yet. |
 
 For exact register addresses, driver file paths, and per-block notes, see [progress.md](progress.md).
 
@@ -126,7 +126,7 @@ Drivers that apply across the SoC family are already named `s5l8940x` and parame
 | **CPU Frequency** | `drivers/cpufreq/s5l8947x-cpufreq.c` | PMGR performance state switching without disturbing peripheral baud clocks. |
 | **GPIO & Pinctrl** | `drivers/pinctrl/pinctrl-s5l8940x-gpio.c` | Banked pin controller and GPIO IRQ chip (`apple,npins` set in DT). |
 | **I2C** | `drivers/i2c/busses/i2c-s5l8940x.c` | Master controller for `i2c0`..`i2c2`. |
-| **PMU & Regulators** | `drivers/mfd/apple-pmu-i2c.c`<br>`drivers/regulator/apple-pmu-pwrsw.c` | Dialog I2C PMU (`D1815` / `D1974` / `D2045`) regmap MFD and GPIO-backed power switches. |
+| **PMU & Regulators** | `drivers/mfd/apple-pmu-i2c.c`<br>`drivers/regulator/apple-pmu-pwrsw.c` | Dialog I2C PMU (`D1815` / `D1974` / `D2045`) regmap MFD with its event interrupts (used for Bluetooth host wake) and GPIO-backed power switches. |
 | **USB 2.0 PHY** | `drivers/phy/phy-apple-s5l-usb.c` | OTG device PHY (paired with mainline `dwc2`) and EHCI HSIC host PHY with GPIO ready handshaking. |
 | **UART** | `scripts/patches/0002-*.patch` | Hooks `ARCH_APPLE_S5L` into mainline `samsung_tty.c` (`apple,s5l-uart`). |
 | **Display & HDMI** | `drivers/video/fbdev/s5l8947x-display.c` | `rgbout` display pipe, 10-bit gamma LUTs, M2M hardware scaler, and HDMI 1.4 transmitter. |
@@ -192,7 +192,6 @@ Contributions of any kind are welcome—whether that is a new board Device Tree,
 High-impact open tasks on `S5L8947X` right now (see [progress.md](progress.md) for details):
 - **USB OTG host mode** (role switching + OHCI companion controller at `0x36500000`) to allow plugging in external USB devices.
 - **Audio at exact 48 kHz**: clock the I2S master from the PMGR clock synthesizer instead of the 24 MHz crystal.
-- **PMU interrupts**: decode the PMU's event registers to wire Bluetooth and Wi-Fi host wake and the PMU button events.
 
 ### Guardrails
 
