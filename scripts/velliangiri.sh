@@ -38,6 +38,7 @@ docker_run() { # <-i|-it> <command...>
 		-v "${ROOT}:/workspace" \
 		-v velliangiri-kbuild:/kbuild \
 		-e KERNEL_TREE=/kbuild/linux \
+		-e SSH_PUBKEY -e WIFI_CONF \
 		-w /workspace \
 		"${IMAGE}" "$@"
 }
