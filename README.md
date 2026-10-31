@@ -16,7 +16,7 @@ Velliangiri brings a current, mainline **Linux 6.12** kernel and an **Alpine Lin
 Every driver in this repository is written from scratch based on observed hardware behaviour, uses standard Linux kernel subsystems, and is kept as a small overlay on top of a pristine kernel tree rather than a frozen vendor fork.
 
 This project is built for two groups of people:
-1. **Users and tinkerers** who want to boot Linux on the **S5L8947X (`j33iap`)** set-top box and use its hardware (HDMI video and audio, optical audio, Ethernet, Wi-Fi, Bluetooth, IR remote, USB networking, internal NAND storage, and hardware AES).
+1. **Users and tinkerers** who want to boot Linux on the **S5L8947X (`j33iap`)** set-top box and use its hardware (HDMI video and audio, optical audio, Ethernet, Wi-Fi, Bluetooth, IR remote, USB networking, internal NAND storage, hardware AES and hardware SHA-2).
 2. **Developers and porters** who want to bring up mainline Linux on other devices in the same SoC family by reusing the interrupt controller, clock, GPIO, I2C, PMU, USB, DMA, crypto, NAND, display, and audio drivers already working here.
 
 ---
@@ -39,6 +39,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2` at 1.6 Mbaud); patch firmware and the factory device address are read from the device's own NAND at boot; LE scanning verified with `btscan`; BlueZ (`bluetoothd`, `bluetoothctl`) runs at boot and discovers nearby devices; the controller sleeps when idle and wakes the host through the PMU's host-wake interrupt |
 | **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`S5L8947X IR Remote`, `/dev/input/event*`) via the MSP430 system microcontroller on `uart1` |
 | **Hardware AES Engine** | CDMA AES crypto engine (`s5l8947x-aes` at `0x37801000`): `ecb(aes)` and `cbc(aes)` `skcipher` algorithms (128 / 192 / 256-bit keys) over CDMA channels 1 and 2, plus hardware device/group key operations (`s5l8947x_aes_hwkey_crypt()`) |
+| **Hardware SHA Engine** | SHA-2 engine (`s5l8947x-sha` at `0x30200000`): `sha224`, `sha256`, `sha384` and `sha512` hashes; SHA-384/512 are faster than the software implementation |
 | **Internal NAND & Volumes** | Managed NAND controller (`s5l8947x-fmi`, 8.9 GB, read/write/erase on `/dev/mtd0`, ~17 MiB/s reads over CDMA) and read-write translation layer (`s5l8947x-ftl`) exposing `/dev/nand0`, `/dev/nand0p1` (`System`, 1.4 GB), and `/dev/nand0p2` (`Data`, 6.5 GB, volume key and per-file `com.apple.system.cprotect` keys of all four protection classes, from the reserved SLC key store and the system keybag); both volumes mount read-write as `hfsplus` with journal verification/replay, transparent file encryption/decryption, and clean unmount handling |
 
 ### What doesn't work yet (honest limitations)
@@ -135,6 +136,7 @@ Drivers that apply across the SoC family are already named `s5l8940x` and parame
 | **Central DMA** | `drivers/dma/s5l8947x-cdma.c` | 42-channel `dmaengine` provider: slave scatter-gather (both directions, audio `0x34000000` and NAND `0x31000000` windows) and cyclic transfers with per-channel interrupts. |
 | **Audio** | `sound/arm/s5l8947x-audio.c` | I2S (HDMI) and S/PDIF (optical) transmitters, each fed by a cyclic DMA transfer. |
 | **CDMA AES Engine** | `drivers/crypto/s5l8947x-aes.c`<br>`include/linux/s5l8947x-aes.h` | `ecb(aes)` and `cbc(aes)` `skcipher` algorithms over CDMA channels 1 and 2, plus `s5l8947x_aes_hwkey_crypt()` for the hardware device and group keys. |
+| **SHA Engine** | `drivers/crypto/s5l8947x-sha.c` | `sha224` / `sha256` / `sha384` / `sha512` `shash` algorithms on the SoC hash engine. |
 | **Managed NAND & FTL** | `drivers/mtd/devices/s5l8947x-fmi.c`<br>`drivers/mtd/s5l8947x-ftl.c`<br>`scripts/patches/0008-*.patch` | Managed NAND controller (`FMI0`), read-write translation layer (`/dev/nand0`), key-store and system keybag unwrapping, factory system configuration (MAC addresses into the DT), and encrypted volume + per-file `hfsplus` read/write encryption and journal handling (`/dev/nand0p1`, `/dev/nand0p2`). |
 
 ### How the boot bundle works (`scripts/boot/`)
