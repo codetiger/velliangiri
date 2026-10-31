@@ -56,6 +56,17 @@
 		clock-output-names = "uart_clk";
 	};
 
+	/*
+	 * Reference of the PMGR audio oscillators, measured from the I2S frame
+	 * rate against the 24 MHz crystal (two thirds of the 513 MHz PLL).
+	 */
+	nco_ref: clock-342000000 {
+		compatible = "fixed-clock";
+		#clock-cells = <0>;
+		clock-frequency = <342000000>;
+		clock-output-names = "nco_ref";
+	};
+
 	soc: soc@30000000 {
 		compatible = "simple-bus";
 		#address-cells = <1>;
@@ -131,6 +142,14 @@
 			compatible = "apple,s5l8947x-pmgr-gates";
 			reg = <0xf101008 0x200>;
 			clocks = <&osc24m>;
+			#clock-cells = <1>;
+		};
+
+		/* Audio master clocks: 0 = I2S master, 4 = S/PDIF */
+		pmgr_nco: clock-controller@f100110 {
+			compatible = "apple,s5l8947x-pmgr-nco";
+			reg = <0xf100110 0x70>;
+			clocks = <&nco_ref>, <&pmgr_gates 44>, <&pmgr_gates 45>;
 			#clock-cells = <1>;
 		};
 
@@ -301,7 +320,10 @@
 			dma-names = "hdmi", "optical";
 			clocks = <&pmgr_gates 37>, <&pmgr_gates 38>,
 				 <&pmgr_gates 39>, <&pmgr_gates 40>,
-				 <&pmgr_gates 41>, <&pmgr_gates 42>;
+				 <&pmgr_gates 41>, <&pmgr_gates 42>,
+				 <&pmgr_nco 0>;
+			clock-names = "i2s-master", "i2s0", "i2s1", "i2s2",
+				      "i2s3", "spdif", "mclk";
 			status = "disabled";
 		};
 
