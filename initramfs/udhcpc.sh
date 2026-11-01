@@ -38,6 +38,13 @@ case "$1" in
 
 		echo "[velliangiri] $interface leased $ip (gw: ${router:-none})" >/dev/kmsg 2>/dev/null || true
 
+		# Set the clock from the network once a lease and DNS are up: HTTPS
+		# certificate checks fail with a wrong date, and the PMU RTC loses its
+		# calendar offset on power loss. ntpd-event writes it back to the RTC.
+		if ! pidof ntpd >/dev/null 2>&1; then
+			ntpd -p pool.ntp.org -S /etc/ntpd-event.sh 2>/dev/null || true
+		fi
+
 		# Configure dynamic UDP netconsole broadcast on port 6666 if configfs is available
 		if [ -d /sys/kernel/config/netconsole ] && [ "$interface" = "eth0" ]; then
 			mount -t configfs none /sys/kernel/config 2>/dev/null || true

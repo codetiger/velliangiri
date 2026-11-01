@@ -23,7 +23,7 @@ This project is built for two groups of people:
 
 ## Hardware Support (`S5L8947X` / `j33iap`)
 
-Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) in about 20 seconds and exposes the internal NAND volumes (`/dev/nand0p1` and `/dev/nand0p2`) with full read-write HFS+ and hardware AES support. Nothing is installed to the device, but the internal flash is not left untouched: at every boot `stage2` mounts `Data` read-write to load its system keybag (which unlocks protected files) and to keep the SSH host key, Wi-Fi settings and a cache of the wireless firmware under `/linux` there; `System` is mounted read-only only on the first boot, to copy that firmware.
+Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) in about 20 seconds and exposes the internal NAND volumes (`/dev/nand0p1` and `/dev/nand0p2`) with full read-write HFS+ and hardware AES support. Nothing is installed to the device, but the internal flash is not left untouched: at every boot `stage2` mounts `Data` read-write at `/mnt/data` and keeps it mounted until shutdown: it loads the system keybag (which unlocks protected files) and keeps the SSH host key, Wi-Fi settings, Bluetooth pairings and a cache of the wireless firmware under `/linux` there; `System` is mounted read-only only on the first boot, to copy that firmware.
 
 ### What works
 
@@ -36,7 +36,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
 | **USB Networking & Console** | Micro-USB port runs in USB device mode (`dwc2`), providing a virtual Ethernet link (`usb0` at `10.55.0.2`, SSH enabled) and a USB serial console (`/dev/ttyGS0`) |
 | **Wi-Fi (2.4 & 5 GHz)** | Broadcom BCM4334 over internal HSIC USB host (`ehci-platform` + custom PHY handshake); scans and joins WPA2 networks via `wpa_supplicant` and the built-in `wifi` helper; firmware, NVRAM, and the factory MAC address are read from the device's own NAND at boot; the regulatory country can be set with `iw reg set` or `country=` in `wpa_supplicant.conf` |
-| **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2` at 1.6 Mbaud); patch firmware and the factory device address are read from the device's own NAND at boot; LE scanning verified with `btscan`; BlueZ (`bluetoothd`, `bluetoothctl`) runs at boot and discovers nearby devices; the controller sleeps when idle and wakes the host through the PMU's host-wake interrupt |
+| **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2` at 1.6 Mbaud); patch firmware and the factory device address are read from the device's own NAND at boot; LE scanning verified with `btscan`; BlueZ (`bluetoothd`, `bluetoothctl`) runs at boot and discovers nearby devices, with HID support for Classic (`hidp`) and LE (`uhid`) keyboards and pairings kept on `Data`; the controller sleeps when idle and wakes the host through the PMU's host-wake interrupt |
 | **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`S5L8947X IR Remote`, `/dev/input/event*`) via the MSP430 system microcontroller on `uart1`, with the stock version/active handshake at probe, ACK-waited raw commands, an event trace for further protocol work, and the MCU NMI line as a wake source. The board enables `apple,game-keys`, so the seven buttons report game keys (arrows, Ctrl, Space, Escape); `.../game_map` switches back to media codes |
 | **Hardware AES Engine** | CDMA AES crypto engine (`s5l8947x-aes` at `0x37801000`): `ecb(aes)` and `cbc(aes)` `skcipher` algorithms (128 / 192 / 256-bit keys) over CDMA channels 1 and 2, plus hardware device/group key operations (`s5l8947x_aes_hwkey_crypt()`) |
 | **Hardware SHA Engine & NEON Crypto** | SHA-2 engine (`s5l8947x-sha` at `0x30200000`): `sha224`, `sha256`, `sha384` and `sha512` hashes, alongside built-in ARMv7/NEON kernel crypto (`sha1-neon`, `sha256-neon`, `sha512-neon`, `blake2b-neon`, `blake2s-arm`, `chacha20-neon`, `poly1305-neon`, `aes-arm`, `aes-neonbs`) and `AF_ALG` userspace sockets |
@@ -100,7 +100,7 @@ Load `out/boot-bundle-s5l8947x-j33iap.bin` into the device's RAM over USB and ju
 hwtest                       # Run the automated on-device hardware test suite
 hwtest -i display audio      # Run interactive display and audio checks
 mount -t hfsplus /dev/nand0p1 /mnt        # Mount the System volume read-write (-o ro for read-only)
-mount -t hfsplus /dev/nand0p2 /mnt        # Mount the decrypted Data volume read-write (-o ro for read-only)
+ls /mnt/data                 # The decrypted Data volume, mounted read-write by stage2 at boot
 cat /sys/block/nand0/keybag  # Show which file-protection classes are unlocked
 wifi scan                    # Scan for 2.4 GHz and 5 GHz Wi-Fi networks
 wifi connect "MySSID" "PSK"  # Connect to WPA2 Wi-Fi and obtain a DHCP lease

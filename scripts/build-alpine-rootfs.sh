@@ -76,7 +76,9 @@ cp "${ROOT}/initramfs/init.sh" "${STAGE_DIR}/init"
 cp "${ROOT}/initramfs/stage2.sh" "${STAGE_DIR}/sbin/velliangiri-stage2"
 cp "${ROOT}/initramfs/udhcpc.sh" "${STAGE_DIR}/etc/udhcpc/default.script"
 cp "${ROOT}/initramfs/wifi.sh" "${STAGE_DIR}/bin/wifi"
-chmod 755 "${STAGE_DIR}/init" "${STAGE_DIR}/sbin/velliangiri-stage2" "${STAGE_DIR}/etc/udhcpc/default.script" "${STAGE_DIR}/bin/wifi"
+cp "${ROOT}/initramfs/ntpd-event.sh" "${STAGE_DIR}/etc/ntpd-event.sh"
+chmod 755 "${STAGE_DIR}/init" "${STAGE_DIR}/sbin/velliangiri-stage2" "${STAGE_DIR}/etc/udhcpc/default.script" "${STAGE_DIR}/bin/wifi" \
+	"${STAGE_DIR}/etc/ntpd-event.sh"
 
 # Optional Wi-Fi network joined at boot: a wpa_supplicant.conf kept out of git
 # (it holds the passphrase); without it, join at runtime with 'wifi connect'

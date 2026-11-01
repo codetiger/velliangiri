@@ -42,11 +42,11 @@ Status of every hardware block, checked against the drivers in the tree and the 
 
 - Not the stock 3 Mbaud: the UART's two clock sources measure about 51.3 MHz and 24 MHz, there is no fractional divider (the slot register does not latch), and 3,206,250 baud (51.3 MHz / 16) is not matched by the controller.
 - This controller firmware sets extra high bits in the LE advertising report type, so the kernel logs "unknown advertising packet type" for some reports and drops them.
-- Pairing and connections are untested (needs a device to pair with), and pairings are not yet kept across reboots (`/var/lib/bluetooth` is in RAM).
+- Pairing and connections are untested (needs a device to pair with). Keyboards are supported in the kernel (`hidp` for Classic, `uhid` for LE through BlueZ), and pairings are kept on `Data` (`/linux/var/lib/bluetooth`, bind-mounted on `/var/lib/bluetooth`).
 
 ### RTC known limits
 
-- Nothing sets the clock automatically: the image runs no NTP client, so the time has to be set once after power-up (`date -s`, then `hwclock -w`). With the clock set, the kernel keeps it in step from then on (`CONFIG_RTC_SYSTOHC`) only while the system clock is synchronised.
+- The clock is set from the network: the DHCP lease hook starts busybox `ntpd` (`pool.ntp.org`) on the first lease (Ethernet or Wi-Fi), and its event hook writes the time to the PMU RTC once it is known. Without a network after a power loss, the clock falls back to the image build date until a lease arrives.
 - The alarm fires and is reported, but waking the board from MCU standby with it is untested.
 
 ### Thermal known limits

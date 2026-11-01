@@ -12,6 +12,8 @@ log_msg() {
 clean_shutdown() {
 	log_msg "syncing and unmounting NAND filesystems before $1..."
 	sync
+	# Stop the daemons that write to Data before unmounting it
+	killall bluetoothd 2>/dev/null || true
 	if [ -r /proc/mounts ]; then
 		awk '$1 ~ /^\/dev\/nand/ || $3 == "hfsplus" { print $2 }' /proc/mounts | sort -r | while read -r mp; do
 			if ! umount "$mp" 2>/dev/null; then
@@ -35,6 +37,22 @@ hostname -F /etc/hostname 2>/dev/null || hostname velliangiri 2>/dev/null || tru
 if [ -c /dev/watchdog ]; then
 	watchdog -T 60 -t 15 /dev/watchdog
 	log_msg "hardware watchdog daemon active (60s bite, 15s feed)"
+fi
+
+# Compressed swap in RAM: the root filesystem already lives in RAM, so idle
+# pages are packed with lz4 instead of being kept whole. A quarter of RAM
+# (about 120 MiB) typically holds two to three times that in idle pages.
+if [ -w /sys/block/zram0/disksize ]; then
+	mem_kb=$(awk '/^MemTotal:/ { print $2 }' /proc/meminfo)
+	echo lz4 >/sys/block/zram0/comp_algorithm 2>/dev/null || true
+	if echo "$((mem_kb / 4))K" >/sys/block/zram0/disksize 2>/dev/null &&
+		mkswap /dev/zram0 >/dev/null 2>&1 && swapon -p 100 /dev/zram0 2>/dev/null; then
+		# zram swap is cheap compared to dropping and re-reading file pages from NAND
+		echo 100 >/proc/sys/vm/swappiness 2>/dev/null || true
+		log_msg "zram0: $((mem_kb / 4 / 1024)) MiB lz4 swap active"
+	else
+		log_msg "zram0: swap setup failed"
+	fi
 fi
 
 # Bring up USB CDC-ECM + CDC-ACM gadget if UDC is active
@@ -229,8 +247,17 @@ if [ "$DATA" = 1 ]; then
 		chmod 600 "$PDIR/wpa_supplicant/wpa_supplicant.conf" 2>/dev/null
 		log_msg "nand0p2: seeded persistent wpa_supplicant.conf"
 	fi
+	# Bluetooth pairings are written by bluetoothd whenever a device pairs, so
+	# its state directory lives on Data, which stays mounted for the session
+	# (clean_shutdown unmounts it before reboot, halt and power-off)
+	BTSTATE=/mnt/data/linux/var/lib/bluetooth
+	mkdir -p "$BTSTATE" /var/lib/bluetooth
+	chmod 700 "$BTSTATE" 2>/dev/null || true
+	if mount --bind "$BTSTATE" /var/lib/bluetooth 2>/dev/null; then
+		log_msg "nand0p2: Bluetooth pairings kept in /linux/var/lib/bluetooth"
+	fi
 	sync
-	umount /mnt/data 2>/dev/null || true
+	log_msg "nand0p2: Data stays mounted at /mnt/data"
 fi
 
 # Start Dropbear SSH server on port 22 in background

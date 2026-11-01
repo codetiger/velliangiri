@@ -44,14 +44,19 @@ apply_mac() {
 
 persist_conf() {
 	[ -b /dev/nand0p2 ] || return 0
-	mkdir -p /mnt/data
-	if mount -t hfsplus -o rw /dev/nand0p2 /mnt/data 2>/dev/null; then
-		mkdir -p /mnt/data/linux/etc/wpa_supplicant
-		cp "$CONF" /mnt/data/linux/etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null || true
-		chmod 600 /mnt/data/linux/etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null || true
-		sync
-		umount /mnt/data 2>/dev/null || true
+	# stage2 keeps Data mounted at /mnt/data; mount it only if it is not
+	mounted=0
+	if ! grep -q " /mnt/data hfsplus " /proc/mounts 2>/dev/null; then
+		mkdir -p /mnt/data
+		mount -t hfsplus -o rw /dev/nand0p2 /mnt/data 2>/dev/null || return 0
+		mounted=1
 	fi
+	mkdir -p /mnt/data/linux/etc/wpa_supplicant
+	cp "$CONF" /mnt/data/linux/etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null || true
+	chmod 600 /mnt/data/linux/etc/wpa_supplicant/wpa_supplicant.conf 2>/dev/null || true
+	sync
+	[ "$mounted" = 1 ] && umount /mnt/data 2>/dev/null
+	return 0
 }
 
 start() {
