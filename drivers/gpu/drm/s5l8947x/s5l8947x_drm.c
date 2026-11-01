@@ -31,15 +31,19 @@
 #include <linux/clk.h>
 #include <linux/delay.h>
 #include <linux/hdmi.h>
+#include <linux/hrtimer.h>
 #include <linux/i2c.h>
+#include <linux/interrupt.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
+#include <linux/ktime.h>
 #include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/s5l8947x-display.h>
+#include <linux/string.h>
 #include <linux/workqueue.h>
 
 #include <drm/drm_atomic_helper.h>
@@ -70,6 +74,8 @@
 #define RGB_2068		0x2068
 #define RGB_2078		0x2078
 #define RGB_2088		0x2088
+/* Interrupt registers decoded from the stock driver; see irq_probe below */
+#define RGB_INT_STATUS		0x1014
 #define RGB_PLANE0		0x4000
 #define  PLANE_CTL		0x40
 #define  PLANE_ADDR		0x44
@@ -80,6 +86,8 @@
 #define OUT_START		0x00
 #define OUT_CFG			0x04
 #define OUT_RESET		0x08
+#define OUT_INT_EN		0x10
+#define OUT_INT_STATUS		0x14
 #define OUT_1C			0x1c
 #define OUT_24			0x24
 #define OUT_VSIZE		0x34
@@ -147,6 +155,34 @@
 
 #define S5L_MAX_W		4096
 #define S5L_MAX_H		2048
+
+#define S5L_IRQ_PROBE_MS	1000
+#define S5L_IRQ_PROBE_MAX	4096
+
+/*
+ * One-shot interrupt probe. The display node carries three interrupts, but
+ * no frame/vblank source is known: the stock driver only enables the
+ * output-stage error bits and the display-pipe interrupts are all error
+ * conditions. On j33iap all three lines stay silent while the display runs
+ * (measured 2026-11-01, with the output-stage enable at 1 and its status at
+ * 0), so the probe is kept to look for error events and for any board whose
+ * wiring differs. A line that keeps firing is disabled after
+ * S5L_IRQ_PROBE_MAX hits, so an unacknowledged level interrupt cannot lock
+ * up the CPU.
+ */
+struct s5l_irq_probe {
+	struct mutex lock;
+	int irq;
+	atomic_t hits;
+	u64 first_ns;
+	u64 last_ns;
+	u32 int_en;
+	u32 int_status;
+	u32 rgbout_status;
+	u32 hpd;
+	bool storm;
+	bool valid;
+};
 
 /*
  * Highest pixel clock with a clean HDMI link on this board. 1280x1024@60
@@ -387,9 +423,74 @@ struct s5l_display {
 	unsigned int audio_channels;
 	unsigned int gamma_brightness;
 	unsigned long tmds_hz;
+	struct hrtimer vblank_timer;
+	ktime_t vblank_period;
+	struct s5l_irq_probe probe;
 };
 
 static struct s5l_display *g_s5l_display;
+
+/*
+ * Forced display mode, "WxH" or "WxH@Hz". Empty keeps the sink's native
+ * mode. This exists for workloads that need a higher refresh rate than the
+ * sink's largest drivable mode offers: a 4K sink is driven at 1080p30
+ * because the PHY tops out at 108 MHz, while 1280x720@60 is within reach.
+ * Writing a value re-probes the connector, so the mode can be chosen at
+ * runtime without rebuilding the device tree.
+ */
+static char s5l_preferred_mode[32];
+static struct kparam_string s5l_preferred_mode_param = {
+	.maxlen = sizeof(s5l_preferred_mode),
+	.string = s5l_preferred_mode,
+};
+
+static int s5l_preferred_mode_set(const char *val, const struct kernel_param *kp)
+{
+	char buf[sizeof(s5l_preferred_mode)];
+	char *mode;
+	unsigned int w, h;
+	int hz = 0;
+
+	if (!val || strlen(val) >= sizeof(buf))
+		return -ENOSPC;
+
+	/* sysfs appends a newline; accept surrounding whitespace */
+	strscpy(buf, val, sizeof(buf));
+	mode = strim(buf);
+
+	/* An empty value clears the override; anything else must parse */
+	if (*mode && sscanf(mode, "%ux%u@%d", &w, &h, &hz) < 2)
+		return -EINVAL;
+
+	strscpy(s5l_preferred_mode, mode, sizeof(s5l_preferred_mode));
+
+	if (g_s5l_display)
+		drm_kms_helper_hotplug_event(&g_s5l_display->drm);
+	return 0;
+}
+
+static const struct kernel_param_ops s5l_preferred_mode_ops = {
+	.set	= s5l_preferred_mode_set,
+	.get	= param_get_string,
+};
+module_param_cb(preferred_mode, &s5l_preferred_mode_ops,
+		&s5l_preferred_mode_param, 0644);
+MODULE_PARM_DESC(preferred_mode,
+	"Force a display mode as WxH[@Hz], for example 1280x720@60");
+
+/*
+ * The display path has no frame interrupt: the output-stage status only
+ * carries error bits and all three display lines stay silent while the
+ * display runs. Report a vblank at the mode's refresh rate from an hrtimer
+ * instead, so page flips complete on time and FBIO_WAITFORVSYNC blocks.
+ * This is pacing, not phase: the timer is not locked to the scanout, so it
+ * reduces tearing without guaranteeing it. Off gives the old behaviour of
+ * completing every flip immediately.
+ */
+static bool vblank_sim = true;
+module_param(vblank_sim, bool, 0444);
+MODULE_PARM_DESC(vblank_sim,
+	"synthesize a vblank at the mode refresh rate (default on)");
 
 static inline struct s5l_display *to_s5l(struct drm_device *drm)
 {
@@ -907,16 +1008,40 @@ static enum drm_mode_status s5l_pipe_mode_valid(struct drm_simple_display_pipe *
 	return s5l_mode_ok(mode);
 }
 
-static void s5l_send_event(struct drm_crtc *crtc)
+/*
+ * Complete the commit's event. With a synthesized vblank the event is armed
+ * so it is sent on the next tick; the reference keeps vblanking on until
+ * then. Otherwise, and when vblanking is unavailable, send it now.
+ */
+static void s5l_complete_event(struct drm_crtc *crtc, bool wait_vblank)
 {
 	struct drm_pending_vblank_event *event = crtc->state->event;
+	unsigned long flags;
 
 	if (!event)
 		return;
 	crtc->state->event = NULL;
-	spin_lock_irq(&crtc->dev->event_lock);
+
+	if (wait_vblank && vblank_sim && drm_crtc_vblank_get(crtc) == 0) {
+		spin_lock_irqsave(&crtc->dev->event_lock, flags);
+		drm_crtc_arm_vblank_event(crtc, event);
+		spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+		return;
+	}
+
+	spin_lock_irqsave(&crtc->dev->event_lock, flags);
 	drm_crtc_send_vblank_event(crtc, event);
-	spin_unlock_irq(&crtc->dev->event_lock);
+	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+}
+
+static enum hrtimer_restart s5l_vblank_timer(struct hrtimer *timer)
+{
+	struct s5l_display *d = container_of(timer, struct s5l_display,
+					     vblank_timer);
+
+	drm_crtc_handle_vblank(&d->pipe.crtc);
+	hrtimer_forward_now(timer, d->vblank_period);
+	return HRTIMER_RESTART;
 }
 
 static void s5l_pipe_enable(struct drm_simple_display_pipe *pipe,
@@ -948,23 +1073,42 @@ static void s5l_pipe_enable(struct drm_simple_display_pipe *pipe,
 	}
 	mutex_unlock(&d->lock);
 
+	if (vblank_sim) {
+		int refresh = drm_mode_vrefresh(m);
+
+		if (refresh > 0) {
+			d->vblank_period = ns_to_ktime(
+				DIV_ROUND_CLOSEST(NSEC_PER_SEC, refresh));
+			drm_crtc_vblank_on(&d->pipe.crtc);
+			hrtimer_start(&d->vblank_timer, d->vblank_period,
+				      HRTIMER_MODE_REL);
+		}
+	}
+
 	if (ret)
 		drm_err(&d->drm, "PHY not ready for %s\n", m->name);
 	else
 		drm_info(&d->drm, "%ux%u@%u, %u kHz, %s\n", m->hdisplay, m->vdisplay,
 			 drm_mode_vrefresh(m), m->clock, hdmi_mode ? "HDMI" : "DVI");
-	s5l_send_event(&pipe->crtc);
+	s5l_complete_event(&pipe->crtc, false);
 }
 
 static void s5l_pipe_disable(struct drm_simple_display_pipe *pipe)
 {
 	struct s5l_display *d = to_s5l(pipe->crtc.dev);
 
+	if (vblank_sim)
+		hrtimer_cancel(&d->vblank_timer);
+
 	mutex_lock(&d->lock);
 	s5l_hdmi_stop(d);
 	writel(1, d->out + OUT_START);
 	mutex_unlock(&d->lock);
-	s5l_send_event(&pipe->crtc);
+	s5l_complete_event(&pipe->crtc, false);
+
+	/* Flushes any flip that was still waiting for a tick */
+	if (vblank_sim)
+		drm_crtc_vblank_off(&d->pipe.crtc);
 }
 
 static void s5l_pipe_update(struct drm_simple_display_pipe *pipe,
@@ -982,7 +1126,8 @@ static void s5l_pipe_update(struct drm_simple_display_pipe *pipe,
 		       p + PLANE_STRIDE);
 		writel(RGB_COMMIT_VAL, d->rgbout + RGB_COMMIT);
 	}
-	s5l_send_event(&pipe->crtc);
+
+	s5l_complete_event(&pipe->crtc, pipe->crtc.state->active);
 }
 
 static const struct drm_simple_display_pipe_funcs s5l_pipe_funcs = {
@@ -1055,6 +1200,39 @@ static void s5l_pick_preferred(struct drm_connector *conn)
 		    m->hdisplay, m->vdisplay, drm_mode_vrefresh(m));
 }
 
+/* True if the requested mode was found and marked preferred */
+static bool s5l_force_preferred(struct drm_connector *conn)
+{
+	struct drm_display_mode *m, *pick = NULL;
+	unsigned int w, h;
+	int hz = 0, best = INT_MAX;
+
+	if (sscanf(s5l_preferred_mode, "%ux%u@%d", &w, &h, &hz) < 2)
+		return false;
+
+	list_for_each_entry(m, &conn->probed_modes, head) {
+		int delta;
+
+		if (m->hdisplay != w || m->vdisplay != h)
+			continue;
+		if (s5l_mode_ok(m) != MODE_OK)
+			continue;
+		delta = hz ? abs(drm_mode_vrefresh(m) - hz) : 0;
+		if (!pick || delta < best) {
+			pick = m;
+			best = delta;
+		}
+	}
+	if (!pick)
+		return false;
+
+	list_for_each_entry(m, &conn->probed_modes, head)
+		m->type &= ~DRM_MODE_TYPE_PREFERRED;
+	pick->type |= DRM_MODE_TYPE_PREFERRED;
+	drm_info(conn->dev, "forced mode %s\n", pick->name);
+	return true;
+}
+
 static int s5l_conn_get_modes(struct drm_connector *conn)
 {
 	const struct drm_edid *edid = drm_edid_read(conn);
@@ -1069,6 +1247,20 @@ static int s5l_conn_get_modes(struct drm_connector *conn)
 		/* No EDID: offer 720p, which every HDMI sink takes */
 		n = drm_add_modes_noedid(conn, 1280, 720);
 		drm_set_preferred_mode(conn, 1280, 720);
+	}
+
+	if (s5l_preferred_mode[0] && !s5l_force_preferred(conn)) {
+		unsigned int w, h;
+
+		/*
+		 * The sink need not list the requested mode: add the
+		 * standard 60 Hz modes the pipe can drive and look again.
+		 */
+		if (sscanf(s5l_preferred_mode, "%ux%u", &w, &h) == 2)
+			n += drm_add_modes_noedid(conn, w, h);
+		if (n && !s5l_force_preferred(conn))
+			drm_warn(conn->dev, "preferred_mode %s not available\n",
+				 s5l_preferred_mode);
 	}
 	return n;
 }
@@ -1202,6 +1394,139 @@ static ssize_t gamma_brightness_store(struct device *dev, struct device_attribut
 }
 static DEVICE_ATTR_RW(gamma_brightness);
 
+/*
+ * irq_probe: write one of the display interrupt numbers, wait a second, read
+ * the result. Used to look for a frame/vblank source on real hardware. The
+ * status words of the three candidate blocks are captured on the first hit;
+ * nothing is written, so a pending error interrupt is not cleared and shows
+ * up as a storm.
+ *
+ * A second value sets the output-stage interrupt-enable register for the
+ * duration of the probe and restores it afterwards, which is needed when the
+ * source is masked: "echo 44 1 > irq_probe".
+ */
+static irqreturn_t s5l_irq_probe_irq(int irq, void *data)
+{
+	struct s5l_display *d = data;
+	struct s5l_irq_probe *p = &d->probe;
+	u64 now = ktime_get_ns();
+
+	if (atomic_inc_return(&p->hits) == 1) {
+		p->first_ns = now;
+		p->int_status = readl(d->out + OUT_INT_STATUS);
+		p->rgbout_status = readl(d->rgbout + RGB_INT_STATUS);
+		p->hpd = readl(d->hdmi + HDMI_HPD_STATUS);
+	}
+	p->last_ns = now;
+
+	if (atomic_read(&p->hits) > S5L_IRQ_PROBE_MAX && !p->storm) {
+		p->storm = true;
+		disable_irq_nosync(irq);
+	}
+	return IRQ_HANDLED;
+}
+
+static ssize_t irq_probe_show(struct device *dev, struct device_attribute *a,
+			      char *buf)
+{
+	struct s5l_display *d = dev_get_drvdata(dev);
+	struct platform_device *pdev = to_platform_device(dev);
+	struct s5l_irq_probe *p = &d->probe;
+	ssize_t len = 0;
+	unsigned int hits;
+	u64 span, avg;
+	int i, nirq, irq;
+
+	nirq = platform_irq_count(pdev);
+	for (i = 0; i < nirq; i++) {
+		irq = platform_get_irq(pdev, i);
+		if (irq >= 0)
+			len += sysfs_emit_at(buf, len, "%s%d", i ? " " : "",
+					     irq);
+	}
+	len += sysfs_emit_at(buf, len, "\n");
+
+	mutex_lock(&p->lock);
+	if (p->valid) {
+		hits = atomic_read(&p->hits);
+		span = (hits > 1 && p->last_ns > p->first_ns) ?
+		       p->last_ns - p->first_ns : 0;
+		avg = hits > 1 ? div_u64(span, hits - 1) : 0;
+		len += sysfs_emit_at(buf, len,
+			"last: irq=%d hits=%u storm=%u span_us=%llu avg_us=%llu "
+			"en=0x%08x status=0x%08x rgbout=0x%08x hpd=0x%08x\n",
+			p->irq, hits, p->storm,
+			div_u64(span, NSEC_PER_USEC), div_u64(avg, NSEC_PER_USEC),
+			p->int_en, p->int_status, p->rgbout_status, p->hpd);
+	}
+	mutex_unlock(&p->lock);
+	return len;
+}
+
+static ssize_t irq_probe_store(struct device *dev, struct device_attribute *a,
+			       const char *buf, size_t count)
+{
+	struct s5l_display *d = dev_get_drvdata(dev);
+	struct platform_device *pdev = to_platform_device(dev);
+	struct s5l_irq_probe *p = &d->probe;
+	unsigned int want, en = 0;
+	int i, nirq, irq = -1, parsed, ret;
+
+	parsed = sscanf(buf, "%u %x", &want, &en);
+	if (parsed < 1)
+		return -EINVAL;
+
+	nirq = platform_irq_count(pdev);
+	for (i = 0; i < nirq; i++) {
+		int n = platform_get_irq(pdev, i);
+
+		if (n >= 0 && n == (int)want) {
+			irq = n;
+			break;
+		}
+	}
+	if (irq < 0)
+		return -EINVAL;
+
+	mutex_lock(&p->lock);
+	p->irq = irq;
+	atomic_set(&p->hits, 0);
+	p->first_ns = 0;
+	p->last_ns = 0;
+	p->storm = false;
+	p->valid = false;
+	/*
+	 * Snapshot the blocks, so a silent line still reports what it saw.
+	 * The enable/status pair lives in the output stage.
+	 */
+	p->int_en = readl(d->out + OUT_INT_EN);
+	p->int_status = readl(d->out + OUT_INT_STATUS);
+	p->rgbout_status = readl(d->rgbout + RGB_INT_STATUS);
+	p->hpd = readl(d->hdmi + HDMI_HPD_STATUS);
+	if (parsed == 2)
+		writel(en, d->out + OUT_INT_EN);
+
+	ret = request_irq(irq, s5l_irq_probe_irq, 0, "s5l-irqprobe", d);
+	if (ret)
+		goto out_restore;
+
+	msleep(S5L_IRQ_PROBE_MS);
+
+	/* Balance the disable the handler did within the probe window */
+	if (p->storm)
+		enable_irq(irq);
+	free_irq(irq, d);
+	p->valid = true;
+
+out_restore:
+	if (parsed == 2)
+		writel(p->int_en, d->out + OUT_INT_EN);
+	mutex_unlock(&p->lock);
+
+	return ret ? ret : count;
+}
+static DEVICE_ATTR_RW(irq_probe);
+
 static ssize_t scaler_status_show(struct device *dev, struct device_attribute *a,
 				  char *buf)
 {
@@ -1292,6 +1617,7 @@ static struct attribute *s5l_attrs[] = {
 	&dev_attr_phy_ready.attr,
 	&dev_attr_plane_phys.attr,
 	&dev_attr_gamma_brightness.attr,
+	&dev_attr_irq_probe.attr,
 	&dev_attr_scaler_status.attr,
 	&dev_attr_hdmi_audio.attr,
 	NULL,
@@ -1320,6 +1646,7 @@ static int s5l_probe(struct platform_device *pdev)
 	struct device_node *ddc_node;
 	struct s5l_display *d;
 	struct drm_device *drm;
+	const char *preferred;
 	unsigned int i;
 	int ret;
 
@@ -1338,6 +1665,7 @@ static int s5l_probe(struct platform_device *pdev)
 	d->tmds_hz = 74250000;
 	d->audio_channels = 2;
 	mutex_init(&d->lock);
+	mutex_init(&d->probe.lock);
 	platform_set_drvdata(pdev, d);
 
 	d->ddc = of_get_i2c_adapter_by_node(ddc_node);
@@ -1379,6 +1707,14 @@ static int s5l_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	/*
+	 * The board may name the mode to start in; a value given on the
+	 * command line or written to the module parameter takes precedence.
+	 */
+	if (!s5l_preferred_mode[0] &&
+	    !device_property_read_string(dev, "apple,preferred-mode", &preferred))
+		strscpy(s5l_preferred_mode, preferred, sizeof(s5l_preferred_mode));
+
 	ret = drmm_mode_config_init(drm);
 	if (ret)
 		return ret;
@@ -1403,6 +1739,14 @@ static int s5l_probe(struct platform_device *pdev)
 		return ret;
 	drm_mode_config_reset(drm);
 
+	hrtimer_init(&d->vblank_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
+	d->vblank_timer.function = s5l_vblank_timer;
+	if (vblank_sim) {
+		ret = drm_vblank_init(drm, 1);
+		if (ret)
+			return ret;
+	}
+
 	/* Take over from the boot framebuffer the loader set up */
 	ret = aperture_remove_all_conflicting_devices(s5l_drm_driver.name);
 	if (ret)
@@ -1426,6 +1770,7 @@ static void s5l_remove(struct platform_device *pdev)
 {
 	struct s5l_display *d = platform_get_drvdata(pdev);
 
+	hrtimer_cancel(&d->vblank_timer);
 	cancel_delayed_work_sync(&d->hpd_work);
 	drm_dev_unplug(&d->drm);
 	drm_atomic_helper_shutdown(&d->drm);
@@ -1436,6 +1781,7 @@ static void s5l_shutdown(struct platform_device *pdev)
 {
 	struct s5l_display *d = platform_get_drvdata(pdev);
 
+	hrtimer_cancel(&d->vblank_timer);
 	drm_atomic_helper_shutdown(&d->drm);
 }
 

@@ -215,6 +215,11 @@
 /* Display pipe (rgbout + out + HDMI + M2M scaler) */
 &display_pipe {
 	status = "okay";
+	/*
+	 * Start in 720p60: the PHY stops at 108 MHz, so 1080p is only
+	 * available at 30 Hz. s5l8947x_drm.preferred_mode still overrides.
+	 */
+	apple,preferred-mode = "1280x720@60";
 };
 
 /* Audio (I2S0..I2S3 to HDMI, S/PDIF to optical) */
