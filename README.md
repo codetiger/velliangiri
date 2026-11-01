@@ -31,13 +31,13 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 |---|---|
 | **CPU & Core SoC** | Single-core Cortex-A9 up to 850 MHz (VFPv3-D32 and ARM NEON), CPU frequency scaling (`212.5` / `425` / `850 MHz`), 512 KB PL310 L2 cache (~3.7 GB/s L2 and ~1.6 GB/s DRAM NEON streaming read), `aic,1` interrupt controller, 24 MHz timer, 42-channel central DMA (`dmaengine`), hardware watchdog, clean reboot and standby power-off |
 | **Clocks, GPIO, I2C, PMU** | PMGR peripheral clock gates and audio oscillators, 144-pin GPIO and pinctrl controller (with IRQs), 3x I2C controllers, Dialog I2C PMU power switches, real-time clock (with alarm) and temperature sensors (four board thermistors, PMU junction) with a CPU thermal zone |
-| **HDMI Video** | DRM/KMS driver with EDID mode detection (up to 1920x1080@30, picked to match the TV's native aspect ratio), framebuffer console, a 1080p logo boot splash drawn by the pre-kernel loader, hardware gamma LUT, and memory-to-memory hardware scaler |
+| **HDMI Video** | DRM/KMS driver with EDID mode detection (up to 1920x1080@30; the board starts at 1280x720@60 for 60 Hz output with a synthesized vblank for frame pacing), framebuffer console, a 1080p logo boot splash drawn by the pre-kernel loader, hardware gamma LUT, and memory-to-memory hardware scaler |
 | **Audio (HDMI & Optical)** | ALSA playback (`s5l8947x-audio`) on two PCM devices: HDMI over I2S (`pcmC0D0p`, 2/4/6/8-channel LPCM with one data line per channel pair) and optical S/PDIF (`pcmC0D1p`), each fed by a cyclic DMA transfer with period interrupts, with HDMI hot-plug mute/unmute and a `wavplay` CLI player |
 | **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
 | **USB Networking & Console** | Micro-USB port runs in USB device mode (`dwc2`), providing a virtual Ethernet link (`usb0` at `10.55.0.2`, SSH enabled) and a USB serial console (`/dev/ttyGS0`) |
 | **Wi-Fi (2.4 & 5 GHz)** | Broadcom BCM4334 over internal HSIC USB host (`ehci-platform` + custom PHY handshake); scans and joins WPA2 networks via `wpa_supplicant` and the built-in `wifi` helper; firmware, NVRAM, and the factory MAC address are read from the device's own NAND at boot; the regulatory country can be set with `iw reg set` or `country=` in `wpa_supplicant.conf` |
 | **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2` at 1.6 Mbaud); patch firmware and the factory device address are read from the device's own NAND at boot; LE scanning verified with `btscan`; BlueZ (`bluetoothd`, `bluetoothctl`) runs at boot and discovers nearby devices; the controller sleeps when idle and wakes the host through the PMU's host-wake interrupt |
-| **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`S5L8947X IR Remote`, `/dev/input/event*`) via the MSP430 system microcontroller on `uart1`, with the stock version/active handshake at probe, ACK-waited raw commands, an event trace for further protocol work, and the MCU NMI line as a wake source |
+| **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`S5L8947X IR Remote`, `/dev/input/event*`) via the MSP430 system microcontroller on `uart1`, with the stock version/active handshake at probe, ACK-waited raw commands, an event trace for further protocol work, and the MCU NMI line as a wake source. The board enables `apple,game-keys`, so the seven buttons report game keys (arrows, Ctrl, Space, Escape); `.../game_map` switches back to media codes |
 | **Hardware AES Engine** | CDMA AES crypto engine (`s5l8947x-aes` at `0x37801000`): `ecb(aes)` and `cbc(aes)` `skcipher` algorithms (128 / 192 / 256-bit keys) over CDMA channels 1 and 2, plus hardware device/group key operations (`s5l8947x_aes_hwkey_crypt()`) |
 | **Hardware SHA Engine & NEON Crypto** | SHA-2 engine (`s5l8947x-sha` at `0x30200000`): `sha224`, `sha256`, `sha384` and `sha512` hashes, alongside built-in ARMv7/NEON kernel crypto (`sha1-neon`, `sha256-neon`, `sha512-neon`, `blake2b-neon`, `blake2s-arm`, `chacha20-neon`, `poly1305-neon`, `aes-arm`, `aes-neonbs`) and `AF_ALG` userspace sockets |
 | **Internal NAND & Volumes** | Managed NAND controller (`s5l8947x-fmi`, 8.9 GB, read/write/erase on `/dev/mtd0`, ~17 MiB/s reads over CDMA) and read-write translation layer (`s5l8947x-ftl`) exposing `/dev/nand0`, `/dev/nand0p1` (`System`, 1.4 GB), and `/dev/nand0p2` (`Data`, 6.5 GB, volume key and per-file `com.apple.system.cprotect` keys of all four protection classes, from the reserved SLC key store and the system keybag); both volumes mount read-write as `hfsplus` with journal verification/replay, transparent file encryption/decryption, and clean unmount handling |
@@ -108,6 +108,7 @@ wifi status                  # Check Wi-Fi link speed and IP address
 wavplay /path/to/file.wav    # Play a WAV file over HDMI (-d /dev/snd/pcmC0D1p for optical)
 btscan 10                    # Scan for Bluetooth LE advertisers for 10 seconds
 l2bench                      # Measure L1, L2, and DRAM latency and NEON streaming bandwidth
+fbtest -s 5                  # Measure framebuffer write throughput at the current mode
 ```
 
 ---
@@ -185,7 +186,7 @@ Instead of storing a full kernel source tree, this repository holds only the fil
 | `scripts/patches/` | 9 small, self-contained patches to mainline Linux 6.12 files |
 | `scripts/boot/` | Position-independent entry stub, pre-kernel C loader, HDMI init, boot splash and its generator |
 | `scripts/tests/` | On-device hardware test suite (`hwtest`) |
-| `scripts/tools/` | Userspace tools built into the image (`-mcpu=cortex-a9 -mfpu=neon`): diagnostics (`peek`, `i2cpoke`, `l2bench`), `wavplay`, `btscan`, the firmware carvers (`hcdcarve`, `sgxcarve`), and the early entropy seeder `jitterseed` |
+| `scripts/tools/` | Userspace tools built into the image (`-mcpu=cortex-a9 -mfpu=neon`): diagnostics (`peek`, `i2cpoke`, `l2bench`, `fbtest`), `wavplay`, `btscan`, the firmware carvers (`hcdcarve`, `sgxcarve`), and the early entropy seeder `jitterseed` |
 | `config/` | Kernel configuration fragments layered on `multi_v7_defconfig` |
 | `initramfs/` | Init scripts, USB gadget / SSH setup, and the `wifi` helper |
 | `progress.md`, `benchmarks.md` | Per-block driver status / hardware notes and on-device ARM NEON / subsystem benchmark tables |
