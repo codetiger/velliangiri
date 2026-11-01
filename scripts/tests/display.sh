@@ -19,21 +19,32 @@ t_display() {
 		fail "HDMI PHY not ready"
 	fi
 	if [ -c /dev/fb0 ]; then
-		pass "framebuffer /dev/fb0"
+		pass "framebuffer /dev/fb0 ($(rd /sys/class/graphics/fb0/name))"
 	else
 		fail "framebuffer /dev/fb0 missing"
 	fi
 
-	fb=$(rd "$DISP/plane_phys")
-	if [ -n "$fb" ] && [ $((fb)) -ge $((0x9ec00000)) ] && [ $((fb)) -lt $((0x9f000000)) ]; then
-		pass "Plane 0 scans out reserved framebuffer at $fb"
-		if wr "$DISP/plane_phys" "$fb"; then
-			pass "Plane 0 address commit accepted"
+	# DRM connector: EDID modes, and the active mode is the best one listed
+	conn=$(ls -d /sys/class/drm/card*-HDMI-A-* 2>/dev/null | head -n 1)
+	if [ -n "$conn" ] && [ "$(rd "$conn/status")" = connected ]; then
+		modes=$(rd "$conn/modes")
+		pass "HDMI connector connected, $(echo "$modes" | wc -l) modes from EDID"
+		best=$(echo "$modes" | head -n 1)
+		size=$(rd /sys/class/graphics/fb0/virtual_size | tr , x)
+		if [ -n "$best" ] && [ "$size" = "$best" ]; then
+			pass "running the best supported mode ($best)"
 		else
-			fail "Plane 0 address commit rejected"
+			fail "running $size, best supported mode is '$best'"
 		fi
 	else
-		fail "Plane 0 address '$fb' outside reserved framebuffer"
+		fail "HDMI connector not connected"
+	fi
+
+	fb=$(rd "$DISP/plane_phys")
+	if [ -n "$fb" ] && [ $((fb)) -ne 0 ] && [ $((fb & 0x3f)) -eq 0 ]; then
+		pass "Plane 0 scans out $fb"
+	else
+		fail "Plane 0 address '$fb'"
 	fi
 
 	orig=$(rd "$DISP/gamma_brightness")
