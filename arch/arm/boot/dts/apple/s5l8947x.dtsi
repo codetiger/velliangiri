@@ -349,6 +349,8 @@
 				 <&pmgr_gates 80>, <&pmgr_gates 26>;
 			clock-names = "hperf-rt-a", "rgbout-a", "hperf-rt-b",
 				      "rgbout-b", "hdmi", "scaler";
+			/* HDMI DDC (EDID at 0x50) */
+			ddc-i2c-bus = <&i2c2>;
 			status = "disabled";
 		};
 
