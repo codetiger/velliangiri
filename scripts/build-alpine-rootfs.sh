@@ -49,10 +49,10 @@ python3 "${ROOT}/scripts/apk-unpack.py" \
 	done
 )
 
-# Cross-compile the early entropy seeder, diagnostic tools, the WAV player and the BT patch carver
+# Cross-compile the early entropy seeder, diagnostic tools, the WAV player and the BT patch and GPU microkernel carvers
 # ("<installed name>:<source in scripts/tools>")
 echo "[rootfs] Cross-compiling userspace tools ..."
-for tool in jitterseed:jitterseed.c peek:mmio-peek.c i2cpoke:i2c-poke.c wavplay:wavplay.c l2bench:l2bench.c btscan:btscan.c hcdcarve:hcdcarve.c; do
+for tool in jitterseed:jitterseed.c peek:mmio-peek.c i2cpoke:i2c-poke.c wavplay:wavplay.c l2bench:l2bench.c btscan:btscan.c hcdcarve:hcdcarve.c sgxcarve:sgxcarve.c; do
 	"${CROSS_CC}" -O2 -Wall -Wextra -static \
 		-o "${STAGE_DIR}/bin/${tool%%:*}" "${ROOT}/scripts/tools/${tool#*:}" -lm
 	chmod 755 "${STAGE_DIR}/bin/${tool%%:*}"
@@ -65,9 +65,9 @@ cp "${ROOT}"/scripts/tests/*.sh "${TEST_DIR}/"
 chmod 755 "${TEST_DIR}/hwtest.sh"
 ln -sf /usr/share/velliangiri/tests/hwtest.sh "${STAGE_DIR}/bin/hwtest"
 
-# Wi-Fi and Bluetooth firmware are never part of the image: stage2.sh
+# Wi-Fi, Bluetooth and GPU firmware are never part of the image: stage2.sh
 # provisions them at boot from the on-device System volume (/dev/nand0p1).
-mkdir -p "${STAGE_DIR}/lib/firmware/brcm"
+mkdir -p "${STAGE_DIR}/lib/firmware/brcm" "${STAGE_DIR}/lib/firmware/s5l8947x"
 
 # Install initramfs boot and DHCP scripts
 echo "[rootfs] Installing initramfs boot scripts ..."
