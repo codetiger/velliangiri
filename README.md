@@ -32,7 +32,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **CPU & Core SoC** | Single-core Cortex-A9 up to 850 MHz (VFPv3-D32 and ARM NEON), CPU frequency scaling (`212.5` / `425` / `850 MHz`), 512 KB PL310 L2 cache (~3.7 GB/s L2 and ~1.6 GB/s DRAM NEON streaming read), `aic,1` interrupt controller, 24 MHz timer, 42-channel central DMA (`dmaengine`), hardware watchdog, clean reboot and standby power-off |
 | **Clocks, GPIO, I2C, PMU** | PMGR peripheral clock gates and audio oscillators, 144-pin GPIO and pinctrl controller (with IRQs), 3x I2C controllers, Dialog I2C PMU power switches, real-time clock (with alarm) and temperature sensors (four board thermistors, PMU junction) with a CPU thermal zone |
 | **HDMI Video** | DRM/KMS driver with EDID mode detection (up to 1920x1080@30; the board starts at 1280x720@60 for 60 Hz output with a synthesized vblank for frame pacing), framebuffer console, a 1080p logo boot splash drawn by the pre-kernel loader, and hardware gamma LUT |
-| **Hardware Scaler** | Both M2 memory-to-memory scalers (`s5l8947x-m2sc`, `/dev/video0` and `/dev/video1`) as V4L2 mem2mem devices: scaling up to 8x down, NV12/NV16/YUYV to and from RGB565/XRGB1555/XRGB8888 with BT.601 or BT.709 matrices in limited or full range, MMAP and DMABUF buffers. NV12 640x360 to XRGB8888 1280x720 takes 5 ms at under 10% CPU |
+| **Hardware Scaler** | Both M2 memory-to-memory scalers (`s5l8947x-m2sc`, `/dev/video0` and `/dev/video1`) as V4L2 mem2mem devices: scaling up to 8x down, NV12/NV16/YUYV to and from RGB565/XRGB1555/XRGB8888 with BT.601 or BT.709 matrices in limited or full range, MMAP and DMABUF buffers, including zero-copy output into DRM framebuffers. NV12 640x360 to XRGB8888 1280x720 takes 5 ms at under 10% CPU |
 | **Audio (HDMI & Optical)** | ALSA playback (`s5l8947x-audio`) on two PCM devices: HDMI over I2S (`pcmC0D0p`, 2/4/6/8-channel LPCM with one data line per channel pair) and optical S/PDIF (`pcmC0D1p`), each fed by a cyclic DMA transfer with period interrupts, with HDMI hot-plug mute/unmute and a `wavplay` CLI player |
 | **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
 | **USB Networking & Console** | Micro-USB port runs in USB device mode (`dwc2`), providing a virtual Ethernet link (`usb0` at `10.55.0.2`, SSH enabled) and a USB serial console (`/dev/ttyGS0`) |
@@ -111,6 +111,7 @@ btscan 10                    # Scan for Bluetooth LE advertisers for 10 seconds
 l2bench                      # Measure L1, L2, and DRAM latency and NEON streaming bandwidth
 fbtest -s 5                  # Measure framebuffer write throughput at the current mode
 m2mtest nv12 640x360 xrgb 1280x720  # Scale and convert on the hardware scaler; reports fps and CPU
+m2mshow                      # Scale a moving test frame straight into the display (zero-copy DMABUF)
 ```
 
 ---
@@ -189,7 +190,7 @@ Instead of storing a full kernel source tree, this repository holds only the fil
 | `scripts/patches/` | 9 small, self-contained patches to mainline Linux 6.12 files |
 | `scripts/boot/` | Position-independent entry stub, pre-kernel C loader, HDMI init, boot splash and its generator |
 | `scripts/tests/` | On-device hardware test suite (`hwtest`) |
-| `scripts/tools/` | Userspace tools built into the image (`-mcpu=cortex-a9 -mfpu=neon`): diagnostics (`peek`, `i2cpoke`, `l2bench`, `fbtest`, `m2mtest`), `wavplay`, `btscan`, the firmware carvers (`hcdcarve`, `sgxcarve`), and the early entropy seeder `jitterseed` |
+| `scripts/tools/` | Userspace tools built into the image (`-mcpu=cortex-a9 -mfpu=neon`): diagnostics (`peek`, `i2cpoke`, `l2bench`, `fbtest`, `m2mtest`, `m2mshow`), `wavplay`, `btscan`, the firmware carvers (`hcdcarve`, `sgxcarve`), and the early entropy seeder `jitterseed` |
 | `config/` | Kernel configuration fragments layered on `multi_v7_defconfig` |
 | `initramfs/` | Init scripts, USB gadget / SSH setup, and the `wifi` helper |
 | `progress.md`, `benchmarks.md` | Per-block driver status / hardware notes and on-device ARM NEON / subsystem benchmark tables |

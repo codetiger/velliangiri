@@ -194,12 +194,14 @@ static double now(void)
 	return ts.tv_sec + ts.tv_nsec / 1e9;
 }
 
+static uint32_t src_size;
+
 static void one_frame(void)
 {
 	struct v4l2_buffer b = { .memory = V4L2_MEMORY_MMAP };
 
 	b.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-	b.bytesused = 0;
+	b.bytesused = src_size;
 	xioctl(VIDIOC_QBUF, &b, "QBUF out");
 	b = (struct v4l2_buffer){ .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
 				  .memory = V4L2_MEMORY_MMAP };
@@ -250,6 +252,7 @@ int main(int argc, char **argv)
 	printf("%s: %.4s %ux%u (stride %u) -> %.4s %ux%u (stride %u)\n", dev,
 	       (char *)&s.pixelformat, s.width, s.height, s.bytesperline,
 	       (char *)&d.pixelformat, d.width, d.height, d.bytesperline);
+	src_size = s.sizeimage;
 	fill(&s, sb.p);
 	memset(db.p, 0, db.len);
 
