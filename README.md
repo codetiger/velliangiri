@@ -46,7 +46,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 
 | Area | Current Limitation |
 |---|---|
-| **3D GPU acceleration** | On hold. The PowerVR SGX543 power domain and clocks come up for bus telemetry, but there is no DRM/3D rendering driver. Graphics use the CPU-rendered KMS framebuffer. |
+| **3D GPU acceleration** | The PowerVR SGX543 microkernel starts (firmware carved from the on-device System volume at boot), but there is no command submission, DRM render driver or OpenGL ES userspace. Graphics use the CPU-rendered KMS framebuffer. |
 | **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a CDC-ECM + CDC-ACM composite gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
 | **Audio sample rates** | HDMI plays `32`, `44.1` and `48 kHz` exactly. Optical is still clocked from the 24 MHz crystal and runs at `46,875 Hz`; use `wavplay` (which resamples automatically) or ALSA resampling there. The optical output has not been checked on a receiver yet. |
 | **Bluetooth** | The controller runs at 1.6 Mbaud rather than the stock 3 Mbaud (the UART clocks cannot produce 3 Mbaud), and pairing and connections through `bluetoothctl` have not been tested yet. |
