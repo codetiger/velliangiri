@@ -1,0 +1,16 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config DRM_S5L8947X
+	tristate "S5L8947X display pipe and HDMI"
+	depends on DRM && OF
+	depends on ARCH_APPLE_S5L || COMPILE_TEST
+	select DRM_KMS_HELPER
+	select DRM_GEM_DMA_HELPER
+	select DRM_DISPLAY_HELPER
+	select HDMI
+	select VIDEOMODE_HELPERS
+	default ARCH_APPLE_S5L
+	help
+	  KMS driver for the S5L8947X rgbout display pipe and its HDMI 1.4
+	  transmitter. Modes come from the sink's EDID; the HDMI PHY limits
+	  them to a 162 MHz pixel clock (1080p60). It also provides the HDMI
+	  audio bridge used by the S5L8947X ALSA driver.

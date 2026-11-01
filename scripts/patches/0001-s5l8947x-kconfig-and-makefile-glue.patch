@@ -20,6 +20,8 @@ existing Apple drivers.
  drivers/crypto/Makefile             |  2 ++
  drivers/dma/Kconfig                 | 12 ++++++++++++
  drivers/dma/Makefile                |  1 +
+ drivers/gpu/drm/Kconfig             |  2 ++
+ drivers/gpu/drm/Makefile            |  1 +
  drivers/hwmon/Kconfig               |  8 ++++++++
  drivers/hwmon/Makefile              |  1 +
  drivers/i2c/busses/Kconfig          |  8 ++++++++
@@ -46,11 +48,9 @@ existing Apple drivers.
  drivers/rtc/Makefile                |  1 +
  drivers/soc/apple/Kconfig           | 11 ++++++++++-
  drivers/soc/apple/Makefile          |  2 ++
- drivers/video/fbdev/Kconfig         |  9 +++++++++
- drivers/video/fbdev/Makefile        |  1 +
  sound/arm/Kconfig                   | 12 ++++++++++++
  sound/arm/Makefile                  |  2 ++
- 41 files changed, 233 insertions(+), 2 deletions(-)
+ 41 files changed, 226 insertions(+), 2 deletions(-)
 
 diff --git a/arch/arm/Kconfig b/arch/arm/Kconfig
 index cc8becc..f8c2184 100644
@@ -217,6 +217,29 @@ index ad6a03c..78888e8 100644
  obj-$(CONFIG_STE_DMA40) += ste_dma40.o ste_dma40_ll.o
  obj-$(CONFIG_SPRD_DMA) += sprd-dma.o
  obj-$(CONFIG_TXX9_DMAC) += txx9dmac.o
+diff --git a/drivers/gpu/drm/Kconfig b/drivers/gpu/drm/Kconfig
+--- a/drivers/gpu/drm/Kconfig
++++ b/drivers/gpu/drm/Kconfig
+@@ -457,6 +457,8 @@
+ 
+ source "drivers/gpu/drm/tiny/Kconfig"
+ 
++source "drivers/gpu/drm/s5l8947x/Kconfig"
++
+ source "drivers/gpu/drm/pl111/Kconfig"
+ 
+ source "drivers/gpu/drm/tve200/Kconfig"
+diff --git a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
+--- a/drivers/gpu/drm/Makefile
++++ b/drivers/gpu/drm/Makefile
+@@ -208,6 +208,7 @@
+ obj-y			+= hisilicon/
+ obj-y			+= mxsfb/
+ obj-y			+= tiny/
++obj-$(CONFIG_DRM_S5L8947X) += s5l8947x/
+ obj-$(CONFIG_DRM_PL111) += pl111/
+ obj-$(CONFIG_DRM_TVE200) += tve200/
+ obj-$(CONFIG_DRM_XEN) += xen/
 diff --git a/drivers/hwmon/Kconfig b/drivers/hwmon/Kconfig
 --- a/drivers/hwmon/Kconfig
 +++ b/drivers/hwmon/Kconfig
@@ -625,32 +648,6 @@ index 4d9ab8f..e77a163 100644
  apple-sart-y = sart.o
 +
 +obj-$(CONFIG_APPLE_S5L8947X_SGX) += s5l8947x-sgx.o
-diff --git a/drivers/video/fbdev/Kconfig b/drivers/video/fbdev/Kconfig
-index de03507..ed90ec4 100644
---- a/drivers/video/fbdev/Kconfig
-+++ b/drivers/video/fbdev/Kconfig
-@@ -1816,3 +1816,12 @@ source "drivers/video/fbdev/omap2/Kconfig"
- source "drivers/video/fbdev/mmp/Kconfig"
- 
- source "drivers/video/fbdev/core/Kconfig"
-+
-+config FB_S5L8947X_DISPLAY
-+	tristate "S5L8947X Display Pipe (rgbout), HDMI 1.4, and M2M Scaler support"
-+	depends on ARCH_APPLE_S5L || COMPILE_TEST
-+	depends on OF
-+	default ARCH_APPLE_S5L
-+	help
-+	  Support for the S5L8947X rgbout display pipe, 10-bit gamma stage,
-+	  HDMI 1.4 transmitter, and M2M hardware scaler.
-diff --git a/drivers/video/fbdev/Makefile b/drivers/video/fbdev/Makefile
-index b3d12f9..0cd2e04 100644
---- a/drivers/video/fbdev/Makefile
-+++ b/drivers/video/fbdev/Makefile
-@@ -126,3 +126,4 @@ obj-$(CONFIG_FB_SIMPLE)           += simplefb.o
- 
- # the test framebuffer is last
- obj-$(CONFIG_FB_VIRTUAL)          += vfb.o
-+obj-$(CONFIG_FB_S5L8947X_DISPLAY) += s5l8947x-display.o
 diff --git a/sound/arm/Kconfig b/sound/arm/Kconfig
 index dea2c66..8175dcb 100644
 --- a/sound/arm/Kconfig
@@ -663,7 +660,7 @@ index dea2c66..8175dcb 100644
 +	tristate "S5L8947X I2S0 / S/PDIF audio"
 +	depends on ARCH_APPLE_S5L || COMPILE_TEST
 +	depends on OF && COMMON_CLK
-+	depends on FB_S5L8947X_DISPLAY || !FB_S5L8947X_DISPLAY
++	depends on DRM_S5L8947X || !DRM_S5L8947X
 +	depends on DMA_ENGINE
 +	select SND_PCM
 +	default ARCH_APPLE_S5L
