@@ -1,6 +1,6 @@
 # Driver Progress (`S5L8947X` / `j33iap`)
 
-Status of every hardware block, checked against the drivers in the tree and the enabled nodes in `s5l8947x-j33iap.dts`. Last reviewed 2026-11-01 (`hwtest`: 106 passed, 0 failed, 2 skipped).
+Status of every hardware block, checked against the drivers in the tree and the enabled nodes in `s5l8947x-j33iap.dts`. Last reviewed 2026-11-01 (`hwtest`: 106 passed, 0 failed, 2 skipped). For full cache, crypto, and ARM NEON benchmark tables, see [benchmarks.md](benchmarks.md).
 
 ## Done
 
@@ -8,7 +8,7 @@ Status of every hardware block, checked against the drivers in the tree and the 
 |---|---|---|
 | Interrupt controller, 24 MHz timer | `0x3f200000` | `drivers/irqchip/irq-apple-aic1.c` |
 | Watchdog, clocksource, restart | `0x3f103020` | `arch/arm/mach-apple/` |
-| L2 cache (PL310, 512 KB) | `0x3e000000` | mainline `cache-l2x0.c`, started from `arch/arm/mach-apple/s5l8947x.c`; loader leaves it disabled |
+| L2 cache (PL310, 512 KB) & ARM NEON | `0x3e000000` | mainline `cache-l2x0.c`, started from `arch/arm/mach-apple/s5l8947x.c`; loader leaves it disabled. At 850 MHz, `l2bench` measures ~4.7 ns L1 latency, ~45–64 ns L2 latency, ~159 ns DRAM latency, and NEON streaming read bandwidth of ~3,728 MB/s from L2 (256 KB) and ~1,596 MB/s from DRAM (16 MB). The rootfs uses Alpine `armv7` packages and static tools in `scripts/tools/` are built with `-O2 -mcpu=cortex-a9 -mfpu=neon` and NEON intrinsics (`sgxcarve` Adler-32 at 397 MB/s, `wavplay` stereo resampler at 174 MB/s). |
 | PMGR clock gates and audio oscillators | `0x3f101008`, `0x3f100110` | `drivers/clk/clk-s5l8940x-pmgr.c`; 28 peripheral gates on `j33iap` are claimed via Device Tree (`cdma`, `display_pipe`, `eth0`, `i2c0`/`i2c2`, `uart1`/`uart2`, `fmi0`, `audio0`, `usb_phy`/`usb_ehci`, `aes`, `sgx0`), while the pre-kernel loader enables core and early-boot gates. The seven audio oscillators (NCOs) are a second provider: the output is set to the hertz from a 342 MHz reference (measured, two thirds of the 513 MHz PLL), and channel 0 clocks the I2S master |
 | CPU frequency (212.5 / 425 / 850 MHz) | `0x3f100000` | `drivers/cpufreq/s5l8947x-cpufreq.c`; every state keeps the peripheral divider, so the 51.3 MHz UART clock does not change with the CPU speed |
 | I2C 0/1/2 | `0x33200000`..`0x33400000` | `drivers/i2c/busses/i2c-s5l8940x.c` |

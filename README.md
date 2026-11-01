@@ -29,7 +29,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 
 | Hardware | Status & Details |
 |---|---|
-| **CPU & Core SoC** | Single-core Cortex-A9 up to 850 MHz (VFPv3-D32 and ARM NEON), CPU frequency scaling (`212.5` / `425` / `850 MHz`), 512 KB PL310 L2 cache, `aic,1` interrupt controller, 24 MHz timer, 42-channel central DMA (`dmaengine`), hardware watchdog, clean reboot and standby power-off |
+| **CPU & Core SoC** | Single-core Cortex-A9 up to 850 MHz (VFPv3-D32 and ARM NEON), CPU frequency scaling (`212.5` / `425` / `850 MHz`), 512 KB PL310 L2 cache (~3.7 GB/s L2 and ~1.6 GB/s DRAM NEON streaming read), `aic,1` interrupt controller, 24 MHz timer, 42-channel central DMA (`dmaengine`), hardware watchdog, clean reboot and standby power-off |
 | **Clocks, GPIO, I2C, PMU** | PMGR peripheral clock gates and audio oscillators, 144-pin GPIO and pinctrl controller (with IRQs), 3x I2C controllers, Dialog I2C PMU power switches, real-time clock (with alarm) and temperature sensors (four board thermistors, PMU junction) with a CPU thermal zone |
 | **HDMI Video** | DRM/KMS driver with EDID mode detection (up to 1920x1080@30, picked to match the TV's native aspect ratio), framebuffer console, a 1080p logo boot splash drawn by the pre-kernel loader, hardware gamma LUT, and memory-to-memory hardware scaler |
 | **Audio (HDMI & Optical)** | ALSA playback (`s5l8947x-audio`) on two PCM devices: HDMI over I2S (`pcmC0D0p`, verified clean with speech) and optical S/PDIF (`pcmC0D1p`), each fed by a cyclic DMA transfer with period interrupts, with HDMI hot-plug mute/unmute and a `wavplay` CLI player |
@@ -51,7 +51,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **Audio sample rates** | HDMI plays `32`, `44.1` and `48 kHz` exactly. Optical is still clocked from the 24 MHz crystal and runs at `46,875 Hz`; use `wavplay` (which resamples automatically) or ALSA resampling there. The optical output has not been checked on a receiver yet. |
 | **Bluetooth** | The controller runs at 1.6 Mbaud rather than the stock 3 Mbaud (the UART clocks cannot produce 3 Mbaud), and pairing and connections through `bluetoothctl` have not been tested yet. |
 
-For exact register addresses, driver file paths, and per-block notes, see [progress.md](progress.md).
+For exact register addresses, driver file paths, and per-block notes, see [progress.md](progress.md). For cache/memory latency, kernel crypto, and ARM NEON SIMD benchmarks measured on the device, see [benchmarks.md](benchmarks.md).
 
 ---
 
@@ -107,6 +107,7 @@ wifi connect "MySSID" "PSK"  # Connect to WPA2 Wi-Fi and obtain a DHCP lease
 wifi status                  # Check Wi-Fi link speed and IP address
 wavplay /path/to/file.wav    # Play a WAV file over HDMI (-d /dev/snd/pcmC0D1p for optical)
 btscan 10                    # Scan for Bluetooth LE advertisers for 10 seconds
+l2bench                      # Measure L1, L2, and DRAM latency and NEON streaming bandwidth
 ```
 
 ---
@@ -183,9 +184,10 @@ Instead of storing a full kernel source tree, this repository holds only the fil
 | `scripts/patches/` | 9 small, self-contained patches to mainline Linux 6.12 files |
 | `scripts/boot/` | Position-independent entry stub, pre-kernel C loader, HDMI init, boot splash and its generator |
 | `scripts/tests/` | On-device hardware test suite (`hwtest`) |
-| `scripts/tools/` | Userspace tools built into the image: diagnostics (`peek`, `i2cpoke`, `l2bench`), `wavplay`, `btscan`, the Bluetooth patch carver `hcdcarve`, and the early entropy seeder `jitterseed` |
+| `scripts/tools/` | Userspace tools built into the image (`-mcpu=cortex-a9 -mfpu=neon`): diagnostics (`peek`, `i2cpoke`, `l2bench`), `wavplay`, `btscan`, the firmware carvers (`hcdcarve`, `sgxcarve`), and the early entropy seeder `jitterseed` |
 | `config/` | Kernel configuration fragments layered on `multi_v7_defconfig` |
 | `initramfs/` | Init scripts, USB gadget / SSH setup, and the `wifi` helper |
+| `progress.md`, `benchmarks.md` | Per-block driver status / hardware notes and on-device ARM NEON / subsystem benchmark tables |
 
 ---
 
