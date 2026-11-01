@@ -31,7 +31,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 |---|---|
 | **CPU & Core SoC** | Single-core Cortex-A9 up to 850 MHz, CPU frequency scaling (`212.5` / `425` / `850 MHz`), 512 KB PL310 L2 cache, `aic,1` interrupt controller, 24 MHz timer, 42-channel central DMA (`dmaengine`), hardware watchdog, clean reboot and standby power-off |
 | **Clocks, GPIO, I2C, PMU** | PMGR peripheral clock gates and audio oscillators, 144-pin GPIO and pinctrl controller (with IRQs), 3x I2C controllers, Dialog I2C PMU power switches, real-time clock (with alarm) and temperature sensors (four board thermistors, PMU junction) with a CPU thermal zone |
-| **HDMI Video** | 720p60 framebuffer console (`simple-framebuffer` + `s5l8947x-display`), a logo boot splash drawn by the pre-kernel loader, 10-bit hardware gamma LUT, and memory-to-memory hardware scaler |
+| **HDMI Video** | DRM/KMS driver with EDID mode detection (up to 1920x1080@30, picked to match the TV's native aspect ratio), framebuffer console, a 1080p logo boot splash drawn by the pre-kernel loader, hardware gamma LUT, and memory-to-memory hardware scaler |
 | **Audio (HDMI & Optical)** | ALSA playback (`s5l8947x-audio`) on two PCM devices: HDMI over I2S (`pcmC0D0p`, verified clean with speech) and optical S/PDIF (`pcmC0D1p`), each fed by a cyclic DMA transfer with period interrupts, with HDMI hot-plug mute/unmute and a `wavplay` CLI player |
 | **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
 | **USB Networking & Console** | Micro-USB port runs in USB device mode (`dwc2`), providing a virtual Ethernet link (`usb0` at `10.55.0.2`, SSH enabled) and a USB serial console (`/dev/ttyGS0`) |
@@ -46,7 +46,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 
 | Area | Current Limitation |
 |---|---|
-| **3D GPU acceleration** | On hold. The PowerVR SGX543 power domain and clocks come up for bus telemetry, but there is no DRM/3D rendering driver. Graphics use the 720p CPU framebuffer. |
+| **3D GPU acceleration** | On hold. The PowerVR SGX543 power domain and clocks come up for bus telemetry, but there is no DRM/3D rendering driver. Graphics use the CPU-rendered KMS framebuffer. |
 | **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a CDC-ECM + CDC-ACM composite gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
 | **Audio sample rates** | HDMI plays `32`, `44.1` and `48 kHz` exactly. Optical is still clocked from the 24 MHz crystal and runs at `46,875 Hz`; use `wavplay` (which resamples automatically) or ALSA resampling there. The optical output has not been checked on a receiver yet. |
 | **Bluetooth** | The controller runs at 1.6 Mbaud rather than the stock 3 Mbaud (the UART clocks cannot produce 3 Mbaud), and pairing and connections through `bluetoothctl` have not been tested yet. |
@@ -132,7 +132,7 @@ Drivers that apply across the SoC family are already named `s5l8940x` and parame
 | **Temperature sensors** | `drivers/hwmon/apple-pmu-hwmon.c` | PMU ADC readings of the board thermistors and the PMU junction as hwmon channels; the SoC thermistor drives a thermal zone with cpufreq cooling. |
 | **USB 2.0 PHY** | `drivers/phy/phy-apple-s5l-usb.c` | OTG device PHY (paired with mainline `dwc2`) and EHCI HSIC host PHY with GPIO ready handshaking. |
 | **UART** | `scripts/patches/0002-*.patch` | Hooks `ARCH_APPLE_S5L` into mainline `samsung_tty.c` (`apple,s5l-uart`). |
-| **Display & HDMI** | `drivers/video/fbdev/s5l8947x-display.c` | `rgbout` display pipe, 10-bit gamma LUTs, M2M hardware scaler, and HDMI 1.4 transmitter. |
+| **Display & HDMI** | `drivers/gpu/drm/s5l8947x/s5l8947x_drm.c` | DRM/KMS driver for the `rgbout` display pipe and HDMI 1.4 transmitter: EDID modes, PHY configuration per pixel clock, AVI and audio infoframes, gamma LUT, M2M hardware scaler. |
 | **Central DMA** | `drivers/dma/s5l8947x-cdma.c` | 42-channel `dmaengine` provider: slave scatter-gather (both directions, audio `0x34000000` and NAND `0x31000000` windows) and cyclic transfers with per-channel interrupts. |
 | **Audio** | `sound/arm/s5l8947x-audio.c` | I2S (HDMI) and S/PDIF (optical) transmitters, each fed by a cyclic DMA transfer. |
 | **CDMA AES Engine** | `drivers/crypto/s5l8947x-aes.c`<br>`include/linux/s5l8947x-aes.h` | `ecb(aes)` and `cbc(aes)` `skcipher` algorithms over CDMA channels 1 and 2, plus `s5l8947x_aes_hwkey_crypt()` for the hardware device and group keys. |
@@ -146,7 +146,7 @@ Device bootloaders in this family do not boot standard Linux `zImage` + Device T
 To solve this cleanly for any board, `scripts/build-bundle.sh` wraps the kernel in a tiny, self-relocating pre-kernel loader:
 
 1. **Position-independent entry stub (`scripts/boot/entry-stub.S`):** Runs from whatever RAM address the bootloader loads it at. It masks interrupts, cleanly flushes/invalidates L1 and PL310 L2 caches whether the MMU was on or off, disables the MMU, arms the hardware watchdog as a 120-second safety net, copies the payload to the start of RAM (`0x80000000`), and jumps there.
-2. **Pre-kernel C loader (`scripts/boot/boot-loader.c`):** Runs in the first 32 KB of RAM (`0x80000000..0x80007fff`), turns on essential PMGR clock gates, draws the boot splash and starts 720p scanout for `simple-framebuffer`, and jumps to `zImage` at `0x80008000` with `r2` pointing to the appended `.dtb`. Its stack grows down from `0x80007000` in the same slot, so the build rejects a loader image larger than 24 KB.
+2. **Pre-kernel C loader (`scripts/boot/boot-loader.c`):** Runs in the first 32 KB of RAM (`0x80000000..0x80007fff`), turns on essential PMGR clock gates, draws the boot splash and starts 1080p30 scanout for `simple-framebuffer` (8 MB reserved at `0x9e400000`), and jumps to `zImage` at `0x80008000` with `r2` pointing to the appended `.dtb`. Its stack grows down from `0x80007000` in the same slot, so the build rejects a loader image larger than 24 KB.
 3. **Boot splash (`scripts/boot/gen-splash.py`, `splash.c`):** At build time the generator flattens `logo.svg` and the wordmark into polygon tables with precomputed edge slopes, and the loader fills them into the framebuffer with no runtime division. To brand a port, replace `logo.svg`.
 
 ### Step-by-step guide to porting a new board
