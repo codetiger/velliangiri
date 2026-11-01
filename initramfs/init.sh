@@ -32,11 +32,13 @@ msg "stage1 starting"
 
 # The kernel sets the clock from the PMU RTC when that has been set since
 # power-up; otherwise, or if it is older than the image, use the build
-# timestamp so TLS/SSH services start with a plausible date.
+# timestamp so TLS/SSH services start with a plausible date. An RTC older
+# than the image is wrong, so it gets the new time too.
 if [ -r /etc/build-date ]; then
 	read -r BUILD_EPOCH < /etc/build-date || true
 	if [ -n "$BUILD_EPOCH" ] && [ "$(date -u +%s)" -lt "$BUILD_EPOCH" ]; then
 		date -u -s "@$BUILD_EPOCH" >/dev/null 2>&1 || true
+		[ -e /dev/rtc0 ] && hwclock -w -u -f /dev/rtc0 >/dev/null 2>&1 || true
 	fi
 fi
 
