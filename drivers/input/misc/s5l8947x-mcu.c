@@ -36,6 +36,7 @@
 #include <linux/interrupt.h>
 #include <linux/kernel.h>
 #include <linux/ktime.h>
+#include <linux/math64.h>
 #include <linux/module.h>
 #include <linux/mutex.h>
 #include <linux/of.h>
@@ -126,6 +127,7 @@ struct s5l8947x_mcu {
 
 	unsigned int key;		/* key held down, or KEY_RESERVED */
 	u8 key_code;			/* its NEC command byte */
+	bool game_map;			/* remote reports game keys */
 
 	int nmi_irq;
 	atomic_t nmi_count;
@@ -150,6 +152,8 @@ struct s5l8947x_mcu {
 static const unsigned int s5l8947x_mcu_keys[] = {
 	KEY_UP, KEY_DOWN, KEY_LEFT, KEY_RIGHT, KEY_ENTER, KEY_MENU,
 	KEY_PLAYPAUSE,
+	/* game mapping of the same buttons */
+	KEY_ESC, KEY_LEFTCTRL, KEY_SPACE,
 };
 
 static u16 s5l8947x_mcu_crc16(u16 crc, const u8 *data, size_t len)
@@ -165,13 +169,19 @@ static u16 s5l8947x_mcu_crc16(u16 crc, const u8 *data, size_t len)
 	return crc;
 }
 
-static unsigned int s5l8947x_mcu_map_ir_key(u8 code)
+/*
+ * The remote has seven buttons. The default mapping keeps their media key
+ * codes; the game mapping (apple,game-keys in the device tree) turns the
+ * same buttons into the keys a first-person shooter expects, so the arrows
+ * stay on movement and the remaining three become fire, use and menu.
+ */
+static unsigned int s5l8947x_mcu_map_ir_key(struct s5l8947x_mcu *mcu, u8 code)
 {
 	switch (code & 0xfeU) {
 	case 0x02:
-		return KEY_MENU;
+		return mcu->game_map ? KEY_ESC : KEY_MENU;
 	case MCU_IR_SELECT:
-		return KEY_ENTER;
+		return mcu->game_map ? KEY_LEFTCTRL : KEY_ENTER;
 	case 0x06:
 		return KEY_RIGHT;
 	case 0x08:
@@ -182,7 +192,7 @@ static unsigned int s5l8947x_mcu_map_ir_key(u8 code)
 		return KEY_DOWN;
 	case MCU_IR_PLAY_COMPAT:
 	case MCU_IR_PLAY:
-		return KEY_PLAYPAUSE;
+		return mcu->game_map ? KEY_SPACE : KEY_PLAYPAUSE;
 	default:
 		return KEY_UNKNOWN;
 	}
@@ -210,6 +220,14 @@ static void s5l8947x_mcu_key_release_work(struct work_struct *work)
 }
 
 /* Called with mcu->lock held */
+static void s5l8947x_mcu_key_repeat(struct s5l8947x_mcu *mcu)
+{
+	input_event(mcu->input, EV_KEY, mcu->key, 2);
+	input_sync(mcu->input);
+	mod_delayed_work(system_wq, &mcu->key_release, MCU_KEY_RELEASE);
+}
+
+/* Called with mcu->lock held */
 static void s5l8947x_mcu_handle_ir_key(struct s5l8947x_mcu *mcu,
 				       const u8 *payload, size_t len)
 {
@@ -229,8 +247,14 @@ static void s5l8947x_mcu_handle_ir_key(struct s5l8947x_mcu *mcu,
 		return;
 	}
 
+	/* A repeat of the key already down is not a new press */
+	if (mcu->key != KEY_RESERVED && code == mcu->key_code) {
+		s5l8947x_mcu_key_repeat(mcu);
+		return;
+	}
+
 	s5l8947x_mcu_key_up(mcu);
-	keycode = s5l8947x_mcu_map_ir_key(code);
+	keycode = s5l8947x_mcu_map_ir_key(mcu, code);
 	if (keycode != KEY_UNKNOWN) {
 		input_report_key(mcu->input, keycode, 1);
 		mcu->key = keycode;
@@ -245,9 +269,7 @@ static void s5l8947x_mcu_handle_ir_repeat(struct s5l8947x_mcu *mcu)
 {
 	if (mcu->key == KEY_RESERVED)
 		return;
-	input_event(mcu->input, EV_KEY, mcu->key, 2);
-	input_sync(mcu->input);
-	mod_delayed_work(system_wq, &mcu->key_release, MCU_KEY_RELEASE);
+	s5l8947x_mcu_key_repeat(mcu);
 }
 
 /* Called with mcu->lock held */
@@ -703,7 +725,7 @@ static ssize_t events_show(struct device *dev,
 		struct s5l8947x_mcu_event *event = &mcu->events[index];
 
 		pos += sysfs_emit_at(buf, pos, "%llu cmd=0x%02x len=%u data=%*phN\n",
-				     event->ts_ns / NSEC_PER_MSEC, event->cmd,
+				     div_u64(event->ts_ns, NSEC_PER_MSEC), event->cmd,
 				     event->len, event->len, event->payload);
 	}
 	spin_unlock(&mcu->lock);
@@ -775,6 +797,38 @@ static ssize_t transact_store(struct device *dev,
 }
 static DEVICE_ATTR_WO(transact);
 
+/* 0 = media key codes, 1 = game key codes (apple,game-keys in the DT) */
+static ssize_t game_map_show(struct device *dev,
+			     struct device_attribute *attr, char *buf)
+{
+	struct s5l8947x_mcu *mcu = dev_get_drvdata(dev);
+	bool on;
+
+	spin_lock(&mcu->lock);
+	on = mcu->game_map;
+	spin_unlock(&mcu->lock);
+	return sysfs_emit(buf, "%u\n", on);
+}
+
+static ssize_t game_map_store(struct device *dev,
+			      struct device_attribute *attr,
+			      const char *buf, size_t count)
+{
+	struct s5l8947x_mcu *mcu = dev_get_drvdata(dev);
+	bool on;
+	int ret;
+
+	ret = kstrtobool(buf, &on);
+	if (ret)
+		return ret;
+
+	spin_lock(&mcu->lock);
+	mcu->game_map = on;
+	spin_unlock(&mcu->lock);
+	return count;
+}
+static DEVICE_ATTR_RW(game_map);
+
 static struct attribute *s5l8947x_mcu_attrs[] = {
 	&dev_attr_fw_version.attr,
 	&dev_attr_response.attr,
@@ -787,6 +841,7 @@ static struct attribute *s5l8947x_mcu_attrs[] = {
 	&dev_attr_events.attr,
 	&dev_attr_send_cmd.attr,
 	&dev_attr_transact.attr,
+	&dev_attr_game_map.attr,
 	NULL,
 };
 ATTRIBUTE_GROUPS(s5l8947x_mcu);
@@ -876,6 +931,8 @@ static int s5l8947x_mcu_probe(struct serdev_device *serdev)
 			 mcu->recovery_cmd);
 		mcu->recovery_cmd = 0;
 	}
+
+	mcu->game_map = device_property_read_bool(dev, "apple,game-keys");
 
 	mcu->input = devm_input_allocate_device(dev);
 	if (!mcu->input)

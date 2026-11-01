@@ -171,6 +171,14 @@
 		compatible = "apple,j33-mcu";
 		current-speed = <250000>;
 		/*
+		 * The remote has seven buttons and no other input device is
+		 * present, so report them as the keys a game expects: the
+		 * arrows stay on movement, Select is fire (Ctrl), Play is
+		 * use (Space) and Menu is Escape. Clear the property for the
+		 * media key codes instead (or toggle .../game_map at runtime).
+		 */
+		apple,game-keys;
+		/*
 		 * The MCU raises its NMI/SOS line on GPIO 2, normally high
 		 * and driven low to assert it. It is also the wake source for
 		 * system suspend. GPIO 0 (MCU reset) is shared with the PMU
