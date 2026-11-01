@@ -105,10 +105,31 @@ static int s5l8940x_i2c_wait_complete(struct s5l8940x_i2c *ai)
 	return 0;
 }
 
+/*
+ * Collect the bytes of a queued read as they arrive. The receive FIFO holds
+ * 16 bytes, so longer reads (EDID blocks are 128) must be drained while the
+ * transfer runs rather than after it completes.
+ */
+static int s5l8940x_i2c_drain(struct s5l8940x_i2c *ai, struct i2c_msg *msg)
+{
+	unsigned int i;
+	u32 status;
+	int ret;
+
+	for (i = 0; i < msg->len; i++) {
+		ret = readl_relaxed_poll_timeout(ai->base + REG_MRXFIFO, status,
+						 !(status & REG_MRXFIFO_EMPTY),
+						 5, 100000);
+		if (ret)
+			return -EIO;
+		msg->buf[i] = status & REG_MRXFIFO_DATA_MASK;
+	}
+	return 0;
+}
+
 static int s5l8940x_i2c_xfer_msg(struct s5l8940x_i2c *ai, struct i2c_msg *msg,
 				 int stop)
 {
-	u32 status;
 	unsigned int i;
 	int ret;
 
@@ -120,15 +141,11 @@ static int s5l8940x_i2c_xfer_msg(struct s5l8940x_i2c *ai, struct i2c_msg *msg,
 		i2c_s5l_wr(ai, REG_MTXFIFO,
 			   REG_MTXFIFO_READ | msg->len |
 			   (stop ? REG_MTXFIFO_STOP : 0));
-		ret = s5l8940x_i2c_wait_complete(ai);
+		ret = s5l8940x_i2c_drain(ai, msg);
+		if (!ret)
+			ret = s5l8940x_i2c_wait_complete(ai);
 		if (ret)
 			return ret;
-		for (i = 0; i < msg->len; i++) {
-			status = i2c_s5l_rd(ai, REG_MRXFIFO);
-			if (status & REG_MRXFIFO_EMPTY)
-				return -EIO;
-			msg->buf[i] = status & REG_MRXFIFO_DATA_MASK;
-		}
 	} else {
 		i2c_s5l_wr(ai, REG_MTXFIFO,
 			   REG_MTXFIFO_START | (msg->addr << 1) |
@@ -156,7 +173,6 @@ static int s5l8940x_i2c_xfer_combined(struct s5l8940x_i2c *ai,
 				      struct i2c_msg *wmsg,
 				      struct i2c_msg *rmsg)
 {
-	u32 status = 0;
 	unsigned int i;
 	int ret;
 
@@ -173,24 +189,10 @@ static int s5l8940x_i2c_xfer_combined(struct s5l8940x_i2c *ai,
 	i2c_s5l_wr(ai, REG_MTXFIFO,
 		   REG_MTXFIFO_READ | rmsg->len | REG_MTXFIFO_STOP);
 
-	ret = s5l8940x_i2c_wait_complete(ai);
-	if (ret)
-		return ret;
-
-	for (i = 0; i < rmsg->len; i++) {
-		int wait = 1000;
-
-		while (wait-- > 0) {
-			status = i2c_s5l_rd(ai, REG_MRXFIFO);
-			if (!(status & REG_MRXFIFO_EMPTY))
-				break;
-			udelay(5);
-		}
-		if (status & REG_MRXFIFO_EMPTY)
-			return -EIO;
-		rmsg->buf[i] = status & REG_MRXFIFO_DATA_MASK;
-	}
-	return 0;
+	ret = s5l8940x_i2c_drain(ai, rmsg);
+	if (!ret)
+		ret = s5l8940x_i2c_wait_complete(ai);
+	return ret;
 }
 
 static int s5l8940x_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
@@ -205,7 +207,7 @@ static int s5l8940x_i2c_xfer(struct i2c_adapter *adap, struct i2c_msg *msgs,
 	    !(msgs[0].flags & I2C_M_RD) &&
 	    (msgs[1].flags & I2C_M_RD) &&
 	    msgs[0].addr == msgs[1].addr &&
-	    msgs[0].len <= 4 && msgs[1].len <= 16) {
+	    msgs[0].len <= 4 && msgs[1].len && msgs[1].len <= 255) {
 		err = s5l8940x_i2c_xfer_combined(ai, &msgs[0], &msgs[1]);
 		if (err)
 			return err;
