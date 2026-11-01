@@ -302,7 +302,7 @@ static bool autostart;
 module_param(autostart, bool, 0444);
 MODULE_PARM_DESC(autostart, "Start the GPU microkernel at probe if its firmware is present");
 
-static unsigned int clock_khz = 200000;
+static unsigned int clock_khz = 256500;
 module_param(clock_khz, uint, 0644);
 MODULE_PARM_DESC(clock_khz, "GPU core clock in kHz reported to the microkernel");
 
