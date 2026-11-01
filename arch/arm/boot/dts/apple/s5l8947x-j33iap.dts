@@ -215,7 +215,7 @@
 	status = "okay";
 };
 
-/* PowerVR SGX543 GPU (master block only; per-core registers hang the bus) */
+/* PowerVR SGX543 GPU; the microkernel is provisioned from the System volume */
 &sgx0 {
 	status = "okay";
 };
