@@ -361,5 +361,20 @@
 			clocks = <&pmgr_gates 7>, <&pmgr_gates 8>, <&pmgr_gates 9>;
 			status = "disabled";
 		};
+
+		/*
+		 * H.264/MPEG-4 decoder. The firmware is carved from the device's
+		 * own kernel image at first boot (vxdcarve); there is no decode
+		 * interface yet, only power, upload and the microkernel handshake.
+		 */
+		vxd: video-decoder@8100000 {
+			compatible = "apple,s5l8947x-vxd";
+			reg = <0x8100000 0x1000>;
+			interrupts = <50>;
+			clocks = <&pmgr_gates 10>;
+			clock-names = "vdec";
+			firmware-name = "s5l8947x/vxd390.fw";
+			status = "disabled";
+		};
 	};
 };

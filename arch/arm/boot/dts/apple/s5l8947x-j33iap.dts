@@ -220,6 +220,11 @@
 	status = "okay";
 };
 
+/* VXD decoder: power, firmware upload and handshake (no decode interface yet) */
+&vxd {
+	status = "okay";
+};
+
 / {
 	thermal-zones {
 		/* Board thermistor next to the SoC (temp1) */

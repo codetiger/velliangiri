@@ -64,6 +64,7 @@ BT_REBIND=0
 BOARD=monopoly
 GPUFW=/lib/firmware/s5l8947x
 GPU_FILE=sgx543.fw
+VXD_FILE=vxd390.fw
 
 # Copy the BCM4334 Wi-Fi firmware, NVRAM and Bluetooth patch out of the on-device
 # System volume (/dev/nand0p1): its files are compressed, and the Bluetooth patch is
@@ -101,6 +102,17 @@ provision_from_system() {
 		else
 			rm -f "$GPUFW/$GPU_FILE.tmp"
 			log_msg "nand0p1: no SGX543 microkernel ($out)"
+		fi
+	fi
+	# The video decoder firmware is in the same stock kernel image
+	if [ ! -s "$GPUFW/$VXD_FILE" ] && [ -r "$KIMG" ] && command -v vxdcarve >/dev/null; then
+		mkdir -p "$GPUFW"
+		if out=$(vxdcarve "$KIMG" "$GPUFW/$VXD_FILE.tmp" 2>&1); then
+			mv "$GPUFW/$VXD_FILE.tmp" "$GPUFW/$VXD_FILE"
+			log_msg "nand0p1: provisioned VXD decoder firmware ($out)"
+		else
+			rm -f "$GPUFW/$VXD_FILE.tmp"
+			log_msg "nand0p1: no VXD decoder firmware ($out)"
 		fi
 	fi
 	umount /mnt/system 2>/dev/null || true
@@ -148,17 +160,23 @@ if [ "$DATA" = 1 ] && [ -d "$FWCACHE" ]; then
 	case "$got" in *BCM4334B0.hcd*) BT_REBIND=1 ;; esac
 	[ -n "$got" ] && log_msg "nand0p2: firmware from cache:$got"
 fi
-if [ "$DATA" = 1 ] && [ ! -s "$GPUFW/$GPU_FILE" ] && [ -s "$GPUCACHE/$GPU_FILE" ]; then
-	mkdir -p "$GPUFW"
-	cp "$GPUCACHE/$GPU_FILE" "$GPUFW/$GPU_FILE.tmp" 2>/dev/null &&
-		mv "$GPUFW/$GPU_FILE.tmp" "$GPUFW/$GPU_FILE" &&
-		log_msg "nand0p2: firmware from cache: $GPU_FILE"
+if [ "$DATA" = 1 ]; then
+	for f in $GPU_FILE $VXD_FILE; do
+		if [ ! -s "$GPUFW/$f" ] && [ -s "$GPUCACHE/$f" ]; then
+			mkdir -p "$GPUFW"
+			cp "$GPUCACHE/$f" "$GPUFW/$f.tmp" 2>/dev/null &&
+				mv "$GPUFW/$f.tmp" "$GPUFW/$f" &&
+				log_msg "nand0p2: firmware from cache: $f"
+		fi
+	done
 fi
 missing=0
 for f in $FW_FILES; do
 	[ -s "$FW/$f" ] || missing=1
 done
-[ -s "$GPUFW/$GPU_FILE" ] || missing=1
+for f in $GPU_FILE $VXD_FILE; do
+	[ -s "$GPUFW/$f" ] || missing=1
+done
 if [ "$missing" = 1 ] && [ -b /dev/nand0p1 ]; then
 	provision_from_system
 	if [ "$DATA" = 1 ]; then
@@ -169,12 +187,14 @@ if [ "$missing" = 1 ] && [ -b /dev/nand0p1 ]; then
 				log_msg "nand0p2: cached $f"
 			fi
 		done
-		if [ -s "$GPUFW/$GPU_FILE" ] && [ ! -s "$GPUCACHE/$GPU_FILE" ]; then
-			mkdir -p "$GPUCACHE"
-			cp "$GPUFW/$GPU_FILE" "$GPUCACHE/$GPU_FILE.tmp" 2>/dev/null &&
-				mv "$GPUCACHE/$GPU_FILE.tmp" "$GPUCACHE/$GPU_FILE" &&
-				log_msg "nand0p2: cached $GPU_FILE"
-		fi
+		for f in $GPU_FILE $VXD_FILE; do
+			if [ -s "$GPUFW/$f" ] && [ ! -s "$GPUCACHE/$f" ]; then
+				mkdir -p "$GPUCACHE"
+				cp "$GPUFW/$f" "$GPUCACHE/$f.tmp" 2>/dev/null &&
+					mv "$GPUCACHE/$f.tmp" "$GPUCACHE/$f" &&
+					log_msg "nand0p2: cached $f"
+			fi
+		done
 	fi
 fi
 
