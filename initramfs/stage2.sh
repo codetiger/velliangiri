@@ -61,6 +61,8 @@ FW_FILES="brcmfmac4334.bin brcmfmac4334.txt BCM4334B0.hcd"
 BT_REBIND=0
 # The System volume carries firmware for several boards; this one's files carry its board name
 BOARD=monopoly
+GPUFW=/lib/firmware/s5l8947x
+GPU_FILE=sgx543.fw
 
 # Copy the BCM4334 Wi-Fi firmware, NVRAM and Bluetooth patch out of the on-device
 # System volume (/dev/nand0p1): its files are compressed, and the Bluetooth patch is
@@ -86,6 +88,18 @@ provision_from_system() {
 		else
 			rm -f "$FW/BCM4334B0.hcd.tmp"
 			log_msg "nand0p1: no Bluetooth patch for this board ($out)"
+		fi
+	fi
+	# The GPU microkernel lives inside the stock kernel image, not in a file of its own
+	KIMG=/mnt/system/System/Library/Caches/com.apple.kernelcaches/kernelcache
+	if [ ! -s "$GPUFW/$GPU_FILE" ] && [ -r "$KIMG" ] && command -v sgxcarve >/dev/null; then
+		mkdir -p "$GPUFW"
+		if out=$(sgxcarve "$KIMG" "$GPUFW/$GPU_FILE.tmp" 2>&1); then
+			mv "$GPUFW/$GPU_FILE.tmp" "$GPUFW/$GPU_FILE"
+			log_msg "nand0p1: provisioned SGX543 microkernel ($out)"
+		else
+			rm -f "$GPUFW/$GPU_FILE.tmp"
+			log_msg "nand0p1: no SGX543 microkernel ($out)"
 		fi
 	fi
 	umount /mnt/system 2>/dev/null || true
@@ -117,6 +131,7 @@ if [ -b /dev/nand0p2 ]; then
 fi
 PDIR=/mnt/data/linux/etc
 FWCACHE=/mnt/data/linux/lib/firmware/brcm
+GPUCACHE=/mnt/data/linux/lib/firmware/s5l8947x
 
 # Firmware: use the copy cached on Data, so later boots skip mounting System,
 # inflating its compressed files and carving the Bluetooth patch
@@ -132,10 +147,17 @@ if [ "$DATA" = 1 ] && [ -d "$FWCACHE" ]; then
 	case "$got" in *BCM4334B0.hcd*) BT_REBIND=1 ;; esac
 	[ -n "$got" ] && log_msg "nand0p2: firmware from cache:$got"
 fi
+if [ "$DATA" = 1 ] && [ ! -s "$GPUFW/$GPU_FILE" ] && [ -s "$GPUCACHE/$GPU_FILE" ]; then
+	mkdir -p "$GPUFW"
+	cp "$GPUCACHE/$GPU_FILE" "$GPUFW/$GPU_FILE.tmp" 2>/dev/null &&
+		mv "$GPUFW/$GPU_FILE.tmp" "$GPUFW/$GPU_FILE" &&
+		log_msg "nand0p2: firmware from cache: $GPU_FILE"
+fi
 missing=0
 for f in $FW_FILES; do
 	[ -s "$FW/$f" ] || missing=1
 done
+[ -s "$GPUFW/$GPU_FILE" ] || missing=1
 if [ "$missing" = 1 ] && [ -b /dev/nand0p1 ]; then
 	provision_from_system
 	if [ "$DATA" = 1 ]; then
@@ -146,6 +168,12 @@ if [ "$missing" = 1 ] && [ -b /dev/nand0p1 ]; then
 				log_msg "nand0p2: cached $f"
 			fi
 		done
+		if [ -s "$GPUFW/$GPU_FILE" ] && [ ! -s "$GPUCACHE/$GPU_FILE" ]; then
+			mkdir -p "$GPUCACHE"
+			cp "$GPUFW/$GPU_FILE" "$GPUCACHE/$GPU_FILE.tmp" 2>/dev/null &&
+				mv "$GPUCACHE/$GPU_FILE.tmp" "$GPUCACHE/$GPU_FILE" &&
+				log_msg "nand0p2: cached $GPU_FILE"
+		fi
 	fi
 fi
 
