@@ -33,7 +33,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | **Clocks, GPIO, I2C, PMU** | PMGR peripheral clock gates and audio oscillators, 144-pin GPIO and pinctrl controller (with IRQs), 3x I2C controllers, Dialog I2C PMU power switches, real-time clock (with alarm) and temperature sensors (four board thermistors, PMU junction) with a CPU thermal zone |
 | **HDMI Video** | DRM/KMS driver with EDID mode detection (up to 1920x1080@30; the board starts at 1280x720@60 for 60 Hz output with a synthesized vblank for frame pacing), framebuffer console, a 1080p logo boot splash drawn by the pre-kernel loader, and hardware gamma LUT |
 | **JPEG Decoder** | Hardware baseline JPEG decoder (`s5l8947x-jpeg`, `/dev/video2`) as a V4L2 mem2mem device: the core parses the headers itself and writes NV12, YUYV or UYVY. A 1080p photo decodes in 22 ms and, through the scaler, reaches the screen in about 32 ms at 1% CPU |
-| **Hardware Scaler** | Both M2 memory-to-memory scalers (`s5l8947x-m2sc`, `/dev/video0` and `/dev/video1`) as V4L2 mem2mem devices: scaling up to 8x down, NV12/NV16/YUYV to and from RGB565/XRGB1555/XRGB8888 with BT.601 or BT.709 matrices in limited or full range, MMAP and DMABUF buffers, including zero-copy output into DRM framebuffers. NV12 640x360 to XRGB8888 1280x720 takes 5 ms at under 10% CPU |
+| **Hardware Scaler** | Both M2 memory-to-memory scalers (`s5l8947x-m2sc`, `/dev/video0` and `/dev/video1`) as V4L2 mem2mem devices: scaling up to 8x down horizontally and 7x vertically with area-averaging filters, source crop and destination placement (letterboxing), NV12/NV16/YUYV to and from RGB565/XRGB1555/XRGB8888 with BT.601 or BT.709 matrices in limited or full range, MMAP and DMABUF buffers, including zero-copy output into DRM framebuffers. NV12 640x360 to XRGB8888 1280x720 takes 5 ms at under 10% CPU |
 | **Audio (HDMI & Optical)** | ALSA playback (`s5l8947x-audio`) on two PCM devices: HDMI over I2S (`pcmC0D0p`, 2/4/6/8-channel LPCM with one data line per channel pair) and optical S/PDIF (`pcmC0D1p`), each fed by a cyclic DMA transfer with period interrupts, with HDMI hot-plug mute/unmute and a `wavplay` CLI player |
 | **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
 | **USB Networking & Console** | Micro-USB port runs in USB device mode (`dwc2`), providing a virtual Ethernet link (`usb0` at `10.55.0.2`, SSH enabled) and a USB serial console (`/dev/ttyGS0`) |
@@ -112,8 +112,10 @@ btscan 10                    # Scan for Bluetooth LE advertisers for 10 seconds
 l2bench                      # Measure L1, L2, and DRAM latency and NEON streaming bandwidth
 fbtest -s 5                  # Measure framebuffer write throughput at the current mode
 m2mtest nv12 640x360 xrgb 1280x720  # Scale and convert on the hardware scaler; reports fps and CPU
+m2mtest -c 160,0,960x720 nv12 640x480 xrgb 1280x720  # Letterbox into a rectangle of the frame
+m2mtest -z xrgb 1920x1080 xrgb 320x180  # Downscale a 1-pixel checkerboard; checks it averages to grey
 m2mshow                      # Scale a moving test frame straight into the display (zero-copy DMABUF)
-jpegtest -s 5 photo.jpg      # Decode a JPEG on the hardware and show it through the scaler
+jpegtest -s 5 photo.jpg      # Decode a JPEG on the hardware and show it letterboxed through the scaler
 ```
 
 ---
@@ -142,7 +144,7 @@ Drivers that apply across the SoC family are already named `s5l8940x` and parame
 | **IOP coprocessor** | `drivers/soc/apple/s5l8947x-iop.c`<br>`scripts/tools/iopcarve.c` | Bring-up for the separate IOP core: clock gate (decoded from `pmgr:device-clocks`), firmware carved from the device's own kernel image, heap/page-table patching and the A5IOP start sequence. The core starts and runs its firmware, then aborts in its scheduler because the stock message-channel/endpoint setup is not implemented; there is no Linux client for it. |
 | **Display & HDMI** | `drivers/gpu/drm/s5l8947x/s5l8947x_drm.c` | DRM/KMS driver for the `rgbout` display pipe and HDMI 1.4 transmitter: EDID modes, PHY configuration per pixel clock, AVI and audio infoframes, gamma LUT. |
 | **JPEG Decoder** | `drivers/media/platform/apple/s5l8947x-jpeg.c` | V4L2 memory-to-memory baseline JPEG decoder (PMGR gate 13, IRQ 118): header phase, then body decode into NV12, YUYV or UYVY. |
-| **M2 Scaler** | `drivers/media/platform/apple/s5l8947x-m2sc.c` | V4L2 memory-to-memory scaling and colour-space conversion on both M2 instances (PMGR gates 11 and 12, IRQs 9 and 10), generated bilinear filters, and a debugfs self-test. |
+| **M2 Scaler** | `drivers/media/platform/apple/s5l8947x-m2sc.c` | V4L2 memory-to-memory scaling and colour-space conversion on both M2 instances (PMGR gates 11 and 12, IRQs 9 and 10), filters generated per job from the scaling ratio, crop and compose rectangles, and a debugfs self-test. |
 | **Central DMA** | `drivers/dma/s5l8947x-cdma.c` | 42-channel `dmaengine` provider: slave scatter-gather (both directions, audio `0x34000000` and NAND `0x31000000` windows) and cyclic transfers with per-channel interrupts. |
 | **Audio** | `sound/arm/s5l8947x-audio.c` | I2S0..I2S3 (HDMI, 2 to 8 channels over one data line per channel pair) and S/PDIF (optical) transmitters, each fed by a cyclic DMA transfer. |
 | **CDMA AES Engine** | `drivers/crypto/s5l8947x-aes.c`<br>`include/linux/s5l8947x-aes.h` | `ecb(aes)` and `cbc(aes)` `skcipher` algorithms over CDMA channels 1 and 2, plus `s5l8947x_aes_hwkey_crypt()` for the hardware device and group keys. |

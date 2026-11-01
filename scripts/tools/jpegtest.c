@@ -9,8 +9,12 @@
  * the NV12 result is written out (plane 0 then plane 1, stride printed).
  * With -s the decoded frame is handed to the M2 scaler as a DMABUF and
  * scaled straight into a DRM framebuffer at the display mode, shown for
- * the given number of seconds (stretched to fill the screen). No pixel is
- * copied by the CPU on that path.
+ * the given number of seconds, fitted to the screen with its aspect ratio
+ * kept (V4L2 crop to the image size, compose to the centred rectangle; the
+ * bars stay black). No pixel is copied by the CPU on that path. Afterwards
+ * the framebuffer is read back and the bounding box of the non-black
+ * pixels is printed, which matches the placed rectangle for an image
+ * without black edges.
  */
 #include <drm/drm.h>
 #include <drm/drm_fourcc.h>
@@ -145,8 +149,13 @@ static void m2m_run(int fd, struct v4l2_buffer *out, struct v4l2_buffer *cap, co
 	xioctl(fd, VIDIOC_DQBUF, &b, "DQBUF out");
 }
 
-static void show(int jfd, const struct v4l2_pix_format *dec, int secs)
+static void show(int jfd, const struct v4l2_pix_format *dec, uint32_t iw, uint32_t ih,
+		 int secs)
 {
+	struct v4l2_selection crop = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT,
+				       .target = V4L2_SEL_TGT_CROP };
+	struct v4l2_selection comp = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+				       .target = V4L2_SEL_TGT_COMPOSE };
 	struct v4l2_format sf = { .type = V4L2_BUF_TYPE_VIDEO_OUTPUT };
 	struct v4l2_format cf = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
 	struct v4l2_exportbuffer eb = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE, .flags = O_RDWR };
@@ -191,6 +200,20 @@ static void show(int jfd, const struct v4l2_pix_format *dec, int secs)
 	cf.fmt.pix.height = mode.vdisplay;
 	cf.fmt.pix.bytesperline = cd.pitch;
 	xioctl(sfd, VIDIOC_S_FMT, &cf, "scaler S_FMT cap");
+
+	/* the decoded frame may be padded: scale only the image itself */
+	crop.r = (struct v4l2_rect){ 0, 0, iw, ih };
+	xioctl(sfd, VIDIOC_S_SELECTION, &crop, "scaler crop");
+	/* largest centred rectangle with the image's aspect ratio */
+	comp.r.width = mode.hdisplay;
+	comp.r.height = (uint64_t)ih * mode.hdisplay / iw;
+	if (comp.r.height > mode.vdisplay) {
+		comp.r.height = mode.vdisplay;
+		comp.r.width = (uint64_t)iw * mode.vdisplay / ih;
+	}
+	comp.r.left = (mode.hdisplay - comp.r.width) / 2;
+	comp.r.top = (mode.vdisplay - comp.r.height) / 2;
+	xioctl(sfd, VIDIOC_S_SELECTION, &comp, "scaler compose");
 	rb = (struct v4l2_requestbuffers){ .count = 1, .type = sf.type,
 					   .memory = V4L2_MEMORY_DMABUF };
 	xioctl(sfd, VIDIOC_REQBUFS, &rb, "scaler REQBUFS out");
@@ -209,14 +232,34 @@ static void show(int jfd, const struct v4l2_pix_format *dec, int secs)
 	cb.m.fd = ph.fd;
 	t = now();
 	m2m_run(sfd, &ob, &cb, "scale");
-	printf("scaled %ux%u NV12 -> %ux%u XRGB8888 in %.2f ms (zero-copy)\n", dec->width,
-	       dec->height, mode.hdisplay, mode.vdisplay, 1000 * (now() - t));
+	printf("scaled %ux%u NV12 -> %ux%u at %d,%d of %ux%u XRGB8888 in %.2f ms (zero-copy)\n",
+	       crop.r.width, crop.r.height, comp.r.width, comp.r.height, comp.r.left,
+	       comp.r.top, mode.hdisplay, mode.vdisplay, 1000 * (now() - t));
 	{
 		struct drm_mode_crtc c = { .crtc_id = crtc_id, .fb_id = fb.fb_id,
 					   .set_connectors_ptr = (uintptr_t)&conn_id,
 					   .count_connectors = 1, .mode = mode, .mode_valid = 1 };
 
 		xioctl(dfd, DRM_IOCTL_MODE_SETCRTC, &c, "SETCRTC");
+	}
+	{
+		struct drm_mode_map_dumb md = { .handle = cd.handle };
+		uint32_t x, y, x0 = ~0u, y0 = ~0u, x1 = 0, y1 = 0;
+		const uint8_t *px;
+
+		xioctl(dfd, DRM_IOCTL_MODE_MAP_DUMB, &md, "MAP_DUMB");
+		px = mmap(NULL, cd.size, PROT_READ, MAP_SHARED, dfd, md.offset);
+		if (px == MAP_FAILED)
+			die("mmap fb");
+		for (y = 0; y < mode.vdisplay; y++)
+			for (x = 0; x < mode.hdisplay; x++)
+				if (((const uint32_t *)(px + y * cd.pitch))[x] & 0xffffff) {
+					x0 = x < x0 ? x : x0;
+					y0 = y < y0 ? y : y0;
+					x1 = x > x1 ? x : x1;
+					y1 = y > y1 ? y : y1;
+				}
+		printf("non-black pixels span %u,%u to %u,%u\n", x0, y0, x1, y1);
 	}
 	sleep(secs);
 }
@@ -313,7 +356,7 @@ int main(int argc, char **argv)
 		printf("wrote %s (%u bytes)\n", outfile, cf.fmt.pix.sizeimage);
 	}
 	if (secs)
-		show(jfd, &cf.fmt.pix, secs);
+		show(jfd, &cf.fmt.pix, w, h, secs);
 	return 0;
 
 usage:
