@@ -65,6 +65,7 @@ BOARD=monopoly
 GPUFW=/lib/firmware/s5l8947x
 GPU_FILE=sgx543.fw
 VXD_FILE=vxd390.fw
+IOP_FILE=iop.fw
 
 # Copy the BCM4334 Wi-Fi firmware, NVRAM and Bluetooth patch out of the on-device
 # System volume (/dev/nand0p1): its files are compressed, and the Bluetooth patch is
@@ -104,7 +105,7 @@ provision_from_system() {
 			log_msg "nand0p1: no SGX543 microkernel ($out)"
 		fi
 	fi
-	# The video decoder firmware is in the same stock kernel image
+	# The video decoder and IOP firmwares are in the same stock kernel image
 	if [ ! -s "$GPUFW/$VXD_FILE" ] && [ -r "$KIMG" ] && command -v vxdcarve >/dev/null; then
 		mkdir -p "$GPUFW"
 		if out=$(vxdcarve "$KIMG" "$GPUFW/$VXD_FILE.tmp" 2>&1); then
@@ -113,6 +114,16 @@ provision_from_system() {
 		else
 			rm -f "$GPUFW/$VXD_FILE.tmp"
 			log_msg "nand0p1: no VXD decoder firmware ($out)"
+		fi
+	fi
+	if [ ! -s "$GPUFW/$IOP_FILE" ] && [ -r "$KIMG" ] && command -v iopcarve >/dev/null; then
+		mkdir -p "$GPUFW"
+		if out=$(iopcarve "$KIMG" "$GPUFW/$IOP_FILE.tmp" 2>&1); then
+			mv "$GPUFW/$IOP_FILE.tmp" "$GPUFW/$IOP_FILE"
+			log_msg "nand0p1: provisioned IOP firmware ($out)"
+		else
+			rm -f "$GPUFW/$IOP_FILE.tmp"
+			log_msg "nand0p1: no IOP firmware ($out)"
 		fi
 	fi
 	umount /mnt/system 2>/dev/null || true
@@ -161,7 +172,7 @@ if [ "$DATA" = 1 ] && [ -d "$FWCACHE" ]; then
 	[ -n "$got" ] && log_msg "nand0p2: firmware from cache:$got"
 fi
 if [ "$DATA" = 1 ]; then
-	for f in $GPU_FILE $VXD_FILE; do
+	for f in $GPU_FILE $VXD_FILE $IOP_FILE; do
 		if [ ! -s "$GPUFW/$f" ] && [ -s "$GPUCACHE/$f" ]; then
 			mkdir -p "$GPUFW"
 			cp "$GPUCACHE/$f" "$GPUFW/$f.tmp" 2>/dev/null &&
@@ -174,7 +185,7 @@ missing=0
 for f in $FW_FILES; do
 	[ -s "$FW/$f" ] || missing=1
 done
-for f in $GPU_FILE $VXD_FILE; do
+for f in $GPU_FILE $VXD_FILE $IOP_FILE; do
 	[ -s "$GPUFW/$f" ] || missing=1
 done
 if [ "$missing" = 1 ] && [ -b /dev/nand0p1 ]; then
@@ -187,7 +198,7 @@ if [ "$missing" = 1 ] && [ -b /dev/nand0p1 ]; then
 				log_msg "nand0p2: cached $f"
 			fi
 		done
-		for f in $GPU_FILE $VXD_FILE; do
+		for f in $GPU_FILE $VXD_FILE $IOP_FILE; do
 			if [ -s "$GPUFW/$f" ] && [ ! -s "$GPUCACHE/$f" ]; then
 				mkdir -p "$GPUCACHE"
 				cp "$GPUFW/$f" "$GPUCACHE/$f.tmp" 2>/dev/null &&

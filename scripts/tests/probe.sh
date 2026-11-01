@@ -3,7 +3,8 @@
 
 t_probe() {
 	section "Driver probe"
-	for dev in "$UART1" "$UART2" "$DISP" "$AUD" "$EHCI" "$AES" "$SHA"; do
+	for dev in "$UART0" "$UART1" "$UART2" "$UART3" "$UART4" \
+		   "$DISP" "$AUD" "$EHCI" "$AES" "$SHA" "$IOP"; do
 		name=${dev##*/}
 		if bound "$dev"; then
 			drv=$(readlink "$dev/driver")
@@ -12,6 +13,15 @@ t_probe() {
 			fail "$name present but no driver bound"
 		else
 			fail "$name missing (device tree node disabled?)"
+		fi
+	done
+	# Test-point UARTs keep their alias-derived line numbers; UART1/2 are
+	# consumed by serdev (MCU and Bluetooth) and have no tty.
+	for n in 0 3 4; do
+		if [ -e "/sys/class/tty/ttySAC$n" ]; then
+			pass "UART$n tty port registered"
+		else
+			fail "UART$n tty port missing"
 		fi
 	done
 	# The SHA engine serves sha384/sha512 ahead of the generic code
@@ -25,6 +35,15 @@ t_probe() {
 			fail "$a served by '${d:-nothing}', not $a-s5l8947x"
 		fi
 	done
+	if bound "$IOP"; then
+		for fw in /lib/firmware/s5l8947x/iop.fw; do
+			if [ -s "$fw" ]; then
+				pass "IOP firmware provisioned (${fw##*/})"
+			else
+				fail "IOP firmware missing ($fw)"
+			fi
+		done
+	fi
 	if bound "$MCU"; then
 		pass "${MCU##*/} (UART1) bound to s5l8947x-mcu"
 	else

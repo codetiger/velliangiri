@@ -52,7 +52,7 @@ python3 "${ROOT}/scripts/apk-unpack.py" \
 # Cross-compile the early entropy seeder, diagnostic tools, the WAV player, the BT patch/tools and the firmware carvers
 # ("<installed name>:<source in scripts/tools>")
 echo "[rootfs] Cross-compiling userspace tools (-O2 -mcpu=cortex-a9 -mfpu=neon) ..."
-for tool in jitterseed:jitterseed.c peek:mmio-peek.c i2cpoke:i2c-poke.c wavplay:wavplay.c l2bench:l2bench.c btscan:btscan.c hcdcarve:hcdcarve.c sgxcarve:sgxcarve.c vxdcarve:vxdcarve.c; do
+for tool in jitterseed:jitterseed.c peek:mmio-peek.c i2cpoke:i2c-poke.c wavplay:wavplay.c l2bench:l2bench.c btscan:btscan.c hcdcarve:hcdcarve.c sgxcarve:sgxcarve.c vxdcarve:vxdcarve.c iopcarve:iopcarve.c; do
 	"${CROSS_CC}" -O2 -mcpu=cortex-a9 -mfpu=neon -Wall -Wextra -static \
 		-o "${STAGE_DIR}/bin/${tool%%:*}" "${ROOT}/scripts/tools/${tool#*:}" -lm
 	chmod 755 "${STAGE_DIR}/bin/${tool%%:*}"

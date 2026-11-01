@@ -16,11 +16,13 @@
 		serial0 = &uart0;
 		serial1 = &uart1;
 		serial2 = &uart2;
+		serial3 = &uart3;
+		serial4 = &uart4;
 		ethernet0 = &eth0;
 	};
 
 	chosen {
-		bootargs = "earlycon=s3c6400,0x32500000 keep_bootcon console=tty0 root=/dev/ram0 rw rootwait panic=10 loglevel=8 ignore_loglevel g_cdc.host_addr=02:10:5a:33:00:01 g_cdc.dev_addr=02:10:5a:33:00:02 netconsole=6666@10.55.0.2/eth0,6666@255.255.255.255/ff:ff:ff:ff:ff:ff rdinit=/init";
+		bootargs = "earlycon=s3c6400,0x32500000 console=tty0 root=/dev/ram0 rw rootwait panic=10 loglevel=8 ignore_loglevel g_cdc.host_addr=02:10:5a:33:00:01 g_cdc.dev_addr=02:10:5a:33:00:02 netconsole=6666@10.55.0.2/eth0,6666@255.255.255.255/ff:ff:ff:ff:ff:ff rdinit=/init";
 	};
 
 	memory@80000000 {
@@ -220,8 +222,26 @@
 	status = "okay";
 };
 
+/* Test-point UARTs: MCU bootstrap/earlycon, boot console, Wi-Fi debug */
+&uart0 {
+	status = "okay";
+};
+
+&uart3 {
+	status = "okay";
+};
+
+&uart4 {
+	status = "okay";
+};
+
 /* VXD decoder: power, firmware upload and handshake (no decode interface yet) */
 &vxd {
+	status = "okay";
+};
+
+/* IOP coprocessor: power, firmware load and CPU start (no client yet) */
+&iop {
 	status = "okay";
 };
 

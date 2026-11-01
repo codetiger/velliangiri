@@ -83,6 +83,7 @@
 			apple,main-cpus = <1>;
 		};
 
+		/* System MCU bootstrap link / earlycon (test pads) */
 		uart0: serial@2500000 {
 			compatible = "apple,s5l-uart", "samsung,s3c6400-uart";
 			reg = <0x2500000 0x1000>;
@@ -108,6 +109,26 @@
 			reg = <0x2700000 0x1000>;
 			interrupts = <23>;
 			clocks = <&pmgr_gates 62>, <&uart_clk>;
+			clock-names = "uart", "clk_uart_baud0";
+			status = "disabled";
+		};
+
+		/* Boot console (test pads) */
+		uart3: serial@2800000 {
+			compatible = "apple,s5l-uart", "samsung,s3c6400-uart";
+			reg = <0x2800000 0x1000>;
+			interrupts = <24>;
+			clocks = <&pmgr_gates 63>, <&uart_clk>;
+			clock-names = "uart", "clk_uart_baud0";
+			status = "disabled";
+		};
+
+		/* Wi-Fi debug link (test pads) */
+		uart4: serial@2900000 {
+			compatible = "apple,s5l-uart", "samsung,s3c6400-uart";
+			reg = <0x2900000 0x1000>;
+			interrupts = <25>;
+			clocks = <&pmgr_gates 64>, <&uart_clk>;
 			clock-names = "uart", "clk_uart_baud0";
 			status = "disabled";
 		};
@@ -366,6 +387,21 @@
 			reg = <0x5100000 0x18000>, <0xf10b000 0x1000>;
 			interrupts = <49>;
 			clocks = <&pmgr_gates 7>, <&pmgr_gates 8>, <&pmgr_gates 9>;
+			status = "disabled";
+		};
+
+		/*
+		 * IOP coprocessor.  The stock OS runs its NAND client on it;
+		 * this port drives NAND from the main CPU, so the driver only
+		 * provides power, firmware load and the start sequence.
+		 */
+		iop: coprocessor@f300000 {
+			compatible = "apple,s5l8947x-iop";
+			reg = <0xf300000 0x1000>;
+			interrupts = <2>;
+			clocks = <&pmgr_gates 29>;
+			clock-names = "iop";
+			firmware-name = "s5l8947x/iop.fw";
 			status = "disabled";
 		};
 

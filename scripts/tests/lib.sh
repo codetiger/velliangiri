@@ -2,13 +2,17 @@
 # Shared helpers for the S5L8947X (j33iap) on-demand hardware tests
 
 PLAT=/sys/bus/platform/devices
+UART0=$PLAT/32500000.serial
 UART1=$PLAT/32600000.serial
 UART2=$PLAT/32700000.serial
+UART3=$PLAT/32800000.serial
+UART4=$PLAT/32900000.serial
 DISP=$PLAT/3a200000.display-controller
 AUD=$PLAT/34190000.audio-controller
 EHCI=$PLAT/36400000.usb
 AES=$PLAT/37801000.crypto
 SHA=$PLAT/30200000.crypto
+IOP=$PLAT/3f300000.coprocessor
 
 # serdev clients are named after their controller; find them by driver
 serdev() { ls -d /sys/bus/serial/drivers/"$1"/serial* 2>/dev/null | head -n 1; }
