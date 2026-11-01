@@ -1,6 +1,6 @@
 # SPDX-License-Identifier: GPL-2.0-only
 # System / IR remote MCU on UART1: input device, interrupt-driven receive,
-# firmware query, remote key frames
+# probe handshake, firmware query, raw transactions, remote key frames
 #
 # Nothing here sends the standby state: the MCU puts the whole box into
 # standby when it receives it.
@@ -25,8 +25,16 @@ t_mcu() {
 		fail "IR input device not registered"
 	fi
 	info "fw_version=$(rd "$MCU/fw_version") rx_count=$(rd "$MCU/rx_count") crc_errors=$(rd "$MCU/crc_errors")"
+	info "late_acks=$(rd "$MCU/late_acks") timeouts=$(rd "$MCU/timeouts")"
+	info "NMI count=$(rd "$MCU/nmi_count")"
 	info "last packet: $(rd "$MCU/last_packet")"
-	info "UART1 interrupts: $(irqs 32600000.serial)"
+
+	# The probe repeats the stock bring-up (version, then active state)
+	if [ "$(rd "$MCU/fw_version")" != unknown ]; then
+		pass "probe handshake reported firmware $(rd "$MCU/fw_version")"
+	else
+		fail "probe handshake left the firmware version unknown"
+	fi
 
 	# The version query is read-only; HWTEST_MCU_PING=0 skips it
 	if [ "${HWTEST_MCU_PING:-1}" = 1 ]; then
@@ -35,8 +43,26 @@ t_mcu() {
 		else
 			fail "MCU did not answer the firmware version query"
 		fi
+		if wr "$MCU/transact" 2; then
+			rsp=$(rd "$MCU/response")
+			case "$rsp" in
+			cmd=0x80*) pass "raw transaction answered ($rsp)" ;;
+			*) fail "raw transaction reply was '$rsp'" ;;
+			esac
+		else
+			fail "raw transaction 0x02 failed"
+		fi
 	else
 		skip "MCU firmware query (HWTEST_MCU_PING=0)"
+	fi
+
+	if [ -e "$MCU/events" ]; then
+		info "recent frames:"
+		rd "$MCU/events" | while IFS= read -r line; do
+			info "  $line"
+		done
+	else
+		fail "event ring is missing"
 	fi
 
 	if [ "$INTERACTIVE" = 1 ]; then
@@ -78,6 +104,7 @@ t_mcu() {
 			fail "no key presses reached /dev/input/${ev:-event0}"
 		fi
 		info "last packet: $(rd "$MCU/last_packet")"
+		info "NMI count now: $(rd "$MCU/nmi_count")"
 	else
 		skip "IR remote key check (needs -i)"
 	fi

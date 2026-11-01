@@ -5,6 +5,8 @@
 
 /dts-v1/;
 
+#include <dt-bindings/gpio/gpio.h>
+#include <dt-bindings/interrupt-controller/irq.h>
 #include <dt-bindings/thermal/thermal.h>
 #include "s5l8947x.dtsi"
 
@@ -168,6 +170,15 @@
 	mcu {
 		compatible = "apple,j33-mcu";
 		current-speed = <250000>;
+		/*
+		 * The MCU raises its NMI/SOS line on GPIO 2, normally high
+		 * and driven low to assert it. It is also the wake source for
+		 * system suspend. GPIO 0 (MCU reset) is shared with the PMU
+		 * external-shutdown line, so it is left alone.
+		 */
+		interrupts-extended = <&gpio 2 IRQ_TYPE_EDGE_FALLING>;
+		interrupt-names = "nmi";
+		wakeup-source;
 	};
 };
 
