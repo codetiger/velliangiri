@@ -24,6 +24,12 @@
  * other 3 KiB. With host configuration 3 the controller splits each logical
  * page into the data FIFO and the metadata FIFO, and two central DMA channels
  * drain them; page writes stream the logical page layout over PIO.
+ *
+ * Waits spin for a few microseconds (command phases end that fast) and then
+ * sleep on the controller interrupt: the sequencer raises it on a NAND status
+ * match (busy -> ready after a read, program or erase) and the host block on
+ * the end of a logical page transfer. If an operation completes without the
+ * interrupt, the driver falls back to polling for the rest of the session.
  */
 
 #include <linux/bitfield.h>
@@ -33,6 +39,7 @@
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
 #include <linux/io.h>
+#include <linux/interrupt.h>
 #include <linux/iopoll.h>
 #include <linux/module.h>
 #include <linux/mtd/mtd.h>
@@ -154,6 +161,16 @@
 #define FMI_LP_META		16
 #define FMI_SECTOR		1024
 #define FMI_POLL_US		200000
+#define FMI_SPIN_US		5	/* busy-wait this long before sleeping (measured best) */
+#define FMI_IRQ_MS		20	/* longer waits continue by polling */
+
+static bool use_irq = true;
+module_param(use_irq, bool, 0644);
+MODULE_PARM_DESC(use_irq, "Sleep on the FMI interrupt instead of polling (default: true)");
+
+static uint spin_us = FMI_SPIN_US;
+module_param(spin_us, uint, 0644);
+MODULE_PARM_DESC(spin_us, "Busy-wait before sleeping on the interrupt, in microseconds");
 
 static const u8 mn_signature[3] = { 0x50, 0x50, 0x4e };
 
@@ -172,6 +189,9 @@ struct s5l_fmi {
 	size_t buf_size;
 	struct completion data_done;
 	struct completion meta_done;
+	struct completion irq_done;
+	int irq;
+	bool irq_broken;	/* an operation finished without raising it */
 	struct mutex lock;
 	struct mtd_info mtd;
 
@@ -191,11 +211,67 @@ static int s5l_fmi_wait(struct s5l_fmi *fmi, void __iomem *reg, u32 mask, const 
 {
 	u32 v;
 
-	if (readl_poll_timeout(reg, v, (v & mask) == mask, 2, FMI_POLL_US)) {
+	if (readl_poll_timeout_atomic(reg, v, (v & mask) == mask, 1, FMI_SPIN_US) &&
+	    readl_poll_timeout(reg, v, (v & mask) == mask, 2, FMI_POLL_US)) {
 		dev_err_ratelimited(fmi->dev, "timeout waiting for %s (%08x)\n", what, v);
 		return -ETIMEDOUT;
 	}
 	writel(mask, reg);
+	return 0;
+}
+
+static irqreturn_t s5l_fmi_irq(int irq, void *data)
+{
+	struct s5l_fmi *fmi = data;
+	u32 seq = readl(fmi->seq + FMI_S_IRQEN) & readl(fmi->seq + FMI_S_STAT);
+	u32 host = readl(fmi->host + FMI_H_IRQEN) & readl(fmi->host + FMI_H_STAT);
+
+	if (!seq && !host)
+		return IRQ_NONE;
+	/* Mask the sources; the waiter reads and clears the status itself */
+	writel(0, fmi->seq + FMI_S_IRQEN);
+	writel(0, fmi->host + FMI_H_IRQEN);
+	complete(&fmi->irq_done);
+	return IRQ_HANDLED;
+}
+
+/*
+ * Wait until ready() is non-zero: spin briefly, then sleep on the interrupt
+ * with the given sequencer and host enables, then poll whatever is left.
+ */
+static int s5l_fmi_wait_ready(struct s5l_fmi *fmi, u32 seq_en, u32 host_en,
+			      u32 (*ready)(struct s5l_fmi *fmi), const char *what)
+{
+	unsigned long left;
+	u32 v;
+
+	if (!read_poll_timeout_atomic(ready, v, v, 1, READ_ONCE(spin_us), false, fmi))
+		return 0;
+
+	if (fmi->irq > 0 && use_irq && !fmi->irq_broken) {
+		reinit_completion(&fmi->irq_done);
+		writel(seq_en, fmi->seq + FMI_S_IRQEN);
+		writel(host_en, fmi->host + FMI_H_IRQEN);
+		/* Already done: an edge raised before the enable would be lost */
+		left = ready(fmi) ? 1 :
+		       wait_for_completion_timeout(&fmi->irq_done, msecs_to_jiffies(FMI_IRQ_MS));
+		writel(0, fmi->seq + FMI_S_IRQEN);
+		writel(0, fmi->host + FMI_H_IRQEN);
+		if (ready(fmi)) {
+			if (!left) {
+				fmi->irq_broken = true;
+				dev_warn(fmi->dev,
+					 "%s finished without an interrupt, polling from now on\n",
+					 what);
+			}
+			return 0;
+		}
+	}
+
+	if (read_poll_timeout(ready, v, v, 2, FMI_POLL_US, false, fmi)) {
+		dev_err_ratelimited(fmi->dev, "timeout waiting for %s\n", what);
+		return -ETIMEDOUT;
+	}
 	return 0;
 }
 
@@ -242,9 +318,13 @@ static u32 s5l_fmi_status_ready(struct s5l_fmi *fmi)
 	       (readl(fmi->host + FMI_H_STAT) & FMI_H_STAT_STATUS);
 }
 
+static u32 s5l_fmi_xfer_done(struct s5l_fmi *fmi)
+{
+	return readl(fmi->host + FMI_H_STAT) & FMI_H_STAT_DONE;
+}
+
 static int s5l_fmi_poll_status(struct s5l_fmi *fmi, u32 cmds, u32 go)
 {
-	u32 v;
 	int st;
 
 	if (s5l_fmi_cmd(fmi, cmds, go, 0, 0, 0))
@@ -253,14 +333,14 @@ static int s5l_fmi_poll_status(struct s5l_fmi *fmi, u32 cmds, u32 go)
 	writel(readl(fmi->seq + FMI_S_TIMING) & ~FMI_S_TIMING_NOPOLL, fmi->seq + FMI_S_TIMING);
 	writel(FMI_S_MATCH_READY, fmi->seq + FMI_S_MATCH);
 	writel(0, fmi->seq + FMI_S_24);
+	/* Enabled before the poll starts, as the polling-only driver always did */
 	writel(FMI_S_STAT_MATCH, fmi->seq + FMI_S_IRQEN);
 	writel(FMI_S_GO_POLL, fmi->seq + FMI_S_GO);
-	if (read_poll_timeout(s5l_fmi_status_ready, v, v, 2, FMI_POLL_US, false, fmi)) {
-		dev_err_ratelimited(fmi->dev, "timeout waiting for the NAND status\n");
+	if (s5l_fmi_wait_ready(fmi, FMI_S_STAT_MATCH, FMI_H_STAT_STATUS, s5l_fmi_status_ready,
+			       "the NAND status"))
 		st = -ETIMEDOUT;
-	} else {
+	else
 		st = readl(fmi->seq + FMI_S_NSTAT) & 0xff;
-	}
 	writel(0, fmi->seq + FMI_S_GO);
 	s5l_fmi_quiesce(fmi);
 	return st;
@@ -432,7 +512,10 @@ static int s5l_fmi_xfer(struct s5l_fmi *fmi, u32 row)
 		writel(FMI_H_CFG_SPLIT, fmi->host + FMI_H_CFG);
 		writel(shape, fmi->host + FMI_H_SHAPE);
 		writel(FMI_H_CMD_START, fmi->host + FMI_H_CMD);
-		ret = s5l_fmi_wait(fmi, fmi->host + FMI_H_STAT, FMI_H_STAT_DONE, "page transfer");
+		ret = s5l_fmi_wait_ready(fmi, 0, FMI_H_STAT_DONE, s5l_fmi_xfer_done,
+					 "page transfer");
+		if (!ret)
+			writel(FMI_H_STAT_DONE, fmi->host + FMI_H_STAT);
 		if (ret) {
 			struct dma_tx_state ds, ms;
 
@@ -939,6 +1022,7 @@ static int s5l_fmi_probe(struct platform_device *pdev)
 		return -ENOMEM;
 	fmi->dev = dev;
 	mutex_init(&fmi->lock);
+	init_completion(&fmi->irq_done);
 
 	fmi->host = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(fmi->host))
@@ -962,6 +1046,16 @@ static int s5l_fmi_probe(struct platform_device *pdev)
 	fmi->timing = FMI_S_TIMING_SLOW;
 	s5l_fmi_ctl_reset(fmi);
 	writel(0, fmi->ecc + FMI_E_14);
+
+	/* The controller is quiesced (all enables off) by the reset above */
+	fmi->irq = platform_get_irq_optional(pdev, 0);
+	if (fmi->irq > 0) {
+		ret = devm_request_irq(dev, fmi->irq, s5l_fmi_irq, 0, dev_name(dev), fmi);
+		if (ret)
+			return dev_err_probe(dev, ret, "failed to request IRQ %d\n", fmi->irq);
+	} else {
+		dev_info(dev, "no interrupt, polling\n");
+	}
 
 	ret = s5l_fmi_identify(fmi);
 	if (ret)
