@@ -12,10 +12,12 @@ config VIDEO_S5L8947X_M2SC
 	select V4L2_MEM2MEM_DEV
 	help
 	  Memory-to-memory scaler of the S5L8947X SoC: scales frames up or
-	  down (up to 8x down), converts between YCbCr (NV12, NV16, YUYV)
-	  and RGB (XRGB8888, RGB565, ARGB1555) with BT.601 or BT.709
-	  matrices. A debugfs self-test runs two jobs on hardware and
-	  checks the result.
+	  down (up to 8x down horizontally, 7x vertically) with area-
+	  averaging filters, crops the source and places the result in a
+	  rectangle of the destination, and converts between YCbCr (NV12,
+	  NV16, YUYV) and RGB (XRGB8888, RGB565, ARGB1555) with BT.601 or
+	  BT.709 matrices. A debugfs self-test runs two jobs on hardware
+	  and checks the result.
 
 config VIDEO_S5L8947X_JPEG
 	tristate "S5L8947X JPEG decoder"

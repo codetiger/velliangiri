@@ -25,6 +25,12 @@
  * block is left in bypass). Crop offsets are folded into the addresses, so
  * the start registers stay zero.
  *
+ * A source crop rectangle (OUTPUT, V4L2_SEL_TGT_CROP) selects the part of
+ * the source that is scaled, and a compose rectangle (CAPTURE,
+ * V4L2_SEL_TGT_COMPOSE) places the result inside the destination frame,
+ * for example to letterbox an image. Destination pixels outside the
+ * compose rectangle are left untouched.
+ *
  * Each instance is a V4L2 memory-to-memory device: the OUTPUT queue takes
  * the source frames and the CAPTURE queue receives the scaled, converted
  * result, both as single contiguous buffers (NV12 and NV16 with the CbCr
@@ -174,6 +180,7 @@ struct m2sc_dev {
 struct m2sc_q_data {
 	const struct m2sc_fmt *fmt;
 	struct v4l2_pix_format pix;
+	struct v4l2_rect rect;	/* crop (source) or compose (destination) */
 	u32 sequence;
 };
 
@@ -241,31 +248,68 @@ static int m2sc_reset(struct m2sc_dev *m)
 }
 
 /*
- * Polyphase filters. Phase p (0..8 of 16) is the sample position p/16 of a
- * source pixel; phase 0 is centred on tap 4 (horizontal) or tap 2
- * (vertical) and higher phases move weight toward the previous tap. These
- * are linear-interpolation kernels, taps in 2.7 fixed point summing to 128.
+ * Polyphase filters, generated for each job from its scaling ratio. A tap's
+ * weight is the overlap between its source pixel and the footprint of the
+ * destination pixel, which is r source pixels wide (r = max(ratio, 1)). At
+ * ratio 1 and when upscaling this is linear interpolation; when
+ * downscaling it averages the covered area, so detail finer than a
+ * destination pixel is blended instead of aliased. A footprint wider than
+ * the taps reach (beyond 6x horizontally, 2x vertically) is clipped.
+ *
+ * Phase p (0..8 of 16) puts the sample p/16 of a pixel before the centre
+ * tap (tap 4 of 8 horizontally, tap 2 of 4 vertically). Taps are 2.7 fixed
+ * point and sum to 128; rounding error goes to the largest tap.
  */
-static void m2sc_write_filters(struct m2sc_dev *m)
+static void m2sc_make_filter(u32 step, unsigned int taps, unsigned int p, s16 *c)
+{
+	s32 half = max_t(u32, step, 1 << 16) / 2;	/* 16.16 */
+	unsigned int k, big = taps / 2;
+	u32 w[8], sum = 0;
+	int total = 0;
+
+	for (k = 0; k < taps; k++) {
+		s32 d = ((s32)k - (s32)(taps / 2)) * 65536 + (s32)p * 4096;
+		s32 lo = max(d - 32768, -half), hi = min(d + 32768, half);
+
+		w[k] = hi > lo ? hi - lo : 0;
+		sum += w[k];
+	}
+	for (k = 0; k < taps; k++) {
+		c[k] = (w[k] * 128 + sum / 2) / sum;
+		total += c[k];
+		if (w[k] > w[big])
+			big = k;
+	}
+	c[big] += 128 - total;
+}
+
+static u32 m2sc_pair(const s16 *c, unsigned int k)
+{
+	return (u16)c[k] | (u32)(u16)c[k + 1] << 16;
+}
+
+static void m2sc_write_filters(struct m2sc_dev *m, u32 hstep, u32 vstep)
 {
 	static const u32 h_banks[] = { M2SC_COEF_H_LUMA, M2SC_COEF_H_CHROMA };
 	static const u32 v_banks[] = { M2SC_COEF_V_LUMA, M2SC_COEF_V_CHROMA };
 	unsigned int b, p;
+	s16 hc[8], vc[4];
 
-	for (b = 0; b < 2; b++) {
-		for (p = 0; p < M2SC_PHASES; p++) {
-			u32 near = 128 - 8 * p, far = 8 * p;
+	for (p = 0; p < M2SC_PHASES; p++) {
+		m2sc_make_filter(hstep, 8, p, hc);
+		m2sc_make_filter(vstep, 4, p, vc);
+		for (b = 0; b < 2; b++) {
 			void __iomem *h = m->base + h_banks[b] + 16 * p;
 			void __iomem *v = m->base + v_banks[b] + 8 * p;
 
 			/* words hold taps (6,7) (4,5) (2,3) (0,1), low half first */
-			writel(0, h);
-			writel(near, h + 4);
-			writel(far << 16, h + 8);
-			writel(0, h + 12);
+			writel(m2sc_pair(hc, 6), h);
+			writel(m2sc_pair(hc, 4), h + 4);
+			writel(m2sc_pair(hc, 2), h + 8);
+			writel(m2sc_pair(hc, 0), h + 12);
 			/* words hold taps (2,3) (0,1) */
-			writel(near, v);
-			writel(far << 16, v + 4);
+			writel(m2sc_pair(vc, 2), v);
+			writel(m2sc_pair(vc, 0), v + 4);
 		}
 	}
 }
@@ -299,8 +343,12 @@ static int m2sc_check(const struct m2sc_job *j)
 	    d->width < M2SC_MIN_SIZE || d->height < M2SC_MIN_SIZE ||
 	    d->width > M2SC_MAX_DST || d->height > M2SC_MAX_DST)
 		return -ERANGE;
-	/* steps are 3.16 fixed point: at most 8x down */
-	if (s->width >= 8 * d->width || s->height >= 8 * d->height)
+	/*
+	 * Steps are 3.16 fixed point, so at most 8x down. Vertically the
+	 * block reads the wrong source lines beyond exactly 7x (measured: a
+	 * step of 7.000 works, 7.027 does not), so stop there.
+	 */
+	if (s->width >= 8 * d->width || s->height > 7 * d->height)
 		return -ERANGE;
 	if (s->addr[0] > U32_MAX || d->addr[0] > U32_MAX ||
 	    s->addr[1] > U32_MAX || d->addr[1] > U32_MAX)
@@ -312,8 +360,8 @@ static int m2sc_check(const struct m2sc_job *j)
 static int m2sc_run(struct m2sc_dev *m, const struct m2sc_job *j)
 {
 	const struct m2sc_surface *s = &j->src, *d = &j->dst;
+	u32 ctrl, hstep, vstep;
 	const s16 *mat;
-	u32 ctrl;
 	int ret;
 
 	ret = m2sc_check(j);
@@ -362,9 +410,11 @@ static int m2sc_run(struct m2sc_dev *m, const struct m2sc_job *j)
 		ctrl |= M2SC_CTRL_OUT_OFFSETS;
 	writel(ctrl, m->base + M2SC_CTRL);
 
-	writel(((s->width << 16) / d->width) & M2SC_STEP_MASK, m->base + M2SC_HSTEP);
-	writel(((s->height << 16) / d->height) & M2SC_STEP_MASK, m->base + M2SC_VSTEP);
-	m2sc_write_filters(m);
+	hstep = ((s->width << 16) / d->width) & M2SC_STEP_MASK;
+	vstep = ((s->height << 16) / d->height) & M2SC_STEP_MASK;
+	writel(hstep, m->base + M2SC_HSTEP);
+	writel(vstep, m->base + M2SC_VSTEP);
+	m2sc_write_filters(m, hstep, vstep);
 	writel(0, m->base + M2SC_DITHER);
 	writel(readl(m->base + M2SC_ROT) & ~M2SC_ROT_MASK, m->base + M2SC_ROT);
 
@@ -615,18 +665,23 @@ static const struct m2sc_fmt *m2sc_try_pix(struct v4l2_pix_format *pix, bool dst
 	return f;
 }
 
+/* Describe the rectangle of a buffer, offsets folded into the plane addresses */
 static void m2sc_surface_from(struct m2sc_surface *s, const struct m2sc_q_data *q,
 			      struct vb2_buffer *vb)
 {
 	const struct v4l2_pix_format *pix = &q->pix;
+	const struct v4l2_rect *r = &q->rect;
+	dma_addr_t base = vb2_dma_contig_plane_dma_addr(vb, 0);
 
 	s->fmt = q->fmt;
-	s->width = pix->width;
-	s->height = pix->height;
+	s->width = r->width;
+	s->height = r->height;
 	s->pitch[0] = pix->bytesperline;
 	s->pitch[1] = q->fmt->planes > 1 ? pix->bytesperline : 0;
-	s->addr[0] = vb2_dma_contig_plane_dma_addr(vb, 0);
-	s->addr[1] = s->addr[0] + (dma_addr_t)pix->bytesperline * pix->height;
+	s->addr[0] = base + (dma_addr_t)r->top * s->pitch[0] + r->left * q->fmt->cpp;
+	/* the CbCr plane has one byte pair per two luma columns */
+	s->addr[1] = base + (dma_addr_t)pix->bytesperline * pix->height +
+		     (dma_addr_t)(r->top / q->fmt->vsub) * s->pitch[1] + r->left;
 	s->limited = q->fmt->yuv && pix->quantization == V4L2_QUANTIZATION_LIM_RANGE;
 }
 
@@ -809,6 +864,64 @@ static int m2sc_s_fmt(struct file *file, void *fh, struct v4l2_format *f)
 		return -EBUSY;
 	q->fmt = m2sc_try_pix(&f->fmt.pix, m2sc_is_dst(f->type));
 	q->pix = f->fmt.pix;
+	q->rect = (struct v4l2_rect){ 0, 0, q->pix.width, q->pix.height };
+	return 0;
+}
+
+/* Source: crop targets on OUTPUT. Destination: compose targets on CAPTURE. */
+static int m2sc_sel_queue(u32 type, u32 target)
+{
+	switch (target) {
+	case V4L2_SEL_TGT_CROP:
+	case V4L2_SEL_TGT_CROP_DEFAULT:
+	case V4L2_SEL_TGT_CROP_BOUNDS:
+		return type == V4L2_BUF_TYPE_VIDEO_OUTPUT ? 0 : -EINVAL;
+	case V4L2_SEL_TGT_COMPOSE:
+	case V4L2_SEL_TGT_COMPOSE_DEFAULT:
+	case V4L2_SEL_TGT_COMPOSE_BOUNDS:
+		return type == V4L2_BUF_TYPE_VIDEO_CAPTURE ? 1 : -EINVAL;
+	}
+	return -EINVAL;
+}
+
+static int m2sc_g_selection(struct file *file, void *fh, struct v4l2_selection *s)
+{
+	struct m2sc_ctx *ctx = fh_to_ctx(file);
+	int i = m2sc_sel_queue(s->type, s->target);
+
+	if (i < 0)
+		return i;
+	if (s->target == V4L2_SEL_TGT_CROP || s->target == V4L2_SEL_TGT_COMPOSE)
+		s->r = ctx->q[i].rect;
+	else
+		s->r = (struct v4l2_rect){ 0, 0, ctx->q[i].pix.width, ctx->q[i].pix.height };
+	return 0;
+}
+
+static int m2sc_s_selection(struct file *file, void *fh, struct v4l2_selection *s)
+{
+	struct m2sc_ctx *ctx = fh_to_ctx(file);
+	int i = m2sc_sel_queue(s->type, s->target);
+	struct m2sc_q_data *q;
+	struct v4l2_rect *r = &s->r;
+	u32 w, h;
+
+	if (i < 0)
+		return i;
+	if (s->target != V4L2_SEL_TGT_CROP && s->target != V4L2_SEL_TGT_COMPOSE)
+		return -EINVAL;
+	q = &ctx->q[i];
+	w = q->pix.width;
+	h = q->pix.height;
+
+	/* keep chroma sites whole: even offsets and sizes for subsampled planes */
+	r->left = ALIGN_DOWN(clamp_t(s32, r->left, 0, w - M2SC_MIN_SIZE), q->fmt->hsub);
+	r->top = ALIGN_DOWN(clamp_t(s32, r->top, 0, h - M2SC_MIN_SIZE), q->fmt->vsub);
+	r->width = ALIGN_DOWN(clamp_t(u32, r->width, M2SC_MIN_SIZE, w - r->left),
+			      q->fmt->hsub);
+	r->height = ALIGN_DOWN(clamp_t(u32, r->height, M2SC_MIN_SIZE, h - r->top),
+			       q->fmt->vsub);
+	q->rect = *r;
 	return 0;
 }
 
@@ -822,6 +935,8 @@ static const struct v4l2_ioctl_ops m2sc_ioctl_ops = {
 	.vidioc_try_fmt_vid_out		= m2sc_try_fmt,
 	.vidioc_s_fmt_vid_cap		= m2sc_s_fmt,
 	.vidioc_s_fmt_vid_out		= m2sc_s_fmt,
+	.vidioc_g_selection		= m2sc_g_selection,
+	.vidioc_s_selection		= m2sc_s_selection,
 	.vidioc_reqbufs			= v4l2_m2m_ioctl_reqbufs,
 	.vidioc_querybuf		= v4l2_m2m_ioctl_querybuf,
 	.vidioc_qbuf			= v4l2_m2m_ioctl_qbuf,
@@ -851,6 +966,7 @@ static int m2sc_open(struct file *file)
 		pix->width = 1280;
 		pix->height = 720;
 		ctx->q[i].fmt = m2sc_try_pix(pix, i);
+		ctx->q[i].rect = (struct v4l2_rect){ 0, 0, pix->width, pix->height };
 	}
 
 	if (mutex_lock_interruptible(&m->vdev_lock)) {
