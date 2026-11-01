@@ -433,6 +433,15 @@
 			status = "disabled";
 		};
 
+		/* Baseline JPEG codec, used as a decoder */
+		jpeg: jpeg@8200000 {
+			compatible = "apple,s5l8947x-jpeg";
+			reg = <0x8200000 0x1000>;
+			interrupts = <118>;
+			clocks = <&pmgr_gates 13>;
+			status = "disabled";
+		};
+
 		scaler1: scaler@8400000 {
 			compatible = "apple,s5l8947x-m2sc";
 			reg = <0x8400000 0x1000>;

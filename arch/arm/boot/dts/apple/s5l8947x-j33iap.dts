@@ -273,6 +273,11 @@
 	status = "okay";
 };
 
+/* JPEG decoder (V4L2 memory-to-memory) */
+&jpeg {
+	status = "okay";
+};
+
 /* IOP coprocessor: power, firmware load and CPU start (no client yet) */
 &iop {
 	status = "okay";
