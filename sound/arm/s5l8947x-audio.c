@@ -4,9 +4,10 @@
  *
  * The card has two PCM devices:
  *
- *   0  HDMI     I2S0 (0x34190000) as a slave of the I2S clock master
- *               (0x34195000); the HDMI I2S receiver takes I2S0's data line
- *               and the master's bit and frame clocks.
+ *   0  HDMI     I2S0..I2S3 (0x34190000..0x34193000), all slaves of the I2S
+ *               clock master (0x34195000).  Two channels use I2S0 alone;
+ *               4/6/8 channels use 2/3/4 data lines, one channel pair each,
+ *               in the CEA-861 order the HDMI sink expects.
  *   1  Optical  S/PDIF transmitter (0x34194000).
  *
  * Both blocks are programmed from the measured register model, not the
@@ -79,7 +80,8 @@
 /* One FIFO word per request; 16-word bursts outrun the 16-entry S/PDIF FIFO */
 #define AUDIO_DMA_WIDTH		DMA_SLAVE_BUSWIDTH_4_BYTES
 #define AUDIO_DMA_BURST		1
-#define AUDIO_FRAME_BYTES	8	/* L, R */
+#define AUDIO_MAX_HDMI_LINES	4
+#define AUDIO_LINE_FRAME_BYTES	8	/* L, R words for one data line */
 
 #define AUDIO_RATE_OPTICAL	46875U
 
@@ -91,28 +93,52 @@ enum s5l8947x_output {
 
 struct s5l8947x_audio;
 
+/*
+ * One I2S data line: its register window, the DMA channel that feeds its
+ * FIFO, and the coherent ring shaped like the application's frames.
+ */
+struct s5l8947x_line {
+	void __iomem *i2s;
+	phys_addr_t fifo_phys;
+
+	struct dma_chan *dma;
+	dma_cookie_t cookie;
+	bool dma_started;
+
+	void *ring;
+	dma_addr_t ring_phys;
+	size_t ring_bytes;
+	unsigned int ring_frames;
+};
+
 struct s5l8947x_stream {
 	struct s5l8947x_audio *aud;
 	enum s5l8947x_output out;
 	struct snd_pcm_substream *substream;
 
+	unsigned int rate;
+	unsigned int channels;
+	unsigned int nlines;
+
+	/* S/PDIF transmitter */
 	phys_addr_t fifo_phys;
 	struct dma_chan *dma;
 	dma_cookie_t cookie;
 	bool dma_started;
-
-	unsigned int rate;
 	void *dma_ring;
 	dma_addr_t dma_ring_phys;
 	size_t dma_ring_bytes;
 	unsigned int dma_ring_frames;
+
+	/* HDMI I2S data lines */
+	struct s5l8947x_line lines[AUDIO_MAX_HDMI_LINES];
 };
 
 struct s5l8947x_audio {
 	struct device *dev;
 	struct snd_card *card;
 
-	void __iomem *i2s;		/* I2S0, data */
+	void __iomem *i2s[AUDIO_MAX_HDMI_LINES];	/* data lines */
 	void __iomem *i2s_master;	/* bit and frame clocks */
 	void __iomem *spdif;
 	struct clk *mclk;		/* I2S master clock */
@@ -130,6 +156,14 @@ static const unsigned int s5l8947x_optical_rates[] = {
 	AUDIO_RATE_OPTICAL,
 };
 
+/*
+ * One channel pair per I2S data line.  The HDMI receiver maps I2S0 to
+ * channels 0/1, I2S1 to 2/3 and so on, so only even counts are usable.
+ */
+static const unsigned int s5l8947x_hdmi_channels[] = {
+	2, 4, 6, 8,
+};
+
 static const struct snd_pcm_hw_constraint_list s5l8947x_rate_constraints[] = {
 	[AUDIO_HDMI] = {
 		.count	= ARRAY_SIZE(s5l8947x_hdmi_rates),
@@ -141,6 +175,24 @@ static const struct snd_pcm_hw_constraint_list s5l8947x_rate_constraints[] = {
 	},
 };
 
+static const struct snd_pcm_hw_constraint_list s5l8947x_channel_constraints = {
+	.count	= ARRAY_SIZE(s5l8947x_hdmi_channels),
+	.list	= s5l8947x_hdmi_channels,
+};
+
+/*
+ * ALSA's default multichannel order is FL, FR, RL, RR, FC, LFE[, SL, SR],
+ * while the sink expects the CEA-861 order FL, FR, FC, LFE, RL, RR[, ...].
+ * Map each data line's left channel to the stream channel it must carry;
+ * the right channel follows.
+ */
+static const u8 s5l8947x_line_map[9][8] = {
+	[2] = { 0, 1 },
+	[4] = { 0, 1, 2, 3 },
+	[6] = { 0, 1, 4, 5, 2, 3 },
+	[8] = { 0, 1, 4, 5, 2, 3, 6, 7 },
+};
+
 static const struct snd_pcm_hardware s5l8947x_pcm_hw = {
 	.info			= SNDRV_PCM_INFO_INTERLEAVED,
 	.formats		= SNDRV_PCM_FMTBIT_S16_LE,
@@ -148,10 +200,10 @@ static const struct snd_pcm_hardware s5l8947x_pcm_hw = {
 	.rate_min		= 32000,
 	.rate_max		= 48000,
 	.channels_min		= 2,
-	.channels_max		= 2,
-	.buffer_bytes_max	= 64 * 1024,
+	.channels_max		= 8,
+	.buffer_bytes_max	= 256 * 1024,
 	.period_bytes_min	= 1024,
-	.period_bytes_max	= 16 * 1024,
+	.period_bytes_max	= 32 * 1024,
 	.periods_min		= 2,
 	.periods_max		= 32,
 };
@@ -180,9 +232,24 @@ static int s5l8947x_mclk_on(struct s5l8947x_audio *aud, unsigned int rate)
 	return 0;
 }
 
+static void s5l8947x_line_stop(struct s5l8947x_line *ln)
+{
+	writel(0, ln->i2s + I2S_TXCOM);
+	writel(I2S_CTL_STOP, ln->i2s + I2S_CTL);
+}
+
+static void s5l8947x_line_config(struct s5l8947x_line *ln)
+{
+	writel(I2S_CTL_RESET, ln->i2s + I2S_CTL);
+	writel(0, ln->i2s + I2S_TXCOM);
+	writel(I2S_TXCON_BASE | I2S_TXCON_SLAVE, ln->i2s + I2S_TXCON);
+	writel(I2S_CTL_ENABLE, ln->i2s + I2S_CTL);
+}
+
 static int s5l8947x_engine_config(struct s5l8947x_stream *st)
 {
 	struct s5l8947x_audio *aud = st->aud;
+	unsigned int i;
 	int ret;
 
 	if (st->out == AUDIO_OPTICAL) {
@@ -200,56 +267,74 @@ static int s5l8947x_engine_config(struct s5l8947x_stream *st)
 		return ret;
 
 	/*
-	 * The master's clocks must be running before the slave is reset: a
+	 * The master's clocks must be running before the slaves are reset: a
 	 * slave brought out of reset without a bit clock never starts draining.
-	 * The master's own FIFO stays empty; only I2S0's data reaches HDMI.
+	 * The master's own FIFO stays empty; only the I2S0..3 data lines reach
+	 * HDMI.
 	 */
 	writel(I2S_CTL_RESET, aud->i2s_master + I2S_CTL);
 	writel(0, aud->i2s_master + I2S_TXCOM);
-	writel(I2S_TXCON_BASE | I2S_TXCON_BCLK_DIV8, aud->i2s_master + I2S_TXCON);
+	writel(I2S_TXCON_BASE | I2S_TXCON_BCLK_DIV8,
+	       aud->i2s_master + I2S_TXCON);
 	writel(I2S_CTL_ENABLE_MCLK, aud->i2s_master + I2S_CTL);
 	writel(I2S_TXCOM_RUN, aud->i2s_master + I2S_TXCOM);
 
-	writel(I2S_CTL_RESET, aud->i2s + I2S_CTL);
-	writel(0, aud->i2s + I2S_TXCOM);
-	writel(I2S_TXCON_BASE | I2S_TXCON_SLAVE, aud->i2s + I2S_TXCON);
-	writel(I2S_CTL_ENABLE, aud->i2s + I2S_CTL);
+	for (i = 0; i < AUDIO_MAX_HDMI_LINES; i++) {
+		if (i < st->nlines)
+			s5l8947x_line_config(&st->lines[i]);
+		else
+			s5l8947x_line_stop(&st->lines[i]);
+	}
 	return 0;
 }
 
 static void s5l8947x_engine_start(struct s5l8947x_stream *st)
 {
-	if (st->out == AUDIO_OPTICAL)
+	unsigned int i;
+
+	if (st->out == AUDIO_OPTICAL) {
 		writel(SPDIF_CLKCON_PWR, st->aud->spdif + SPDIF_CLKCON);
-	else
-		writel(I2S_TXCOM_DMA, st->aud->i2s + I2S_TXCOM);
+		return;
+	}
+	for (i = 0; i < st->nlines; i++)
+		writel(I2S_TXCOM_DMA, st->lines[i].i2s + I2S_TXCOM);
 }
 
 static void s5l8947x_engine_stop(struct s5l8947x_stream *st)
 {
 	struct s5l8947x_audio *aud = st->aud;
+	unsigned int i;
 
 	if (st->out == AUDIO_OPTICAL) {
 		writel(0, aud->spdif + SPDIF_CLKCON);
 		writel(SPDIF_CON_SW_RESET, aud->spdif + SPDIF_CON);
 		return;
 	}
-	writel(0, aud->i2s + I2S_TXCOM);
-	writel(I2S_CTL_STOP, aud->i2s + I2S_CTL);
+	for (i = 0; i < AUDIO_MAX_HDMI_LINES; i++)
+		s5l8947x_line_stop(&st->lines[i]);
 	writel(0, aud->i2s_master + I2S_TXCOM);
 	writel(I2S_CTL_STOP, aud->i2s_master + I2S_CTL);
 }
 
-static void s5l8947x_dma_halt(struct s5l8947x_stream *st)
+static void s5l8947x_line_dma_free(struct device *dev,
+				   struct s5l8947x_line *ln)
 {
-	if (st->dma_started) {
-		st->dma_started = false;
-		dmaengine_terminate_async(st->dma);
+	if (ln->ring) {
+		dma_free_coherent(dev, ln->ring_bytes, ln->ring, ln->ring_phys);
+		ln->ring = NULL;
 	}
+	ln->ring_frames = 0;
 }
 
 static void s5l8947x_dma_free(struct s5l8947x_stream *st)
 {
+	unsigned int i;
+
+	if (st->out == AUDIO_HDMI) {
+		for (i = 0; i < AUDIO_MAX_HDMI_LINES; i++)
+			s5l8947x_line_dma_free(st->aud->dev, &st->lines[i]);
+		return;
+	}
 	if (st->dma_ring) {
 		dma_free_coherent(st->aud->dev, st->dma_ring_bytes,
 				  st->dma_ring, st->dma_ring_phys);
@@ -259,10 +344,45 @@ static void s5l8947x_dma_free(struct s5l8947x_stream *st)
 }
 
 /*
- * The DMA ring mirrors the application's frames one-for-one, but each frame
- * is two 32-bit FIFO words.  It is rebuilt whenever the application changes
- * the buffer size.
+ * Each data line's DMA ring mirrors the application's frames one-for-one,
+ * but holds only that line's channel pair: two 32-bit FIFO words per frame.
+ * It is rebuilt whenever the application changes the buffer size.
  */
+static int s5l8947x_line_dma_setup(struct s5l8947x_audio *aud,
+				   struct s5l8947x_line *ln,
+				   unsigned int frames)
+{
+	struct dma_slave_config cfg = {
+		.direction	= DMA_MEM_TO_DEV,
+		.dst_addr	= ln->fifo_phys,
+		.dst_addr_width	= AUDIO_DMA_WIDTH,
+		.dst_maxburst	= AUDIO_DMA_BURST,
+	};
+	size_t bytes = frames * AUDIO_LINE_FRAME_BYTES;
+	int ret;
+
+	if (!frames)
+		return -EINVAL;
+	ret = dmaengine_slave_config(ln->dma, &cfg);
+	if (ret)
+		return ret;
+	if (ln->ring && ln->ring_frames == frames)
+		goto clear;
+
+	s5l8947x_line_dma_free(aud->dev, ln);
+	ln->ring = dma_alloc_coherent(aud->dev, bytes, &ln->ring_phys,
+				      GFP_KERNEL);
+	if (!ln->ring)
+		return -ENOMEM;
+	ln->ring_bytes = bytes;
+	ln->ring_frames = frames;
+
+clear:
+	/* Never replay a previous stream's samples */
+	memset(ln->ring, 0, ln->ring_bytes);
+	return 0;
+}
+
 static int s5l8947x_dma_setup(struct s5l8947x_stream *st,
 			      struct snd_pcm_runtime *runtime)
 {
@@ -273,9 +393,21 @@ static int s5l8947x_dma_setup(struct s5l8947x_stream *st,
 		.dst_maxburst	= AUDIO_DMA_BURST,
 	};
 	unsigned int frames = runtime->buffer_size;
-	size_t bytes = frames * AUDIO_FRAME_BYTES;
+	unsigned int i;
+	size_t bytes;
 	int ret;
 
+	if (st->out == AUDIO_HDMI) {
+		for (i = 0; i < st->nlines; i++) {
+			ret = s5l8947x_line_dma_setup(st->aud, &st->lines[i],
+						      frames);
+			if (ret)
+				return ret;
+		}
+		return 0;
+	}
+
+	bytes = frames * AUDIO_LINE_FRAME_BYTES;
 	if (!frames)
 		return -EINVAL;
 	ret = dmaengine_slave_config(st->dma, &cfg);
@@ -293,7 +425,6 @@ static int s5l8947x_dma_setup(struct s5l8947x_stream *st,
 	st->dma_ring_frames = frames;
 
 clear:
-	/* Never replay a previous stream's samples */
 	memset(st->dma_ring, 0, st->dma_ring_bytes);
 	return 0;
 }
@@ -303,22 +434,88 @@ static void s5l8947x_dma_period(void *data)
 	snd_pcm_period_elapsed(data);
 }
 
+static void s5l8947x_dma_halt(struct s5l8947x_stream *st)
+{
+	unsigned int i;
+
+	if (st->out == AUDIO_HDMI) {
+		for (i = 0; i < AUDIO_MAX_HDMI_LINES; i++) {
+			struct s5l8947x_line *ln = &st->lines[i];
+
+			if (ln->dma_started) {
+				ln->dma_started = false;
+				dmaengine_terminate_async(ln->dma);
+			}
+		}
+		return;
+	}
+	if (st->dma_started) {
+		st->dma_started = false;
+		dmaengine_terminate_async(st->dma);
+	}
+}
+
+static void s5l8947x_dma_sync(struct s5l8947x_stream *st)
+{
+	unsigned int i;
+
+	if (st->out == AUDIO_HDMI) {
+		for (i = 0; i < AUDIO_MAX_HDMI_LINES; i++)
+			dmaengine_synchronize(st->lines[i].dma);
+		return;
+	}
+	dmaengine_synchronize(st->dma);
+}
+
 static int s5l8947x_dma_start(struct s5l8947x_stream *st)
 {
 	struct snd_pcm_runtime *runtime = st->substream->runtime;
-	struct dma_async_tx_descriptor *desc;
+	unsigned int i;
 
-	desc = dmaengine_prep_dma_cyclic(st->dma, st->dma_ring_phys,
-					 st->dma_ring_bytes,
-					 runtime->period_size * AUDIO_FRAME_BYTES,
-					 DMA_MEM_TO_DEV, DMA_PREP_INTERRUPT);
-	if (!desc)
-		return -ENOMEM;
-	desc->callback = s5l8947x_dma_period;
-	desc->callback_param = st->substream;
-	st->cookie = dmaengine_submit(desc);
-	dma_async_issue_pending(st->dma);
-	st->dma_started = true;
+	if (st->out == AUDIO_HDMI) {
+		for (i = 0; i < st->nlines; i++) {
+			struct s5l8947x_line *ln = &st->lines[i];
+			struct dma_async_tx_descriptor *desc;
+
+			desc = dmaengine_prep_dma_cyclic(ln->dma,
+					ln->ring_phys, ln->ring_bytes,
+					runtime->period_size *
+						AUDIO_LINE_FRAME_BYTES,
+					DMA_MEM_TO_DEV, DMA_PREP_INTERRUPT);
+			if (!desc)
+				return -ENOMEM;
+			/*
+			 * Only line 0 reports periods: all lines run from the
+			 * same bit clock and advance in lockstep.
+			 */
+			if (i == 0) {
+				desc->callback = s5l8947x_dma_period;
+				desc->callback_param = st->substream;
+			}
+			ln->cookie = dmaengine_submit(desc);
+			dma_async_issue_pending(ln->dma);
+			ln->dma_started = true;
+		}
+		return 0;
+	}
+
+	{
+		struct dma_async_tx_descriptor *desc;
+
+		desc = dmaengine_prep_dma_cyclic(st->dma, st->dma_ring_phys,
+						 st->dma_ring_bytes,
+						 runtime->period_size *
+						 AUDIO_LINE_FRAME_BYTES,
+						 DMA_MEM_TO_DEV,
+						 DMA_PREP_INTERRUPT);
+		if (!desc)
+			return -ENOMEM;
+		desc->callback = s5l8947x_dma_period;
+		desc->callback_param = st->substream;
+		st->cookie = dmaengine_submit(desc);
+		dma_async_issue_pending(st->dma);
+		st->dma_started = true;
+	}
 	return 0;
 }
 
@@ -331,37 +528,74 @@ s5l8947x_substream_stream(struct snd_pcm_substream *substream)
 }
 
 /*
- * Convert the application's S16 stereo frames into the FIFO word layout.
- * Called from the PCM copy callback, which is serialized with the stream.
+ * Convert the application's interleaved S16 frames into each data line's
+ * FIFO word layout.  Called from the PCM copy callback, which is serialized
+ * with the stream.
  */
 static int s5l8947x_pcm_copy(struct snd_pcm_substream *substream, int channel,
 			     unsigned long pos, struct iov_iter *iter,
 			     unsigned long count)
 {
 	struct s5l8947x_stream *st = s5l8947x_substream_stream(substream);
-	unsigned int frames = count / 4;
-	u32 *ring = st->dma_ring;
+	unsigned int frame_bytes = st->channels * 2;
+	unsigned int frames = count / frame_bytes;
 	unsigned int frame;
-	s16 tmp[128];
-	unsigned int n, i;
+	s16 tmp[256];
+	unsigned int n, i, line;
 
-	if (!ring)
-		return -EINVAL;
-	frame = (pos / 4) % st->dma_ring_frames;
+	if (st->out == AUDIO_OPTICAL) {
+		u32 *ring = st->dma_ring;
+		s16 stereo[128];
+
+		if (!ring)
+			return -EINVAL;
+		frame = (pos / frame_bytes) % st->dma_ring_frames;
+		while (frames) {
+			n = min(frames, ARRAY_SIZE(stereo) / 2);
+			if (copy_from_iter(stereo, n * 4, iter) != n * 4)
+				return -EFAULT;
+			for (i = 0; i < n; i++) {
+				u32 l = (u16)stereo[i * 2];
+				u32 r = (u16)stereo[i * 2 + 1];
+				u32 *dst = ring + frame * 2;
+
+				dst[0] = l << 16 | l;
+				dst[1] = r << 16 | r;
+				if (++frame == st->dma_ring_frames)
+					frame = 0;
+			}
+			frames -= n;
+		}
+		return 0;
+	}
+
+	for (line = 0; line < st->nlines; line++)
+		if (!st->lines[line].ring)
+			return -EINVAL;
+	frame = (pos / frame_bytes) % st->lines[0].ring_frames;
 
 	while (frames) {
-		n = min(frames, ARRAY_SIZE(tmp) / 2);
-		if (copy_from_iter(tmp, n * 4, iter) != n * 4)
+		n = min(frames, ARRAY_SIZE(tmp) / st->channels);
+		if (copy_from_iter(tmp, n * frame_bytes, iter) !=
+		    n * frame_bytes)
 			return -EFAULT;
-		for (i = 0; i < n; i++) {
-			u32 l = (u16)tmp[i * 2], r = (u16)tmp[i * 2 + 1];
-			u32 *dst = ring + frame * 2;
+		for (line = 0; line < st->nlines; line++) {
+			unsigned int src = s5l8947x_line_map[st->channels][line * 2];
+			u32 *dst = st->lines[line].ring + frame * 2;
+			unsigned int f;
 
-			dst[0] = l << 16 | l;
-			dst[1] = r << 16 | r;
-			if (++frame == st->dma_ring_frames)
-				frame = 0;
+			for (f = 0; f < n; f++) {
+				s16 *s = tmp + f * st->channels + src;
+				u32 l = (u16)s[0], r = (u16)s[1];
+
+				dst[0] = l << 16 | l;
+				dst[1] = r << 16 | r;
+				dst += 2;
+			}
 		}
+		frame += n;
+		if (frame >= st->lines[0].ring_frames)
+			frame -= st->lines[0].ring_frames;
 		frames -= n;
 	}
 	return 0;
@@ -380,6 +614,14 @@ static int s5l8947x_pcm_open(struct snd_pcm_substream *substream)
 	if (ret < 0)
 		return ret;
 
+	if (st->out == AUDIO_HDMI) {
+		ret = snd_pcm_hw_constraint_list(runtime, 0,
+						 SNDRV_PCM_HW_PARAM_CHANNELS,
+						 &s5l8947x_channel_constraints);
+		if (ret < 0)
+			return ret;
+	}
+
 	/* A cyclic transfer is a whole number of periods */
 	ret = snd_pcm_hw_constraint_integer(runtime, SNDRV_PCM_HW_PARAM_PERIODS);
 	if (ret < 0)
@@ -394,13 +636,13 @@ static int s5l8947x_pcm_close(struct snd_pcm_substream *substream)
 	struct s5l8947x_stream *st = s5l8947x_substream_stream(substream);
 
 	s5l8947x_dma_halt(st);
-	dmaengine_synchronize(st->dma);
+	s5l8947x_dma_sync(st);
 	s5l8947x_engine_stop(st);
 	if (st->out == AUDIO_HDMI)
 		s5l8947x_mclk_off(st->aud);
 	st->substream = NULL;
 	if (st->out == AUDIO_HDMI && st->aud->hdmi_enable)
-		s5l8947x_hdmi_audio_configure(st->rate, false);
+		s5l8947x_hdmi_audio_configure(st->rate, st->channels, false);
 	s5l8947x_dma_free(st);
 	return 0;
 }
@@ -412,8 +654,10 @@ static int s5l8947x_pcm_prepare(struct snd_pcm_substream *substream)
 	int ret;
 
 	st->rate = runtime->rate;
+	st->channels = runtime->channels;
+	st->nlines = st->out == AUDIO_HDMI ? st->channels / 2 : 1;
 	s5l8947x_dma_halt(st);
-	dmaengine_synchronize(st->dma);
+	s5l8947x_dma_sync(st);
 
 	ret = s5l8947x_engine_config(st);
 	if (ret < 0)
@@ -426,7 +670,7 @@ static int s5l8947x_pcm_prepare(struct snd_pcm_substream *substream)
 	runtime->start_threshold = runtime->buffer_size;
 
 	if (st->out == AUDIO_HDMI && st->aud->hdmi_enable)
-		s5l8947x_hdmi_audio_configure(st->rate, true);
+		s5l8947x_hdmi_audio_configure(st->rate, st->channels, true);
 	return 0;
 }
 
@@ -468,7 +712,7 @@ static int s5l8947x_pcm_sync_stop(struct snd_pcm_substream *substream)
 {
 	struct s5l8947x_stream *st = s5l8947x_substream_stream(substream);
 
-	dmaengine_synchronize(st->dma);
+	s5l8947x_dma_sync(st);
 	return 0;
 }
 
@@ -477,15 +721,30 @@ s5l8947x_pcm_pointer(struct snd_pcm_substream *substream)
 {
 	struct s5l8947x_stream *st = s5l8947x_substream_stream(substream);
 	struct dma_tx_state state;
-	size_t played;
+	struct dma_chan *dma;
+	dma_cookie_t cookie;
+	size_t bytes, played;
 
-	if (!st->dma_started || !st->dma_ring_bytes)
+	if (st->out == AUDIO_HDMI) {
+		/* All lines run from the same clock; line 0 is the reference. */
+		dma = st->lines[0].dma;
+		cookie = st->lines[0].cookie;
+		bytes = st->lines[0].ring_bytes;
+		if (!st->lines[0].dma_started || !bytes)
+			return 0;
+	} else {
+		dma = st->dma;
+		cookie = st->cookie;
+		bytes = st->dma_ring_bytes;
+		if (!st->dma_started || !bytes)
+			return 0;
+	}
+
+	dmaengine_tx_status(dma, cookie, &state);
+	if (state.residue > bytes)
 		return 0;
-	dmaengine_tx_status(st->dma, st->cookie, &state);
-	if (state.residue > st->dma_ring_bytes)
-		return 0;
-	played = st->dma_ring_bytes - state.residue;
-	return (played / AUDIO_FRAME_BYTES) % substream->runtime->buffer_size;
+	played = bytes - state.residue;
+	return (played / AUDIO_LINE_FRAME_BYTES) % substream->runtime->buffer_size;
 }
 
 static const struct snd_pcm_ops s5l8947x_pcm_ops = {
@@ -528,7 +787,7 @@ static int s5l8947x_ctl_switch_put(struct snd_kcontrol *kcontrol,
 		return 0;
 	aud->hdmi_enable = en;
 	if (st->substream) {
-		s5l8947x_hdmi_audio_configure(st->rate, en);
+		s5l8947x_hdmi_audio_configure(st->rate, st->channels, en);
 		if (en && st->dma_started)
 			s5l8947x_hdmi_audio_arm(st->rate);
 	}
@@ -569,21 +828,41 @@ static void s5l8947x_gates_disable(void *gates)
 	clk_bulk_disable_unprepare(AUDIO_NUM_GATES, gates);
 }
 
+static const char * const s5l8947x_i2s_names[AUDIO_MAX_HDMI_LINES] = {
+	"i2s0", "i2s1", "i2s2", "i2s3",
+};
+
+static const char * const s5l8947x_hdmi_dma_names[AUDIO_MAX_HDMI_LINES] = {
+	"hdmi0", "hdmi1", "hdmi2", "hdmi3",
+};
+
+static void s5l8947x_audio_release_dma(struct s5l8947x_audio *aud)
+{
+	unsigned int i;
+
+	for (i = 0; i < AUDIO_MAX_HDMI_LINES; i++) {
+		struct s5l8947x_line *ln = &aud->streams[AUDIO_HDMI].lines[i];
+
+		if (ln->dma)
+			dma_release_channel(ln->dma);
+	}
+	if (aud->streams[AUDIO_OPTICAL].dma)
+		dma_release_channel(aud->streams[AUDIO_OPTICAL].dma);
+}
+
 static int s5l8947x_audio_probe(struct platform_device *pdev)
 {
-	static const char * const dma_names[AUDIO_NUM_OUTPUTS] = {
-		[AUDIO_HDMI]	= "hdmi",
-		[AUDIO_OPTICAL]	= "optical",
-	};
 	static const char * const pcm_names[AUDIO_NUM_OUTPUTS] = {
 		[AUDIO_HDMI]	= "S5L8947X HDMI (I2S)",
 		[AUDIO_OPTICAL]	= "S5L8947X Optical (S/PDIF)",
 	};
-	phys_addr_t phys[AUDIO_NUM_OUTPUTS];
+	struct s5l8947x_stream *hdmi;
+	struct s5l8947x_stream *opt;
 	struct s5l8947x_audio *aud;
 	struct snd_card *card;
 	struct clk_bulk_data *gates;
 	struct snd_pcm *pcm;
+	phys_addr_t phys;
 	unsigned int i;
 	int ret;
 
@@ -596,14 +875,24 @@ static int s5l8947x_audio_probe(struct platform_device *pdev)
 	aud->dev = &pdev->dev;
 	aud->card = card;
 	aud->hdmi_enable = true;
+	hdmi = &aud->streams[AUDIO_HDMI];
+	opt = &aud->streams[AUDIO_OPTICAL];
 	platform_set_drvdata(pdev, aud);
 
-	aud->i2s = s5l8947x_map(pdev, "i2s0", &phys[AUDIO_HDMI]);
 	aud->i2s_master = s5l8947x_map(pdev, "i2s-master", NULL);
-	aud->spdif = s5l8947x_map(pdev, "spdif", &phys[AUDIO_OPTICAL]);
-	if (IS_ERR(aud->i2s) || IS_ERR(aud->i2s_master) || IS_ERR(aud->spdif)) {
+	aud->spdif = s5l8947x_map(pdev, "spdif", &phys);
+	if (IS_ERR(aud->i2s_master) || IS_ERR(aud->spdif)) {
 		ret = -ENODEV;
 		goto err_free_card;
+	}
+
+	for (i = 0; i < AUDIO_MAX_HDMI_LINES; i++) {
+		aud->i2s[i] = s5l8947x_map(pdev, s5l8947x_i2s_names[i], &phys);
+		if (IS_ERR(aud->i2s[i])) {
+			ret = -ENODEV;
+			goto err_free_card;
+		}
+		hdmi->lines[i].fifo_phys = phys + I2S_TXDATA;
 	}
 
 	ret = dma_set_mask_and_coherent(&pdev->dev, DMA_BIT_MASK(32));
@@ -636,20 +925,35 @@ static int s5l8947x_audio_probe(struct platform_device *pdev)
 	}
 
 	for (i = 0; i < AUDIO_NUM_OUTPUTS; i++) {
-		struct s5l8947x_stream *st = &aud->streams[i];
+		aud->streams[i].aud = aud;
+		aud->streams[i].out = i;
+		aud->streams[i].rate = i == AUDIO_HDMI ? 48000 : AUDIO_RATE_OPTICAL;
+		aud->streams[i].channels = 2;
+		aud->streams[i].nlines = 1;
+	}
+	opt->fifo_phys = phys + SPDIF_DATA;
 
-		st->aud = aud;
-		st->out = i;
-		st->rate = i == AUDIO_HDMI ? 48000 : AUDIO_RATE_OPTICAL;
-		st->fifo_phys = phys[i] + (i == AUDIO_HDMI ? I2S_TXDATA : SPDIF_DATA);
-		st->dma = dma_request_chan(&pdev->dev, dma_names[i]);
-		if (IS_ERR(st->dma)) {
-			ret = dev_err_probe(&pdev->dev, PTR_ERR(st->dma),
+	for (i = 0; i < AUDIO_MAX_HDMI_LINES; i++) {
+		struct s5l8947x_line *ln = &hdmi->lines[i];
+
+		ln->i2s = aud->i2s[i];
+		ln->dma = dma_request_chan(&pdev->dev,
+					   s5l8947x_hdmi_dma_names[i]);
+		if (IS_ERR(ln->dma)) {
+			ret = dev_err_probe(&pdev->dev, PTR_ERR(ln->dma),
 					    "failed to get the %s DMA channel\n",
-					    dma_names[i]);
-			st->dma = NULL;
+					    s5l8947x_hdmi_dma_names[i]);
+			ln->dma = NULL;
 			goto err_release_dma;
 		}
+	}
+
+	opt->dma = dma_request_chan(&pdev->dev, "optical");
+	if (IS_ERR(opt->dma)) {
+		ret = dev_err_probe(&pdev->dev, PTR_ERR(opt->dma),
+				    "failed to get the optical DMA channel\n");
+		opt->dma = NULL;
+		goto err_release_dma;
 	}
 
 	strscpy(card->driver, "s5l8947x-audio", sizeof(card->driver));
@@ -664,8 +968,12 @@ static int s5l8947x_audio_probe(struct platform_device *pdev)
 		pcm->private_data = aud;
 		strscpy(pcm->name, pcm_names[i], sizeof(pcm->name));
 		snd_pcm_set_ops(pcm, SNDRV_PCM_STREAM_PLAYBACK, &s5l8947x_pcm_ops);
+		/*
+		 * ALSA caps the usable buffer at the preallocated size, so
+		 * reserve the maximum: 8192 frames of 8-channel audio.
+		 */
 		snd_pcm_set_managed_buffer_all(pcm, SNDRV_DMA_TYPE_VMALLOC, NULL,
-					       32 * 1024, 64 * 1024);
+					       256 * 1024, 256 * 1024);
 	}
 
 	for (i = 0; i < ARRAY_SIZE(s5l8947x_audio_controls); i++) {
@@ -680,16 +988,13 @@ static int s5l8947x_audio_probe(struct platform_device *pdev)
 		goto err_release_dma;
 
 	dev_info(&pdev->dev,
-		 "registered '%s': pcm0 I2S -> HDMI (32/44.1/48 kHz, DMA %s), pcm1 S/PDIF -> optical (%u Hz, DMA %s)\n",
-		 card->shortname,
-		 dma_chan_name(aud->streams[AUDIO_HDMI].dma), AUDIO_RATE_OPTICAL,
-		 dma_chan_name(aud->streams[AUDIO_OPTICAL].dma));
+		 "registered '%s': pcm0 I2S x4 -> HDMI (32/44.1/48 kHz, 2..8 ch, DMA %s), pcm1 S/PDIF -> optical (%u Hz, DMA %s)\n",
+		 card->shortname, dma_chan_name(hdmi->lines[0].dma),
+		 AUDIO_RATE_OPTICAL, dma_chan_name(opt->dma));
 	return 0;
 
 err_release_dma:
-	for (i = 0; i < AUDIO_NUM_OUTPUTS; i++)
-		if (aud->streams[i].dma)
-			dma_release_channel(aud->streams[i].dma);
+	s5l8947x_audio_release_dma(aud);
 err_free_card:
 	snd_card_free(card);
 	return ret;
@@ -698,15 +1003,15 @@ err_free_card:
 static void s5l8947x_audio_remove(struct platform_device *pdev)
 {
 	struct s5l8947x_audio *aud = platform_get_drvdata(pdev);
-	struct dma_chan *dma[AUDIO_NUM_OUTPUTS];
 	unsigned int i;
 
-	for (i = 0; i < AUDIO_NUM_OUTPUTS; i++)
-		dma[i] = aud->streams[i].dma;
 	/* Closing the PCMs stops the transfers and frees the rings */
 	snd_card_free(aud->card);
-	for (i = 0; i < AUDIO_NUM_OUTPUTS; i++)
-		dma_release_channel(dma[i]);
+	for (i = 0; i < AUDIO_MAX_HDMI_LINES; i++)
+		if (aud->streams[AUDIO_HDMI].lines[i].dma)
+			dma_release_channel(aud->streams[AUDIO_HDMI].lines[i].dma);
+	if (aud->streams[AUDIO_OPTICAL].dma)
+		dma_release_channel(aud->streams[AUDIO_OPTICAL].dma);
 }
 
 static const struct of_device_id s5l8947x_audio_of_match[] = {

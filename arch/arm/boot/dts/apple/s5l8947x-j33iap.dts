@@ -196,7 +196,7 @@
 	status = "okay";
 };
 
-/* Audio (I2S0 to HDMI, S/PDIF to optical) */
+/* Audio (I2S0..I2S3 to HDMI, S/PDIF to optical) */
 &audio0 {
 	status = "okay";
 };

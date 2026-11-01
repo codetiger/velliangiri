@@ -384,6 +384,7 @@ struct s5l_display {
 	bool scaler_enabled;
 	bool audio_enabled;
 	unsigned int audio_rate;
+	unsigned int audio_channels;
 	unsigned int gamma_brightness;
 	unsigned long tmds_hz;
 };
@@ -529,11 +530,15 @@ static void s5l_audio_off(struct s5l_display *d)
 	hdmi_mask(d, HDMI_CON_0, 0x04, 0);
 }
 
-static void s5l_audio_on(struct s5l_display *d, unsigned int rate)
+static void s5l_audio_on(struct s5l_display *d, unsigned int rate,
+			 unsigned int channels)
 {
-	static const u8 aui[5] = { 0x01, 0x00, 0x00, 0x00, 0x00 };
+	u8 aui[5] = { 0x01, 0x00, 0x00, 0x00, 0x00 };
 	u32 csum;
 	int i;
+
+	/* Audio InfoFrame: channel count in byte 1, default allocation */
+	aui[0] = (channels - 1) & 0x07;
 
 	/* HDMI mode with guard bands and preambles for the data islands */
 	writel(0x02, d->hdmi + HDMI_MODE_SEL);
@@ -567,7 +572,8 @@ static void s5l_audio_on(struct s5l_display *d, unsigned int rate)
 	       d->hdmi + HDMI_I2S_CH_ST_3);
 	writel(0x02, d->hdmi + HDMI_I2S_CH_ST_4);
 	writel(0x01, d->hdmi + HDMI_I2S_CH_ST_CON);
-	writel(0x03, d->hdmi + HDMI_I2S_MUX_CH);
+	/* One mux bit per channel (I2S0 = 0/1, I2S1 = 2/3, ...) */
+	writel((1U << channels) - 1, d->hdmi + HDMI_I2S_MUX_CH);
 	writel(0x03, d->hdmi + HDMI_I2S_MUX_CUV);
 	writel(0x77, d->hdmi + HDMI_I2S_MUX_CON);
 
@@ -600,23 +606,27 @@ static void s5l_audio_arm(struct s5l_display *d, unsigned int rate)
 	writel(0x04, d->hdmi + HDMI_ACR_CON);
 }
 
-int s5l8947x_hdmi_audio_configure(unsigned int sample_rate, bool enable)
+int s5l8947x_hdmi_audio_configure(unsigned int sample_rate,
+				  unsigned int channels, bool enable)
 {
 	struct s5l_display *d = g_s5l_display;
 
 	if (!d)
 		return -ENODEV;
-	if (enable && !sample_rate)
+	if (enable && (!sample_rate || !channels || channels > 8 ||
+		       (channels & 1)))
 		return -EINVAL;
 
 	mutex_lock(&d->lock);
 	if (enable)
-		s5l_audio_on(d, sample_rate);
+		s5l_audio_on(d, sample_rate, channels);
 	else
 		s5l_audio_off(d);
 	d->audio_enabled = enable;
-	if (enable)
+	if (enable) {
 		d->audio_rate = sample_rate;
+		d->audio_channels = channels;
+	}
 	mutex_unlock(&d->lock);
 	return 0;
 }
@@ -932,7 +942,8 @@ static void s5l_pipe_enable(struct drm_simple_display_pipe *pipe,
 	writel(9, d->out + OUT_START);
 	s5l_gamma(d, d->gamma_brightness);
 	if (hdmi_mode && d->audio_enabled) {
-		s5l_audio_on(d, d->audio_rate);
+		s5l_audio_on(d, d->audio_rate,
+			    d->audio_channels ?: 2);
 		s5l_audio_arm(d, d->audio_rate);
 	}
 	mutex_unlock(&d->lock);
@@ -1128,7 +1139,8 @@ static void s5l_hpd_poll(struct work_struct *work)
 			hdmi_mask(d, HDMI_CON_0, 0x04, 0);
 			writel(0x00, d->hdmi + HDMI_ACR_CON);
 		} else if (d->audio_enabled) {
-			s5l_audio_on(d, d->audio_rate);
+			s5l_audio_on(d, d->audio_rate,
+			    d->audio_channels ?: 2);
 			s5l_audio_arm(d, d->audio_rate);
 		}
 		mutex_unlock(&d->lock);
@@ -1228,27 +1240,45 @@ static ssize_t hdmi_audio_show(struct device *dev, struct device_attribute *a,
 	struct s5l_display *d = dev_get_drvdata(dev);
 
 	return sysfs_emit(buf,
-			  "enabled=%u rate=%u con0=0x%02x acr_con=0x%02x n=%u cts=%u asp_con=0x%02x aui_con=0x%02x i2s_mux=0x%02x\n",
-			  d->audio_enabled, d->audio_rate,
+			  "enabled=%u rate=%u channels=%u con0=0x%02x acr_con=0x%02x n=%u cts=%u asp_con=0x%02x aui_con=0x%02x i2s_mux=0x%02x mux_ch=0x%02x\n",
+			  d->audio_enabled, d->audio_rate, d->audio_channels,
 			  readl(d->hdmi + HDMI_CON_0) & 0xffU,
 			  readl(d->hdmi + HDMI_ACR_CON) & 0xffU,
 			  hdmi_rb(d, HDMI_ACR_N0, 3), hdmi_rb(d, HDMI_ACR_CTS0, 3),
 			  readl(d->hdmi + HDMI_ASP_CON) & 0xffU,
 			  readl(d->hdmi + HDMI_AUI_CON) & 0xffU,
-			  readl(d->hdmi + HDMI_I2S_MUX_CON) & 0xffU);
+			  readl(d->hdmi + HDMI_I2S_MUX_CON) & 0xffU,
+			  readl(d->hdmi + HDMI_I2S_MUX_CH) & 0xffU);
 }
 
 static ssize_t hdmi_audio_store(struct device *dev, struct device_attribute *a,
 				const char *buf, size_t count)
 {
-	unsigned int rate;
+	unsigned int rate, channels = 2;
+	char tmp[32];
+	const char *sep;
 	int ret;
 
-	if (sysfs_streq(buf, "off"))
+	if (sysfs_streq(buf, "off")) {
 		rate = 0;
-	else if (kstrtouint(buf, 0, &rate))
-		return -EINVAL;
-	ret = s5l8947x_hdmi_audio_configure(rate, rate != 0);
+	} else {
+		/* Accept "rate" or "rate:channels" (channels 2..8, even) */
+		sep = strchr(buf, ':');
+		if (sep) {
+			size_t len = min_t(size_t, sep - buf, sizeof(tmp) - 1);
+
+			memcpy(tmp, buf, len);
+			tmp[len] = '\0';
+			if (kstrtouint(tmp, 0, &rate) ||
+			    kstrtouint(sep + 1, 0, &channels))
+				return -EINVAL;
+		} else if (kstrtouint(buf, 0, &rate)) {
+			return -EINVAL;
+		}
+		if (rate && (!channels || channels > 8 || (channels & 1)))
+			return -EINVAL;
+	}
+	ret = s5l8947x_hdmi_audio_configure(rate, channels, rate != 0);
 	if (ret)
 		return ret;
 	if (rate)
@@ -1306,6 +1336,7 @@ static int s5l_probe(struct platform_device *pdev)
 	d->dev = dev;
 	d->gamma_brightness = 100;
 	d->tmds_hz = 74250000;
+	d->audio_channels = 2;
 	mutex_init(&d->lock);
 	platform_set_drvdata(pdev, d);
 

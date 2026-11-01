@@ -35,6 +35,7 @@ t_audio() {
 
 	if [ "$(rd "$DISP/hpd_connected")" = 1 ]; then
 		t_audio_rates
+		t_audio_channels
 	fi
 
 	if [ -z "$WAV" ]; then
@@ -87,6 +88,32 @@ t_audio_rates() {
 			pass "HDMI $r Hz exact (N $(field n "$hdmi"), CTS $cts, measured $mcts)"
 		else
 			fail "HDMI $r Hz: announced CTS $cts, measured $mcts ($hdmi)"
+		fi
+	done
+	rm -f "$wav"
+}
+
+# 4/6/8-channel HDMI: every data line must open and stream. The sink may
+# downmix or ignore channels it does not support, so this only checks the
+# engine side; a listening test with -p (pair) tells which line is which.
+t_audio_channels() {
+	wav=/tmp/hwtest-silence.wav
+	{
+		printf '\122\111\106\106\244\273\000\000\127\101\126\105\146\155\164\040'
+		printf '\020\000\000\000\001\000\001\000\100\037\000\000\200\076\000\000'
+		printf '\002\000\020\000\144\141\164\141\200\273\000\000'
+		head -c 48000 /dev/zero
+	} >"$wav"
+	for ch in 4 6 8; do
+		if run wavplay -c "$ch" "$wav"; then
+			hdmi=$(rd "$DISP/hdmi_audio")
+			if [ "$(field channels "$hdmi")" = "$ch" ]; then
+				pass "HDMI $ch channels streamed and announced"
+			else
+				fail "HDMI $ch channels: $hdmi"
+			fi
+		else
+			fail "HDMI $ch-channel playback"
 		fi
 	done
 	rm -f "$wav"

@@ -2,14 +2,15 @@
 /*
  * WAV file player for the S5L8947X ALSA card (/bin/wavplay)
  *
- * Usage: wavplay [-d pcm-device] [-r rate] file.wav
+ * Usage: wavplay [-d pcm-device] [-r rate] [-c channels] [-p pair] file.wav
  *
  * Plays 8-bit and 16-bit PCM WAV files with any number of channels at any
- * sample rate. The audio engine plays S16 stereo at 32, 44.1 and 48 kHz on
- * HDMI and 46875 Hz on optical, so the file is converted on the fly: the
- * first two channels are used (mono is duplicated) and, when the device does
- * not take the file's rate (or -r asks for another), the rate is converted by
- * linear interpolation.
+ * sample rate. The audio engine plays S16 at 32, 44.1 and 48 kHz on HDMI
+ * (2, 4, 6 or 8 channels) and 46875 Hz stereo on optical, so the file is
+ * converted on the fly: a file with at least -c channels is copied channel
+ * for channel, otherwise its first two channels are placed in pair -p (mono
+ * is duplicated). When the device does not take the file's rate (or -r asks
+ * for another), the rate is converted by linear interpolation.
  *
  * The ALSA PCM is driven through the kernel ioctl interface directly so the
  * player builds statically without alsa-lib.
@@ -155,15 +156,31 @@ static int16_t wav_sample(const struct wav *w, size_t frame, unsigned int ch)
  * once it passes the end of the file the rest is silence. Returns the number of
  * frames that still came from the file.
  */
+static int wav_src_channel(const struct wav *w, unsigned int out_ch, int pair,
+			   unsigned int ch)
+{
+	if (w->channels >= out_ch)
+		return ch;
+	if (pair < 0)
+		return ch < w->channels ? (int)ch : -1;
+	if ((int)(ch / 2) != pair)
+		return -1;
+	ch %= 2;
+	if (ch < w->channels)
+		return ch;
+	return w->channels == 1 ? 0 : -1;
+}
+
 static size_t wav_render(const struct wav *w, uint64_t *pos, unsigned int dst_rate,
-			 int16_t *out, size_t frames)
+			 int16_t *out, size_t frames, unsigned int out_ch, int pair)
 {
 	uint64_t step = ((uint64_t)w->rate << 32) / dst_rate;
 	unsigned int right = w->channels > 1 ? 1 : 0;
 	size_t i = 0, live = 0;
 
 #ifdef __ARM_NEON
-	if (w->bytes == 2 && w->channels == 2 && w->frames > 1) {
+	if (out_ch == 2 && pair == 0 && w->bytes == 2 && w->channels == 2 &&
+	    w->frames > 1) {
 		const int16_t *in = (const int16_t *)w->data;
 
 		for (; i + 4 <= frames; i += 4) {
@@ -208,25 +225,51 @@ static size_t wav_render(const struct wav *w, uint64_t *pos, unsigned int dst_ra
 	}
 #endif
 
+	if (out_ch == 2 && pair == 0) {
+		for (; i < frames; i++, *pos += step) {
+			size_t idx = *pos >> 32;
+			int32_t frac = (*pos >> 16) & 0xffff;
+			int32_t l, r;
+
+			if (idx >= w->frames) {
+				out[i * 2] = 0;
+				out[i * 2 + 1] = 0;
+				continue;
+			}
+			live++;
+			l = wav_sample(w, idx, 0);
+			r = wav_sample(w, idx, right);
+			if (idx + 1 < w->frames) {
+				l += ((int64_t)(wav_sample(w, idx + 1, 0) - l) * frac) >> 16;
+				r += ((int64_t)(wav_sample(w, idx + 1, right) - r) * frac) >> 16;
+			}
+			out[i * 2] = l;
+			out[i * 2 + 1] = r;
+		}
+		return live;
+	}
+
 	for (; i < frames; i++, *pos += step) {
 		size_t idx = *pos >> 32;
 		int32_t frac = (*pos >> 16) & 0xffff;
-		int32_t l, r;
+		unsigned int ch;
 
-		if (idx >= w->frames) {
-			out[i * 2] = 0;
-			out[i * 2 + 1] = 0;
-			continue;
+		for (ch = 0; ch < out_ch; ch++) {
+			int src = wav_src_channel(w, out_ch, pair, ch);
+			int32_t v;
+
+			if (src < 0 || idx >= w->frames) {
+				out[i * out_ch + ch] = 0;
+				continue;
+			}
+			v = wav_sample(w, idx, src);
+			if (idx + 1 < w->frames)
+				v += ((int64_t)(wav_sample(w, idx + 1, src) - v) *
+				      frac) >> 16;
+			out[i * out_ch + ch] = v;
 		}
-		live++;
-		l = wav_sample(w, idx, 0);
-		r = wav_sample(w, idx, right);
-		if (idx + 1 < w->frames) {
-			l += ((int64_t)(wav_sample(w, idx + 1, 0) - l) * frac) >> 16;
-			r += ((int64_t)(wav_sample(w, idx + 1, right) - r) * frac) >> 16;
-		}
-		out[i * 2] = l;
-		out[i * 2 + 1] = r;
+		if (idx < w->frames)
+			live++;
 	}
 	return live;
 }
@@ -250,7 +293,7 @@ static void hw_interval_set(struct snd_pcm_hw_params *p, int param, unsigned int
 	iv->integer = 1;
 }
 
-static int pcm_hw_params(int fd, unsigned int rate)
+static int pcm_hw_params(int fd, unsigned int rate, unsigned int channels)
 {
 	struct snd_pcm_hw_params hw;
 	int i;
@@ -263,7 +306,7 @@ static int pcm_hw_params(int fd, unsigned int rate)
 	hw_mask_set(&hw, SNDRV_PCM_HW_PARAM_ACCESS, SNDRV_PCM_ACCESS_RW_INTERLEAVED);
 	hw_mask_set(&hw, SNDRV_PCM_HW_PARAM_FORMAT, SNDRV_PCM_FORMAT_S16_LE);
 	hw_mask_set(&hw, SNDRV_PCM_HW_PARAM_SUBFORMAT, SNDRV_PCM_SUBFORMAT_STD);
-	hw_interval_set(&hw, SNDRV_PCM_HW_PARAM_CHANNELS, 2);
+	hw_interval_set(&hw, SNDRV_PCM_HW_PARAM_CHANNELS, channels);
 	hw_interval_set(&hw, SNDRV_PCM_HW_PARAM_RATE, rate);
 	hw_interval_set(&hw, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, PERIOD_FRAMES);
 	hw_interval_set(&hw, SNDRV_PCM_HW_PARAM_BUFFER_SIZE, BUFFER_FRAMES);
@@ -276,19 +319,20 @@ static int pcm_hw_params(int fd, unsigned int rate)
  * rate and the device's standard rates that the device accepts. Returns the
  * rate in use, 0 on failure.
  */
-static unsigned int pcm_setup(int fd, unsigned int rate, unsigned int file_rate)
+static unsigned int pcm_setup(int fd, unsigned int rate, unsigned int file_rate,
+			      unsigned int channels)
 {
 	const unsigned int tries[] = { file_rate, 48000, 44100, 32000, 46875 };
 	unsigned int i;
 
 	if (rate) {
-		if (pcm_hw_params(fd, rate) < 0) {
+		if (pcm_hw_params(fd, rate, channels) < 0) {
 			perror("wavplay: SNDRV_PCM_IOCTL_HW_PARAMS");
 			return 0;
 		}
 	} else {
 		for (i = 0; i < sizeof(tries) / sizeof(tries[0]); i++)
-			if (pcm_hw_params(fd, tries[i]) == 0)
+			if (pcm_hw_params(fd, tries[i], channels) == 0)
 				break;
 		if (i == sizeof(tries) / sizeof(tries[0])) {
 			fprintf(stderr, "wavplay: the device takes none of the standard rates\n");
@@ -323,21 +367,24 @@ static int pcm_write(int fd, int16_t *buf, size_t frames)
 
 static void usage(const char *prog)
 {
-	fprintf(stderr, "usage: %s [-d pcm-device] [-r rate] file.wav\n", prog);
+	fprintf(stderr, "usage: %s [-d pcm-device] [-r rate] [-c channels] [-p pair] file.wav\n",
+		prog);
 }
 
 int main(int argc, char **argv)
 {
 	const char *dev = DEFAULT_PCM;
 	unsigned int rate = 0;
-	int16_t period[PERIOD_FRAMES * 2];
+	unsigned int channels = 2;
+	int pair = 0;
+	int16_t *period;
 	struct wav w = { 0 };
 	uint8_t *file;
 	size_t len;
 	uint64_t pos = 0;
 	int opt, fd, ret = 1;
 
-	while ((opt = getopt(argc, argv, "d:r:")) != -1) {
+	while ((opt = getopt(argc, argv, "d:r:c:p:")) != -1) {
 		switch (opt) {
 		case 'd':
 			dev = optarg;
@@ -346,6 +393,22 @@ int main(int argc, char **argv)
 			rate = strtoul(optarg, NULL, 10);
 			if (!rate) {
 				fprintf(stderr, "wavplay: bad rate '%s'\n", optarg);
+				return 2;
+			}
+			break;
+		case 'c':
+			channels = strtoul(optarg, NULL, 10);
+			if (!channels || channels > 8) {
+				fprintf(stderr, "wavplay: bad channel count '%s'\n",
+					optarg);
+				return 2;
+			}
+			break;
+		case 'p':
+			pair = strtol(optarg, NULL, 10);
+			if (pair < 0 || pair > 3) {
+				fprintf(stderr, "wavplay: bad channel pair '%s'\n",
+					optarg);
 				return 2;
 			}
 			break;
@@ -372,16 +435,27 @@ int main(int argc, char **argv)
 		free(file);
 		return 2;
 	}
-	rate = pcm_setup(fd, rate, w.rate);
-	if (!rate)
+	period = malloc(PERIOD_FRAMES * channels * sizeof(*period));
+	if (!period) {
+		fprintf(stderr, "wavplay: out of memory\n");
 		goto out;
-	printf("%s: %u Hz, %u ch, %u-bit, %.2f s -> %u Hz stereo\n", argv[optind],
-	       w.rate, w.channels, w.bytes * 8, (double)w.frames / w.rate, rate);
-
-	while (wav_render(&w, &pos, rate, period, PERIOD_FRAMES)) {
-		if (pcm_write(fd, period, PERIOD_FRAMES))
-			goto out;
 	}
+	rate = pcm_setup(fd, rate, w.rate, channels);
+	if (!rate) {
+		free(period);
+		goto out;
+	}
+	printf("%s: %u Hz, %u ch, %u-bit, %.2f s -> %u Hz, %u ch (source pair %d)\n",
+	       argv[optind], w.rate, w.channels, w.bytes * 8,
+	       (double)w.frames / w.rate, rate, channels, pair);
+
+	while (wav_render(&w, &pos, rate, period, PERIOD_FRAMES, channels, pair)) {
+		if (pcm_write(fd, period, PERIOD_FRAMES)) {
+			free(period);
+			goto out;
+		}
+	}
+	free(period);
 	if (ioctl(fd, SNDRV_PCM_IOCTL_DRAIN) < 0 && errno != EPIPE) {
 		perror("wavplay: drain");
 		goto out;
