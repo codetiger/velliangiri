@@ -31,7 +31,8 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 |---|---|
 | **CPU & Core SoC** | Single-core Cortex-A9 up to 850 MHz (VFPv3-D32 and ARM NEON), CPU frequency scaling (`212.5` / `425` / `850 MHz`), 512 KB PL310 L2 cache (~3.7 GB/s L2 and ~1.6 GB/s DRAM NEON streaming read), `aic,1` interrupt controller, 24 MHz timer, 42-channel central DMA (`dmaengine`), hardware watchdog, clean reboot and standby power-off |
 | **Clocks, GPIO, I2C, PMU** | PMGR peripheral clock gates and audio oscillators, 144-pin GPIO and pinctrl controller (with IRQs), 3x I2C controllers, Dialog I2C PMU power switches, real-time clock (with alarm) and temperature sensors (four board thermistors, PMU junction) with a CPU thermal zone |
-| **HDMI Video** | DRM/KMS driver with EDID mode detection (up to 1920x1080@30; the board starts at 1280x720@60 for 60 Hz output with a synthesized vblank for frame pacing), framebuffer console, a 1080p logo boot splash drawn by the pre-kernel loader, hardware gamma LUT, and memory-to-memory hardware scaler |
+| **HDMI Video** | DRM/KMS driver with EDID mode detection (up to 1920x1080@30; the board starts at 1280x720@60 for 60 Hz output with a synthesized vblank for frame pacing), framebuffer console, a 1080p logo boot splash drawn by the pre-kernel loader, and hardware gamma LUT |
+| **Hardware Scaler** | Both M2 memory-to-memory scalers (`s5l8947x-m2sc`, `/dev/video0` and `/dev/video1`) as V4L2 mem2mem devices: scaling up to 8x down, NV12/NV16/YUYV to and from RGB565/XRGB1555/XRGB8888 with BT.601 or BT.709 matrices in limited or full range, MMAP and DMABUF buffers. NV12 640x360 to XRGB8888 1280x720 takes 5 ms at under 10% CPU |
 | **Audio (HDMI & Optical)** | ALSA playback (`s5l8947x-audio`) on two PCM devices: HDMI over I2S (`pcmC0D0p`, 2/4/6/8-channel LPCM with one data line per channel pair) and optical S/PDIF (`pcmC0D1p`), each fed by a cyclic DMA transfer with period interrupts, with HDMI hot-plug mute/unmute and a `wavplay` CLI player |
 | **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
 | **USB Networking & Console** | Micro-USB port runs in USB device mode (`dwc2`), providing a virtual Ethernet link (`usb0` at `10.55.0.2`, SSH enabled) and a USB serial console (`/dev/ttyGS0`) |
@@ -109,6 +110,7 @@ wavplay /path/to/file.wav    # Play a WAV file over HDMI (-d /dev/snd/pcmC0D1p f
 btscan 10                    # Scan for Bluetooth LE advertisers for 10 seconds
 l2bench                      # Measure L1, L2, and DRAM latency and NEON streaming bandwidth
 fbtest -s 5                  # Measure framebuffer write throughput at the current mode
+m2mtest nv12 640x360 xrgb 1280x720  # Scale and convert on the hardware scaler; reports fps and CPU
 ```
 
 ---
@@ -135,7 +137,8 @@ Drivers that apply across the SoC family are already named `s5l8940x` and parame
 | **USB 2.0 PHY** | `drivers/phy/phy-apple-s5l-usb.c` | OTG device PHY (paired with mainline `dwc2`) and EHCI HSIC host PHY with GPIO ready handshaking. |
 | **UART** | `scripts/patches/0002-*.patch`<br>`scripts/patches/0012-*.patch` | Hooks `ARCH_APPLE_S5L` into mainline `samsung_tty.c` (`apple,s5l-uart`) and raises its port count to five for this SoC: UART1 is the MCU link, UART2 Bluetooth, and UART0/3/4 are the test-point ports (MCU bootstrap/earlycon, stock boot console, Wi-Fi debug). UART0 requires dropping `keep_bootcon`, which otherwise keeps earlycon writing to the port the driver resets. |
 | **IOP coprocessor** | `drivers/soc/apple/s5l8947x-iop.c`<br>`scripts/tools/iopcarve.c` | Bring-up for the separate IOP core: clock gate (decoded from `pmgr:device-clocks`), firmware carved from the device's own kernel image, heap/page-table patching and the A5IOP start sequence. The core starts and runs its firmware, then aborts in its scheduler because the stock message-channel/endpoint setup is not implemented; there is no Linux client for it. |
-| **Display & HDMI** | `drivers/gpu/drm/s5l8947x/s5l8947x_drm.c` | DRM/KMS driver for the `rgbout` display pipe and HDMI 1.4 transmitter: EDID modes, PHY configuration per pixel clock, AVI and audio infoframes, gamma LUT, M2M hardware scaler. |
+| **Display & HDMI** | `drivers/gpu/drm/s5l8947x/s5l8947x_drm.c` | DRM/KMS driver for the `rgbout` display pipe and HDMI 1.4 transmitter: EDID modes, PHY configuration per pixel clock, AVI and audio infoframes, gamma LUT. |
+| **M2 Scaler** | `drivers/media/platform/apple/s5l8947x-m2sc.c` | V4L2 memory-to-memory scaling and colour-space conversion on both M2 instances (PMGR gates 11 and 12, IRQs 9 and 10), generated bilinear filters, and a debugfs self-test. |
 | **Central DMA** | `drivers/dma/s5l8947x-cdma.c` | 42-channel `dmaengine` provider: slave scatter-gather (both directions, audio `0x34000000` and NAND `0x31000000` windows) and cyclic transfers with per-channel interrupts. |
 | **Audio** | `sound/arm/s5l8947x-audio.c` | I2S0..I2S3 (HDMI, 2 to 8 channels over one data line per channel pair) and S/PDIF (optical) transmitters, each fed by a cyclic DMA transfer. |
 | **CDMA AES Engine** | `drivers/crypto/s5l8947x-aes.c`<br>`include/linux/s5l8947x-aes.h` | `ecb(aes)` and `cbc(aes)` `skcipher` algorithms over CDMA channels 1 and 2, plus `s5l8947x_aes_hwkey_crypt()` for the hardware device and group keys. |
@@ -186,7 +189,7 @@ Instead of storing a full kernel source tree, this repository holds only the fil
 | `scripts/patches/` | 9 small, self-contained patches to mainline Linux 6.12 files |
 | `scripts/boot/` | Position-independent entry stub, pre-kernel C loader, HDMI init, boot splash and its generator |
 | `scripts/tests/` | On-device hardware test suite (`hwtest`) |
-| `scripts/tools/` | Userspace tools built into the image (`-mcpu=cortex-a9 -mfpu=neon`): diagnostics (`peek`, `i2cpoke`, `l2bench`, `fbtest`), `wavplay`, `btscan`, the firmware carvers (`hcdcarve`, `sgxcarve`), and the early entropy seeder `jitterseed` |
+| `scripts/tools/` | Userspace tools built into the image (`-mcpu=cortex-a9 -mfpu=neon`): diagnostics (`peek`, `i2cpoke`, `l2bench`, `fbtest`, `m2mtest`), `wavplay`, `btscan`, the firmware carvers (`hcdcarve`, `sgxcarve`), and the early entropy seeder `jitterseed` |
 | `config/` | Kernel configuration fragments layered on `multi_v7_defconfig` |
 | `initramfs/` | Init scripts, USB gadget / SSH setup, and the `wifi` helper |
 | `progress.md`, `benchmarks.md` | Per-block driver status / hardware notes and on-device ARM NEON / subsystem benchmark tables |
