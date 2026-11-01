@@ -28,6 +28,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 #define SGXF_MAGIC	0x46584753u	/* "SGXF" */
 #define SGXF_VERSION	1
@@ -111,11 +114,52 @@ static void wr32le(uint8_t *p, uint32_t v)
 static uint32_t adler32(const uint8_t *p, size_t n)
 {
 	uint32_t a = 1, b = 0;
+#ifdef __ARM_NEON
+	static const uint16_t weights[16] = {
+		16, 15, 14, 13, 12, 11, 10, 9, 8, 7, 6, 5, 4, 3, 2, 1
+	};
+	uint16x8_t w_lo = vld1q_u16(weights);
+	uint16x8_t w_hi = vld1q_u16(weights + 8);
+#endif
 
 	while (n) {
 		size_t k = n < 5552 ? n : 5552;
 
 		n -= k;
+#ifdef __ARM_NEON
+		if (k >= 16) {
+			uint32x4_t vs1 = vdupq_n_u32(0);
+			uint32x4_t vs2 = vdupq_n_u32(0);
+			uint32x4_t vcol = vdupq_n_u32(0);
+			size_t blocks = k >> 4;
+
+			k &= 15;
+			b += a * (uint32_t)(blocks << 4);
+			while (blocks--) {
+				uint8x16_t v = vld1q_u8(p);
+				uint16x8_t lo = vmovl_u8(vget_low_u8(v));
+				uint16x8_t hi = vmovl_u8(vget_high_u8(v));
+
+				p += 16;
+				vs2 = vaddq_u32(vs2, vs1);
+				vs1 = vpadalq_u16(vs1, vpaddlq_u8(v));
+				vcol = vmlal_u16(vcol, vget_low_u16(lo), vget_low_u16(w_lo));
+				vcol = vmlal_u16(vcol, vget_high_u16(lo), vget_high_u16(w_lo));
+				vcol = vmlal_u16(vcol, vget_low_u16(hi), vget_low_u16(w_hi));
+				vcol = vmlal_u16(vcol, vget_high_u16(hi), vget_high_u16(w_hi));
+			}
+			uint32x2_t s1_2 = vadd_u32(vget_low_u32(vs1), vget_high_u32(vs1));
+			s1_2 = vpadd_u32(s1_2, s1_2);
+			a += vget_lane_u32(s1_2, 0);
+
+			vs2 = vshlq_n_u32(vs2, 4);
+			uint32x2_t c_2 = vadd_u32(vget_low_u32(vcol), vget_high_u32(vcol));
+			uint32x2_t s2_2 = vadd_u32(vget_low_u32(vs2), vget_high_u32(vs2));
+			s2_2 = vadd_u32(s2_2, c_2);
+			s2_2 = vpadd_u32(s2_2, s2_2);
+			b += vget_lane_u32(s2_2, 0);
+		}
+#endif
 		while (k--) {
 			a += *p++;
 			b += a;

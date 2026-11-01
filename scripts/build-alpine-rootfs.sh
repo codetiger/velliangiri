@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
-# Build the Alpine armhf initramfs cpio archive for S5L8947X (j33iap)
+# Build the Alpine armv7 initramfs cpio archive for S5L8947X (j33iap)
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ALPINE_VER="${ALPINE_VER:-3.21.3}"
 ALPINE_BRANCH="${ALPINE_VER%.*}"
-ALPINE_ARCH="${ALPINE_ARCH:-armhf}"
+ALPINE_ARCH="${ALPINE_ARCH:-armv7}"
 ALPINE_MIRROR="${ALPINE_MIRROR:-https://dl-cdn.alpinelinux.org}"
 TARBALL="alpine-minirootfs-${ALPINE_VER}-${ALPINE_ARCH}.tar.gz"
 URL="${ALPINE_MIRROR}/alpine/v${ALPINE_BRANCH}/releases/${ALPINE_ARCH}/${TARBALL}"
@@ -33,7 +33,7 @@ mkdir -p "${STAGE_DIR}"
 tar --no-same-owner --no-same-permissions -xzf "${DL_DIR}/${TARBALL}" -C "${STAGE_DIR}"
 
 # Install APK packages (dropbear, nfs-utils, busybox-static, Wi-Fi and Bluetooth tools) via pure-Python resolver
-echo "[rootfs] Resolving and unpacking Alpine armhf packages ..."
+echo "[rootfs] Resolving and unpacking Alpine ${ALPINE_ARCH} packages ..."
 python3 "${ROOT}/scripts/apk-unpack.py" \
 	--repo "${REPO_MAIN}" \
 	--dest "${APK_WORK}" \
@@ -51,9 +51,9 @@ python3 "${ROOT}/scripts/apk-unpack.py" \
 
 # Cross-compile the early entropy seeder, diagnostic tools, the WAV player and the BT patch and GPU microkernel carvers
 # ("<installed name>:<source in scripts/tools>")
-echo "[rootfs] Cross-compiling userspace tools ..."
+echo "[rootfs] Cross-compiling userspace tools (-O2 -mcpu=cortex-a9 -mfpu=neon) ..."
 for tool in jitterseed:jitterseed.c peek:mmio-peek.c i2cpoke:i2c-poke.c wavplay:wavplay.c l2bench:l2bench.c btscan:btscan.c hcdcarve:hcdcarve.c sgxcarve:sgxcarve.c; do
-	"${CROSS_CC}" -O2 -Wall -Wextra -static \
+	"${CROSS_CC}" -O2 -mcpu=cortex-a9 -mfpu=neon -Wall -Wextra -static \
 		-o "${STAGE_DIR}/bin/${tool%%:*}" "${ROOT}/scripts/tools/${tool#*:}" -lm
 	chmod 755 "${STAGE_DIR}/bin/${tool%%:*}"
 done

@@ -25,6 +25,9 @@
 #include <sys/ioctl.h>
 #include <unistd.h>
 #include <sound/asound.h>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 
 #define DEFAULT_PCM	"/dev/snd/pcmC0D0p"
 #define PERIOD_FRAMES	1024	/* multiples of the 256-frame DMA segment */
@@ -157,9 +160,55 @@ static size_t wav_render(const struct wav *w, uint64_t *pos, unsigned int dst_ra
 {
 	uint64_t step = ((uint64_t)w->rate << 32) / dst_rate;
 	unsigned int right = w->channels > 1 ? 1 : 0;
-	size_t i, live = 0;
+	size_t i = 0, live = 0;
 
-	for (i = 0; i < frames; i++, *pos += step) {
+#ifdef __ARM_NEON
+	if (w->bytes == 2 && w->channels == 2 && w->frames > 1) {
+		const int16_t *in = (const int16_t *)w->data;
+
+		for (; i + 4 <= frames; i += 4) {
+			uint64_t p3 = *pos + step * 3;
+			if ((p3 >> 32) + 1 >= w->frames)
+				break;
+			size_t idx0 = *pos >> 32;
+			int16_t f0 = (int16_t)((*pos >> 17) & 0x7fff);
+			*pos += step;
+			size_t idx1 = *pos >> 32;
+			int16_t f1 = (int16_t)((*pos >> 17) & 0x7fff);
+			*pos += step;
+			size_t idx2 = *pos >> 32;
+			int16_t f2 = (int16_t)((*pos >> 17) & 0x7fff);
+			*pos += step;
+			size_t idx3 = *pos >> 32;
+			int16_t f3 = (int16_t)((*pos >> 17) & 0x7fff);
+			*pos += step;
+
+			int16x4_t s0 = vld1_s16(&in[idx0 * 2]);
+			int16x4_t s1 = vld1_s16(&in[idx1 * 2]);
+			int16x4_t s2 = vld1_s16(&in[idx2 * 2]);
+			int16x4_t s3 = vld1_s16(&in[idx3 * 2]);
+
+			int32x2x2_t t01 = vtrn_s32(vreinterpret_s32_s16(s0), vreinterpret_s32_s16(s1));
+			int32x2x2_t t23 = vtrn_s32(vreinterpret_s32_s16(s2), vreinterpret_s32_s16(s3));
+			int16x8_t v0 = vreinterpretq_s16_s32(vcombine_s32(t01.val[0], t23.val[0]));
+			int16x8_t v1 = vreinterpretq_s16_s32(vcombine_s32(t01.val[1], t23.val[1]));
+			int16_t fracs[8] = { f0, f0, f1, f1, f2, f2, f3, f3 };
+			int16x8_t vf = vld1q_s16(fracs);
+
+			int32x4_t d_lo = vsubl_s16(vget_low_s16(v1), vget_low_s16(v0));
+			int32x4_t d_hi = vsubl_s16(vget_high_s16(v1), vget_high_s16(v0));
+			d_lo = vmulq_s32(d_lo, vmovl_s16(vget_low_s16(vf)));
+			d_hi = vmulq_s32(d_hi, vmovl_s16(vget_high_s16(vf)));
+
+			int16x4_t r_lo = vadd_s16(vget_low_s16(v0), vshrn_n_s32(d_lo, 15));
+			int16x4_t r_hi = vadd_s16(vget_high_s16(v0), vshrn_n_s32(d_hi, 15));
+			vst1q_s16(&out[i * 2], vcombine_s16(r_lo, r_hi));
+			live += 4;
+		}
+	}
+#endif
+
+	for (; i < frames; i++, *pos += step) {
 		size_t idx = *pos >> 32;
 		int32_t frac = (*pos >> 16) & 0xffff;
 		int32_t l, r;

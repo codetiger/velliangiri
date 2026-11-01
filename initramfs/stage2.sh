@@ -41,7 +41,8 @@ fi
 if [ -d /sys/class/net/usb0 ] || ip link show usb0 >/dev/null 2>&1; then
 	ip link set usb0 up 2>/dev/null || true
 	ip addr add 10.55.0.2/24 dev usb0 2>/dev/null || true
-	log_msg "usb0 configured at 10.55.0.2/24"
+	ip addr add 169.254.9.2/16 dev usb0 2>/dev/null || true
+	log_msg "usb0 configured at 10.55.0.2/24 and 169.254.9.2/16"
 fi
 
 # Spawn interactive getty/shell on USB CDC-ACM (/dev/ttyGS0)

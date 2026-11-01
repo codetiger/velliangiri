@@ -1,6 +1,6 @@
 # Driver Progress (`S5L8947X` / `j33iap`)
 
-Status of every hardware block, checked against the drivers in the tree and the enabled nodes in `s5l8947x-j33iap.dts`. Last reviewed 2026-11-01 (`hwtest`: 101 passed, 0 failed, 2 skipped).
+Status of every hardware block, checked against the drivers in the tree and the enabled nodes in `s5l8947x-j33iap.dts`. Last reviewed 2026-11-01 (`hwtest`: 106 passed, 0 failed, 2 skipped).
 
 ## Done
 
@@ -73,7 +73,7 @@ Status of every hardware block, checked against the drivers in the tree and the 
 
 - The CPU feeds the engine one 32-bit write at a time, which caps it at about 15 MB/s; the engine alone hashes about 47 MB/s (SHA-256) and 76 MB/s (SHA-512).
 - CDMA cannot feed it. The engine has a FIFO mode (mode bit 0: words written to `+0x20` fill the block and each full block is hashed), and the stock hardware description assigns it CDMA channel 4, request 1, but no setup moves data into it: programmed exactly as the stock CDMA driver would, the channel reports completion without reading the data or ends in an error, and a failed attempt leaves channel 4 busy in a way that stops other CDMA transfers (audio, NAND) until a reboot. The stock software never uses this path.
-- The comparison is with the generic C code: the ARM assembly versions (`sha256-arm`, `sha512-arm`) are built as modules, which the image does not install.
+- Built-in ARMv7 and NEON crypto (`sha1-neon` 90.5 MB/s, `sha256-neon` 48.6 MB/s, `sha512-neon` 31.6 MB/s, `blake2b-512-neon` 58.3 MB/s, `chacha20-neon` 73.1 MB/s, `poly1305-neon` 221.4 MB/s, `cbc-aes-neonbs` 23.1 MB/s, `ctr-aes-neonbs` 33.9 MB/s) are also compiled into the kernel alongside `AF_ALG` hash and skcipher sockets.
 
 ### NAND and FTL known limits
 

@@ -89,7 +89,8 @@ static double chase(struct node *nodes, unsigned int n)
 	return best;
 }
 
-static double seq_read_mbs(const uint32_t *buf, size_t bytes)
+static double __attribute__((optimize("O3")))
+seq_read_mbs(const uint32_t *buf, size_t bytes)
 {
 	size_t words = bytes / sizeof(*buf), i, reps = (64u << 20) / bytes;
 	uint32_t sum = 0;
