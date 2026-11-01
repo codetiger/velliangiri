@@ -1,0 +1,18 @@
+# SPDX-License-Identifier: GPL-2.0-only
+
+comment "Apple S5L media platform drivers"
+
+config VIDEO_S5L8947X_M2SC
+	tristate "S5L8947X M2 scaler and colour-space converter"
+	depends on V4L_MEM2MEM_DRIVERS
+	depends on VIDEO_DEV
+	depends on ARCH_APPLE_S5L || COMPILE_TEST
+	depends on COMMON_CLK && HAS_DMA
+	select VIDEOBUF2_DMA_CONTIG
+	select V4L2_MEM2MEM_DEV
+	help
+	  Memory-to-memory scaler of the S5L8947X SoC: scales frames up or
+	  down (up to 8x down), converts between YCbCr (NV12, NV16, YUYV)
+	  and RGB (XRGB8888, RGB565, ARGB1555) with BT.601 or BT.709
+	  matrices, and can rotate and mirror. A debugfs self-test runs one
+	  job on hardware and checks the result.

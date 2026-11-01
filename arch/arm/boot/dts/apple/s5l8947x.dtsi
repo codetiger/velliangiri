@@ -419,5 +419,26 @@
 			firmware-name = "s5l8947x/vxd390.fw";
 			status = "disabled";
 		};
+
+		/*
+		 * M2 scalers: memory-to-memory scaling and colour-space
+		 * conversion. The register window must not be read while the
+		 * PMGR gate is off.
+		 */
+		scaler0: scaler@8300000 {
+			compatible = "apple,s5l8947x-m2sc";
+			reg = <0x8300000 0x1000>;
+			interrupts = <9>;
+			clocks = <&pmgr_gates 11>;
+			status = "disabled";
+		};
+
+		scaler1: scaler@8400000 {
+			compatible = "apple,s5l8947x-m2sc";
+			reg = <0x8400000 0x1000>;
+			interrupts = <10>;
+			clocks = <&pmgr_gates 12>;
+			status = "disabled";
+		};
 	};
 };

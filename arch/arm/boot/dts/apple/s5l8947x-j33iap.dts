@@ -264,6 +264,15 @@
 	status = "okay";
 };
 
+/* M2 scalers (V4L2 memory-to-memory) */
+&scaler0 {
+	status = "okay";
+};
+
+&scaler1 {
+	status = "okay";
+};
+
 /* IOP coprocessor: power, firmware load and CPU start (no client yet) */
 &iop {
 	status = "okay";
