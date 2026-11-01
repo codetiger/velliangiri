@@ -33,18 +33,19 @@
 		#size-cells = <1>;
 		ranges;
 
-		fb_region: framebuffer@9ec00000 {
-			reg = <0x9ec00000 0x400000>;
+		fb_region: framebuffer@9e400000 {
+			reg = <0x9e400000 0x800000>;
 			no-map;
 		};
 	};
 
-	framebuffer0: framebuffer@9ec00000 {
+	/* 1080p30 boot splash scanned out by the boot loader */
+	framebuffer0: framebuffer@9e400000 {
 		compatible = "simple-framebuffer";
-		reg = <0x9ec00000 0x384000>;
-		width = <1280>;
-		height = <720>;
-		stride = <5120>;
+		reg = <0x9e400000 0x7e9000>;
+		width = <1920>;
+		height = <1080>;
+		stride = <7680>;
 		format = "a8r8g8b8";
 		memory-region = <&fb_region>;
 		status = "okay";

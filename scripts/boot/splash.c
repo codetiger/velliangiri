@@ -4,8 +4,11 @@
  *
  * Fills each shape with nonzero winding, anti-aliased with 16 sample rows
  * per pixel and 1/16 pixel horizontal coverage, and blends it over the
- * framebuffer with a solid or two-stop linear gradient paint. Partially
- * covered pixels are blended in linear light so edges keep their weight.
+ * framebuffer with a solid or two-stop linear gradient paint. Gradients
+ * carry 8 fractional bits and are ordered-dithered to the 8-bit output, so
+ * shallow ramps between close colours do not band. Partially covered pixels
+ * are blended in 16-bit linear light and converted back exactly, so edges
+ * keep their weight even on dark shapes.
  */
 
 #include <stdint.h>
@@ -15,7 +18,7 @@
 #define SUB		16
 #define SAMPLES		16
 #define MAX_CROSS	64
-#define MAX_W		1280
+#define MAX_W		1920
 
 struct crossing {
 	int32_t x;
@@ -24,9 +27,14 @@ struct crossing {
 
 static uint16_t cov[MAX_W];
 
+/* 4x4 ordered-dither thresholds, in 1/16 of an output step */
+static const uint8_t bayer4[16] = {
+	0, 8, 2, 10, 12, 4, 14, 6, 3, 11, 1, 9, 15, 7, 13, 5,
+};
+
 static uint32_t paint_at(const struct splash_shape *s, int x, int y)
 {
-	int32_t t;
+	int32_t t, d;
 	uint32_t c = 0;
 	int sh;
 
@@ -37,13 +45,36 @@ static uint32_t paint_at(const struct splash_shape *s, int x, int y)
 		t = 0;
 	if (t > 65536)
 		t = 65536;
+	d = bayer4[(y & 3) * 4 + (x & 3)] * 16 + 8;
 	for (sh = 0; sh < 24; sh += 8) {
 		int32_t a = (s->c0 >> sh) & 0xff;
 		int32_t b = (s->c1 >> sh) & 0xff;
+		/* 8.8 fixed point, then round with the dither threshold */
+		int32_t v = ((a << 8) + (((b - a) * t) >> 8) + d) >> 8;
 
-		c |= (uint32_t)(a + (((b - a) * t) >> 16)) << sh;
+		if (v > 255)
+			v = 255;
+		c |= (uint32_t)v << sh;
 	}
 	return c;
+}
+
+/* Nearest 8-bit sRGB value of a 16-bit linear value */
+static uint32_t to_srgb(uint32_t lin)
+{
+	uint32_t lo = 0, hi = 255;
+
+	while (lo < hi) {
+		uint32_t mid = (lo + hi + 1) / 2;
+
+		if (splash_to_linear[mid] <= lin)
+			lo = mid;
+		else
+			hi = mid - 1;
+	}
+	if (lo < 255 && lin - splash_to_linear[lo] > splash_to_linear[lo + 1] - lin)
+		lo++;
+	return lo;
 }
 
 static uint32_t blend(uint32_t dst, uint32_t src, uint32_t a)
@@ -57,7 +88,7 @@ static uint32_t blend(uint32_t dst, uint32_t src, uint32_t a)
 		uint32_t d = splash_to_linear[(dst >> sh) & 0xff];
 		uint32_t s = splash_to_linear[(src >> sh) & 0xff];
 
-		c |= (uint32_t)splash_to_srgb[(d * (256 - a) + s * a) >> 14] << sh;
+		c |= to_srgb((d * (256 - a) + s * a) >> 8) << sh;
 	}
 	return c;
 }

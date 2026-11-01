@@ -1,32 +1,34 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * S5L8947X 720p60 HDMI + rgbout pre-kernel display initialization
+ * S5L8947X 1080p30 HDMI + rgbout pre-kernel display initialization
  *
  * Configures:
  *   - PMGR display clock gates at 0x3f101008 + n * 4 (gates 15, 21, 20, 25, 80)
- *   - rgbout display pipe at 0x3a200000 scanning out 1280x720x32bpp ARGB
- *     (stride 5120) from reserved RAM at 0x9ec00000
+ *   - rgbout display pipe at 0x3a200000 scanning out 1920x1080x32bpp ARGB
+ *     (stride 7680) from reserved RAM at 0x9e400000
  *   - Output stage at 0x39600000 (gamma LUTs + timing)
- *   - HDMI transmitter & PHY bridge at 0x39700000 for 74.25 MHz (720p@60Hz, VIC 4)
+ *   - HDMI transmitter & PHY bridge at 0x39700000 for 74.25 MHz
+ *     (1080p@30Hz, VIC 34; the kernel driver keeps this mode on 1080p sinks)
  */
 
-#ifndef VELLIANGIRI_HDMI_720P_H
-#define VELLIANGIRI_HDMI_720P_H
+#ifndef VELLIANGIRI_HDMI_BOOT_H
+#define VELLIANGIRI_HDMI_BOOT_H
 
 #include <stdint.h>
 #include "splash.h"
 
-#define S5L_FB_PHYS		0x9ec00000U
-#define S5L_FB_W		1280
-#define S5L_FB_H		720
-#define S5L_HTOTAL		1650
-#define S5L_VTOTAL		750
-#define S5L_HSW			40
-#define S5L_HBP			110
-#define S5L_HFP			220
+/* CEA-861 1920x1080p30: 74.25 MHz, positive syncs */
+#define S5L_FB_PHYS		0x9e400000U
+#define S5L_FB_W		1920
+#define S5L_FB_H		1080
+#define S5L_HFP			88
+#define S5L_HSW			44
+#define S5L_HBP			148
+#define S5L_VFP			4
 #define S5L_VSW			5
-#define S5L_VBP			5
-#define S5L_VFP			20
+#define S5L_VBP			36
+#define S5L_HTOTAL		(S5L_FB_W + S5L_HFP + S5L_HSW + S5L_HBP)
+#define S5L_VTOTAL		(S5L_FB_H + S5L_VFP + S5L_VSW + S5L_VBP)
 #define S5L_BPP			4
 #define S5L_STRIDE		((S5L_FB_W * S5L_BPP + 63) & ~63)
 #define S5L_FB_SIZE		((S5L_STRIDE * S5L_FB_H + 0xfff) & ~0xfff)
@@ -168,7 +170,8 @@ static void hdmi_out_init(void)
 	io_wr(OUT_HSIZE, S5L_FB_W - 1);
 	io_wr(OUT_VSIZE, S5L_FB_H - 1);
 	io_wr(OUT_CFG, 0x23);
-	io_wr(OUT_VSYNC, S5L_VFP + S5L_VSW - 2);
+	/* V sync position is sync width + back porch - 2 */
+	io_wr(OUT_VSYNC, S5L_VSW + S5L_VBP - 2);
 }
 
 static void hdmi_plane_init(uint32_t fb_phys)
@@ -198,18 +201,13 @@ static void hdmi_rgbout_enable(void)
 	io_wr(RGB_CTL, io_rd(RGB_CTL) | 0x100U);
 }
 
-static void hdmi_gamma_identity(void)
+/*
+ * Bypass the output gamma LUT: loaded with 256 linear entries it posterizes
+ * the picture and crushes the darks, so the framebuffer goes out unchanged.
+ */
+static void hdmi_gamma_bypass(void)
 {
-	uint32_t base = io_rd(OUT_GAMMA_IDX) & 0xfffe0f00U;
-	int c, i;
-
-	io_wr(OUT_GAMMA_IDX, base);
-	for (c = 0; c < 3; c++)
-		for (i = 0; i < 256; i++) {
-			io_wr(OUT_GAMMA_IDX, base | i | (0x14000U + c * 0x1000U));
-			io_wr(OUT_GAMMA_VAL, ((i * 1023 + 127) / 255) & 0xfffffU);
-		}
-	io_wr(OUT_GAMMA_EN, 9);
+	io_wr(OUT_GAMMA_EN, 0);
 }
 
 static void hdmi_out_start(void)
@@ -366,8 +364,9 @@ static void hdmi_color_init(void)
 	hdmi_hmask(HDMI_VIDEO_PATTERN_GEN, 0x01, 0);
 }
 
-static const uint8_t hdmi_avi_720p[13] = {
-	0x10, 0x68, 0x00, 0x04, 0x00, 0, 0, 0, 0, 0, 0, 0, 0
+/* RGB, 16:9, full quantization range (Q = 2), VIC 34 */
+static const uint8_t hdmi_avi[13] = {
+	0x10, 0x68, 0x08, 0x22, 0x00, 0, 0, 0, 0, 0, 0, 0, 0
 };
 
 static const uint8_t hdmi_phy_74250[31] = {
@@ -412,9 +411,9 @@ static int hdmi_start_video(const uint8_t *phy_cfg, int hdmi_mode)
 		hdmi_hw(HDMI_AVI_HEADER0, 0x82, 1);
 		hdmi_hw(HCORE(0x714), 0x02, 1);
 		hdmi_hw(HCORE(0x718), 0x0d, 1);
-		hdmi_hw(HDMI_AVI_CHECK_SUM, 0xf3, 1);
+		hdmi_hw(HDMI_AVI_CHECK_SUM, 0xcd, 1);
 		for (i = 0; i < 13; i++)
-			hdmi_hw(HDMI_AVI_BYTE(i + 1), hdmi_avi_720p[i], 1);
+			hdmi_hw(HDMI_AVI_BYTE(i + 1), hdmi_avi[i], 1);
 		hdmi_hmask(HDMI_AVI_CON, 0x03, 0x02);
 		hdmi_hw(HDMI_GCP_BYTE1, 0, 3);
 		hdmi_hmask(HDMI_GCP_BYTE2, 0x07, 0);
@@ -434,7 +433,7 @@ static int hdmi_start_video(const uint8_t *phy_cfg, int hdmi_mode)
 	return 0;
 }
 
-static int hdmi_720p_init(void)
+static int hdmi_boot_init(void)
 {
 	splash_draw((volatile uint32_t *)S5L_FB_PHYS, S5L_FB_W, S5L_FB_H,
 		    S5L_STRIDE / S5L_BPP);
@@ -449,8 +448,8 @@ static int hdmi_720p_init(void)
 	(void)hdmi_controller_start();
 	hdmi_start_video(hdmi_phy_74250, 1);
 	hdmi_out_start();
-	hdmi_gamma_identity();
+	hdmi_gamma_bypass();
 	return 0;
 }
 
-#endif /* VELLIANGIRI_HDMI_720P_H */
+#endif /* VELLIANGIRI_HDMI_BOOT_H */

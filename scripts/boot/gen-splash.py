@@ -5,7 +5,7 @@ Generate the pre-kernel boot splash as C polygon tables.
 
 Reads the project logo (a small SVG subset: path with absolute M/L/H/V/C/Q/Z,
 polygon, two-stop linearGradient fills, opacity and round-capped strokes),
-flattens it into contours laid out for the 1280x720 scanout, and adds the
+flattens it into contours laid out for the 1920x1080 scanout, and adds the
 "Velliangiri" wordmark below it drawn with a built-in geometric stroke font.
 
 The loader has no runtime division, so every edge carries a precomputed
@@ -19,12 +19,12 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 
-FB_W, FB_H = 1280, 720
+FB_W, FB_H = 1920, 1080
 SUB = 16                    # subpixel units per pixel
-LOGO_H = 150                # rendered logo content height in pixels
-GAP = 24                    # logo bottom to text cap line, pixels
-CAP_H = 42                  # wordmark cap height, pixels
-FLAT_TOL = 0.2              # curve flattening tolerance, pixels
+LOGO_H = 225                # rendered logo content height in pixels
+GAP = 36                    # logo bottom to text cap line, pixels
+CAP_H = 63                  # wordmark cap height, pixels
+FLAT_TOL = 0.3              # curve flattening tolerance, pixels
 
 BG = 0xfef3c7
 TEXT_COLOR = 0x1e293b
@@ -188,7 +188,7 @@ GLYPHS = {
 def wordmark_contours(text, top_px):
     s = CAP_H / FONT_CAP
     r = FONT_STROKE / 2 * s
-    step = 1.0
+    step = 1.3
     width = sum(GLYPHS[ch][0] for ch in text) + FONT_SPACING * (len(text) - 1)
     x0 = (FB_W - width * s) / 2
     base = top_px + CAP_H
@@ -390,11 +390,6 @@ def emit(shapes, out):
     lin = [round(srgb_to_linear(k / 255) * 65535) for k in range(256)]
     for k in range(0, 256, 8):
         w("\t" + " ".join(f"{v}," for v in lin[k:k + 8]) + "\n")
-    w("};\n\n")
-    w("static const uint8_t splash_to_srgb[1024] = {\n")
-    srgb = [round(linear_to_srgb(k / 1023) * 255) for k in range(1024)]
-    for k in range(0, 1024, 16):
-        w("\t" + " ".join(f"{v}," for v in srgb[k:k + 16]) + "\n")
     w("};\n")
     print(f"gen-splash: {len(recs)} shapes, {len(clen)} contours, {len(vtx)} vertices",
           file=sys.stderr)
