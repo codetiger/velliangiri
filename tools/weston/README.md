@@ -45,8 +45,9 @@ the Mesa install, so the compositor survives a reboot in the same way.
 ## Running
 
 ```sh
-weston-run 20                       # 20 s of weston-simple-shm on HDMI
-weston-run 20 weston-simple-shm
+weston-run 20                       # 20 s of weston-simple-egl on HDMI
+weston-run 20 weston-simple-egl
+weston-run 20 weston-simple-shm     # the shared-memory client
 weston-run 20 weston-terminal       # needs a font; not installed here
 ```
 
@@ -55,16 +56,14 @@ display imports and scans out (kmsro), and its GL renderer is the SGX.  The
 console comes back when the compositor exits (a blank/unblank makes fbcon
 repaint).
 
+Verified on the device: `weston-run 20` started Weston on `HDMI-A-1` at
+1280x720 with the GL renderer on the SGX, the kiosk shell, and
+`weston-simple-egl`; the client chose the `r8g8b8a8` config, its dma-buf was
+imported, and the scanout buffer held the square (read back with `peek`).
+`weston-simple-shm` works too (the compositor uploads its buffer).
+
 ## What is not there yet
 
-- **EGL clients.**  `weston-simple-egl` starts, chooses a config
-  (`r8g8b8a0`), and its dmabufs reach Weston with a file descriptor that is
-  not the buffer's (the compositor sees a duplicate of the client's stdout),
-  so Weston rejects the import with `invalid stride` and the client exits.
-  Shm clients (`weston-simple-shm`) work: the compositor uploads their
-  buffers and renders them on the GPU, and the scanout buffer shows the
-  pattern.  This needs the Wayland platform's image export path sorted out
-  (a client-side Mesa issue, not the compositor).
 - **Input.**  The board has no USB host mode yet, so Weston starts with
   `--continue-without-input`; there is no keyboard or mouse.
 - **Fonts.**  `weston-terminal` runs but has no font package installed, so

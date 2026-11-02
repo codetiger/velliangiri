@@ -4,15 +4,12 @@
 #
 #   /usr/local/bin/weston-run [seconds] [client...]
 #
-# The default client is weston-simple-shm (a moving pattern drawn through
-# shared memory; Weston uploads it and composites on the SGX).  Input is not
-# required (--continue-without-input); the board has no USB host yet.  The
-# compositor keeps the console's mode and exits after the seconds given
-# (default 15), then the console is asked to repaint.
-#
-# EGL clients (weston-simple-egl) are not there yet: their dmabufs arrive at
-# the compositor with a file descriptor that is not the buffer's, so Weston
-# rejects the import.  Shm clients are unaffected.
+# The default client is weston-simple-egl (a spinning square rendered on the
+# SGX and imported by the compositor as a dma-buf); weston-simple-shm is the
+# shared-memory fallback.  Input is not required
+# (--continue-without-input); the board has no USB host yet.  The compositor
+# keeps the console's mode and exits after the seconds given (default 15),
+# then the console is asked to repaint.
 set -eu
 
 PREFIX=/usr/local
@@ -20,7 +17,7 @@ RUNTIME=${XDG_RUNTIME_DIR:-/tmp/weston-run}
 DURATION=${1:-15}
 if [ "$#" -gt 0 ]; then shift; fi
 if [ "$#" -eq 0 ]; then
-	set -- weston-simple-shm
+	set -- weston-simple-egl
 fi
 CLIENTS=$*
 LOG=/tmp/weston.log
