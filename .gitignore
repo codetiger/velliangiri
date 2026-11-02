@@ -1,6 +1,8 @@
 /research/
 /build/
 /out/
+.tmp.config.*
+.merge_tmp.config.*
 .DS_Store
 __pycache__/
 *.py[cod]

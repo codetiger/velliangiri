@@ -55,6 +55,10 @@ fi
 
 make -C "${TREE}" olddefconfig >/dev/null
 
+# merge_config.sh puts its temporaries in the caller's directory and only
+# removes them on a clean exit
+rm -f "${ROOT}"/.tmp.config.* "${ROOT}"/.merge_tmp.config.*
+
 echo "[kernel] Verifying required S5L8947X config symbols ..."
 awk -f "${ROOT}/scripts/check-config-fragment.awk" "${CONFIG_BASE}" "${TREE}/.config"
 
