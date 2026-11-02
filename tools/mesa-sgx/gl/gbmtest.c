@@ -2,13 +2,16 @@
 /* gbmtest -- OpenGL ES 2.0 on a GBM surface, through kmsro, on the HDMI
  * display.
  *
- *   sgx-gl gbmtest [seconds] [/dev/dri/card1]
+ *   sgx-gl gbmtest [--finish] [--quads N] [frames] [/dev/dri/card1]
  *
  * The screen is the display device (s5l8947x); GBM opens it, EGL picks the
  * kmsro screen it pairs with the SGX render node, and the surface's buffers
  * are SGX render targets the display scans out.  Each frame is cleared and
- * gets a triangle, is finished on the GPU, and is then flipped onto the
- * display with DRM_MODE_PAGE_FLIP_EVENT; the console's framebuffer is put
+ * gets a triangle and is then flipped onto the display with
+ * DRM_MODE_PAGE_FLIP_EVENT.  The display's atomic commit waits on the render
+ * node's fence through the dma-buf, so the client does not call glFinish
+ * (--finish does, for comparison); --quads N makes a frame heavy enough for
+ * the wait to show in the "frame 0" timing.  The console's framebuffer is put
  * back on exit.
  *
  * This is the EGL/GBM half of the route to OpenGL ES 2.0: no read-back and
@@ -39,6 +42,15 @@
 #define MAX_FRAMES 100000
 
 static int flip_done;
+
+static double
+now(void)
+{
+	struct timespec ts;
+
+	clock_gettime(CLOCK_MONOTONIC, &ts);
+	return ts.tv_sec + ts.tv_nsec / 1e9;
+}
 
 static void
 flip_handler(int fd, unsigned int frame, unsigned int sec, unsigned int usec,
@@ -104,6 +116,13 @@ main(int argc, char **argv)
 		 0.8f, -0.8f, 0.0f, 1.0f, 0.0f,
 		 0.0f,  0.8f, 0.0f, 0.0f, 1.0f,
 	};
+	static const float quad[] = {
+		/* a full-screen strip, for --quads N: N times the fill */
+		-1.0f, -1.0f, 0.2f, 0.4f, 0.8f,
+		 1.0f, -1.0f, 0.2f, 0.4f, 0.8f,
+		-1.0f,  1.0f, 0.2f, 0.4f, 0.8f,
+		 1.0f,  1.0f, 0.2f, 0.4f, 0.8f,
+	};
 	static drmEventContext ev = {
 		.version = 2,
 		.page_flip_handler = flip_handler,
@@ -129,16 +148,34 @@ main(int argc, char **argv)
 	EGLConfig cfg;
 	EGLContext ctx = EGL_NO_CONTEXT;
 	EGLSurface esurf = EGL_NO_SURFACE;
-	GLuint prog, vbo;
+	GLuint prog, vbo, qvbo;
 	const char *card = "/dev/dri/card1";
 	int fd = -1, frames = 120, n, got, ret = 1, i;
+	/* (the display waits on the render node's fence through the dma-buf:
+	 * glFinish is not needed, and --finish is the comparison) */
+	int no_finish = 1, quads = 0, have_frames = 0;
 
-	if (argc > 1)
-		frames = atoi(argv[1]) > 0 ? atoi(argv[1]) : 120;
+	setvbuf(stdout, NULL, _IONBF, 0);
+
+	for (i = 1; i < argc; i++) {
+		if (!strcmp(argv[i], "--no-finish")) {
+			no_finish = 1;
+		} else if (!strcmp(argv[i], "--finish")) {
+			no_finish = 0;
+		} else if (!strcmp(argv[i], "--quads") && i + 1 < argc) {
+			quads = atoi(argv[++i]);
+		} else if (argv[i][0] == '-') {
+			fprintf(stderr, "usage: gbmtest [--finish] [--quads N] [frames] [card]\n");
+			return 2;
+		} else if (!have_frames) {
+			frames = atoi(argv[i]) > 0 ? atoi(argv[i]) : 120;
+			have_frames = 1;
+		} else {
+			card = argv[i];
+		}
+	}
 	if (frames > MAX_FRAMES)
 		frames = MAX_FRAMES;
-	if (argc > 2)
-		card = argv[2];
 
 	fd = open(card, O_RDWR | O_CLOEXEC);
 	if (fd < 0) {
@@ -236,6 +273,9 @@ main(int argc, char **argv)
 	glGenBuffers(1, &vbo);
 	glBindBuffer(GL_ARRAY_BUFFER, vbo);
 	glBufferData(GL_ARRAY_BUFFER, sizeof(verts), verts, GL_STATIC_DRAW);
+	glGenBuffers(1, &qvbo);
+	glBindBuffer(GL_ARRAY_BUFFER, qvbo);
+	glBufferData(GL_ARRAY_BUFFER, sizeof(quad), quad, GL_STATIC_DRAW);
 	glEnableVertexAttribArray(0);
 	glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE, 5 * sizeof(float),
 			      (void *)0);
@@ -247,15 +287,38 @@ main(int argc, char **argv)
 	for (i = 0; i < frames; i++) {
 		int32_t px[4];
 		float f = (i % 60) / 60.0f;
+		double t0, t1, t_finish = 0, t_swap, t_flip, t_event;
 
 		/* a colour that moves, then the triangle over it: at frame 0
 		 * the clear is orange, so a blue pixel proves the draw */
 		glClearColor(1.0f - f, 0.2f, f, 1.0f);
 		glClear(GL_COLOR_BUFFER_BIT);
-		glDrawArrays(GL_TRIANGLES, 0, 3);
-		glFinish();
+		if (quads) {
+			glBindBuffer(GL_ARRAY_BUFFER, qvbo);
+			glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
+					      5 * sizeof(float), (void *)0);
+			glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE,
+					      5 * sizeof(float),
+					      (void *)(2 * sizeof(float)));
+			for (int q = 0; q < quads; q++)
+				glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+		} else {
+			glBindBuffer(GL_ARRAY_BUFFER, vbo);
+			glVertexAttribPointer(0, 2, GL_FLOAT, GL_FALSE,
+					      5 * sizeof(float), (void *)0);
+			glVertexAttribPointer(1, 3, GL_FLOAT, GL_FALSE,
+					      5 * sizeof(float),
+					      (void *)(2 * sizeof(float)));
+			glDrawArrays(GL_TRIANGLES, 0, 3);
+		}
 
-		if (i == 0) {
+		t0 = now();
+		if (!no_finish)
+			glFinish();
+		t1 = now();
+		t_finish = t1 - t0;
+
+		if (i == 0 && !quads && !no_finish) {
 			/* near the triangle's top vertex, which is blue */
 			int r, g, b;
 
@@ -273,10 +336,13 @@ main(int argc, char **argv)
 			       r, g, b);
 		}
 
+		t0 = now();
 		if (!eglSwapBuffers(dpy, esurf)) {
 			fprintf(stderr, "gbmtest: eglSwapBuffers (0x%x)\n", eglGetError());
 			goto out;
 		}
+		t1 = now();
+		t_swap = t1 - t0;
 		bo = gbm_surface_lock_front_buffer(gsurf);
 		if (!bo) {
 			fprintf(stderr, "gbmtest: lock_front_buffer: %s\n", strerror(errno));
@@ -289,6 +355,7 @@ main(int argc, char **argv)
 			goto out;
 		}
 		flip_done = 0;
+		t0 = now();
 		if (drmModePageFlip(fd, crtc_id, fb, DRM_MODE_PAGE_FLIP_EVENT,
 				    &flip_done)) {
 			fprintf(stderr, "gbmtest: drmModePageFlip: %s\n", strerror(errno));
@@ -296,6 +363,8 @@ main(int argc, char **argv)
 			fb = 0;
 			goto out;
 		}
+		t1 = now();
+		t_flip = t1 - t0;
 		while (!flip_done) {
 			fd_set fds;
 			struct timeval tv = { 2, 0 };
@@ -309,6 +378,14 @@ main(int argc, char **argv)
 			}
 			drmHandleEvent(fd, &ev);
 		}
+		t1 = now();
+		t_event = t1 - t0;
+		if (i == 0)
+			printf("frame 0 (%s, %d quads): glFinish %.1f ms, swap %.1f ms, "
+			       "flip ioctl %.1f ms, flip done %.1f ms\n",
+			       no_finish ? "no glFinish" : "glFinish", quads,
+			       t_finish * 1e3, t_swap * 1e3, t_flip * 1e3,
+			       t_event * 1e3);
 		if (i == 0)
 			printf("first frame flipped onto the display\n");
 		if (prev) {

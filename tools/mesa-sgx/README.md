@@ -146,6 +146,18 @@ GBM surface buffer, checks one pixel through `glReadPixels`, and flips with
 The buffers are SGX render targets the display scans out -- no CPU copy and
 no `/dev/fb0`.
 
+The display waits on the render node's fence through the buffer's dma
+reservation, so the test does not call `glFinish`; `--finish` is the
+comparison and `--quads N` makes a frame heavy enough to show the wait:
+
+```
+no glFinish, 100 quads: swap 1.6 ms, flip ioctl 0.1 ms, flip done 390 ms
+--finish,   100 quads: glFinish 390.9 ms, flip done 9.0 ms
+```
+
+A Wayland compositor on this path is in `tools/weston/` (Weston 14 with the
+DRM backend and GL renderer; `weston-run`).
+
 Scanout resources are allocated with `APPLE_SGX_BO_CONTIGUOUS`, because the
 display's DMA-GEM import accepts only a one-entry scatter/gather table;
 the SGX side needs no change to render into one.  `sgx_resource_get_param()`
