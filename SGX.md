@@ -25,6 +25,9 @@ system image at first boot, as the Wi-Fi and Bluetooth firmware already are.
 | Render node | `/dev/dri/renderD128`, driver `apple_sgx`: GEM buffers, syncobjs, a DRM scheduler, fences and timeouts |
 | Screen | the display pipe's live scanout is mapped at `0x90000000` and reported by `APPLE_SGX_PARAM_FB_*`; `BLIT` with `dst_handle` 0 copies onto it with no CPU copy |
 | Mesa / OpenGL ES 2.0 | the SGX Gallium driver in `tools/mesa-sgx/`, built into Mesa 26.1.8 for Alpine armv7 (musl) and installed as the system GL; clears, draws, the fragment compiler, textures, blending, depth and render targets of any size verified on the device |
+| EGL/GBM on the display | kmsro pairs the render node with the `s5l8947x` display: GBM surfaces are contiguous SGX buffers the display imports and scans out, flipped with page-flip events (`gbmtest`, 300 frames on hardware) |
+| Desktop GL (opt-in build) | `MESA_BUILD=desktop`: GLX, the X11/Wayland EGL platforms and desktop OpenGL; desktop GL 2.1 verified through EGL on the device (GLX needs an X server, which the image has not) |
+| Mesa install across reboots | `install.sh` keeps the tarball on Data; `stage2` unpacks it at boot and makes it the system GL |
 | Debug interface | `/sys/kernel/debug/apple-sgx/{regs,boot,cmd,mem}` |
 | Test tools | `sgxinfo` prints the render node's parameters; `sgxgem` creates, maps and checks a GEM buffer (`-c` for a contiguous, dma-buf-exportable one, `-i` to import a display buffer); `sgx2d` exercises the 2D engine; `sgxpresent` puts a buffer on the HDMI output (`-s` draws on the live screen); `sgxframe` runs one clear through the TA/3D queue; `hwtest gpu` checks the handshake, a CCB command, the render node and the screen blit |
 
@@ -49,6 +52,24 @@ system image at first boot, as the Wi-Fi and Bluetooth firmware already are.
   only the event program from the stock driver.  `GL_RENDERER` is
   "PowerVR SGX543MP1" -- the kernel's own core count, not the reference's
   fixed MP2.
+- **EGL/GBM works through kmsro.**  `gbmtest` created a 1280x720 GBM
+  surface, got an EGL window surface and a GLES 2 context, cleared and drew
+  into the scanout buffer (a blue pixel read back at the triangle's top),
+  and flipped 300 frames with `DRM_MODE_PAGE_FLIP_EVENT`; the console's
+  framebuffer came back on exit.  No CPU copy and no `/dev/fb0`.
+- **The Mesa install survives a reboot.**  After a DFU boot the initramfs
+  has no `/usr/local/lib/sgx-mesa`; `stage2` unpacked the tarball left on
+  Data ("Mesa userspace unpacked from cache"), made its `lib` the system's
+  GL, and `sgx-gl glclear`, `gbmtest` and `glclear-gl` all ran without
+  reinstalling.
+- **Desktop OpenGL is in the opt-in image.**  `MESA_BUILD=desktop` adds
+  `-Dplatforms=x11,wayland -Dglx=dri -Dopengl=true` and the X11/Wayland
+  libraries the libraries link against.  On the device `glclear-gl`
+  created a desktop OpenGL 2.1 context through surfaceless EGL, cleared 0
+  pixels wrong, and reported `GL_RENDERER PowerVR SGX543MP1`.  GLX itself
+  cannot be exercised without an X server, but `libGL` and its xcb/X11
+  dependencies load (no missing libraries), and its DRI name for this
+  display (`s5l8947x_dri.so`) is installed.
 - The TA/3D render queue runs: `sgxframe` builds the template frame and a
   render target's data, submits a full-screen clear through `SUBMIT`, and
   reads back every checked pixel right at 1280x720 and 640x360, twice in a
@@ -203,8 +224,33 @@ lock is held across the check and the transfer, so a modeset cannot pull
 the buffer out from under a running copy.  This is the path a Mesa flush or
 a full-screen renderer uses when it does not want a compositor.
 
-The kernel halves are in the tree and build (2026-11-02); the screen mapping
-and `sgxframe` still have to be run on the device.
+The screen mapping and `sgxframe -s` are verified on the device: the
+kernel maps what the pipe is showing and the 2D engine draws on it.
+
+### EGL and GBM (kmsro)
+
+Mesa's kmsro pairs the display's GBM device (`/dev/dri/card1`, kernel driver
+`s5l8947x`) with the `apple_sgx` render node.  GBM allocates a surface
+buffer on the render node with `PIPE_BIND_SCANOUT`; the SGX driver makes it
+contiguous (`APPLE_SGX_BO_CONTIGUOUS`, one CMA block) so its dma-buf has a
+one-entry scatter/gather table, exports it, and the display imports it as a
+scanout buffer.  `WINSYS_HANDLE_TYPE_KMS` then returns the display's handle,
+which is what `drmModeAddFB` needs, and `resource_get_param` reports the
+stride, offset and linear modifier kmsro asks for.  A page flip puts the
+rendered buffer on HDMI.
+
+```sh
+sgx-gl gbmtest 300		# 300 frames on HDMI, then the console returns
+```
+
+`gbmtest` keeps the console's mode, clears and draws into each surface
+buffer, checks one pixel through `glReadPixels`, and flips with
+`DRM_MODE_PAGE_FLIP_EVENT`; the display's simulated vblank completes the
+event.  It ran 300 frames on the device, and the console's framebuffer came
+back on exit.  Rendering and scanning out are not implicitly ordered: the
+test calls `glFinish()` before the flip, and a compositor has to order its
+own commits (the render node's syncobjs export sync files, but the display
+driver's atomic commit does not wait on them yet).
 
 ### Drawing into the display's own buffer (bring-up path)
 
@@ -252,23 +298,25 @@ physical address from `plane_info`.
 The console may repaint the screen; `echo 0 > /sys/class/vtconsole/vtcon1/bind`
 stops it for the test, and `echo 1 > ...` brings it back.
 
-PRIME export from the render node works (the GEM object's `get_sg_table` is
-the shmem helper's), but the display driver's DMA-GEM import requires a
-physically contiguous scatter/gather table.  The SGX render node's buffers
-are shmem and may be scattered, so importing one into the display fails with
-`-EINVAL`.  A clean future path is a CMA-backed SGX buffer object; until
-then the `map_phys` debugfs path is how the 2D engine reaches the screen.
+PRIME export from the render node works, and a buffer created with
+`APPLE_SGX_BO_CONTIGUOUS` has a one-entry scatter/gather table that the
+display's DMA-GEM import accepts.  Mesa allocates scanout resources that
+way for kmsro (above); the `map_phys` debugfs path below is the older
+bring-up route and needs no PRIME at all.
 
 What is not there yet:
 
 - **No KMS plane on the render node.**  The `s5l8947x` driver owns the HDMI
-  output and the render node has no connector.  For KMS/GBM programs the
-  render node is meant to pair with that driver through Mesa's `kmsro`; the
-  full-screen path does not need it (the screen blit above).  The overlay
-  ioctl still returns `-EOPNOTSUPP`, and the UAPI stays version 3.
-- **No Mesa/OpenGL ES userspace in the image.**  The render node is the
-  kernel half; the Gallium driver and its USSE/PDS program packs are a
-  separate body of work.
+  output and the render node has no connector; kmsro is how EGL/GBM pairs
+  them.  The overlay ioctl still returns `-EOPNOTSUPP`, and the UAPI stays
+  version 3.
+- **No compositor.**  The EGL/GBM path is there (`gbmtest`), but nothing
+  uses it as a display server yet.  A compositor also needs explicit
+  ordering: the display's atomic commit does not wait on the render node's
+  fence through the dma-buf yet.
+- **No implicit fencing on scanout buffers.**  The render node signals
+  syncobjs; the display driver waits on none of them, so a client finishes
+  its renders (`glFinish`/a fence wait) before the flip.
 
 ## The route to OpenGL ES 2.0
 
@@ -300,28 +348,32 @@ everything else is userspace.
    that path, the same default directory for the frame, and the renderer
    string.  `glclear`, `gltri`, `glfs`, `glsize`, `gltex`, `glblend` and
    `gldepth` all pass on the device.
-3. **Put it on the screen.**  For EGL/GBM, pair the render node with the
-   `s5l8947x` KMS driver through `kmsro`: GBM allocates the scanout buffer
-   on the display, the SGX node imports its dma-buf and renders into it,
-   and the display's atomic commit waits on the GPU's fence through the
-   shared dma-buf reservation.  For full-screen programs the screen blit
-   above is enough.
+3. **Put it on the screen.**  Done for an EGL/GBM client: kmsro pairs the
+   render node with the `s5l8947x` display driver, GBM allocates the
+   scanout buffer on the render node (contiguous, CMA), the display imports
+   its dma-buf, and page flips put it on HDMI (`gbmtest`, 300 frames on the
+   device).  For full-screen programs the screen blit above is the shorter
+   path.  A compositor is the next step; it needs explicit fence ordering
+   until the display waits on the render node's dma-buf.
 4. **Then the 2D engine's leftovers** (fill and non-scaled copy), the
    interrupt and runtime PM.
 
 ## Next steps
 
-1. **kmsro** for EGL/GBM: the render node with the `s5l8947x` KMS driver,
-   then a compositor.  Until then the screen blit (`BLIT dst 0`,
-   `sgxpresent -s`) puts a rendered buffer on the display.
-2. **Make the Mesa install survive a reboot.**  It is on the initramfs
-   (`/usr/local/lib/sgx-mesa`, ~19 MB installed) and `install.sh --system`
-   makes it the system GL; caching the tarball on `Data` and unpacking it in
-   `stage2` is the next step.
+1. **A compositor.**  The EGL/GBM half works; a Wayland compositor with a
+   DRM backend (or an SDL client) would be the first real consumer.  The
+   open piece is ordering: the display's atomic commit does not wait on the
+   render node's fence, so a compositor has to wait explicitly (or the
+   kernel gains dma-fence waiting in the display's commit).
+2. **Implicit fencing between the render node and the display.**  The
+   render node signals syncobjs, and its dma-bufs could carry a fence the
+   display's atomic commit waits on.  Until then `gbmtest` calls
+   `glFinish()` before each flip.
 3. **The desktop-GL half of the driver** (GLX and the x11/wayland
-   platforms) is not built in this image: the device has neither.  Add
-   `-Dplatforms=x11,wayland -Dglx=dri` and the X/wayland libraries when a
-   compositor needs them.
+   platforms) is an opt-in build (`MESA_BUILD=desktop`) with the
+   X11/Wayland libraries it needs; desktop GL 2.1 is verified through EGL
+   (`glclear-gl`), while GLX waits for an X server.  Build it into the
+   default image if a compositor or X client needs it.
 4. **More of the 2D engine.**  BLIT covers a scaled copy; a fill and a
    non-scaled copy are the same transfer with other programs.
 5. **Power management.**  The microkernel's power and idle commands are
