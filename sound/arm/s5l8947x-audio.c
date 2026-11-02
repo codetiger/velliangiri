@@ -105,7 +105,7 @@ struct s5l8947x_line {
 	dma_cookie_t cookie;
 	bool dma_started;
 
-	void *ring;
+	u32 *ring;
 	dma_addr_t ring_phys;
 	size_t ring_bytes;
 	unsigned int ring_frames;
@@ -125,7 +125,7 @@ struct s5l8947x_stream {
 	struct dma_chan *dma;
 	dma_cookie_t cookie;
 	bool dma_started;
-	void *dma_ring;
+	u32 *dma_ring;
 	dma_addr_t dma_ring_phys;
 	size_t dma_ring_bytes;
 	unsigned int dma_ring_frames;
@@ -575,7 +575,8 @@ static int s5l8947x_pcm_copy(struct snd_pcm_substream *substream, int channel,
 	frame = (pos / frame_bytes) % st->lines[0].ring_frames;
 
 	while (frames) {
-		n = min(frames, ARRAY_SIZE(tmp) / st->channels);
+		n = min3(frames, (unsigned int)(ARRAY_SIZE(tmp) / st->channels),
+			 st->lines[0].ring_frames - frame);
 		if (copy_from_iter(tmp, n * frame_bytes, iter) !=
 		    n * frame_bytes)
 			return -EFAULT;
