@@ -9,6 +9,7 @@
 #   ./scripts/velliangiri.sh bundle         # Pack self-relocating boot bundle
 #   ./scripts/velliangiri.sh all            # Run rootfs + kernel + bundle
 #   ./scripts/velliangiri.sh clean          # Clean build outputs (preserves downloaded tarballs)
+#   ./scripts/velliangiri.sh mesa           # Build Mesa with the SGX driver (tools/mesa-sgx)
 #   ./scripts/velliangiri.sh check          # Run clean-room guardrail verification
 #   ./scripts/velliangiri.sh shell          # Open interactive shell in build container
 
@@ -82,11 +83,29 @@ case "${CMD}" in
 	check)
 		bash "${ROOT}/scripts/check-no-proprietary.sh" --all
 		;;
+	mesa)
+		# Mesa with the SGX543's driver: fetched on the host, built in the
+		# Alpine armv7 image, packed into build/mesa-sgx-install.tar
+		if [ ! -d "${ROOT}/build/mesa/src" ]; then
+			bash "${ROOT}/tools/mesa-sgx/fetch.sh"
+		fi
+		docker image inspect velliangiri-mesa >/dev/null 2>&1 ||
+			docker build --platform linux/arm/v7 -t velliangiri-mesa \
+				-f "${ROOT}/tools/mesa-sgx/container.conf" "${ROOT}/tools/mesa-sgx"
+		docker volume inspect velliangiri-mesa >/dev/null 2>&1 ||
+			docker volume create velliangiri-mesa >/dev/null
+		docker run --rm --platform linux/arm/v7 \
+			-v "${ROOT}/build/mesa/src":/from:ro -v velliangiri-mesa:/to \
+			alpine:3.21 sh -c '[ -d /to/src/.git ] || { rm -rf /to/src && cp -a /from /to/src; }'
+		docker run --rm --platform linux/arm/v7 -v "${ROOT}":/workspace \
+			-v velliangiri-mesa:/workspace/build/mesa -w /workspace \
+			velliangiri-mesa sh tools/mesa-sgx/build.sh
+		;;
 	shell)
 		docker_run -it /bin/bash
 		;;
 	*)
-		echo "Usage: $0 {all|image|rootfs|kernel|bundle|clean|check|shell}" >&2
+		echo "Usage: $0 {all|image|rootfs|kernel|bundle|mesa|clean|check|shell}" >&2
 		exit 1
 		;;
 esac
