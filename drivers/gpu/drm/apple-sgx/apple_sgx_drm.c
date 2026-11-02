@@ -110,7 +110,6 @@ struct apple_sgx_drm {
 	struct drm_mm_node fb_window;
 	struct drm_mm_node blit_block;	/* the 2D engine's PDS block */
 	struct drm_mm_node blit_param;	/* ... and its parameter page */
-	struct drm_mm_node extra[SGX_MAX_EXTRA];
 
 	atomic_t clients;
 
@@ -462,20 +461,6 @@ sgx_gem_prime_import_sg_table(struct drm_device *drm,
 	return obj;
 }
 
-/* Dumb buffers (kept for the shared interface; no KMS plane here) */
-static int sgx_dumb_create(struct drm_file *file, struct drm_device *drm,
-			   struct drm_mode_create_dumb *args)
-{
-	u32 va = 0;
-
-	if (!args->width || !args->height || !args->bpp || args->width > 4096 ||
-	    args->height > 4096)
-		return -EINVAL;
-	args->pitch = ALIGN(DIV_ROUND_UP(args->width * args->bpp, 8), 64);
-	args->size = ALIGN((u64)args->pitch * args->height, PAGE_SIZE);
-	return sgx_bo_new(drm, file, args->size, 0, &va, &args->handle);
-}
-
 /* where the GPU sees a buffer object */
 u32 apple_sgx_bo_va(struct drm_gem_object *obj)
 {
@@ -638,7 +623,7 @@ static int sgx_ioctl_get_param(struct drm_device *drm, void *data, struct drm_fi
 		return -EINVAL;
 	switch (args->param) {
 	case APPLE_SGX_PARAM_UAPI_VERSION:
-		args->value = 3;	/* (not for OVERLAY: apple_sgx_drm.h) */
+		args->value = 3;
 		break;
 	case APPLE_SGX_PARAM_CORE_ID:
 		args->value = sgx->core_id;
@@ -1260,12 +1245,6 @@ static int sgx_open(struct drm_device *drm, struct drm_file *file)
 	return 0;
 }
 
-/* The overlay is part of the shared interface but has no KMS plane here. */
-static int sgx_ioctl_overlay(struct drm_device *drm, void *data, struct drm_file *file)
-{
-	return -EOPNOTSUPP;
-}
-
 static void sgx_postclose(struct drm_device *drm, struct drm_file *file)
 {
 	struct apple_sgx_drm *sdrm = to_sgx_drm(drm);
@@ -1283,7 +1262,6 @@ static const struct drm_ioctl_desc sgx_ioctls[] = {
 	DRM_IOCTL_DEF_DRV(APPLE_SGX_GEM_WAIT, sgx_ioctl_gem_wait, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(APPLE_SGX_SUBMIT, sgx_ioctl_submit, DRM_RENDER_ALLOW),
 	DRM_IOCTL_DEF_DRV(APPLE_SGX_GEM_INFO, sgx_ioctl_gem_info, DRM_RENDER_ALLOW),
-	DRM_IOCTL_DEF_DRV(APPLE_SGX_OVERLAY, sgx_ioctl_overlay, DRM_RENDER_ALLOW | DRM_ROOT_ONLY),
 	DRM_IOCTL_DEF_DRV(APPLE_SGX_BLIT, sgx_ioctl_blit, DRM_RENDER_ALLOW),
 };
 
@@ -1298,7 +1276,6 @@ static const struct drm_driver sgx_drm_driver = {
 	.fops = &sgx_drm_fops,
 	.gem_create_object = sgx_gem_create_object,
 	.gem_prime_import_sg_table = sgx_gem_prime_import_sg_table,
-	.dumb_create = sgx_dumb_create,
 	.name = "apple_sgx",
 	.desc = "S5L8947X PowerVR SGX543",
 	.date = "20261003",
@@ -1309,44 +1286,6 @@ static const struct drm_driver sgx_drm_driver = {
 bool apple_sgx_drm_busy(struct apple_sgx *sgx)
 {
 	return sgx->drm && atomic_read(&sgx->drm->clients) > 0;
-}
-
-/* debugfs "map": memory mapped at a chosen address, which no buffer of the
- * render node may then take (and the other way round).  Slot is its index
- * in sgx->extra; anything outside the render node's range is not its
- * business. */
-int apple_sgx_drm_reserve(struct apple_sgx *sgx, int slot, u32 va, u32 size)
-{
-	struct apple_sgx_drm *sdrm = sgx->drm;
-	u64 end = (u64)va + size;
-	struct drm_mm_node *n;
-	int ret;
-
-	if (!sdrm || end <= SGX_USER_VA_START || va >= SGX_USER_VA_END)
-		return 0;
-	if (slot < 0 || slot >= SGX_MAX_EXTRA || va < SGX_USER_VA_START ||
-	    end > SGX_USER_VA_END)
-		return -EINVAL;
-	n = &sdrm->extra[slot];
-	memset(n, 0, sizeof(*n));
-	n->start = va;
-	n->size = size;
-	mutex_lock(&sdrm->va_lock);
-	ret = drm_mm_reserve_node(&sdrm->va, n);
-	mutex_unlock(&sdrm->va_lock);
-	return ret == -ENOSPC ? -EEXIST : ret;
-}
-
-void apple_sgx_drm_unreserve(struct apple_sgx *sgx, int slot)
-{
-	struct apple_sgx_drm *sdrm = sgx->drm;
-
-	if (!sdrm || slot < 0 || slot >= SGX_MAX_EXTRA)
-		return;
-	mutex_lock(&sdrm->va_lock);
-	if (drm_mm_node_allocated(&sdrm->extra[slot]))
-		drm_mm_remove_node(&sdrm->extra[slot]);
-	mutex_unlock(&sdrm->va_lock);
 }
 
 static void sgx_drm_release(struct drm_device *drm, void *data)

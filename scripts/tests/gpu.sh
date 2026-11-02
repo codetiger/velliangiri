@@ -41,12 +41,6 @@ t_gpu() {
 		fi
 	done
 
-	if wr "$d/cmd" "hwperf 0"; then
-		pass "kernel CCB command taken"
-	else
-		fail "kernel CCB command not taken"
-	fi
-
 	if [ -e /dev/dri/renderD128 ]; then
 		pass "render node /dev/dri/renderD128 present"
 	else

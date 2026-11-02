@@ -25,45 +25,9 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#define DRM_IOCTL_BASE		'd'
-#define DRM_COMMAND_BASE	0x40
-#define DRM_IOWR(nr, type)	_IOWR(DRM_IOCTL_BASE, nr, type)
-#define DRM_IOW(nr, type)	_IOW(DRM_IOCTL_BASE, nr, type)
+#include "sgx-uapi.h"
 
-struct drm_apple_sgx_get_param {
-	uint32_t param;
-	uint32_t pad;
-	uint64_t value;
-};
-
-struct drm_apple_sgx_gem_create {
-	uint64_t size;
-	uint32_t flags;
-	uint32_t handle;
-	uint32_t va;
-	uint32_t pad;
-};
-
-struct drm_apple_sgx_gem_mmap_offset {
-	uint32_t handle;
-	uint32_t flags;
-	uint64_t offset;
-};
-
-struct drm_apple_sgx_gem_info {
-	uint32_t handle;
-	uint32_t flags;
-	uint32_t va;
-	uint32_t pad;
-	uint64_t size;
-};
-
-struct drm_apple_sgx_gem_wait {
-	uint32_t handle;
-	uint32_t pad;
-	int64_t timeout_ns;
-};
-
+/* generic DRM ioctls, without libdrm */
 struct drm_prime_handle {
 	uint32_t handle;
 	uint32_t flags;
@@ -81,27 +45,9 @@ struct drm_mode_create_dumb {
 };
 
 #define DRM_APPLE_PRIME_FD_TO_HANDLE	0x2e
+#define DRM_APPLE_PRIME_HANDLE_TO_FD	0x2d
 #define DRM_APPLE_MODE_CREATE_DUMB	0xb2
 
-#define DRM_APPLE_SGX_GET_PARAM		0x00
-#define DRM_APPLE_SGX_GEM_CREATE	0x01
-#define DRM_APPLE_SGX_GEM_MMAP_OFFSET	0x02
-#define DRM_APPLE_SGX_GEM_WAIT		0x03
-#define DRM_APPLE_SGX_GEM_INFO		0x05
-
-/* local copies: the tools build without the kernel's uapi headers */
-#define DRM_APPLE_PRIME_HANDLE_TO_FD	0x2d
-
-#define DRM_IOCTL_APPLE_SGX_GET_PARAM \
-	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_SGX_GET_PARAM, struct drm_apple_sgx_get_param)
-#define DRM_IOCTL_APPLE_SGX_GEM_CREATE \
-	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_SGX_GEM_CREATE, struct drm_apple_sgx_gem_create)
-#define DRM_IOCTL_APPLE_SGX_GEM_MMAP_OFFSET \
-	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_SGX_GEM_MMAP_OFFSET, struct drm_apple_sgx_gem_mmap_offset)
-#define DRM_IOCTL_APPLE_SGX_GEM_WAIT \
-	DRM_IOW(DRM_COMMAND_BASE + DRM_APPLE_SGX_GEM_WAIT, struct drm_apple_sgx_gem_wait)
-#define DRM_IOCTL_APPLE_SGX_GEM_INFO \
-	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_SGX_GEM_INFO, struct drm_apple_sgx_gem_info)
 #define DRM_IOCTL_APPLE_PRIME_HANDLE_TO_FD \
 	DRM_IOWR(DRM_APPLE_PRIME_HANDLE_TO_FD, struct drm_prime_handle)
 #define DRM_IOCTL_APPLE_PRIME_FD_TO_HANDLE \
@@ -110,7 +56,6 @@ struct drm_mode_create_dumb {
 	DRM_IOWR(DRM_APPLE_MODE_CREATE_DUMB, struct drm_mode_create_dumb)
 
 #define SGX_GEM_SIZE	4096
-#define APPLE_SGX_BO_CONTIGUOUS	(1u << 5)
 
 /* a display dumb buffer, exported and imported here */
 static int fail(const char *what);

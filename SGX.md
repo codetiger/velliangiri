@@ -19,9 +19,9 @@ system image at first boot, as the Wi-Fi and Bluetooth firmware already are.
 | Register access | Six 16 KiB banks; bank 0 is write-only broadcast, bank 1 the master, bank 2 + n core n.  Reads of bank 0 and of absent cores are refused |
 | GPU MMU | Two-level page table (4 KiB pages, one directory shared by every requestor) over cache-consistent, uncached buffers |
 | Microkernel | Booted from `s5l8947x/sgx543.fw`, which `stage2` carves with `sgxcarve`; handshake checked |
-| Kernel CCB | 256-entry command ring; power, performance-counter, transfer and TA commands |
-| Transfer queue | One queue with a 64 KiB command buffer; a dummy transfer and a real 2D blit have both run through it |
-| Render queue | One TA + 3D queue with a 64 KiB command buffer; used by the render node and debugfs.  Exercised on hardware: `sgxframe` clears 1280x720 and 640x360 through the TA and the 3D pass |
+| Kernel CCB | 256-entry command ring; transfer and TA commands |
+| Transfer queue | One queue with a 64 KiB command buffer; the 2D blit runs through it |
+| Render queue | One TA + 3D queue with a 64 KiB command buffer; used by the render node.  Exercised on hardware: `sgxframe` clears 1280x720 and 640x360 through the TA and the 3D pass |
 | Render node | `/dev/dri/renderD128`, driver `apple_sgx`: GEM buffers, syncobjs, a DRM scheduler, fences and timeouts |
 | Screen | the display pipe's live scanout is mapped at `0x90000000` and reported by `APPLE_SGX_PARAM_FB_*`; `BLIT` with `dst_handle` 0 copies onto it with no CPU copy |
 | Mesa / OpenGL ES 2.0 | the SGX Gallium driver in `tools/mesa-sgx/`, built into Mesa 26.1.8 for Alpine armv7 (musl) and installed as the system GL; clears, draws, the fragment compiler, textures, blending, depth and render targets of any size verified on the device |
@@ -30,8 +30,8 @@ system image at first boot, as the Wi-Fi and Bluetooth firmware already are.
 | Compositor | Weston 14 (DRM backend, GL renderer, kiosk shell) built from source in `tools/weston/`, started by `weston-run`; composites EGL and shm clients on the SGX and scans them out (verified on HDMI) |
 | Implicit fences | the SGX render node's finished fence is on every submitted buffer's reservation, and the display's atomic commit waits on it: a 390 ms render without `glFinish` delays the flip by 390 ms |
 | Mesa install across reboots | `install.sh` keeps the tarball on Data; `stage2` unpacks it at boot and makes it the system GL |
-| Debug interface | `/sys/kernel/debug/apple-sgx/{regs,boot,cmd,mem}` |
-| Test tools | `sgxinfo` prints the render node's parameters; `sgxgem` creates, maps and checks a GEM buffer (`-c` for a contiguous, dma-buf-exportable one, `-i` to import a display buffer); `sgx2d` exercises the 2D engine; `sgxpresent` puts a buffer on the HDMI output (`-s` draws on the live screen); `sgxframe` runs one clear through the TA/3D queue; `hwtest gpu` checks the handshake, a CCB command, the render node and the screen blit |
+| Debug interface | `/sys/kernel/debug/apple-sgx/{regs,boot}` |
+| Test tools | `sgxinfo` prints the render node's parameters; `sgxgem` creates, maps and checks a GEM buffer (`-c` for a contiguous, dma-buf-exportable one, `-i` to import a display buffer); `sgx2d` exercises the 2D engine; `sgxpresent` puts a buffer on the HDMI output (`-s` draws on the live screen); `sgxframe` runs one clear through the TA/3D queue; `hwtest gpu` checks the handshake, the render node and the screen blit |
 
 ### Verified on hardware (2026-11-02, `j33iap`)
 
@@ -99,31 +99,24 @@ bundle:
 
 - The microkernel boots from the carved firmware: `host[0] = 0x00000001`
   about 5 ms after the kick, repeatedly.
-- The kernel CCB takes a `HWPERF` command in 6–10 µs; core 0 reports
-  `EVENT_STATUS 0x20002a00` (timer, TA finished, TPC and DPM clear).
-- The transfer queue runs a dummy transfer (`tq 0x20 0xcafe0001`): the
-  completion value lands in the scratch word, the queue read offset
-  reaches the write offset, the context word clears, and there is no BIF
-  fault or lockup.
-- A real 2D transfer, built from scratch with the reference's `tqgen.py`
-  and loaded through debugfs `map`/`mem`, scales a 64x64 four-quadrant
-  source 2x into a 128x128 linear BGRA buffer.  The four quadrant centre
-  pixels come back red, green, blue and white exactly; the transfer
-  completes, core 0 raises `PIXELBE_END_RENDER`, and there is no BIF
-  fault.  This exercises the transfer queue, the USSE/PDS programs, the
-  pixel back end and the GPU MMU end to end.
+- A 2D transfer through `BLIT` (the kernel builds the USSE/PDS programs
+  and the transfer command) scales a 64x64 four-quadrant source 2x into a
+  128x128 linear BGRA buffer.  The four quadrant centre pixels come back
+  red, green, blue and white exactly; the transfer completes, core 0
+  raises `PIXELBE_END_RENDER`, and there is no BIF fault.  This exercises
+  the transfer queue, the USSE/PDS programs, the pixel back end and the
+  GPU MMU end to end.
 - The render node is `/dev/dri/renderD128`, UAPI version 3.  `sgxgem`
   creates a 4 KiB GEM buffer, maps it write-combined, writes and reads a
   pattern, reads back its GPU address (`0xdfffe000` in the test), and
   waits on it successfully.
 - The 2D engine draws on the screen: the display driver's `plane_info`
   gave the current scanout buffer (`0x9a100000`, stride 5120, 1280x720),
-  `map_phys` mapped it at GPU `0x9e000000`, and a `tqgen.py`-generated
-  1280x720 transfer wrote the four-quadrant pattern into it.  `peek` at
-  the display's physical framebuffer read the quadrant words back
+  the SGX driver mapped it at GPU `0x90000000`, and `BLIT` with
+  `dst_handle` 0 wrote the four-quadrant pattern into it.  `peek` at the
+  display's physical framebuffer read the quadrant words back
   (`ffff0000`, `ff00ff00`, `ffffffff`, `ff0000ff`), so the GPU wrote the
-  buffer the display is scanning out.  `map_phys` here had no CPU view
-  (`ioremap_wc` refused the large RAM range), which is fine for drawing.
+  buffer the display is scanning out.
 - The clean presentation path works end to end: `sgxpresent` makes a
   contiguous 1280x720 SGX buffer at GPU `0x8d000000`, exports it as a
   dma-buf, the display driver imports it (physical `0x9a500000`) and scans
@@ -135,8 +128,8 @@ bundle:
   `DRM_APPLE_SGX_BLIT` and every quadrant word comes back right, twice in a
   row (the second blit runs the same code with different destination
   words).  `sgxpresent -b` shows the same blit on HDMI.
-- `hwtest gpu` passes 11/11, and the full `hwtest` suite passes 125/125 with
-  2 skips on the same boot.
+- `hwtest gpu` passes 10/10, and the full `hwtest` suite passes 124 with
+  0 failures and 2 skips on the same boot.
 
 The first probe happens at ~0.6 s, before `stage2` has copied the firmware
 from NAND (~7.2 s).  The driver now retries the microkernel start when a
@@ -261,6 +254,14 @@ buffer, checks one pixel through `glReadPixels`, and flips with
 event.  It ran 300 frames on the device, and the console's framebuffer came
 back on exit.
 
+For the renderer's own load, `glcubes` draws 10x10x10 textured cubes and
+reports the load time (process start to the first finished frame) and the
+frame rate, with `glFinish` after each frame so the number is GPU time:
+
+```sh
+sgx-gl glcubes --frames 300
+```
+
 Rendering and scanning out are ordered by the buffer's dma reservation: the
 SGX render node puts its job's finished fence on every buffer of a submit
 (`DMA_RESV_USAGE_WRITE`), the display's imported GEM object shares that
@@ -302,64 +303,28 @@ descriptor; with the handle-type parameters absent it falls through to
 `resource_get_handle`, which exports a real dma-buf fd.  Before that,
 Weston received a duplicate of the client's stdout as the buffer.
 
-### Drawing into the display's own buffer (bring-up path)
+### Drawing on the display
 
-The display driver exposes the buffer it is scanning out now as
-`/sys/bus/platform/devices/3a200000.display-controller/plane_info`:
-
-```
-0x<physical> <stride> <width> <height>
-```
-
-The SGX debugfs `cmd` accepts `map_phys VA PA SIZE`, which maps an existing
-physical range into the GPU address space (the range is not owned or freed
-by the SGX driver).  Mapping the display's current scanout buffer at a free
-GPU address (`0x9e000000` here) and pointing a transfer at it lets the 2D
-engine draw directly on the screen:
-
-```sh
-D=/sys/kernel/debug/apple-sgx
-info=$(cat /sys/bus/platform/devices/3a200000.display-controller/plane_info)
-set -- $info
-echo 1 > $D/boot                       # allocates the microkernel buffers
-sleep 0.2
-echo "map_phys 0x9e000000 $1 $(($2 * $4))" > $D/cmd
-# load a tqgen.py-generated transfer with destination 0x9e000000,
-# stride $2, size $3x$4, then:
-echo tqkick > $D/cmd
-```
-
-The first boot is needed because the buffer set (and therefore `map` and
-`map_phys`) exists only after the microkernel has been loaded.  A kick after
-the page tables changed carries `SGX_CC_INVAL_BIF_*`, so the microkernel
-invalidates its MMU caches itself; the extra boot is only needed for
-mappings made *before* the boot.  `0x9e000000` is outside the render node's
-reserved framebuffer window at `0x90000000`.
-
-A boot zeroes the microkernel's queues, so a transfer command has to be
-written (`apple-sgx/mem`, at the transfer CCB's GPU address) after the last
-boot.
-
-`map_phys` may not get a CPU view: `ioremap_wc` can refuse a large RAM
-range, in which case the mapping is GPU-only and `apple-sgx/mem` cannot
-read it.  The display's framebuffer can still be checked with `peek` at the
-physical address from `plane_info`.
-
-The console may repaint the screen; `echo 0 > /sys/class/vtconsole/vtcon1/bind`
-stops it for the test, and `echo 1 > ...` brings it back.
+The display driver publishes the buffer it is scanning out now
+(`include/linux/s5l8947x-display.h`, generation-counted).  The SGX driver
+maps it at `0x90000000` and reports its address, size and stride through
+`APPLE_SGX_PARAM_FB_*`.  `DRM_APPLE_SGX_BLIT` with `dst_handle` 0 then has
+the 2D engine copy a rendered buffer straight onto the live scanout, with
+no CPU copy, no dma-buf and no modeset.  `sgxpresent -s` and `sgxframe -s`
+use that path.  The display's mode changes are handled by remapping when
+its published generation changes, so a copy never lands in a buffer the
+pipe has let go.
 
 PRIME export from the render node works, and a buffer created with
 `APPLE_SGX_BO_CONTIGUOUS` has a one-entry scatter/gather table that the
 display's DMA-GEM import accepts.  Mesa allocates scanout resources that
-way for kmsro (above); the `map_phys` debugfs path below is the older
-bring-up route and needs no PRIME at all.
+way for kmsro (above); the 2D screen blit needs no PRIME at all.
 
 What is not there yet:
 
 - **No KMS plane on the render node.**  The `s5l8947x` driver owns the HDMI
   output and the render node has no connector; kmsro is how EGL/GBM pairs
-  them.  The overlay ioctl still returns `-EOPNOTSUPP`, and the UAPI stays
-  version 3.
+  them.
 - **No input.**  Weston starts with `--continue-without-input`; the board
   has no USB host mode yet, so there is no keyboard or mouse.
 - **No desktop shell or Xwayland.**  Weston runs with the kiosk shell; the
@@ -394,7 +359,8 @@ everything else is userspace.
    (`SGX_EVENT` names another copy).  Three files differ from the reference:
    that path, the same default directory for the frame, and the renderer
    string.  `glclear`, `gltri`, `glfs`, `glsize`, `gltex`, `glblend` and
-   `gldepth` all pass on the device.
+   `gldepth` all pass on the device; `glcubes` reports load time and the
+   frame rate with 1000 textured cubes.
 3. **Put it on the screen.**  Done: kmsro pairs the render node with the
    `s5l8947x` display driver, GBM allocates the scanout buffer on the render
    node (contiguous, CMA), the display imports its dma-buf, and page flips
@@ -429,7 +395,7 @@ everything else is userspace.
 | SGX registers | `0x35100000` | 96 KiB, six 16 KiB banks |
 | GFX_SYS power state | PMGR `0x3f101024` | gate 7 |
 | GFX power state | PMGR `0x3f101028` | gate 8 |
-| Interrupt | AIC 49 | not enabled by default |
+| Interrupt | AIC 49 | not used; renders are polled |
 | Microkernel firmware | `/lib/firmware/s5l8947x/sgx543.fw` | carved by `sgxcarve` |
 
 The device tree node is `sgx0: gpu@5100000` (the `soc@30000000` ranges map it
@@ -500,7 +466,7 @@ index from a code base, so USSE code must stay within 8 MiB of
    `B_TQ_CCB`.  The kernel sends `TRANSFER` through the CCB with the queue's
    hardware context.  A transfer is the GPU's blit/fill path: the 3D pipe
    draws one quad and the pixel back end writes the result.  `BLIT` builds
-   one from two buffers, and `tqkick` replays one written through debugfs.
+   one from two buffers.
 3. **Render queue.**  A render is a TA command (0x11c..0x200 bytes) in
    `B_R_CCB`, sent as `TA` with the render context.  The TA pass builds
    tiles; the 3D pass shades them.  The job is done when the microkernel
@@ -546,15 +512,10 @@ sgxframe -s 5                 # one clear through the TA/3D queue, shown
 glcarve -a /mnt/system/System/Library/Caches/com.apple.dyld/dyld_shared_cache_armv7 /tmp/glc
 cat /sys/kernel/debug/apple-sgx/regs
 echo 1 > /sys/kernel/debug/apple-sgx/boot      # restart the microkernel
-echo "hwperf 0" > /sys/kernel/debug/apple-sgx/cmd
-echo "tq 0x20 0xcafe0001" > /sys/kernel/debug/apple-sgx/cmd
 ```
 
 `regs` shows the master and core registers, the CCB offsets, the host
-control words and the microkernel state.  `mem` exposes GPU memory at file
-offsets equal to GPU addresses, for replay experiments.  `cmd` also accepts
-`power 1|2|3`, `map VA SIZE`, `map_phys VA PA SIZE`, `tqkick` and
-`rkick PB DET CMD [CC]`.
+control words and the microkernel state.
 
 The render node is `/dev/dri/renderD128`.  `sgxinfo` is the quickest check
 that a userspace process can open it and read the parameters.  `sgxframe`
@@ -582,8 +543,8 @@ stock recovery-image template and is built with the sibling workspace's
   The render node has no modeset feature, so presentation is PRIME: a
   contiguous SGX buffer is exported and the `s5l8947x` driver imports it.
   The reference's 2D engine blit is back as the `BLIT` ioctl, with the
-  kernel building the transfer.  `APPLE_SGX_PARAM_FB_*` return 0 and the
-  overlay ioctl returns `-EOPNOTSUPP`.
+  kernel building the transfer; `dst_handle` 0 copies onto the display's
+  live scanout, whose address and size `APPLE_SGX_PARAM_FB_*` report.
 - **Core count and clock:** both are read from the hardware.  The microkernel
   timer clock is 256.5 MHz (the 513 MHz PLL divided by two), the value the
   clean-room work measured on the same GPU family.

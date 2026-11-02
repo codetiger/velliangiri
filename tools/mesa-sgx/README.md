@@ -10,9 +10,8 @@ brought over unchanged except for the two things this port does differently
 |---|---|---|
 | `files/src/gallium/drivers/sgx/` | the Gallium driver: screen, context, VDM streams, the template frame, render target data, the USSE compiler, textures | MIT |
 | `files/src/gallium/winsys/sgx/drm/` | the winsys: one screen for the render node's fd | MIT |
-| `files/src/gallium/drivers/sgx/drm-shim/` | a pretend render node, for running the driver on a PC (optional) | MIT |
 | `mesa.patch` | the lines that register the driver with Mesa (a meson option, the subdirectories, the DRM descriptor, the pipe loader, dril, and kmsro) | MIT |
-| `gl/` | the test programs: `glclear`, `gltri`, `glfs`, `gltex`, `glblend`, `gldepth`, `glsize`, `gbmtest`, `glclear-gl` | GPL-2.0-only |
+| `gl/` | the test programs: `glclear`, `gltri`, `glfs`, `gltex`, `glblend`, `gldepth`, `glsize`, `glcubes`, `gbmtest`, `glclear-gl` | GPL-2.0-only |
 | `container.conf` | the image Mesa is built in: Alpine armv7, musl, the same libraries the device has | — |
 | `fetch.sh` | Mesa at the pinned tag into `build/mesa/src` (on the host: git under emulation is far too slow) | GPL-2.0-only |
 | `build.sh` | the driver in, configure, build, install, pack (inside the image) | GPL-2.0-only |
@@ -119,10 +118,41 @@ sgx: SGX543MP1 rev 1.2.2, clears on the GPU     <- the template frame is built
 sgx: SGX543MP1 rev 1.2.2, clears on the CPU     <- no event program (see dmesg)
 ```
 
-`SGX_EVENT=FILE` names another event program; `SGX_PACK=DIR` another
-template-frame directory.  The driver's own knobs (`SGX_DEBUG`,
-`SGX_FRAME`, `SGX_NOCC`, `SGX_DEBUG_DRAW`, ...) are documented in the
-reference's `mesa/README.md` and in the headers.
+`SGX_EVENT=FILE` names another event program.  The driver's own knobs
+(`SGX_DEBUG`, `SGX_FRAME`, `SGX_NOCC`, `SGX_DEBUG_DRAW`, ...) are
+documented in the reference's `mesa/README.md` and in the headers.
+
+## Load and frame-rate benchmark
+
+`glcubes` renders `N^3` textured cubes (10x10x10 by default) filling the
+view, and reports two numbers: **load** (process start to the first frame
+finished, including EGL, the FBO, the 64x64 texture, the vertex buffer and
+the driver's shader compile) and **fps** over `--frames` frames.  Each frame
+ends with `glFinish()`, so the frame time is GPU time, not queue depth.
+
+```sh
+sgx-gl glcubes                       # 1000 cubes, 1280x720, 300 frames
+sgx-gl glcubes --frames 1000         # a longer run
+sgx-gl glcubes --frames 0            # setup/load time only
+sgx-gl glcubes --grid 12 --width 1920 --height 1080
+```
+
+Example output (the frame rate is the device's; the shape is what the line
+looks like):
+
+```
+glcubes: 10x10x10 cubes (36000 vertices), 1280x720
+load: 212.4 ms (context 96.1, assets 71.8, first render 44.5)
+centre: 4096 of 4096 pixel(s) not the clear colour
+frames: 300 in 9.812 s
+fps: 30.57
+frame: avg 32.71 ms, min 31.90, max 36.40
+glcubes_result cubes=1000 vertices=36000 width=1280 height=720 load_ms=212.4 ...
+```
+
+There is no swap on the surfaceless path: this is the GPU's throughput at
+that resolution, not the display's refresh.  `gbmtest` measures the EGL/GBM
+path that reaches HDMI.
 
 ## On the display: EGL/GBM and kmsro
 

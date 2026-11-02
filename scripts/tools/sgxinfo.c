@@ -16,50 +16,37 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <string.h>
-#include <sys/ioctl.h>
 #include <unistd.h>
 
-#define DRM_IOCTL_BASE		'd'
-#define DRM_COMMAND_BASE	0x40
-#define DRM_IOWR(nr, type)	_IOWR(DRM_IOCTL_BASE, nr, type)
-
-struct drm_apple_sgx_get_param {
-	uint32_t param;
-	uint32_t pad;
-	uint64_t value;
-};
-
-#define DRM_APPLE_SGX_GET_PARAM			0x00
-#define DRM_IOCTL_APPLE_SGX_GET_PARAM \
-	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_SGX_GET_PARAM, struct drm_apple_sgx_get_param)
+#include "sgx-uapi.h"
 
 static const struct {
 	uint32_t id;
 	const char *name;
 	const char *fmt;
 } params[] = {
-	{ 0,  "UAPI_VERSION",        "%llu" },
-	{ 1,  "CORE_ID",             "0x%08llx" },
-	{ 2,  "CORE_REVISION",       "0x%08llx" },
-	{ 3,  "NUM_CORES",           "%llu" },
-	{ 4,  "CLOCK_KHZ",           "%llu" },
-	{ 5,  "UKERNEL_UP",          "%llu" },
-	{ 6,  "VA_START",            "0x%08llx" },
-	{ 7,  "VA_END",              "0x%08llx" },
-	{ 8,  "CODE_BASE",           "0x%08llx" },
-	{ 9,  "CODE_VA_START",       "0x%08llx" },
-	{ 10, "CODE_VA_END",         "0x%08llx" },
-	{ 11, "FB_VA",               "0x%08llx" },
-	{ 12, "FB_WIDTH",            "%llu" },
-	{ 13, "FB_HEIGHT",           "%llu" },
-	{ 14, "FB_STRIDE",           "%llu" },
-	{ 15, "RENDERS_SUBMITTED",   "%llu" },
-	{ 16, "RENDERS_DONE",        "%llu" },
-	{ 17, "RENDERS_TIMED_OUT",   "%llu" },
-	{ 18, "UKERNEL_BOOTS",       "%llu" },
-	{ 19, "PB_VA",               "0x%08llx" },
-	{ 20, "TA_HEAP_START",       "0x%08llx" },
-	{ 21, "TA_HEAP_END",         "0x%08llx" },
+	{ APPLE_SGX_PARAM_UAPI_VERSION,      "UAPI_VERSION",      "%llu" },
+	{ APPLE_SGX_PARAM_CORE_ID,           "CORE_ID",           "0x%08llx" },
+	{ APPLE_SGX_PARAM_CORE_REVISION,     "CORE_REVISION",     "0x%08llx" },
+	{ APPLE_SGX_PARAM_NUM_CORES,         "NUM_CORES",         "%llu" },
+	{ APPLE_SGX_PARAM_CLOCK_KHZ,         "CLOCK_KHZ",         "%llu" },
+	{ APPLE_SGX_PARAM_UKERNEL_UP,        "UKERNEL_UP",        "%llu" },
+	{ APPLE_SGX_PARAM_VA_START,          "VA_START",          "0x%08llx" },
+	{ APPLE_SGX_PARAM_VA_END,            "VA_END",            "0x%08llx" },
+	{ APPLE_SGX_PARAM_CODE_BASE,         "CODE_BASE",         "0x%08llx" },
+	{ APPLE_SGX_PARAM_CODE_VA_START,     "CODE_VA_START",     "0x%08llx" },
+	{ APPLE_SGX_PARAM_CODE_VA_END,       "CODE_VA_END",       "0x%08llx" },
+	{ APPLE_SGX_PARAM_FB_VA,             "FB_VA",             "0x%08llx" },
+	{ APPLE_SGX_PARAM_FB_WIDTH,          "FB_WIDTH",          "%llu" },
+	{ APPLE_SGX_PARAM_FB_HEIGHT,         "FB_HEIGHT",         "%llu" },
+	{ APPLE_SGX_PARAM_FB_STRIDE,         "FB_STRIDE",         "%llu" },
+	{ APPLE_SGX_PARAM_RENDERS_SUBMITTED, "RENDERS_SUBMITTED", "%llu" },
+	{ APPLE_SGX_PARAM_RENDERS_DONE,      "RENDERS_DONE",      "%llu" },
+	{ APPLE_SGX_PARAM_RENDERS_TIMED_OUT, "RENDERS_TIMED_OUT", "%llu" },
+	{ APPLE_SGX_PARAM_UKERNEL_BOOTS,     "UKERNEL_BOOTS",     "%llu" },
+	{ APPLE_SGX_PARAM_PB_VA,             "PB_VA",             "0x%08llx" },
+	{ APPLE_SGX_PARAM_TA_HEAP_START,     "TA_HEAP_START",     "0x%08llx" },
+	{ APPLE_SGX_PARAM_TA_HEAP_END,       "TA_HEAP_END",       "0x%08llx" },
 };
 
 int main(int argc, char **argv)

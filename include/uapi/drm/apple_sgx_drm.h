@@ -62,7 +62,6 @@ extern "C" {
 #define DRM_APPLE_SGX_GEM_WAIT			0x03
 #define DRM_APPLE_SGX_SUBMIT			0x04
 #define DRM_APPLE_SGX_GEM_INFO			0x05
-#define DRM_APPLE_SGX_OVERLAY			0x06
 #define DRM_APPLE_SGX_BLIT			0x07
 
 #define DRM_IOCTL_APPLE_SGX_GET_PARAM \
@@ -77,8 +76,6 @@ extern "C" {
 	DRM_IOW(DRM_COMMAND_BASE + DRM_APPLE_SGX_SUBMIT, struct drm_apple_sgx_submit)
 #define DRM_IOCTL_APPLE_SGX_GEM_INFO \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_SGX_GEM_INFO, struct drm_apple_sgx_gem_info)
-#define DRM_IOCTL_APPLE_SGX_OVERLAY \
-	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_SGX_OVERLAY, struct drm_apple_sgx_overlay)
 #define DRM_IOCTL_APPLE_SGX_BLIT \
 	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_SGX_BLIT, struct drm_apple_sgx_blit)
 
@@ -255,32 +252,6 @@ struct drm_apple_sgx_blit {
 	__u32 dst_stride;	/* in: bytes a destination line, a multiple of 4 */
 	__u32 flags;		/* in: 0 */
 	__u32 pad;		/* in: 0 */
-};
-
-/* ---- OVERLAY: a picture over the screen, whatever shows it -------------- */
-
-/*
- * This port has no KMS plane on the render node yet, so the ioctl returns
- * -EOPNOTSUPP.  The structure stays part of the shared interface so a
- * display integration can implement it without changing the UAPI version.
- */
-#define APPLE_SGX_OVERLAY_QUERY		(1 << 0)	/* only the out fields */
-#define APPLE_SGX_OVERLAY_MAX_RECTS	16
-
-struct drm_apple_sgx_overlay_rect {
-	__u16 x, y, w, h;
-};
-
-struct drm_apple_sgx_overlay {
-	__u32 flags;		/* in: APPLE_SGX_OVERLAY_* */
-	__u32 handle;		/* in: the buffer (BGRA8888, its alpha used), or 0 */
-	__u32 pitch;		/* in: bytes a line, a multiple of 64 */
-	__u16 width, height;	/* in: pixels: the plane's size */
-	__u32 nrects;		/* in: how many rects are used */
-	struct drm_apple_sgx_overlay_rect rects[APPLE_SGX_OVERLAY_MAX_RECTS];
-	__u16 out_width;	/* out: the plane's size now; 0 x 0 with no */
-	__u16 out_height;	/*      framebuffer shown */
-	__u32 out_rotation;	/* out: the plane's DRM_MODE_ROTATE_* */
 };
 
 #if defined(__cplusplus)

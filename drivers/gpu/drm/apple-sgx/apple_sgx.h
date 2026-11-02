@@ -141,13 +141,7 @@ struct sgx_buf {
 	dma_addr_t dma;
 	u32 va;
 	size_t size;
-	struct page **pages;	/* set: allocated page by page (map_extra) */
-	dma_addr_t *page_dma;
-	struct device *dev;
-	bool phys;		/* an existing physical range (map_phys), not ours */
 };
-
-#define SGX_MAX_EXTRA			32
 
 struct apple_sgx {
 	struct device *dev;
@@ -173,24 +167,13 @@ struct apple_sgx {
 	struct sgx_buf buf[B_NUM];
 	bool bufs_ready;
 
-	/* buffers mapped at a chosen GPU address (debugfs, replay tools) */
-	struct sgx_buf extra[SGX_MAX_EXTRA];
-	int nextra;
 	int boot_result;	/* 0 never tried, 1 acknowledged, -errno */
 	unsigned int boots;
-
-	/* the interrupt */
-	int irq;
-	bool irq_on;
-	unsigned int irq_count, irq_unhandled, irq_run;
-	u32 irq_events[SGX_MAX_CORES];	/* every event bit seen, per core */
-	u32 irq_host_flags;		/* host control's interrupt flags, last */
 
 	/* command submission */
 	bool quiet;			/* no log line per microkernel command */
 	spinlock_t ccb_lock;		/* the kernel CCB */
 	struct work_struct boot_work;
-	u32 r_seq;
 
 	/* the render node */
 	struct apple_sgx_drm *drm;
@@ -229,8 +212,6 @@ void apple_sgx_report(struct apple_sgx *sgx, const char *why);
 int apple_sgx_drm_init(struct apple_sgx *sgx);
 void apple_sgx_drm_fini(struct apple_sgx *sgx);
 bool apple_sgx_drm_busy(struct apple_sgx *sgx);
-int apple_sgx_drm_reserve(struct apple_sgx *sgx, int slot, u32 va, u32 size);
-void apple_sgx_drm_unreserve(struct apple_sgx *sgx, int slot);
 u32 apple_sgx_bo_va(struct drm_gem_object *obj);
 
 #endif

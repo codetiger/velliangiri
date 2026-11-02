@@ -134,7 +134,7 @@ if [ "${MESA_BUILD:-}" = desktop ]; then
 fi
 mkdir -p "$I/bin"
 say "the test programs"
-for t in glclear gltri glfs gltex glblend gldepth glsize; do
+for t in glclear gltri glfs gltex glblend gldepth glsize glcubes; do
 	cc -O2 -Wall -I"$I/include" "$ROOT/tools/mesa-sgx/gl/$t.c" \
 	   -L"$I/lib" -lEGL -lGLESv2 -lm \
 	   -Wl,-rpath-link,"$I/lib" -Wl,-rpath,"$PREFIX/lib" -o "$I/bin/$t"

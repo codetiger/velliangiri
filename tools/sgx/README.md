@@ -1,15 +1,17 @@
 # tools/sgx — the GPU's first render, before Mesa
 
-Two pieces of the clean-room SGX543 userspace work published with Project
-Cascadia, and a small program that uses them to run one clear through the
-render node's TA/3D queue:
+One program that runs a clear through the render node's TA/3D queue, built
+on the template-frame library that lives with the Mesa driver:
 
 | file | what | licence |
 |---|---|---|
-| `sgx_template.c`, `sgx_template.h` | the template frame: the PDS block (the 3D pass's event program, the pixel blocks, the loaders), the state area, the VDM stream's tail, the TA command and the 3D register block's GL words, built at addresses the caller gives | MIT |
-| `sgx_rt.c`, `sgx_rt.h` | render target data: the context areas, region arrays, tail pointers, render details and state buffer the TA and the 3D pass keep their state in, what the CPU writes into them, and the words of the TA command and the 3D block that point at them | MIT |
 | `sgxframe.c` | `/bin/sgxframe`: one clear, read back, optionally shown | GPL-2.0-only |
 | `README.md` | this file | — |
+
+The template-frame and render-target builders (`sgx_template.c`,
+`sgx_rt.c`) are not copied here: `sgxframe` builds against the single copy
+in `tools/mesa-sgx/files/src/gallium/drivers/sgx/`.  They have no Mesa
+headers and build standalone.
 
 On the device (2026-11-02) `sgxframe` clears 1280x720 and 640x360 through
 the TA/3D queue, every checked pixel right, twice in a row.  The event
@@ -18,12 +20,10 @@ reference's (SHA-256 `a1b855d41993968b40005e886f7ac11c8c3abb42aa0987e005eec4e6cb
 its stock driver keeps two adjacent records and only the second draws, so
 `stage2` tries every carved candidate and keeps the one that does.
 
-`sgx_template.c` and `sgx_rt.c` are copied from the reference Mesa driver
-(`mesa/files/src/gallium/drivers/sgx/`) so the kernel port has a render to
-run before that driver is brought over.  They have no Mesa headers: the
-reference's host tests build them alone.  Comments that named the vendor's
-driver, its kernel extension or its firmware image were rewritten for this
-tree; the code is unchanged.
+`sgx_template.c` and `sgx_rt.c` are the reference Mesa driver's own files,
+built here for the kernel port so it has a render to run before Mesa is
+installed.  They have no Mesa headers: the reference's host tests build
+them alone.
 
 ## What `sgxframe` does
 
@@ -85,6 +85,8 @@ By hand:
 
 ```sh
 arm-linux-gnueabihf-gcc -O2 -mcpu=cortex-a9 -mfpu=neon -static \
-    -I tools/sgx -o sgxframe tools/sgx/sgxframe.c \
-    tools/sgx/sgx_template.c tools/sgx/sgx_rt.c -lm
+    -I tools -I tools/mesa-sgx/files/src/gallium/drivers/sgx \
+    -o sgxframe tools/sgx/sgxframe.c \
+    tools/mesa-sgx/files/src/gallium/drivers/sgx/sgx_template.c \
+    tools/mesa-sgx/files/src/gallium/drivers/sgx/sgx_rt.c -lm
 ```

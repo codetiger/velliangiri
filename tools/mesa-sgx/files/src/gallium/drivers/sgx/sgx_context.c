@@ -862,11 +862,6 @@ sgx_bind_rs_state(struct pipe_context *pctx, void *state)
 }
 
 static void
-sgx_bind_state(struct pipe_context *pctx, void *state)
-{
-}
-
-static void
 sgx_delete_state(struct pipe_context *pctx, void *state)
 {
    FREE(state);

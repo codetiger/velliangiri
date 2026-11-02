@@ -39,7 +39,3 @@ driver_sgx = declare_dependency(
   link_with : [libsgx, libsgxwinsys],
   dependencies : idep_nir,
 )
-
-if with_tools.contains('drm-shim')
-  subdir('drm-shim')
-endif

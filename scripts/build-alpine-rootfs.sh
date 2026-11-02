@@ -54,18 +54,20 @@ python3 "${ROOT}/scripts/apk-unpack.py" \
 echo "[rootfs] Cross-compiling userspace tools (-O2 -mcpu=cortex-a9 -mfpu=neon) ..."
 for tool in jitterseed:jitterseed.c peek:mmio-peek.c i2cpoke:i2c-poke.c wavplay:wavplay.c l2bench:l2bench.c fbtest:fbtest.c btscan:btscan.c hcdcarve:hcdcarve.c sgxcarve:sgxcarve.c glcarve:glcarve.c vxdcarve:vxdcarve.c iopcarve:iopcarve.c m2mtest:m2mtest.c m2mshow:m2mshow.c jpegtest:jpegtest.c sgxinfo:sgxinfo.c sgxgem:sgxgem.c sgx2d:sgx2d.c sgxpresent:sgxpresent.c; do
 	"${CROSS_CC}" -O2 -mcpu=cortex-a9 -mfpu=neon -Wall -Wextra -static \
+		-I "${ROOT}/tools" \
 		-o "${STAGE_DIR}/bin/${tool%%:*}" "${ROOT}/scripts/tools/${tool#*:}" -lm
 	chmod 755 "${STAGE_DIR}/bin/${tool%%:*}"
 done
 
 # The first render the port runs: a clear through the TA/3D queue, built
-# from the template-frame library in tools/sgx (no Mesa).
+# from the template-frame library in the Mesa driver (no Mesa headers).
+SGXLIB="${ROOT}/tools/mesa-sgx/files/src/gallium/drivers/sgx"
 if [ -f "${ROOT}/tools/sgx/sgxframe.c" ]; then
 	"${CROSS_CC}" -O2 -mcpu=cortex-a9 -mfpu=neon -Wall -Wextra -static \
-		-I "${ROOT}/tools/sgx" -o "${STAGE_DIR}/bin/sgxframe" \
+		-I "${ROOT}/tools" -I "${SGXLIB}" -o "${STAGE_DIR}/bin/sgxframe" \
 		"${ROOT}/tools/sgx/sgxframe.c" \
-		"${ROOT}/tools/sgx/sgx_template.c" \
-		"${ROOT}/tools/sgx/sgx_rt.c" -lm
+		"${SGXLIB}/sgx_template.c" \
+		"${SGXLIB}/sgx_rt.c" -lm
 	chmod 755 "${STAGE_DIR}/bin/sgxframe"
 fi
 

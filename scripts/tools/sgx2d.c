@@ -29,46 +29,7 @@
 #include <sys/mman.h>
 #include <unistd.h>
 
-#define DRM_IOCTL_BASE		'd'
-#define DRM_COMMAND_BASE	0x40
-#define DRM_IOWR(nr, type)	_IOWR(DRM_IOCTL_BASE, nr, type)
-
-struct drm_apple_sgx_gem_create {
-	uint64_t size;
-	uint32_t flags;
-	uint32_t handle;
-	uint32_t va;
-	uint32_t pad;
-};
-
-struct drm_apple_sgx_gem_mmap_offset {
-	uint32_t handle;
-	uint32_t flags;
-	uint64_t offset;
-};
-
-struct drm_apple_sgx_blit {
-	uint32_t src_handle;
-	uint32_t dst_handle;
-	uint32_t src_width, src_height, src_stride;
-	uint32_t dst_width, dst_height, dst_stride;
-	uint32_t flags;
-	uint32_t pad;
-};
-
-#define DRM_APPLE_SGX_GEM_CREATE	0x01
-#define DRM_APPLE_SGX_GEM_MMAP_OFFSET	0x02
-#define DRM_APPLE_SGX_BLIT		0x07
-
-#define DRM_IOCTL_APPLE_SGX_GEM_CREATE \
-	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_SGX_GEM_CREATE, struct drm_apple_sgx_gem_create)
-#define DRM_IOCTL_APPLE_SGX_GEM_MMAP_OFFSET \
-	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_SGX_GEM_MMAP_OFFSET, struct drm_apple_sgx_gem_mmap_offset)
-#define DRM_IOCTL_APPLE_SGX_BLIT \
-	DRM_IOWR(DRM_COMMAND_BASE + DRM_APPLE_SGX_BLIT, struct drm_apple_sgx_blit)
-
-#define APPLE_SGX_BO_FIXED_VA		(1u << 0)
-#define APPLE_SGX_BO_CONTIGUOUS		(1u << 5)
+#include "sgx-uapi.h"
 
 #define SRC_W		64
 #define SRC_H		64
