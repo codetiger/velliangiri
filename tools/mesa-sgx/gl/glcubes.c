@@ -259,6 +259,7 @@ struct screen {
 	EGLSurface esurf;
 	GLuint present_prog, quad_vbo;
 	GLint present_u_tex;
+	int checked;
 };
 
 static volatile int flip_done;
@@ -386,6 +387,11 @@ static int screen_present(struct screen *s, GLuint color_tex, GLuint fbo,
 {
 	struct gbm_bo *bo;
 	uint32_t fb = 0;
+	uint8_t fbo_px[4] = { 0 }, win_px[4] = { 0 };
+
+	if (!s->checked)
+		glReadPixels(width / 2, height / 2, 1, 1, GL_RGBA,
+			     GL_UNSIGNED_BYTE, fbo_px);
 
 	glBindFramebuffer(GL_FRAMEBUFFER, 0);
 	glViewport(0, 0, s->mode.hdisplay, s->mode.vdisplay);
@@ -402,6 +408,15 @@ static int screen_present(struct screen *s, GLuint color_tex, GLuint fbo,
 	glVertexAttribPointer(4, 2, GL_FLOAT, GL_FALSE, 4 * sizeof(float),
 			      (void *)(2 * sizeof(float)));
 	glDrawArrays(GL_TRIANGLE_STRIP, 0, 4);
+	if (!s->checked) {
+		glReadPixels(s->mode.hdisplay / 2, s->mode.vdisplay / 2, 1, 1,
+			     GL_RGBA, GL_UNSIGNED_BYTE, win_px);
+		fprintf(stderr, "glcubes: present check: FBO %02x%02x%02x, "
+			"window %02x%02x%02x\n",
+			fbo_px[0], fbo_px[1], fbo_px[2],
+			win_px[0], win_px[1], win_px[2]);
+		s->checked = 1;
+	}
 
 	if (!eglSwapBuffers(s->dpy, s->esurf))
 		return 0;
