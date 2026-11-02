@@ -555,6 +555,7 @@ static int sgx_ioctl_blit(struct drm_device *drm, void *data, struct drm_file *f
 	struct apple_sgx_drm *sdrm = to_sgx_drm(drm);
 	struct drm_apple_sgx_blit *args = data;
 	struct drm_gem_object *src = NULL, *dst = NULL;
+	bool screen = !args->dst_handle;
 	u64 src_span, dst_span;
 	int ret;
 
@@ -578,17 +579,38 @@ static int sgx_ioctl_blit(struct drm_device *drm, void *data, struct drm_file *f
 	src = drm_gem_object_lookup(file, args->src_handle);
 	if (!src)
 		return -ENOENT;
-	dst = drm_gem_object_lookup(file, args->dst_handle);
-	if (!dst) {
-		ret = -ENOENT;
-		goto out;
+	if (!screen) {
+		dst = drm_gem_object_lookup(file, args->dst_handle);
+		if (!dst) {
+			ret = -ENOENT;
+			goto out;
+		}
 	}
 	if ((src->funcs != &sgx_gem_funcs && src->funcs != &sgx_cma_gem_funcs) ||
-	    (dst->funcs != &sgx_gem_funcs && dst->funcs != &sgx_cma_gem_funcs)) {
+	    (!screen && dst->funcs != &sgx_gem_funcs && dst->funcs != &sgx_cma_gem_funcs)) {
 		ret = -EINVAL;
 		goto out;
 	}
-	if (src_span > src->size || dst_span > dst->size) {
+	if (src_span > src->size) {
+		ret = -EINVAL;
+		goto out;
+	}
+
+	/*
+	 * dst_handle 0 is the screen: the display pipe's live scanout, which
+	 * the kernel has mapped at SGX_FB_VA.  The caller takes its size and
+	 * stride from APPLE_SGX_PARAM_FB_*, and they have to match, so the
+	 * copy can only fill the buffer the pipe is showing.
+	 */
+	if (screen) {
+		ret = apple_sgx_blit_screen(sdrm->sgx, apple_sgx_bo_va(src),
+					    args->src_width, args->src_height,
+					    args->src_stride, args->dst_width,
+					    args->dst_height, args->dst_stride);
+		goto out;
+	}
+
+	if (dst_span > dst->size) {
 		ret = -EINVAL;
 		goto out;
 	}
@@ -597,7 +619,8 @@ static int sgx_ioctl_blit(struct drm_device *drm, void *data, struct drm_file *f
 			     apple_sgx_bo_va(dst), args->dst_width,
 			     args->dst_height, args->dst_stride);
 out:
-	drm_gem_object_put(dst);
+	if (dst)
+		drm_gem_object_put(dst);
 	drm_gem_object_put(src);
 	return ret;
 }
@@ -609,6 +632,7 @@ static int sgx_ioctl_get_param(struct drm_device *drm, void *data, struct drm_fi
 	struct apple_sgx_drm *sdrm = to_sgx_drm(drm);
 	struct drm_apple_sgx_get_param *args = data;
 	struct apple_sgx *sgx = sdrm->sgx;
+	u32 fb_va = 0, fb_stride = 0, fb_w = 0, fb_h = 0;
 
 	if (args->pad)
 		return -EINVAL;
@@ -644,14 +668,30 @@ static int sgx_ioctl_get_param(struct drm_device *drm, void *data, struct drm_fi
 	case APPLE_SGX_PARAM_CODE_VA_END:
 		args->value = SGX_CODE_VA_END;
 		break;
-	/* No KMS plane is attached to this render node yet.  The values
-	 * stay in the interface so a later display integration can fill
-	 * them in without a version bump. */
+	/* The screen: the display pipe's live scanout, mapped at SGX_FB_VA.
+	 * 0 when there is no display or it is not scanning anything out. */
 	case APPLE_SGX_PARAM_FB_VA:
 	case APPLE_SGX_PARAM_FB_WIDTH:
 	case APPLE_SGX_PARAM_FB_HEIGHT:
 	case APPLE_SGX_PARAM_FB_STRIDE:
-		args->value = 0;
+		if (!apple_sgx_fb_sync(sgx, &fb_va, &fb_stride, &fb_w, &fb_h)) {
+			args->value = 0;
+			break;
+		}
+		switch (args->param) {
+		case APPLE_SGX_PARAM_FB_VA:
+			args->value = fb_va;
+			break;
+		case APPLE_SGX_PARAM_FB_WIDTH:
+			args->value = fb_w;
+			break;
+		case APPLE_SGX_PARAM_FB_HEIGHT:
+			args->value = fb_h;
+			break;
+		default:
+			args->value = fb_stride;
+			break;
+		}
 		break;
 	case APPLE_SGX_PARAM_RENDERS_SUBMITTED:
 		args->value = atomic_read(&sdrm->submitted);

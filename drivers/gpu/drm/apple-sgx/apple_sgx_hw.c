@@ -57,7 +57,9 @@
 #include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/of_address.h>
+#include <linux/of_platform.h>
 #include <linux/platform_device.h>
+#include <linux/s5l8947x-display.h>
 #include <linux/seq_file.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
@@ -469,6 +471,83 @@ void apple_sgx_mmu_unmap(struct apple_sgx *sgx, u32 va, size_t size)
 	}
 	atomic_set(&sgx->mmu_dirty, 1);
 	mutex_unlock(&sgx->mmu_lock);
+}
+
+/*
+ * The screen: map what the display pipe is scanning out at SGX_FB_VA, so
+ * the 2D engine can copy a rendered buffer onto it with no CPU copy.  The
+ * display owns the buffer (a physically contiguous DMA-GEM object), and
+ * the generation it publishes changes when it switches buffers, so this
+ * maps again then and never draws into a range the pipe has let go.  The
+ * PTEs are not cache-consistent: the pipe reads the memory, not the CPU's
+ * caches, as the framebuffer was mapped in the reference.
+ *
+ * Returns false when there is no display, or no live scanout, or the mode
+ * does not fit the reserved window; the framebuffer parameters then stay 0.
+ * sgx->blit_lock held.
+ */
+static bool sgx_fb_sync_locked(struct apple_sgx *sgx, u32 *va, u32 *stride, u32 *w, u32 *h)
+{
+	struct s5l8947x_scanout s;
+	u32 size;
+	bool ok = false;
+
+	if (!sgx->disp_dev || s5l8947x_display_scanout(sgx->disp_dev, &s))
+		return false;
+	if (!s.phys || !s.width || !s.height || !s.stride ||
+	    s.width > 4096 || s.height > 4096 || s.stride < s.width * 4)
+		return false;
+	size = PAGE_ALIGN((u64)s.stride * s.height);
+	if (size > SGX_FB_WINDOW)
+		return false;
+
+	mutex_lock(&sgx->fb_lock);
+	if (sgx->fb_mapped && sgx->fb_gen == s.generation &&
+	    sgx->fb_phys == lower_32_bits(s.phys)) {
+		ok = true;
+		goto out;
+	}
+	if (sgx->fb_mapped) {
+		apple_sgx_mmu_unmap(sgx, SGX_FB_VA, sgx->fb_size);
+		sgx->fb_mapped = false;
+	}
+	if (apple_sgx_mmu_map(sgx, SGX_FB_VA, s.phys, size, 0))
+		goto out;
+	sgx->fb_mapped = true;
+	sgx->fb_phys = lower_32_bits(s.phys);
+	sgx->fb_size = size;
+	sgx->fb_gen = s.generation;
+	dev_info(sgx->dev, "screen: %ux%u at 0x%08x, %u bytes a line, GPU 0x%08x\n",
+		 s.width, s.height, lower_32_bits(s.phys), s.stride, SGX_FB_VA);
+	ok = true;
+out:
+	if (ok) {
+		sgx->fb_stride = s.stride;
+		sgx->fb_w = s.width;
+		sgx->fb_h = s.height;
+		if (va)
+			*va = SGX_FB_VA;
+		if (stride)
+			*stride = s.stride;
+		if (w)
+			*w = s.width;
+		if (h)
+			*h = s.height;
+	}
+	mutex_unlock(&sgx->fb_lock);
+	return ok;
+}
+
+/* The same, serialised against the 2D engine: the blit lock is what keeps a
+ * modeset's remap from happening under a transfer. */
+bool apple_sgx_fb_sync(struct apple_sgx *sgx, u32 *va, u32 *stride, u32 *w, u32 *h)
+{
+	bool ok;
+
+	mutex_lock(&sgx->blit_lock);
+	ok = sgx_fb_sync_locked(sgx, va, stride, w, h);
+	mutex_unlock(&sgx->blit_lock);
+	return ok;
 }
 
 static int sgx_buf_alloc(struct apple_sgx *sgx, enum sgx_buf_id id)
@@ -1733,10 +1812,11 @@ static int sgx_blit_alloc(struct apple_sgx *sgx)
  * One 2D copy: the source rectangle (BGRA8888, linear) scaled into the
  * destination's whole dst_w x dst_h area.  Both addresses are the GPU
  * addresses of buffers the caller owns; the caller has already checked them.
- * One transfer queue, so one blit at a time.
+ * One transfer queue, so one blit at a time: sgx->blit_lock held.
  */
-int apple_sgx_blit(struct apple_sgx *sgx, u32 src_va, u32 src_w, u32 src_h, u32 src_stride,
-		   u32 dst_va, u32 dst_w, u32 dst_h, u32 dst_stride)
+static int sgx_blit_locked(struct apple_sgx *sgx, u32 src_va, u32 src_w, u32 src_h,
+			   u32 src_stride, u32 dst_va, u32 dst_w, u32 dst_h,
+			   u32 dst_stride)
 {
 	u32 *ctl = sgx->buf[B_TQ_CTL].cpu, *ctx = sgx->buf[B_TQ_CTX].cpu;
 	u32 *scratch = sgx->buf[B_SCRATCH].cpu, *cmd, wo, got, seq;
@@ -1753,14 +1833,11 @@ int apple_sgx_blit(struct apple_sgx *sgx, u32 src_va, u32 src_w, u32 src_h, u32 
 	if ((src_va & 3) || (dst_va & 3))
 		return -EINVAL;
 
-	mutex_lock(&sgx->blit_lock);
-	if (sgx->boot_result != 1) {
-		ret = -ENODEV;
-		goto out;
-	}
+	if (sgx->boot_result != 1)
+		return -ENODEV;
 	ret = sgx_blit_alloc(sgx);
 	if (ret)
-		goto out;
+		return ret;
 
 	sgx_blit_code(sgx->blit[0].cpu, dst_va, dst_w, dst_h, dst_stride / 4);
 	sgx_blit_block(sgx->blit[1].cpu, src_va, src_w, src_h, src_stride / 4,
@@ -1769,10 +1846,8 @@ int apple_sgx_blit(struct apple_sgx *sgx, u32 src_va, u32 src_w, u32 src_h, u32 
 
 	wo = READ_ONCE(ctl[0]);
 	if (wo + SGX_TQ_CMD_SIZE > SGX_TQ_CCB_SIZE) {
-		if (READ_ONCE(ctl[1]) != wo) {
-			ret = -EBUSY;	/* the queue has not drained */
-			goto out;
-		}
+		if (READ_ONCE(ctl[1]) != wo)
+			return -EBUSY;	/* the queue has not drained */
 		WRITE_ONCE(ctl[0], 0);	/* it has: start over at the bottom */
 		wo = 0;
 	}
@@ -1797,7 +1872,7 @@ int apple_sgx_blit(struct apple_sgx *sgx, u32 src_va, u32 src_w, u32 src_h, u32 
 	sgx->quiet = false;
 	if (ret) {
 		dev_err(sgx->dev, "blit: TRANSFER not sent: %d\n", ret);
-		goto out;
+		return ret;
 	}
 	ret = read_poll_timeout(READ_ONCE, got, got == seq, 10, 500000, false,
 				scratch[0]);
@@ -1809,6 +1884,44 @@ int apple_sgx_blit(struct apple_sgx *sgx, u32 src_va, u32 src_w, u32 src_h, u32 
 			sgx_read(sgx, SGX_CORE(0) + SGX_BIF_FAULT));
 		ret = -ETIMEDOUT;
 	}
+	return ret;
+}
+
+int apple_sgx_blit(struct apple_sgx *sgx, u32 src_va, u32 src_w, u32 src_h, u32 src_stride,
+		   u32 dst_va, u32 dst_w, u32 dst_h, u32 dst_stride)
+{
+	int ret;
+
+	mutex_lock(&sgx->blit_lock);
+	ret = sgx_blit_locked(sgx, src_va, src_w, src_h, src_stride,
+			      dst_va, dst_w, dst_h, dst_stride);
+	mutex_unlock(&sgx->blit_lock);
+	return ret;
+}
+
+/*
+ * A copy onto the screen.  The destination is the display pipe's live
+ * scanout, which sgx_fb_sync_locked() has mapped at SGX_FB_VA; the lock is
+ * held across the check and the transfer, so a modeset cannot pull the
+ * buffer out from under a running blit.  The caller has matched the
+ * geometry to APPLE_SGX_PARAM_FB_*.
+ */
+int apple_sgx_blit_screen(struct apple_sgx *sgx, u32 src_va, u32 src_w, u32 src_h,
+			  u32 src_stride, u32 dst_w, u32 dst_h, u32 dst_stride)
+{
+	int ret;
+
+	mutex_lock(&sgx->blit_lock);
+	if (!sgx_fb_sync_locked(sgx, NULL, NULL, NULL, NULL)) {
+		ret = -ENODEV;
+		goto out;
+	}
+	if (dst_w != sgx->fb_w || dst_h != sgx->fb_h || dst_stride != sgx->fb_stride) {
+		ret = -EINVAL;
+		goto out;
+	}
+	ret = sgx_blit_locked(sgx, src_va, src_w, src_h, src_stride, SGX_FB_VA,
+			      dst_w, dst_h, dst_stride);
 out:
 	mutex_unlock(&sgx->blit_lock);
 	return ret;
@@ -2196,6 +2309,14 @@ static void sgx_power_off(void *data)
 	clk_bulk_disable_unprepare(sgx->num_clks, sgx->clks);
 }
 
+static void sgx_put_display(void *data)
+{
+	struct apple_sgx *sgx = data;
+
+	if (sgx->disp_dev)
+		put_device(sgx->disp_dev);
+}
+
 static int apple_sgx_probe(struct platform_device *pdev)
 {
 	struct device *dev = &pdev->dev;
@@ -2215,6 +2336,7 @@ static int apple_sgx_probe(struct platform_device *pdev)
 	mutex_init(&sgx->lock);
 	mutex_init(&sgx->mmu_lock);
 	mutex_init(&sgx->blit_lock);
+	mutex_init(&sgx->fb_lock);
 	spin_lock_init(&sgx->ccb_lock);
 	INIT_WORK(&sgx->boot_work, sgx_boot_work);
 	sgx->brn_31195 = of_property_read_bool(dev->of_node, "apple,brn-31195");
@@ -2299,6 +2421,27 @@ static int apple_sgx_probe(struct platform_device *pdev)
 		debugfs_remove_recursive(sgx->debugfs);
 		return dev_err_probe(dev, ret, "render node\n");
 	}
+
+	/*
+	 * The display pipe, when there is one, is what the 2D engine can
+	 * copy onto.  Its device may not have probed yet: the scanout getter
+	 * says so, and the next request tries again.
+	 */
+	{
+		struct device_node *np;
+
+		np = of_find_compatible_node(NULL, NULL, "apple,s5l8947x-display-pipe");
+		if (np) {
+			struct platform_device *disp = of_find_device_by_node(np);
+
+			if (disp)
+				sgx->disp_dev = &disp->dev;
+			of_node_put(np);
+		}
+		ret = devm_add_action_or_reset(dev, sgx_put_display, sgx);
+		if (ret)
+			return ret;
+	}
 	if (autoboot)
 		schedule_work(&sgx->boot_work);
 	return 0;
@@ -2310,6 +2453,12 @@ static void apple_sgx_remove(struct platform_device *pdev)
 
 	cancel_work_sync(&sgx->boot_work);
 	apple_sgx_drm_fini(sgx);
+	mutex_lock(&sgx->fb_lock);
+	if (sgx->fb_mapped) {
+		apple_sgx_mmu_unmap(sgx, SGX_FB_VA, sgx->fb_size);
+		sgx->fb_mapped = false;
+	}
+	mutex_unlock(&sgx->fb_lock);
 	debugfs_remove_recursive(sgx->debugfs);
 }
 

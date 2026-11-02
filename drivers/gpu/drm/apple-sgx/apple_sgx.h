@@ -200,6 +200,12 @@ struct apple_sgx {
 	struct sgx_buf blit[3];		/* code, PDS block, parameter page */
 	bool blit_ready;
 	u32 blit_seq;
+
+	/* the screen: the display pipe's scanout, mapped at SGX_FB_VA */
+	struct device *disp_dev;
+	struct mutex fb_lock;
+	bool fb_mapped;
+	u32 fb_phys, fb_size, fb_stride, fb_w, fb_h, fb_gen;
 };
 
 /* apple_sgx_hw.c */
@@ -214,6 +220,9 @@ bool apple_sgx_render_waiting(struct apple_sgx *sgx, u32 at, const u32 *details)
 int apple_sgx_render_rekick(struct apple_sgx *sgx);
 int apple_sgx_blit(struct apple_sgx *sgx, u32 src_va, u32 src_w, u32 src_h, u32 src_stride,
 		   u32 dst_va, u32 dst_w, u32 dst_h, u32 dst_stride);
+int apple_sgx_blit_screen(struct apple_sgx *sgx, u32 src_va, u32 src_w, u32 src_h,
+			  u32 src_stride, u32 dst_w, u32 dst_h, u32 dst_stride);
+bool apple_sgx_fb_sync(struct apple_sgx *sgx, u32 *va, u32 *stride, u32 *w, u32 *h);
 void apple_sgx_report(struct apple_sgx *sgx, const char *why);
 
 /* apple_sgx_drm.c */

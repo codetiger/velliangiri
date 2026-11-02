@@ -429,6 +429,9 @@ struct s5l_display {
 	/* the buffer the plane is scanning out now, for the GPU bring-up path */
 	phys_addr_t fb_pa;
 	u32 fb_stride, fb_w, fb_h;
+	/* the same, published for drivers that draw into it (the SGX node) */
+	spinlock_t fb_lock;
+	struct s5l8947x_scanout scanout;
 };
 
 static struct s5l_display *g_s5l_display;
@@ -744,6 +747,26 @@ void s5l8947x_hdmi_audio_arm(unsigned int sample_rate)
 		s5l_audio_arm(d, sample_rate);
 }
 EXPORT_SYMBOL_GPL(s5l8947x_hdmi_audio_arm);
+
+/*
+ * What the pipe is scanning out now.  The buffer is a DMA-GEM object the
+ * pipe owns, so it stays alive until the pipe stops showing it; the
+ * generation tells a client whether the range it mapped is still the live
+ * one.  Returns -ENODATA while the pipe is off.
+ */
+int s5l8947x_display_scanout(struct device *dev, struct s5l8947x_scanout *out)
+{
+	struct s5l_display *d = dev_get_drvdata(dev);
+	unsigned long flags;
+
+	if (!d || d->dev != dev)
+		return -ENODEV;
+	spin_lock_irqsave(&d->fb_lock, flags);
+	*out = d->scanout;
+	spin_unlock_irqrestore(&d->fb_lock, flags);
+	return out->phys ? 0 : -ENODATA;
+}
+EXPORT_SYMBOL_GPL(s5l8947x_display_scanout);
 
 /* --- display pipe and output stage --- */
 
@@ -1107,6 +1130,13 @@ static void s5l_pipe_disable(struct drm_simple_display_pipe *pipe)
 	s5l_hdmi_stop(d);
 	writel(1, d->out + OUT_START);
 	mutex_unlock(&d->lock);
+
+	spin_lock(&d->fb_lock);
+	d->scanout.phys = 0;
+	d->scanout.generation++;
+	spin_unlock(&d->fb_lock);
+	d->fb_pa = 0;
+
 	s5l_complete_event(&pipe->crtc, false);
 
 	/* Flushes any flip that was still waiting for a tick */
@@ -1132,6 +1162,20 @@ static void s5l_pipe_update(struct drm_simple_display_pipe *pipe,
 		writel((readl(p + PLANE_STRIDE) & 0x3fU) | (fb->pitches[0] & ~0x3fU),
 		       p + PLANE_STRIDE);
 		writel(RGB_COMMIT_VAL, d->rgbout + RGB_COMMIT);
+
+		spin_lock(&d->fb_lock);
+		d->scanout.phys = d->fb_pa;
+		d->scanout.stride = d->fb_stride;
+		d->scanout.width = d->fb_w;
+		d->scanout.height = d->fb_h;
+		d->scanout.format = fb->format->format;
+		d->scanout.generation++;
+		spin_unlock(&d->fb_lock);
+	} else {
+		spin_lock(&d->fb_lock);
+		d->scanout.phys = 0;
+		d->scanout.generation++;
+		spin_unlock(&d->fb_lock);
 	}
 
 	s5l_complete_event(&pipe->crtc, pipe->crtc.state->active);
@@ -1688,6 +1732,7 @@ static int s5l_probe(struct platform_device *pdev)
 	d->tmds_hz = 74250000;
 	d->audio_channels = 2;
 	mutex_init(&d->lock);
+	spin_lock_init(&d->fb_lock);
 	mutex_init(&d->probe.lock);
 	platform_set_drvdata(pdev, d);
 

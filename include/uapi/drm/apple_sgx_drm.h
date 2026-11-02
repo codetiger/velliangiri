@@ -101,9 +101,10 @@ enum drm_apple_sgx_param {
 	APPLE_SGX_PARAM_CODE_VA_START = 9,
 	APPLE_SGX_PARAM_CODE_VA_END = 10,
 
-	/* The framebuffer window the kernel reserved for a display plane.
-	 * It is 0 on this port until a display integration maps one; a
-	 * render can still write anywhere in its own buffers. */
+	/* The screen: the display pipe's live scanout, which the kernel maps
+	 * at FB_VA and BLIT can copy into (dst_handle 0).  0 while there is
+	 * no display or it is not scanning anything out.  Linear, 32 bits a
+	 * pixel, BGRA in memory. */
 	APPLE_SGX_PARAM_FB_VA = 11,
 	APPLE_SGX_PARAM_FB_WIDTH = 12,
 	APPLE_SGX_PARAM_FB_HEIGHT = 13,
@@ -231,6 +232,13 @@ struct drm_apple_sgx_gem_info {
  * dma-buf), and the kernel keeps them alive and mapped until the transfer
  * is over; the ioctl returns when it is, or -ETIMEDOUT.
  *
+ * dst_handle 0 is the screen: the display pipe's live scanout, which the
+ * kernel has mapped already.  Read dst_width, dst_height and dst_stride
+ * from APPLE_SGX_PARAM_FB_* and pass them back unchanged; the copy only
+ * fills the buffer the pipe is showing.  So a program can render into its
+ * own buffer and put it on the display with one call, with no CPU copy and
+ * without a compositor.
+ *
  * The 2D engine works in tiles: buffers of at least 64 KiB are mapped at
  * 64 KiB-aligned GPU addresses, and the destination stride has to be a
  * multiple of 4 bytes (a multiple of 64 is the natural choice).  A buffer
@@ -238,7 +246,7 @@ struct drm_apple_sgx_gem_info {
  */
 struct drm_apple_sgx_blit {
 	__u32 src_handle;	/* in: the source buffer */
-	__u32 dst_handle;	/* in: the destination buffer */
+	__u32 dst_handle;	/* in: the destination buffer, 0 = the screen */
 	__u32 src_width;	/* in: source rectangle, pixels (1..4096) */
 	__u32 src_height;
 	__u32 src_stride;	/* in: bytes a source line, a multiple of 4 */
