@@ -21,12 +21,44 @@ system image at first boot, as the Wi-Fi and Bluetooth firmware already are.
 | Microkernel | Booted from `s5l8947x/sgx543.fw`, which `stage2` carves with `sgxcarve`; handshake checked |
 | Kernel CCB | 256-entry command ring; power, performance-counter, transfer and TA commands |
 | Transfer queue | One queue with a 64 KiB command buffer; a dummy transfer and a real 2D blit have both run through it |
-| Render queue | One TA + 3D queue with a 64 KiB command buffer; used by the render node and debugfs.  The command path is implemented; it still needs a userspace TA command to be exercised |
+| Render queue | One TA + 3D queue with a 64 KiB command buffer; used by the render node and debugfs.  Exercised on hardware: `sgxframe` clears 1280x720 and 640x360 through the TA and the 3D pass |
 | Render node | `/dev/dri/renderD128`, driver `apple_sgx`: GEM buffers, syncobjs, a DRM scheduler, fences and timeouts |
+| Screen | the display pipe's live scanout is mapped at `0x90000000` and reported by `APPLE_SGX_PARAM_FB_*`; `BLIT` with `dst_handle` 0 copies onto it with no CPU copy |
+| Mesa / OpenGL ES 2.0 | the SGX Gallium driver in `tools/mesa-sgx/`, built into Mesa 26.1.8 for Alpine armv7 (musl) and installed as the system GL; clears, draws, the fragment compiler, textures, blending, depth and render targets of any size verified on the device |
 | Debug interface | `/sys/kernel/debug/apple-sgx/{regs,boot,cmd,mem}` |
-| Test tools | `sgxinfo` prints the render node's parameters; `sgxgem` creates, maps and checks a GEM buffer (`-c` for a contiguous, dma-buf-exportable one, `-i` to import a display buffer); `sgx2d` exercises the 2D engine; `sgxpresent` puts a buffer on the HDMI output; `hwtest gpu` checks the handshake, a CCB command and the render node |
+| Test tools | `sgxinfo` prints the render node's parameters; `sgxgem` creates, maps and checks a GEM buffer (`-c` for a contiguous, dma-buf-exportable one, `-i` to import a display buffer); `sgx2d` exercises the 2D engine; `sgxpresent` puts a buffer on the HDMI output (`-s` draws on the live screen); `sgxframe` runs one clear through the TA/3D queue; `hwtest gpu` checks the handshake, a CCB command, the render node and the screen blit |
 
 ### Verified on hardware (2026-11-02, `j33iap`)
+
+- **OpenGL ES 2.0 runs on the GPU through Mesa.**  The Gallium driver from
+  the clean-room SGX543 work (MIT, `tools/mesa-sgx/`) builds into Mesa
+  26.1.8 as a Gallium driver read from the render node, and the device's
+  system GL is now that Mesa:
+
+  | program | what it does | result |
+  |---|---|---|
+  | `glclear` | a clear on the GPU, read back and checked | 0 wrong, 55-69 ms a clear with its read-back |
+  | `gltri` | three draws: a colour per vertex, a uniform, a mat2 | 11 of 11 checks |
+  | `glfs` | the fragment compiler's 40 cases (arithmetic, branches, loops, arrays, uniforms) | 40 of 40 |
+  | `glsize` | render targets 1x1 to 4096x4096 | 15 of 15 sizes |
+  | `gltex` | textures: minification, NPOT, linear | 14 of 14 cases |
+  | `glblend` | blending, the colour mask, repeated renders | 14 of 14 cases |
+  | `gldepth` | the depth test within and across renders | 12 of 12 cases |
+
+  The driver builds its frame with `sgx_template.c`/`sgx_rt.c` and takes
+  only the event program from the stock driver.  `GL_RENDERER` is
+  "PowerVR SGX543MP1" -- the kernel's own core count, not the reference's
+  fixed MP2.
+- The TA/3D render queue runs: `sgxframe` builds the template frame and a
+  render target's data, submits a full-screen clear through `SUBMIT`, and
+  reads back every checked pixel right at 1280x720 and 640x360, twice in a
+  row.  It uses the stock graphics driver's event PDS program (0xa8 bytes,
+  five data rows and 22 instructions) carved from the device's own system
+  image; its SHA-256 is `a1b855d41993968b40005e886f7ac11c8c3abb42aa0987e005eec4e6cb2a2285`,
+  the same template the reference extracts.  The stock driver keeps two
+  adjacent records in `IMGSGX543GLDriver`'s `__TEXT,__const`; only the
+  second draws, so `stage2` tries each carved candidate with `sgxframe` and
+  keeps the one that does.
 
 The device reports an **SGX543MP1, one core, revision 1.2.2** (`CORE_ID
 0x01194101`, `CORE_REVISION 0x00010202`).  With the driver in the boot
@@ -149,6 +181,31 @@ the code page on every blit; the engine reads it again per program.
 `sgx2d` checks it: a 64x64 source into 1280x720 and 640x360 destinations,
 four quadrant centres each.  `sgxpresent -b` puts the result on HDMI.
 
+### Drawing on the screen the display is already showing
+
+The display pipe publishes the buffer it is scanning out (`plane_info`, and
+now `include/linux/s5l8947x-display.h`): its physical address, stride, size
+and a generation that changes when the pipe switches buffers.  The SGX
+driver maps that range at `0x90000000` (the reserved framebuffer window)
+with PTEs that are not cache-consistent, because the pipe reads memory and
+not the CPU's caches.  `APPLE_SGX_PARAM_FB_VA/_WIDTH/_HEIGHT/_STRIDE` report
+where it is, and `DRM_APPLE_SGX_BLIT` with `dst_handle` 0 copies a buffer
+onto it:
+
+```sh
+sgxpresent -s 10		# 2D engine -> the live screen, no modeset
+```
+
+No dma-buf and no PRIME are involved: the kernel holds the display's buffer
+for as long as the pipe is showing it, and a modeset that changes it is
+noticed by the generation, which remaps before the next copy.  The blit
+lock is held across the check and the transfer, so a modeset cannot pull
+the buffer out from under a running copy.  This is the path a Mesa flush or
+a full-screen renderer uses when it does not want a compositor.
+
+The kernel halves are in the tree and build (2026-11-02); the screen mapping
+and `sgxframe` still have to be run on the device.
+
 ### Drawing into the display's own buffer (bring-up path)
 
 The display driver exposes the buffer it is scanning out now as
@@ -205,12 +262,70 @@ then the `map_phys` debugfs path is how the 2D engine reaches the screen.
 What is not there yet:
 
 - **No KMS plane on the render node.**  The `s5l8947x` driver owns the HDMI
-  output and the render node has no connector; presentation goes through
-  PRIME as above.  `APPLE_SGX_PARAM_FB_*` still return 0 and the overlay
-  ioctl `-EOPNOTSUPP`, and the UAPI stays version 3.
+  output and the render node has no connector.  For KMS/GBM programs the
+  render node is meant to pair with that driver through Mesa's `kmsro`; the
+  full-screen path does not need it (the screen blit above).  The overlay
+  ioctl still returns `-EOPNOTSUPP`, and the UAPI stays version 3.
 - **No Mesa/OpenGL ES userspace in the image.**  The render node is the
   kernel half; the Gallium driver and its USSE/PDS program packs are a
   separate body of work.
+
+## The route to OpenGL ES 2.0
+
+The kernel interface a Gallium driver uses is complete (UAPI 3): GEM with
+fixed, code-zone and TA-heap placement, `SUBMIT` with a TA command and a
+parameter buffer, syncobjs, `GEM_INFO`, dma-buf import and the screen blit.
+What is unproven is the TA/3D execution path on this one-core microkernel;
+everything else is userspace.
+
+1. **Prove the render queue.**  Done on hardware: `sgxframe` builds the
+   template frame (the PDS block, the state area, the TA command and the 3D
+   register block), one render target's data, and submits a full-screen
+   clear, then checks the pixels.  It needs 0xa8 bytes the stock graphics driver
+   keeps -- its event PDS program -- which the device's own system image
+   carries.  `glcarve` finds that template by its shape in the system-wide
+   code cache, stage2 runs it on the first boot, and the result is cached on
+   `Data` as `/lib/firmware/s5l8947x/gl-event.pds`; nothing is committed.
+   Several windows can match, so `glcarve -a CACHE DIR` writes them all and
+   `sgxframe -e` says which one draws.  If the clear is wrong or hangs,
+   compare the words with the stock driver's decompiled render-target code
+   (`research/ghidra/out/kc_sgx_r.c`).
+2. **Port the Gallium driver.**  Done on hardware: the clean-room driver
+   published with Project Cascadia (about 15.5k lines, MIT) is in
+   `tools/mesa-sgx/`, builds into Mesa 26.1.8 for Alpine `armv7` (musl) in
+   an armv7 container, and is installed as the system GL.  It builds its own
+   frame from `sgx_template.c`; the only input it takes from outside is the
+   same event program, read from `/lib/firmware/s5l8947x/gl-event.pds`
+   (`SGX_EVENT` names another copy).  Three files differ from the reference:
+   that path, the same default directory for the frame, and the renderer
+   string.  `glclear`, `gltri`, `glfs`, `glsize`, `gltex`, `glblend` and
+   `gldepth` all pass on the device.
+3. **Put it on the screen.**  For EGL/GBM, pair the render node with the
+   `s5l8947x` KMS driver through `kmsro`: GBM allocates the scanout buffer
+   on the display, the SGX node imports its dma-buf and renders into it,
+   and the display's atomic commit waits on the GPU's fence through the
+   shared dma-buf reservation.  For full-screen programs the screen blit
+   above is enough.
+4. **Then the 2D engine's leftovers** (fill and non-scaled copy), the
+   interrupt and runtime PM.
+
+## Next steps
+
+1. **kmsro** for EGL/GBM: the render node with the `s5l8947x` KMS driver,
+   then a compositor.  Until then the screen blit (`BLIT dst 0`,
+   `sgxpresent -s`) puts a rendered buffer on the display.
+2. **Make the Mesa install survive a reboot.**  It is on the initramfs
+   (`/usr/local/lib/sgx-mesa`, ~19 MB installed) and `install.sh --system`
+   makes it the system GL; caching the tarball on `Data` and unpacking it in
+   `stage2` is the next step.
+3. **The desktop-GL half of the driver** (GLX and the x11/wayland
+   platforms) is not built in this image: the device has neither.  Add
+   `-Dplatforms=x11,wayland -Dglx=dri` and the X/wayland libraries when a
+   compositor needs them.
+4. **More of the 2D engine.**  BLIT covers a scaled copy; a fill and a
+   non-scaled copy are the same transfer with other programs.
+5. **Power management.**  The microkernel's power and idle commands are
+   implemented in debugfs; wiring them to runtime PM is a later step.
 
 ## Hardware map
 
@@ -331,6 +446,9 @@ sgxgem -i /dev/dri/card1      # import a display dumb buffer into the GPU
 sgx2d                         # 2D engine: scale a source over two destinations
 sgxpresent 10                 # put an SGX buffer on HDMI through PRIME
 sgxpresent -b 10              # ... with the 2D engine drawing it
+sgxpresent -s 10              # 2D engine straight onto the live scanout
+sgxframe -s 5                 # one clear through the TA/3D queue, shown
+glcarve -a /mnt/system/System/Library/Caches/com.apple.dyld/dyld_shared_cache_armv7 /tmp/glc
 cat /sys/kernel/debug/apple-sgx/regs
 echo 1 > /sys/kernel/debug/apple-sgx/boot      # restart the microkernel
 echo "hwperf 0" > /sys/kernel/debug/apple-sgx/cmd
@@ -344,7 +462,9 @@ offsets equal to GPU addresses, for replay experiments.  `cmd` also accepts
 `rkick PB DET CMD [CC]`.
 
 The render node is `/dev/dri/renderD128`.  `sgxinfo` is the quickest check
-that a userspace process can open it and read the parameters.
+that a userspace process can open it and read the parameters.  `sgxframe`
+reads `/lib/firmware/s5l8947x/gl-event.pds`, which `stage2` provisions with
+`glcarve`; with no display the last two commands skip.
 
 On this board the direct boot route takes the **whole self-relocating
 bundle** as the image DATA, not a separate direct stub.  The bundle's entry
@@ -372,19 +492,13 @@ stock recovery-image template and is built with the sibling workspace's
 - **Core count and clock:** both are read from the hardware.  The microkernel
   timer clock is 256.5 MHz (the 513 MHz PLL divided by two), the value the
   clean-room work measured on the same GPU family.
-
-## Next steps
-
-1. **Userspace.**  Port the USSE/PDS program packs and the Mesa Gallium
-   driver from the clean-room SGX543 work, then build them for Alpine
-   `armv7`.  The TA/3D render queue (`SUBMIT`) still needs a userspace TA
-   command to be exercised; the reference's frame packs come from stock GL
-   captures that are not in either tree.
-2. **More of the 2D engine.**  BLIT covers a scaled copy.  A fill and a
-   non-scaled copy are the same transfer with other programs; the reference
-   driver's simple-framebuffer hooks are not needed now that PRIME works.
-3. **Power management.**  The microkernel's power and idle commands are
-   implemented in debugfs; wiring them to runtime PM is a later step.
+- **Mesa:** the Gallium driver in `tools/mesa-sgx/` is the reference's,
+  unchanged except for three files (the event program's path and the frame
+  directory default, both this port's layout, and the renderer string,
+  which now names the kernel's core count).  It reads the kernel's own
+  `apple_sgx_drm.h` at build time instead of carrying a copy.  The image
+  builds with `-Dplatforms=` (surfaceless EGL, GBM) because the device runs
+  no window system; see the Next steps above for the desktop-GL half.
 
 ## Licence and attribution
 
