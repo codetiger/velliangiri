@@ -27,7 +27,7 @@ system image at first boot, as the Wi-Fi and Bluetooth firmware already are.
 | Mesa / OpenGL ES 2.0 | the SGX Gallium driver in `tools/mesa-sgx/`, built into Mesa 26.1.8 for Alpine armv7 (musl) and installed as the system GL; clears, draws, the fragment compiler, textures, blending, depth and render targets of any size verified on the device |
 | EGL/GBM on the display | kmsro pairs the render node with the `s5l8947x` display: GBM surfaces are contiguous SGX buffers the display imports and scans out, flipped with page-flip events (`gbmtest`, 300 frames on hardware) |
 | Desktop GL (opt-in build) | `MESA_BUILD=desktop`: GLX, the X11/Wayland EGL platforms and desktop OpenGL; desktop GL 2.1 verified through EGL on the device (GLX needs an X server, which the image has not) |
-| Compositor | Weston 14 (DRM backend, GL renderer, kiosk shell) built from source in `tools/weston/`, started by `weston-run`; composites shm clients on the SGX and scans them out (verified on HDMI) |
+| Compositor | Weston 14 (DRM backend, GL renderer, kiosk shell) built from source in `tools/weston/`, started by `weston-run`; composites EGL and shm clients on the SGX and scans them out (verified on HDMI) |
 | Implicit fences | the SGX render node's finished fence is on every submitted buffer's reservation, and the display's atomic commit waits on it: a 390 ms render without `glFinish` delays the flip by 390 ms |
 | Mesa install across reboots | `install.sh` keeps the tarball on Data; `stage2` unpacks it at boot and makes it the system GL |
 | Debug interface | `/sys/kernel/debug/apple-sgx/{regs,boot,cmd,mem}` |
@@ -287,16 +287,20 @@ weston-run 20			# weston-simple-shm on HDMI
 ```
 
 Verified on the device: Weston enabled `HDMI-A-1` at 1280x720, loaded
-`gl-renderer.so` on the SGX render node and `kiosk-shell.so`, composited the
-shm client on the GPU, and the display's scanout buffer (read back with
-`peek` at the address from `plane_info`) held the client's moving pattern.
-The console came back when the compositor exited.  The stock Alpine package
-has no `drm-backend.so`, so it is built from source.
+`gl-renderer.so` on the SGX render node and `kiosk-shell.so`, and ran both
+`weston-simple-egl` (the client chose an `r8g8b8a8` config, the compositor
+imported its dma-buf, and the display's scanout buffer -- read back with
+`peek` at the address from `plane_info` -- held the square) and
+`weston-simple-shm`.  The console came back when the compositor exited.
+The stock Alpine package has no `drm-backend.so`, so it is built from
+source.
 
-EGL clients (`weston-simple-egl`) are not there yet: the client's dmabufs
-reach Weston with a file descriptor that is not the buffer's (a duplicate of
-the client's stdout), so the import fails with `invalid stride`.  Shm
-clients work; the compositor itself renders through the SGX.
+The EGL client needed one Mesa fix: the SGX `resource_get_param` must not
+answer `PIPE_RESOURCE_PARAM_HANDLE_TYPE_FD`, because Mesa's DRI image query
+prefers it over `resource_get_handle` and takes the boolean (1) for a file
+descriptor; with the handle-type parameters absent it falls through to
+`resource_get_handle`, which exports a real dma-buf fd.  Before that,
+Weston received a duplicate of the client's stdout as the buffer.
 
 ### Drawing into the display's own buffer (bring-up path)
 
@@ -356,12 +360,10 @@ What is not there yet:
   output and the render node has no connector; kmsro is how EGL/GBM pairs
   them.  The overlay ioctl still returns `-EOPNOTSUPP`, and the UAPI stays
   version 3.
-- **EGL clients on the compositor.**  Weston runs with shm clients; an EGL
-  client's dmabufs arrive with a wrong fd (the compositor receives a
-  duplicate of the client's stdout), so the import fails.  This is in the
-  Wayland platform's image export, not the compositor or the display.
 - **No input.**  Weston starts with `--continue-without-input`; the board
   has no USB host mode yet, so there is no keyboard or mouse.
+- **No desktop shell or Xwayland.**  Weston runs with the kiosk shell; the
+  desktop shell (cairo/pango) and Xwayland are not built.
 
 ## The route to OpenGL ES 2.0
 
@@ -405,13 +407,11 @@ everything else is userspace.
 
 ## Next steps
 
-1. **EGL clients on Weston.**  Shm clients work; an EGL client's dmabufs
-   reach the compositor with a wrong fd, so the import fails.  The fix is in
-   the Wayland platform's image export (client-side Mesa), not the
-   compositor or the display.
-2. **Input for the compositor.**  Weston starts without one
+1. **Input for the compositor.**  Weston starts without one
    (`--continue-without-input`); the board needs USB host mode for a
    keyboard or mouse.
+2. **The desktop shell and Xwayland** (cairo/pango and an X server) if the
+   kiosk shell is not enough.
 3. **The desktop-GL half of the driver** (GLX and the x11/wayland
    platforms) is an opt-in build (`MESA_BUILD=desktop`) with the
    X11/Wayland libraries it needs; desktop GL 2.1 is verified through EGL
