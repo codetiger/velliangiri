@@ -27,19 +27,21 @@ mkdir -p "${BOOT_BUILD}" "${OUT}"
 ZIMAGE_SIZE=$(wc -c < "${ZIMAGE}" | tr -d ' ')
 DTB_PHYS=$(printf "0x%08xU" $((0x80008000 + ZIMAGE_SIZE)))
 
-echo "[bundle] Compiling pre-kernel loader (0x80000000, PMGR + 1080p30 HDMI, DTB_PHYS=${DTB_PHYS}) ..."
+BOOT_SPLASH="${BOOT_SPLASH:-1}"
+echo "[bundle] Compiling pre-kernel loader (0x80000000, PMGR + 1080p30 HDMI, BOOT_SPLASH=${BOOT_SPLASH}, DTB_PHYS=${DTB_PHYS}) ..."
 CFLAGS_BOOT=(-march=armv7-a -marm -mfloat-abi=soft -ffreestanding -fno-builtin -fno-stack-protector -O2 -Wall -Wextra)
 "${CC}" "${CFLAGS_BOOT[@]}" -c "${BOOT_SRC}/boot-start.S" -o "${BOOT_BUILD}/boot-start.o"
-"${CC}" "${CFLAGS_BOOT[@]}" -DDTB_PHYS="${DTB_PHYS}" -c "${BOOT_SRC}/boot-loader.c" -o "${BOOT_BUILD}/boot-loader.o"
+"${CC}" "${CFLAGS_BOOT[@]}" -DDTB_PHYS="${DTB_PHYS}" -DBOOT_SPLASH="${BOOT_SPLASH}" -c "${BOOT_SRC}/boot-loader.c" -o "${BOOT_BUILD}/boot-loader.o"
 "${CC}" "${CFLAGS_BOOT[@]}" -c "${BOOT_SRC}/pmgr-init.c" -o "${BOOT_BUILD}/pmgr-init.o"
-python3 "${BOOT_SRC}/gen-splash.py" "${ROOT}/logo.svg" > "${BOOT_BUILD}/splash-data.h"
-"${CC}" "${CFLAGS_BOOT[@]}" -I"${BOOT_BUILD}" -c "${BOOT_SRC}/splash.c" -o "${BOOT_BUILD}/splash.o"
+LOADER_OBJS=("${BOOT_BUILD}/boot-start.o" "${BOOT_BUILD}/boot-loader.o" "${BOOT_BUILD}/pmgr-init.o")
+if [ "${BOOT_SPLASH}" = "1" ]; then
+	python3 "${BOOT_SRC}/gen-splash.py" "${ROOT}/logo.svg" > "${BOOT_BUILD}/splash-data.h"
+	"${CC}" "${CFLAGS_BOOT[@]}" -I"${BOOT_BUILD}" -c "${BOOT_SRC}/splash.c" -o "${BOOT_BUILD}/splash.o"
+	LOADER_OBJS+=("${BOOT_BUILD}/splash.o")
+fi
 
 "${LD}" -z noexecstack -T "${BOOT_SRC}/boot-loader.ld" \
-	"${BOOT_BUILD}/boot-start.o" \
-	"${BOOT_BUILD}/boot-loader.o" \
-	"${BOOT_BUILD}/pmgr-init.o" \
-	"${BOOT_BUILD}/splash.o" \
+	"${LOADER_OBJS[@]}" \
 	-o "${BOOT_BUILD}/boot-loader.elf"
 "${OBJCOPY}" -O binary "${BOOT_BUILD}/boot-loader.elf" "${BOOT_BUILD}/boot-loader.bin"
 

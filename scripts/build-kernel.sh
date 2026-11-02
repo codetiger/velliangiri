@@ -41,7 +41,7 @@ make -C "${TREE}" multi_v7_defconfig >/dev/null
 "${TREE}/scripts/kconfig/merge_config.sh" -m -O "${TREE}" \
 	"${TREE}/.config" "${CONFIG_BASE}" "${CONFIG_TRIM}" >/dev/null
 
-if [ -f "${INITRAMFS_CPIO}" ]; then
+if [ "${EMBED_INITRAMFS:-1}" = 1 ] && [ -f "${INITRAMFS_CPIO}" ]; then
 	echo "[kernel] Embedding uncompressed initramfs (${INITRAMFS_CPIO}) for single-stream XZ ..."
 	FRAG="$(mktemp)"
 	{
@@ -62,13 +62,14 @@ rm -f "${ROOT}"/.tmp.config.* "${ROOT}"/.merge_tmp.config.*
 echo "[kernel] Verifying required S5L8947X config symbols ..."
 awk -f "${ROOT}/scripts/check-config-fragment.awk" "${CONFIG_BASE}" "${TREE}/.config"
 
-echo "[kernel] Compiling zImage and s5l8947x-j33iap.dtb (-j${JOBS}) ..."
+echo "[kernel] Compiling Image, zImage and s5l8947x-j33iap.dtb (-j${JOBS}) ..."
 rm -f "${TREE}/arch/arm/boot/dts/apple/s5l8947x-j33iap.dtb"
 make -C "${TREE}" -j"${JOBS}" zImage dtbs
 
+cp "${TREE}/arch/arm/boot/Image" "${OUT}/Image"
 cp "${TREE}/arch/arm/boot/zImage" "${OUT}/zImage"
 cp "${TREE}/arch/arm/boot/dts/apple/s5l8947x-j33iap.dtb" "${OUT}/s5l8947x-j33iap.dtb"
 cp "${TREE}/.config" "${OUT}/kernel.config"
 
 echo "[kernel] Build complete:"
-ls -lh "${OUT}/zImage" "${OUT}/s5l8947x-j33iap.dtb"
+ls -lh "${OUT}/Image" "${OUT}/zImage" "${OUT}/s5l8947x-j33iap.dtb"

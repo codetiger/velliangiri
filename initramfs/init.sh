@@ -22,7 +22,8 @@ mount -t tmpfs tmpfs /run 2>/dev/null || true
 mount -t tmpfs tmpfs /tmp 2>/dev/null || true
 
 msg() {
-	echo "[velliangiri] $*" >/dev/kmsg 2>/dev/null || true
+	read -r up _ < /proc/uptime 2>/dev/null || up="?"
+	echo "[velliangiri +${up}s] $*" >/dev/kmsg 2>/dev/null || true
 }
 
 settle() { s_i=0; while [ $s_i -lt 5000 ]; do s_i=$((s_i+1)); done; }
@@ -50,28 +51,36 @@ fi
 hostname velliangiri 2>/dev/null || true
 ip link set lo up 2>/dev/null || true
 
-# Force clean USB gadget soft-disconnect/reconnect so the host enumerates
-# CDC-ECM (usb0) and CDC-ACM (/dev/ttyGS0) freshly.
+# Ensure USB gadget (CDC-ECM usb0 + CDC-ACM /dev/ttyGS0) is enumerated.
+# If the built-in gadget already reached 'configured' during kernel init,
+# avoid tearing down the link with a redundant soft_connect cycle.
 if ls /sys/class/udc/*/state >/dev/null 2>&1; then
-	msg "forcing USB gadget re-enumeration"
-	for u in /sys/class/udc/*/soft_connect; do
-		echo disconnect > "$u" 2>/dev/null || true
-	done
-	settle
-	for u in /sys/class/udc/*/soft_connect; do
-		echo connect > "$u" 2>/dev/null || true
-	done
-	n=0
 	st=""
-	while [ $n -lt 150 ]; do
-		n=$((n+1))
-		for u in /sys/class/udc/*/state; do
-			st=$(cat "$u" 2>/dev/null)
-		done
-		[ "$st" = "configured" ] && break
-		blip
+	for u in /sys/class/udc/*/state; do
+		st=$(cat "$u" 2>/dev/null)
 	done
-	msg "UDC state=$st after $n polls"
+	if [ "$st" = "configured" ]; then
+		msg "UDC already configured"
+	else
+		msg "forcing USB gadget re-enumeration (was ${st:-unknown})"
+		for u in /sys/class/udc/*/soft_connect; do
+			echo disconnect > "$u" 2>/dev/null || true
+		done
+		settle
+		for u in /sys/class/udc/*/soft_connect; do
+			echo connect > "$u" 2>/dev/null || true
+		done
+		n=0
+		while [ $n -lt 150 ]; do
+			n=$((n+1))
+			for u in /sys/class/udc/*/state; do
+				st=$(cat "$u" 2>/dev/null)
+			done
+			[ "$st" = "configured" ] && break
+			blip
+		done
+		msg "UDC state=$st after $n polls"
+	fi
 fi
 
 exec /sbin/velliangiri-stage2

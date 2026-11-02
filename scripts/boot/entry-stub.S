@@ -38,12 +38,15 @@ _start:
 	blne	v7_flush_dcache_all
 	bleq	v7_invalidate_dcache_all
 
-	/* 2. Disable MMU, D-cache, I-cache, and branch prediction */
+	/*
+	 * 2. Disable MMU and D-cache, but enable I-cache and branch prediction
+	 *    so the 11.5 MB payload relocation loop runs from L1 I-cache.
+	 */
 	mrc	p15, 0, r0, c1, c0, 0
 	bic	r0, r0, #(1 << 0)
 	bic	r0, r0, #(1 << 2)
-	bic	r0, r0, #(1 << 12)
-	bic	r0, r0, #(1 << 11)
+	orr	r0, r0, #(1 << 12)
+	orr	r0, r0, #(1 << 11)
 	mcr	p15, 0, r0, c1, c0, 0
 	isb	sy
 	mov	r0, #0
@@ -77,7 +80,12 @@ _start:
 	subs	r2, r2, #32
 	bhi	1b
 
-	/* 6. Invalidate I-cache and branch predictor, then jump to 0x80000000 */
+	/* 6. Disable and invalidate I-cache and branch predictor, then jump to 0x80000000 */
+	mrc	p15, 0, r0, c1, c0, 0
+	bic	r0, r0, #(1 << 12)
+	bic	r0, r0, #(1 << 11)
+	mcr	p15, 0, r0, c1, c0, 0
+	isb	sy
 	mov	r0, #0
 	mcr	p15, 0, r0, c7, c5, 0
 	mcr	p15, 0, r0, c7, c5, 6

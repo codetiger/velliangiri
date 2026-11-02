@@ -39,7 +39,7 @@ python3 "${ROOT}/scripts/apk-unpack.py" \
 	--dest "${APK_WORK}" \
 	--rootfs "${STAGE_DIR}" \
 	dropbear dropbear-scp nfs-utils busybox-static iw wpa_supplicant wireless-regdb \
-	bluez dbus
+	bluez dbus mtd-utils-ubi
 
 (
 	cd "${APK_WORK}"
@@ -52,7 +52,7 @@ python3 "${ROOT}/scripts/apk-unpack.py" \
 # Cross-compile the early entropy seeder, diagnostic tools, the WAV player, the BT patch/tools and the firmware carvers
 # ("<installed name>:<source in scripts/tools>")
 echo "[rootfs] Cross-compiling userspace tools (-O2 -mcpu=cortex-a9 -mfpu=neon) ..."
-for tool in jitterseed:jitterseed.c peek:mmio-peek.c i2cpoke:i2c-poke.c wavplay:wavplay.c l2bench:l2bench.c fbtest:fbtest.c btscan:btscan.c hcdcarve:hcdcarve.c sgxcarve:sgxcarve.c glcarve:glcarve.c vxdcarve:vxdcarve.c iopcarve:iopcarve.c m2mtest:m2mtest.c m2mshow:m2mshow.c jpegtest:jpegtest.c sgxinfo:sgxinfo.c sgxgem:sgxgem.c sgx2d:sgx2d.c sgxpresent:sgxpresent.c; do
+for tool in jitterseed:jitterseed.c peek:mmio-peek.c i2cpoke:i2c-poke.c wavplay:wavplay.c l2bench:l2bench.c fbtest:fbtest.c btscan:btscan.c hcdcarve:hcdcarve.c sgxcarve:sgxcarve.c glcarve:glcarve.c vxdcarve:vxdcarve.c iopcarve:iopcarve.c m2mtest:m2mtest.c m2mshow:m2mshow.c jpegtest:jpegtest.c sgxinfo:sgxinfo.c sgxgem:sgxgem.c sgx2d:sgx2d.c sgxpresent:sgxpresent.c nand-restore:nand-restore.c; do
 	"${CROSS_CC}" -O2 -mcpu=cortex-a9 -mfpu=neon -Wall -Wextra -static \
 		-I "${ROOT}/tools" \
 		-o "${STAGE_DIR}/bin/${tool%%:*}" "${ROOT}/scripts/tools/${tool#*:}" -lm
@@ -87,10 +87,14 @@ echo "[rootfs] Installing initramfs boot scripts ..."
 mkdir -p "${STAGE_DIR}/sbin" "${STAGE_DIR}/etc/udhcpc" "${STAGE_DIR}/etc/dropbear" "${STAGE_DIR}/root/.ssh"
 cp "${ROOT}/initramfs/init.sh" "${STAGE_DIR}/init"
 cp "${ROOT}/initramfs/stage2.sh" "${STAGE_DIR}/sbin/velliangiri-stage2"
+cp "${ROOT}/scripts/tools/nandboot-install.sh" "${STAGE_DIR}/sbin/nandboot-install"
+cp "${ROOT}/scripts/tools/nand-migrate.sh" "${STAGE_DIR}/sbin/nand-migrate"
 cp "${ROOT}/initramfs/udhcpc.sh" "${STAGE_DIR}/etc/udhcpc/default.script"
 cp "${ROOT}/initramfs/wifi.sh" "${STAGE_DIR}/bin/wifi"
 cp "${ROOT}/initramfs/ntpd-event.sh" "${STAGE_DIR}/etc/ntpd-event.sh"
-chmod 755 "${STAGE_DIR}/init" "${STAGE_DIR}/sbin/velliangiri-stage2" "${STAGE_DIR}/etc/udhcpc/default.script" "${STAGE_DIR}/bin/wifi" \
+chmod 755 "${STAGE_DIR}/init" "${STAGE_DIR}/sbin/velliangiri-stage2" \
+	"${STAGE_DIR}/sbin/nandboot-install" "${STAGE_DIR}/sbin/nand-migrate" \
+	"${STAGE_DIR}/etc/udhcpc/default.script" "${STAGE_DIR}/bin/wifi" \
 	"${STAGE_DIR}/etc/ntpd-event.sh"
 
 # Optional Wi-Fi network joined at boot: a wpa_supplicant.conf kept out of git
@@ -165,6 +169,28 @@ echo "[rootfs] Packing uncompressed cpio archive -> ${OUT_CPIO} ..."
 
 python3 "${ROOT}/scripts/cpio-owners.py" "${OUT_CPIO}"
 cp "${OUT_CPIO}" "${ROOT}/out/initramfs-s5l8947x.cpio"
+if command -v mksquashfs >/dev/null 2>&1; then
+	echo "[rootfs] Packing uncompressed SquashFS image -> ${ROOT}/out/rootfs.sqsh ..."
+	mksquashfs "${STAGE_DIR}" "${ROOT}/out/rootfs.sqsh" \
+		-noappend -all-root -noI -noD -noF -noX -b 131072 >/dev/null
+	if [ -s "${ROOT}/build/mesa-sgx-install.tar" ] || [ -s "${ROOT}/build/weston-armv7.tar" ]; then
+		echo "[rootfs] Packing usr-local SquashFS image -> ${ROOT}/build/usr-local.sqsh ..."
+		ULOCAL_STAGE="/tmp/velliangiri-usr-local-stage"
+		rm -rf "${ULOCAL_STAGE}"
+		mkdir -p "${ULOCAL_STAGE}/bin" "${ULOCAL_STAGE}/lib" "${ULOCAL_STAGE}/share"
+		if [ -s "${ROOT}/build/mesa-sgx-install.tar" ]; then
+			tar --no-same-owner -xf "${ROOT}/build/mesa-sgx-install.tar" -C "${ULOCAL_STAGE}" --strip-components=2
+			chmod +x "${ULOCAL_STAGE}/lib/sgx-mesa/bin/"* 2>/dev/null || true
+			ln -sf /usr/local/lib/sgx-mesa/bin/sgx-gl "${ULOCAL_STAGE}/bin/sgx-gl"
+		fi
+		if [ -s "${ROOT}/build/weston-armv7.tar" ]; then
+			tar --no-same-owner -xf "${ROOT}/build/weston-armv7.tar" -C "${ULOCAL_STAGE}" --strip-components=2
+		fi
+		mksquashfs "${ULOCAL_STAGE}" "${ROOT}/build/usr-local.sqsh" \
+			-noappend -all-root -noI -noD -noF -noX -b 131072 >/dev/null
+		rm -rf "${ULOCAL_STAGE}"
+	fi
+fi
 rm -rf "${STAGE_DIR}" "${APK_WORK}"
 
 echo "[rootfs] Ready: ${OUT_CPIO} ($(du -h "${OUT_CPIO}" | awk '{print $1}'))"

@@ -796,10 +796,36 @@ static void s5l_gamma(struct s5l_display *d, unsigned int pct)
 	writel(9, d->out + OUT_GAMMA_EN);
 }
 
+static void s5l_plane_setup(struct s5l_display *d, const struct drm_display_mode *m,
+			    dma_addr_t addr, u32 pitch)
+{
+	void __iomem *p = d->rgbout + RGB_PLANE0;
+	u32 wh = m->vdisplay | (m->hdisplay << 16);
+
+	/* plane 0: ARGB8888, whole screen */
+	writel(1, p + PLANE_CTL);
+	writel(addr, p + PLANE_ADDR);
+	writel((readl(p + PLANE_STRIDE) & 0x3fU) | (pitch & ~0x3fU), p + PLANE_STRIDE);
+	writel(0, p + 0x4c);
+	writel(wh, p + 0x50);
+	writel(0, p + 0x54);
+	writel(wh, p + 0x58);
+	writel(1, p + 0x5c);
+	writel(0, p + 0x90);
+	writel(0, p + 0x80);
+	writel(0, p + 0x84);
+	writel(0x100000U, p + 0x88);
+	writel(0x100000U, p + 0x8c);
+	writel(0, p + 0x60);
+	writel(wh, p + 0x70);
+	writel(RGB_COMMIT_VAL, d->rgbout + RGB_COMMIT);
+
+	writel(readl(d->rgbout + RGB_CTL) | 0x100U, d->rgbout + RGB_CTL);
+}
+
 static void s5l_pipe_setup(struct s5l_display *d, const struct drm_display_mode *m,
 			   dma_addr_t addr, u32 pitch)
 {
-	void __iomem *p = d->rgbout + RGB_PLANE0;
 	u32 wh = m->vdisplay | (m->hdisplay << 16);
 	u32 v;
 	int i;
@@ -831,25 +857,7 @@ static void s5l_pipe_setup(struct s5l_display *d, const struct drm_display_mode 
 	writel((m->vsync_end - m->vsync_start) + (m->vtotal - m->vsync_end) - 2,
 	       d->out + OUT_VSYNC);
 
-	/* plane 0: ARGB8888, whole screen */
-	writel(1, p + PLANE_CTL);
-	writel(addr, p + PLANE_ADDR);
-	writel((readl(p + PLANE_STRIDE) & 0x3fU) | (pitch & ~0x3fU), p + PLANE_STRIDE);
-	writel(0, p + 0x4c);
-	writel(wh, p + 0x50);
-	writel(0, p + 0x54);
-	writel(wh, p + 0x58);
-	writel(1, p + 0x5c);
-	writel(0, p + 0x90);
-	writel(0, p + 0x80);
-	writel(0, p + 0x84);
-	writel(0x100000U, p + 0x88);
-	writel(0x100000U, p + 0x8c);
-	writel(0, p + 0x60);
-	writel(wh, p + 0x70);
-	writel(RGB_COMMIT_VAL, d->rgbout + RGB_COMMIT);
-
-	writel(readl(d->rgbout + RGB_CTL) | 0x100U, d->rgbout + RGB_CTL);
+	s5l_plane_setup(d, m, addr, pitch);
 }
 
 /* --- HDMI transmitter --- */
@@ -1070,6 +1078,27 @@ static enum hrtimer_restart s5l_vblank_timer(struct hrtimer *timer)
 	return HRTIMER_RESTART;
 }
 
+static bool s5l_hdmi_active_mode(struct s5l_display *d, const struct drm_display_mode *m,
+				 bool hdmi_mode)
+{
+	if (!(readl(d->hdmi + HDMI_PHY_STATUS_0) & 1) ||
+	    !(readl(d->hdmi + HDMI_TG(0x00)) & 1) ||
+	    !(readl(d->hdmi + HDMI_CON_0) & 1))
+		return false;
+	if (d->hpd_present &&
+	    (((readl(d->hdmi + HDMI_MODE_SEL) & 0x03) == 2) != hdmi_mode))
+		return false;
+	if (hdmi_rb(d, HDMI_TG(0x18), 2) != m->htotal ||
+	    hdmi_rb(d, HDMI_TG(0x28), 2) != m->hdisplay ||
+	    hdmi_rb(d, HDMI_TG(0x30), 2) != m->vtotal ||
+	    hdmi_rb(d, HDMI_TG(0x50), 2) != m->vdisplay)
+		return false;
+	if (readl(d->out + OUT_HSIZE) != m->hdisplay - 1 ||
+	    readl(d->out + OUT_VSIZE) != m->vdisplay - 1)
+		return false;
+	return true;
+}
+
 static void s5l_pipe_enable(struct drm_simple_display_pipe *pipe,
 			    struct drm_crtc_state *crtc_state,
 			    struct drm_plane_state *plane_state)
@@ -1079,25 +1108,49 @@ static void s5l_pipe_enable(struct drm_simple_display_pipe *pipe,
 	struct drm_framebuffer *fb = plane_state->fb;
 	const struct s5l_phy_cfg *phy = s5l_phy_find((unsigned long)m->clock * 1000);
 	bool hdmi_mode = d->connector.display_info.is_hdmi;
-	int ret;
+	dma_addr_t fb_addr;
+	bool seamless;
+	int ret = 0;
 
 	if (WARN_ON(!phy || !fb))
 		return;
 
+	fb_addr = drm_fb_dma_get_gem_addr(fb, plane_state, 0);
+
 	mutex_lock(&d->lock);
-	s5l_hdmi_stop(d);
-	s5l_pipe_setup(d, m, drm_fb_dma_get_gem_addr(fb, plane_state, 0),
-		       fb->pitches[0]);
-	d->tmds_hz = phy->clock;
-	ret = s5l_hdmi_start(d, m, phy, hdmi_mode);
-	writel(9, d->out + OUT_START);
+	seamless = s5l_hdmi_active_mode(d, m, hdmi_mode);
+	if (seamless) {
+		s5l_plane_setup(d, m, fb_addr, fb->pitches[0]);
+		if (hdmi_mode)
+			s5l_hdmi_avi(d, m);
+		d->tmds_hz = phy->clock;
+	} else {
+		s5l_hdmi_stop(d);
+		s5l_pipe_setup(d, m, fb_addr, fb->pitches[0]);
+		d->tmds_hz = phy->clock;
+		ret = s5l_hdmi_start(d, m, phy, hdmi_mode);
+		writel(9, d->out + OUT_START);
+	}
 	s5l_gamma(d, d->gamma_brightness);
 	if (hdmi_mode && d->audio_enabled) {
 		s5l_audio_on(d, d->audio_rate,
-			    d->audio_channels ?: 2);
+			     d->audio_channels ?: 2);
 		s5l_audio_arm(d, d->audio_rate);
 	}
 	mutex_unlock(&d->lock);
+
+	d->fb_pa = fb_addr;
+	d->fb_stride = fb->pitches[0];
+	d->fb_w = fb->width;
+	d->fb_h = fb->height;
+	spin_lock(&d->fb_lock);
+	d->scanout.phys = d->fb_pa;
+	d->scanout.stride = d->fb_stride;
+	d->scanout.width = d->fb_w;
+	d->scanout.height = d->fb_h;
+	d->scanout.format = fb->format->format;
+	d->scanout.generation++;
+	spin_unlock(&d->fb_lock);
 
 	if (vblank_sim) {
 		int refresh = drm_mode_vrefresh(m);
@@ -1114,8 +1167,9 @@ static void s5l_pipe_enable(struct drm_simple_display_pipe *pipe,
 	if (ret)
 		drm_err(&d->drm, "PHY not ready for %s\n", m->name);
 	else
-		drm_info(&d->drm, "%ux%u@%u, %u kHz, %s\n", m->hdisplay, m->vdisplay,
-			 drm_mode_vrefresh(m), m->clock, hdmi_mode ? "HDMI" : "DVI");
+		drm_info(&d->drm, "%ux%u@%u, %u kHz, %s%s\n", m->hdisplay, m->vdisplay,
+			 drm_mode_vrefresh(m), m->clock, hdmi_mode ? "HDMI" : "DVI",
+			 seamless ? " (seamless handover)" : "");
 	s5l_complete_event(&pipe->crtc, false);
 }
 
@@ -1284,6 +1338,24 @@ static bool s5l_force_preferred(struct drm_connector *conn)
 	return true;
 }
 
+/* CEA-861 VIC 34: 1920x1080@30 (74.25 MHz), matching Stage-1 hdmi-boot.h */
+static const struct drm_display_mode s5l_cea_1080p30 = {
+	DRM_MODE("1920x1080", DRM_MODE_TYPE_DRIVER, 74250,
+		 1920, 2008, 2052, 2200, 0,
+		 1080, 1084, 1089, 1125, 0,
+		 DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC),
+};
+
+static int s5l_add_1080p30(struct drm_connector *conn)
+{
+	struct drm_display_mode *m = drm_mode_duplicate(conn->dev, &s5l_cea_1080p30);
+
+	if (!m)
+		return 0;
+	drm_mode_probed_add(conn, m);
+	return 1;
+}
+
 static int s5l_conn_get_modes(struct drm_connector *conn)
 {
 	const struct drm_edid *edid = drm_edid_read(conn);
@@ -1295,8 +1367,9 @@ static int s5l_conn_get_modes(struct drm_connector *conn)
 	if (n)
 		s5l_pick_preferred(conn);
 	if (!n) {
-		/* No EDID: offer 720p, which every HDMI sink takes */
-		n = drm_add_modes_noedid(conn, 1280, 720);
+		/* No EDID: offer 1080p30 (Stage-1 mode) and 720p60 */
+		n = s5l_add_1080p30(conn);
+		n += drm_add_modes_noedid(conn, 1280, 720);
 		drm_set_preferred_mode(conn, 1280, 720);
 	}
 
@@ -1305,10 +1378,13 @@ static int s5l_conn_get_modes(struct drm_connector *conn)
 
 		/*
 		 * The sink need not list the requested mode: add the
-		 * standard 60 Hz modes the pipe can drive and look again.
+		 * standard 60 Hz modes (and CEA 1080p30) the pipe can drive.
 		 */
-		if (sscanf(s5l_preferred_mode, "%ux%u", &w, &h) == 2)
+		if (sscanf(s5l_preferred_mode, "%ux%u", &w, &h) == 2) {
+			if (w == 1920 && h == 1080)
+				n += s5l_add_1080p30(conn);
 			n += drm_add_modes_noedid(conn, w, h);
+		}
 		if (n && !s5l_force_preferred(conn))
 			drm_warn(conn->dev, "preferred_mode %s not available\n",
 				 s5l_preferred_mode);

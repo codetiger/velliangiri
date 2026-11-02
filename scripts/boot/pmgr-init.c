@@ -56,9 +56,13 @@ static void pmgr_boost_cpu_850mhz(void)
 	if ((rd32(PMGR_PLL1_CTL) & PMGR_PLL_ENABLE_LOCKED) != PMGR_PLL_ENABLE_LOCKED)
 		return;
 
-	/* Ensure Performance State Table entry 2 (850 MHz, div=1) is populated */
-	if (rd32(PMGR_PERF_STATE2_W0) != 0x01220001U) {
-		wr32(PMGR_PERF_STATE2_W0, 0x01220001U);
+	/*
+	 * Ensure Performance State Table entry 2 (850 MHz, div=1) is populated.
+	 * Keep W0[3:0] = 2 (0x01220002) so the 51.3 MHz UART clock does not
+	 * double when switching from the 212.5 MHz boot state to 850 MHz.
+	 */
+	if (rd32(PMGR_PERF_STATE2_W0) != 0x01220002U) {
+		wr32(PMGR_PERF_STATE2_W0, 0x01220002U);
 		wr32(PMGR_PERF_STATE2_W1, 0x00210141U);
 		wr32(PMGR_PERF_STATE2_W2, 0x00000021U);
 		wr32(PMGR_PERF_STATE2_W3, 0x00000000U);

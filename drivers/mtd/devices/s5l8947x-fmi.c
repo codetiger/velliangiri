@@ -33,11 +33,13 @@
  */
 
 #include <linux/bitfield.h>
+#include <linux/bitmap.h>
 #include <linux/clk.h>
 #include <linux/completion.h>
 #include <linux/delay.h>
 #include <linux/dma-mapping.h>
 #include <linux/dmaengine.h>
+#include <linux/etherdevice.h>
 #include <linux/io.h>
 #include <linux/interrupt.h>
 #include <linux/iopoll.h>
@@ -163,6 +165,22 @@
 #define FMI_POLL_US		200000
 #define FMI_SPIN_US		5	/* busy-wait this long before sleeping (measured best) */
 #define FMI_IRQ_MS		20	/* longer waits continue by polling */
+#define FMI_RESERVED_BLOCKS	16	/* top SLC blocks per CAU (system config + key store) */
+#define FMI_MAX_PEBS		2560
+
+#define SCFG_HDR_LEN		0x80
+#define SCFG_HDR_VERSION	0x20
+#define SCFG_HDR_COPY_VER	0x28
+#define SCFG_MAGIC		0x53436667
+#define SCFG_COUNT		0x14
+#define SCFG_ENTRIES		0x18
+#define SCFG_ENTRY_SIZE		0x14
+#define SCFG_TAG_CNTB		0x434e5442
+#define SCFG_TAG_SRNM		0x53724e6d
+#define SCFG_TAG_MODN		0x4d6f6423
+#define SCFG_TAG_EMAC		0x454d6163
+#define SCFG_TAG_WMAC		0x574d6163
+#define SCFG_TAG_BMAC		0x424d6163
 
 static bool use_irq = true;
 module_param(use_irq, bool, 0644);
@@ -171,6 +189,14 @@ MODULE_PARM_DESC(use_irq, "Sleep on the FMI interrupt instead of polling (defaul
 static uint spin_us = FMI_SPIN_US;
 module_param(spin_us, uint, 0644);
 MODULE_PARM_DESC(spin_us, "Busy-wait before sleeping on the interrupt, in microseconds");
+
+static bool slc_mode;
+module_param(slc_mode, bool, 0444);
+MODULE_PARM_DESC(slc_mode, "Expose data blocks 1..1047 as an interleaved 2 MiB SLC MTD for UBI");
+
+static bool raw_erase_slc;
+module_param(raw_erase_slc, bool, 0644);
+MODULE_PARM_DESC(raw_erase_slc, "Set the SLC row bit on erases when slc_mode is false");
 
 static const u8 mn_signature[3] = { 0x50, 0x50, 0x4e };
 
@@ -192,12 +218,15 @@ struct s5l_fmi {
 	struct completion irq_done;
 	int irq;
 	bool irq_broken;	/* an operation finished without raising it */
+	bool slc_mode;		/* interleaved SLC data mode across CAUs */
 	struct mutex lock;
 	struct mtd_info mtd;
 
 	u32 caus;
 	u32 blocks;		/* per CAU */
-	u32 pages;		/* per block */
+	u32 data_blocks;	/* per CAU, excluding top reserved SLC blocks */
+	u32 pages;		/* MLC pages per block */
+	u32 slc_pages;		/* SLC pages per block (pages / 2) */
 	u32 cau_bits;
 	u32 block_bits;
 	u32 page_bits;
@@ -205,6 +234,15 @@ struct s5l_fmi {
 	u32 lps;		/* logical pages per page */
 	u32 trst_ms;
 	u32 timing;		/* sequencer interface timing */
+	u32 cached_row;		/* row currently in buf, or U32_MAX */
+	int cached_ret;		/* return status of cached_row */
+	DECLARE_BITMAP(bad_blocks, FMI_MAX_PEBS);
+
+	char serial[17];
+	char model[17];
+	u8 emac[ETH_ALEN];
+	u8 wmac[ETH_ALEN];
+	u8 bmac[ETH_ALEN];
 };
 
 static int s5l_fmi_wait(struct s5l_fmi *fmi, void __iomem *reg, u32 mask, const char *what)
@@ -619,27 +657,45 @@ static int s5l_fmi_erase_block(struct s5l_fmi *fmi, u32 row)
 	return st;
 }
 
-static u32 s5l_fmi_row(struct s5l_fmi *fmi, u64 page, bool slc)
+static u32 s5l_fmi_raw_row(struct s5l_fmi *fmi, u32 cau, u32 block, u32 pg, bool slc)
 {
-	u32 pg = do_div(page, fmi->pages);
-	u32 block = do_div(page, fmi->blocks);
-	u32 cau = page;
-	u32 row = cau << (fmi->block_bits + fmi->page_bits) | block << fmi->page_bits | pg;
+	u32 row = cau << (fmi->block_bits + fmi->page_bits) |
+		  block << fmi->page_bits | pg;
 
 	if (slc)
 		row |= BIT(fmi->cau_bits + fmi->block_bits + fmi->page_bits);
 	return row;
 }
 
-/*
- * Read a page with one recovery attempt on a stuck package. Returns the
- * bitflips to report (1 when the package asks for a refresh), -EBADMSG with
- * the data still in the buffer, or another error.
- */
-static int s5l_fmi_read_one(struct s5l_fmi *fmi, u64 page, bool slc)
+static u32 s5l_fmi_row(struct s5l_fmi *fmi, u64 page, bool slc)
 {
-	u32 row = s5l_fmi_row(fmi, page, slc);
-	int st, tries;
+	u32 pg, block, cau;
+
+	if (fmi->slc_mode) {
+		pg = do_div(page, fmi->slc_pages);
+		cau = do_div(page, fmi->caus);
+		block = 1 + (u32)page;
+		slc = true;
+	} else {
+		pg = do_div(page, fmi->pages);
+		block = do_div(page, fmi->blocks);
+		cau = page;
+	}
+	return s5l_fmi_raw_row(fmi, cau, block, pg, slc);
+}
+
+/*
+ * Read a page with one recovery attempt on a stuck package, caching the last
+ * successfully read row in fmi->buf so back-to-back partial page reads (such
+ * as UBI EC/VID header checks) do not repeat the DMA transfer.
+ */
+static int s5l_fmi_read_row(struct s5l_fmi *fmi, u32 row)
+{
+	int st, tries, ret;
+
+	if (fmi->cached_row == row)
+		return fmi->cached_ret;
+	fmi->cached_row = U32_MAX;
 
 	for (tries = 0; tries < 2; tries++) {
 		st = s5l_fmi_read_page(fmi, row);
@@ -653,16 +709,26 @@ static int s5l_fmi_read_one(struct s5l_fmi *fmi, u64 page, bool slc)
 	switch (st) {
 	case MN_ST_OK:
 	case MN_ST_BLANK:
-		return 0;
+		ret = 0;
+		break;
 	case MN_ST_REFRESH:
 		fmi->mtd.ecc_stats.corrected++;
-		return 1;
+		ret = 1;
+		break;
 	default:
 		if (st < 0 || (st & MN_ST_GENERAL_ERROR))
 			return -EIO;
 		fmi->mtd.ecc_stats.failed++;
 		return -EBADMSG;
 	}
+	fmi->cached_row = row;
+	fmi->cached_ret = ret;
+	return ret;
+}
+
+static int s5l_fmi_read_one(struct s5l_fmi *fmi, u64 page, bool slc)
+{
+	return s5l_fmi_read_row(fmi, s5l_fmi_row(fmi, page, slc));
 }
 
 static int s5l_fmi_mtd_read_oob(struct mtd_info *mtd, loff_t from, struct mtd_oob_ops *ops)
@@ -742,6 +808,7 @@ static int s5l_fmi_write_one(struct s5l_fmi *fmi, u64 page, bool slc)
 {
 	u32 row = s5l_fmi_row(fmi, page, slc);
 
+	fmi->cached_row = U32_MAX;
 	return s5l_fmi_finish_op(fmi, row, s5l_fmi_write_page(fmi, row), "program");
 }
 
@@ -749,6 +816,7 @@ static int s5l_fmi_erase_one(struct s5l_fmi *fmi, u64 page, bool slc)
 {
 	u32 row = s5l_fmi_row(fmi, page, slc);
 
+	fmi->cached_row = U32_MAX;
 	return s5l_fmi_finish_op(fmi, row, s5l_fmi_erase_block(fmi, row), "erase");
 }
 
@@ -769,6 +837,7 @@ static int s5l_fmi_mtd_write_oob(struct mtd_info *mtd, loff_t to, struct mtd_oob
 		return -EINVAL;
 
 	mutex_lock(&fmi->lock);
+	fmi->cached_row = U32_MAX;
 	while (dlen || olen) {
 		size_t n = 0;
 
@@ -817,7 +886,8 @@ static int s5l_fmi_mtd_erase(struct mtd_info *mtd, struct erase_info *instr)
 
 	mutex_lock(&fmi->lock);
 	while (len) {
-		ret = s5l_fmi_erase_one(fmi, addr >> mtd->writesize_shift, false);
+		ret = s5l_fmi_erase_one(fmi, addr >> mtd->writesize_shift,
+					READ_ONCE(raw_erase_slc));
 		if (ret) {
 			instr->fail_addr = addr;
 			break;
@@ -853,9 +923,221 @@ static const struct mtd_ooblayout_ops s5l_fmi_ooblayout = {
 
 static int s5l_fmi_mtd_block_isbad(struct mtd_info *mtd, loff_t ofs)
 {
-	/* The package retires bad blocks itself. */
+	struct s5l_fmi *fmi = mtd->priv;
+	u32 eb = mtd_div_by_eb(ofs, mtd);
+
+	if (eb >= FMI_MAX_PEBS)
+		return -EINVAL;
+	return test_bit(eb, fmi->bad_blocks);
+}
+
+static int s5l_fmi_mtd_block_markbad(struct mtd_info *mtd, loff_t ofs)
+{
+	struct s5l_fmi *fmi = mtd->priv;
+	u32 eb = mtd_div_by_eb(ofs, mtd);
+
+	if (eb >= FMI_MAX_PEBS)
+		return -EINVAL;
+	if (!test_and_set_bit(eb, fmi->bad_blocks))
+		mtd->ecc_stats.badblocks++;
 	return 0;
 }
+
+static void s5l_fmi_set_dt_mac(const char *compat, const char *propname,
+			       const u8 *mac, bool reverse)
+{
+	struct device_node *np = of_find_compatible_node(NULL, NULL, compat);
+	struct property *prop;
+	u8 *dst;
+	int i;
+
+	if (!np)
+		return;
+	prop = kzalloc(sizeof(*prop) + ETH_ALEN, GFP_KERNEL);
+	if (!prop)
+		goto out;
+	prop->name = kstrdup(propname, GFP_KERNEL);
+	if (!prop->name) {
+		kfree(prop);
+		goto out;
+	}
+	dst = (u8 *)(prop + 1);
+	if (reverse) {
+		for (i = 0; i < ETH_ALEN; i++)
+			dst[i] = mac[ETH_ALEN - 1 - i];
+	} else {
+		ether_addr_copy(dst, mac);
+	}
+	prop->value = dst;
+	prop->length = ETH_ALEN;
+	if (of_update_property(np, prop)) {
+		kfree(prop->name);
+		kfree(prop);
+	}
+out:
+	of_node_put(np);
+}
+
+static void s5l_fmi_copy_ascii(char *dst, size_t dst_size, const u8 *src, u32 len)
+{
+	size_t i, max = min_t(size_t, len, dst_size - 1);
+
+	for (i = 0; i < max && src[i] >= 0x20 && src[i] < 0x7f; i++)
+		dst[i] = src[i];
+	dst[i] = '\0';
+}
+
+/*
+ * Read the system configuration block from the top 16 reserved SLC blocks of
+ * each CAU before registering the MTD device, so MAC addresses are patched
+ * into the live Device Tree even when the stock FTL is not loaded.
+ */
+static void s5l_fmi_read_syscfg(struct s5l_fmi *fmi)
+{
+	u32 scfg_max = fmi->page_size - SCFG_HDR_LEN;
+	u32 cau, blk, best_ver = 0;
+	const u8 *buf = fmi->buf;
+	u32 count, i;
+	u8 *best;
+
+	if (fmi->page_size <= SCFG_HDR_LEN + SCFG_ENTRIES)
+		return;
+	best = kmalloc(scfg_max, GFP_KERNEL);
+	if (!best)
+		return;
+
+	for (cau = 0; cau < fmi->caus; cau++) {
+		for (blk = fmi->data_blocks; blk < fmi->blocks; blk++) {
+			u32 row = s5l_fmi_raw_row(fmi, cau, blk, 0, true);
+			u32 ver;
+
+			if (s5l_fmi_read_row(fmi, row) < 0 ||
+			    get_unaligned_le32(buf + SCFG_HDR_VERSION) != 1 ||
+			    get_unaligned_le32(buf + SCFG_HDR_LEN) != SCFG_MAGIC)
+				continue;
+			ver = get_unaligned_le32(buf + SCFG_HDR_COPY_VER);
+			if (!best_ver || ver >= best_ver) {
+				memcpy(best, buf + SCFG_HDR_LEN, scfg_max);
+				best_ver = ver ? ver : 1;
+			}
+		}
+	}
+	if (!best_ver)
+		goto out;
+
+	count = get_unaligned_le32(best + SCFG_COUNT);
+	count = min_t(u32, count, (scfg_max - SCFG_ENTRIES) / SCFG_ENTRY_SIZE);
+	for (i = 0; i < count; i++) {
+		const u8 *e = best + SCFG_ENTRIES + i * SCFG_ENTRY_SIZE;
+		u32 tag = get_unaligned_le32(e);
+		const u8 *val = e + 4;
+		u32 vlen = 16;
+
+		if (tag == SCFG_TAG_CNTB) {
+			u32 voff = get_unaligned_le32(e + 12);
+
+			tag = get_unaligned_le32(e + 4);
+			vlen = get_unaligned_le32(e + 8);
+			if (voff >= scfg_max || vlen > scfg_max - voff)
+				continue;
+			val = best + voff;
+		}
+		switch (tag) {
+		case SCFG_TAG_SRNM:
+			s5l_fmi_copy_ascii(fmi->serial, sizeof(fmi->serial), val, vlen);
+			break;
+		case SCFG_TAG_MODN:
+			s5l_fmi_copy_ascii(fmi->model, sizeof(fmi->model), val, vlen);
+			break;
+		case SCFG_TAG_EMAC:
+			if (vlen >= ETH_ALEN && is_valid_ether_addr(val))
+				ether_addr_copy(fmi->emac, val);
+			break;
+		case SCFG_TAG_WMAC:
+			if (vlen >= ETH_ALEN && is_valid_ether_addr(val))
+				ether_addr_copy(fmi->wmac, val);
+			break;
+		case SCFG_TAG_BMAC:
+			if (vlen >= ETH_ALEN && is_valid_ether_addr(val))
+				ether_addr_copy(fmi->bmac, val);
+			break;
+		}
+	}
+
+	if (is_valid_ether_addr(fmi->emac))
+		s5l_fmi_set_dt_mac("apple,s5l8947x-ethernet", "local-mac-address",
+				   fmi->emac, false);
+	if (is_valid_ether_addr(fmi->wmac))
+		s5l_fmi_set_dt_mac("usba5c,bd1a", "local-mac-address",
+				   fmi->wmac, false);
+	if (is_valid_ether_addr(fmi->bmac))
+		s5l_fmi_set_dt_mac("brcm,bcm4334-bt", "local-bd-address",
+				   fmi->bmac, true);
+
+	dev_info(fmi->dev,
+		 "system config: serial %s, model %s, emac %pM, wmac %pM, bmac %pM\n",
+		 fmi->serial[0] ? fmi->serial : "-",
+		 fmi->model[0] ? fmi->model : "-",
+		 fmi->emac, fmi->wmac, fmi->bmac);
+out:
+	kfree(best);
+}
+
+static ssize_t serial_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct s5l_fmi *fmi = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%s\n", fmi->serial);
+}
+static DEVICE_ATTR_RO(serial);
+
+static ssize_t model_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct s5l_fmi *fmi = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "%s\n", fmi->model);
+}
+static DEVICE_ATTR_RO(model);
+
+static ssize_t emac_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct s5l_fmi *fmi = dev_get_drvdata(dev);
+
+	if (!is_valid_ether_addr(fmi->emac))
+		return sysfs_emit(buf, "\n");
+	return sysfs_emit(buf, "%pM\n", fmi->emac);
+}
+static DEVICE_ATTR_RO(emac);
+
+static ssize_t wmac_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct s5l_fmi *fmi = dev_get_drvdata(dev);
+
+	if (!is_valid_ether_addr(fmi->wmac))
+		return sysfs_emit(buf, "\n");
+	return sysfs_emit(buf, "%pM\n", fmi->wmac);
+}
+static DEVICE_ATTR_RO(wmac);
+
+static ssize_t bmac_show(struct device *dev, struct device_attribute *attr, char *buf)
+{
+	struct s5l_fmi *fmi = dev_get_drvdata(dev);
+
+	if (!is_valid_ether_addr(fmi->bmac))
+		return sysfs_emit(buf, "\n");
+	return sysfs_emit(buf, "%pM\n", fmi->bmac);
+}
+static DEVICE_ATTR_RO(bmac);
+
+static struct attribute *s5l_fmi_attrs[] = {
+	&dev_attr_serial.attr,
+	&dev_attr_model.attr,
+	&dev_attr_emac.attr,
+	&dev_attr_wmac.attr,
+	&dev_attr_bmac.attr,
+	NULL,
+};
+ATTRIBUTE_GROUPS(s5l_fmi);
 
 static u32 s5l_fmi_le32(const u8 *p, unsigned int off)
 {
@@ -929,7 +1211,8 @@ static int s5l_fmi_identify(struct s5l_fmi *fmi)
 
 	if (!fmi->caus || fmi->caus > BIT(fmi->cau_bits) || fmi->cau_bits > 6 ||
 	    !fmi->blocks || fmi->blocks > BIT(fmi->block_bits) ||
-	    fmi->pages != BIT(fmi->page_bits) || fmi->block_bits > 15 ||
+	    fmi->pages != BIT(fmi->page_bits) || fmi->pages < 2 ||
+	    fmi->block_bits > 15 ||
 	    fmi->page_size < FMI_LP_SIZE || fmi->page_size % FMI_LP_SIZE ||
 	    fmi->page_size > SZ_16K * 2 ||
 	    fmi->cau_bits + fmi->block_bits + fmi->page_bits > 30) {
@@ -938,11 +1221,15 @@ static int s5l_fmi_identify(struct s5l_fmi *fmi)
 				    fmi->caus, fmi->blocks, fmi->pages, fmi->page_size);
 		goto out;
 	}
+	fmi->data_blocks = fmi->blocks > FMI_RESERVED_BLOCKS ?
+			   fmi->blocks - FMI_RESERVED_BLOCKS : fmi->blocks;
+	fmi->slc_pages = fmi->pages / 2;
 	fmi->lps = fmi->page_size / FMI_LP_SIZE;
 	fmi->timing = s5l_fmi_timing(p);
 	dev_info(fmi->dev,
-		 "managed NAND %5ph: %u CAUs x %u blocks x %u pages x %u bytes, timing %#x\n",
-		 id + 3, fmi->caus, fmi->blocks, fmi->pages, fmi->page_size, fmi->timing);
+		 "managed NAND %5ph: %u CAUs x %u blocks x %u pages x %u bytes, timing %#x%s\n",
+		 id + 3, fmi->caus, fmi->blocks, fmi->pages, fmi->page_size, fmi->timing,
+		 fmi->slc_mode ? " (SLC data mode)" : "");
 out:
 	kfree(p);
 	return ret;
@@ -1021,8 +1308,11 @@ static int s5l_fmi_probe(struct platform_device *pdev)
 	if (!fmi)
 		return -ENOMEM;
 	fmi->dev = dev;
+	fmi->cached_row = U32_MAX;
+	fmi->slc_mode = slc_mode || of_property_read_bool(dev->of_node, "apple,slc-data-mode");
 	mutex_init(&fmi->lock);
 	init_completion(&fmi->irq_done);
+	platform_set_drvdata(pdev, fmi);
 
 	fmi->host = devm_platform_get_and_ioremap_resource(pdev, 0, &res);
 	if (IS_ERR(fmi->host))
@@ -1060,6 +1350,8 @@ static int s5l_fmi_probe(struct platform_device *pdev)
 	ret = s5l_fmi_identify(fmi);
 	if (ret)
 		return ret;
+	if (fmi->slc_mode && fmi->data_blocks <= 1)
+		return dev_err_probe(dev, -EINVAL, "not enough data blocks for SLC mode\n");
 	writel(fmi->timing, fmi->seq + FMI_S_TIMING);
 
 	fmi->dma_dev = fmi->data_chan->device->dev;
@@ -1071,17 +1363,16 @@ static int s5l_fmi_probe(struct platform_device *pdev)
 	if (ret)
 		return ret;
 
+	s5l_fmi_read_syscfg(fmi);
+
 	mtd = &fmi->mtd;
 	mtd->priv = fmi;
 	mtd->dev.parent = dev;
 	mtd->owner = THIS_MODULE;
 	mtd->name = dev_name(dev);
-	mtd->type = MTD_MLCNANDFLASH;
 	mtd->flags = MTD_CAP_NANDFLASH;
 	mtd->writesize = fmi->page_size;
 	mtd->writebufsize = fmi->page_size;
-	mtd->erasesize = fmi->page_size * fmi->pages;
-	mtd->size = (u64)mtd->erasesize * fmi->blocks * fmi->caus;
 	mtd->oobsize = fmi->lps * FMI_LP_META;
 	mtd->oobavail = mtd->oobsize;
 	mtd->ecc_step_size = FMI_LP_SIZE;
@@ -1091,24 +1382,40 @@ static int s5l_fmi_probe(struct platform_device *pdev)
 	mtd->_erase = s5l_fmi_mtd_erase;
 	mtd->_read_oob = s5l_fmi_mtd_read_oob;
 	mtd->_write_oob = s5l_fmi_mtd_write_oob;
-
-	/* One erase region per CAU, so users can find a block's twin in each. */
-	regions = devm_kcalloc(dev, fmi->caus, sizeof(*regions), GFP_KERNEL);
-	if (!regions)
-		return -ENOMEM;
-	for (i = 0; i < fmi->caus; i++) {
-		regions[i].offset = (u64)i * fmi->blocks * mtd->erasesize;
-		regions[i].erasesize = mtd->erasesize;
-		regions[i].numblocks = fmi->blocks;
-	}
-	mtd->eraseregions = regions;
-	mtd->numeraseregions = fmi->caus;
 	mtd->_block_isbad = s5l_fmi_mtd_block_isbad;
+	mtd->_block_markbad = s5l_fmi_mtd_block_markbad;
 
+	if (fmi->slc_mode) {
+		/*
+		 * Interleaved 2 MiB SLC mode across physical blocks 1..1047 of
+		 * all CAUs. Block 0 (boot pages) and the top 16 reserved SLC
+		 * blocks (system config and key store) are excluded.
+		 */
+		mtd->type = MTD_NANDFLASH;
+		mtd->erasesize = fmi->page_size * fmi->slc_pages;
+		mtd->size = (u64)mtd->erasesize * (fmi->data_blocks - 1) * fmi->caus;
+	} else {
+		mtd->type = MTD_MLCNANDFLASH;
+		mtd->erasesize = fmi->page_size * fmi->pages;
+		mtd->size = (u64)mtd->erasesize * fmi->blocks * fmi->caus;
+
+		/* One erase region per CAU, so users can find a block's twin in each. */
+		regions = devm_kcalloc(dev, fmi->caus, sizeof(*regions), GFP_KERNEL);
+		if (!regions)
+			return -ENOMEM;
+		for (i = 0; i < fmi->caus; i++) {
+			regions[i].offset = (u64)i * fmi->blocks * mtd->erasesize;
+			regions[i].erasesize = mtd->erasesize;
+			regions[i].numblocks = fmi->blocks;
+		}
+		mtd->eraseregions = regions;
+		mtd->numeraseregions = fmi->caus;
+	}
+
+	mtd_set_of_node(mtd, dev->of_node);
 	ret = mtd_device_register(mtd, NULL, 0);
 	if (ret)
 		return ret;
-	platform_set_drvdata(pdev, fmi);
 	return 0;
 }
 
@@ -1131,6 +1438,7 @@ static struct platform_driver s5l_fmi_driver = {
 	.driver	= {
 		.name		= "s5l8947x-fmi",
 		.of_match_table	= s5l_fmi_of_match,
+		.dev_groups	= s5l_fmi_groups,
 	},
 };
 module_platform_driver(s5l_fmi_driver);

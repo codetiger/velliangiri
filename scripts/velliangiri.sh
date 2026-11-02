@@ -65,12 +65,20 @@ case "${CMD}" in
 	bundle)
 		run_in_container bash scripts/build-bundle.sh "$@"
 		;;
+	nandboot)
+		run_in_container bash scripts/nandboot/build-nandboot.sh "$@"
+		;;
+	bootslot)
+		run_in_container bash scripts/build-bootslot.sh "$@"
+		;;
 	all)
 		run_in_container bash -c '
 			set -euo pipefail
 			bash scripts/build-alpine-rootfs.sh
 			bash scripts/build-kernel.sh
 			bash scripts/build-bundle.sh
+			bash scripts/nandboot/build-nandboot.sh
+			bash scripts/build-bootslot.sh
 		'
 		;;
 	clean)

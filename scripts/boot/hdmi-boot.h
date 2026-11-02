@@ -16,7 +16,12 @@
 #define VELLIANGIRI_HDMI_BOOT_H
 
 #include <stdint.h>
+#ifndef BOOT_SPLASH
+#define BOOT_SPLASH		1
+#endif
+#if BOOT_SPLASH
 #include "splash.h"
+#endif
 
 /* CEA-861 1920x1080p30: 74.25 MHz, positive syncs */
 #define S5L_FB_PHYS		0x9e400000U
@@ -436,8 +441,17 @@ static int hdmi_start_video(const uint8_t *phy_cfg, int hdmi_mode)
 
 static int hdmi_boot_init(void)
 {
+#if BOOT_SPLASH
 	splash_draw((volatile uint32_t *)S5L_FB_PHYS, S5L_FB_W, S5L_FB_H,
 		    S5L_STRIDE / S5L_BPP);
+#else
+	volatile uint32_t *fb = (volatile uint32_t *)S5L_FB_PHYS;
+	uint32_t words = (S5L_STRIDE * S5L_FB_H) / 4;
+	uint32_t i;
+
+	for (i = 0; i < words; i++)
+		fb[i] = 0xff000000U;
+#endif
 	hdmi_gate(GATE_HPERF_RT_A, 1);
 	hdmi_gate(GATE_HPERF_RT_B, 1);
 	hdmi_gate(GATE_RGBOUT_A, 1);

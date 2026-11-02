@@ -6,16 +6,17 @@ export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 export HOME=/root USER=root LOGNAME=root SHELL=/bin/sh
 
 log_msg() {
-	echo "[velliangiri] $*" >/dev/kmsg 2>/dev/null || echo "[velliangiri] $*"
+	read -r up _ < /proc/uptime 2>/dev/null || up="?"
+	echo "[velliangiri +${up}s] $*" >/dev/kmsg 2>/dev/null || echo "[velliangiri +${up}s] $*"
 }
 
 clean_shutdown() {
 	log_msg "syncing and unmounting NAND filesystems before $1..."
 	sync
-	# Stop the daemons that write to Data before unmounting it
-	killall bluetoothd 2>/dev/null || true
+	# Stop the daemons that use or write to Data before unmounting it
+	killall weston seatd bluetoothd 2>/dev/null || true
 	if [ -r /proc/mounts ]; then
-		awk '$1 ~ /^\/dev\/nand/ || $3 == "hfsplus" { print $2 }' /proc/mounts | sort -r | while read -r mp; do
+		awk '$1 ~ /^\/dev\/(nand|loop)/ || $3 == "hfsplus" || $3 == "squashfs" { print $2 }' /proc/mounts | sort -r | while read -r mp; do
 			if ! umount "$mp" 2>/dev/null; then
 				mount -o remount,ro "$mp" 2>/dev/null || true
 				umount -l "$mp" 2>/dev/null || true
@@ -265,20 +266,25 @@ if [ "$missing" = 1 ] && [ -b /dev/nand0p1 ]; then
 fi
 
 if [ "$DATA" = 1 ]; then
-	# The Mesa userspace (tools/mesa-sgx) is not in the initramfs: the root
-	# is a ramfs, and a GL install is too large to carry there.  install.sh
-	# leaves the same tarball on Data, so every boot unpacks it before any
-	# GL program can run.
+	# Mount the pre-packed usr-local SquashFS image (Mesa + Weston) directly
+	# onto /usr/local via loop device, or fall back to unpacking the tarballs
+	# into ramfs if the SquashFS image is not yet installed on Data.
+	USR_LOCAL_SQSH=/mnt/data/linux/lib/usr-local.sqsh
 	MESA_TAR=/mnt/data/linux/lib/sgx-mesa-install.tar
+	WESTON_TAR=/mnt/data/linux/lib/weston-armv7.tar
 	MESA_DIR=/usr/local/lib/sgx-mesa
-	if [ -s "$MESA_TAR" ] && [ ! -s "$MESA_DIR/lib/libEGL.so.1" ]; then
-		if tar -xf "$MESA_TAR" -C / 2>/dev/null; then
-			chmod +x "$MESA_DIR/bin/"* 2>/dev/null
-			mkdir -p /usr/local/bin
+	mkdir -p /usr/local
+	if [ -s "$USR_LOCAL_SQSH" ] && mount -t squashfs -o ro,loop "$USR_LOCAL_SQSH" /usr/local 2>/dev/null; then
+		log_msg "nand0p2: mounted usr-local.sqsh on /usr/local"
+	else
+		mkdir -p /usr/local/bin /usr/local/lib /usr/local/share
+		if [ -s "$MESA_TAR" ] && tar -xf "$MESA_TAR" -C / 2>/dev/null; then
+			chmod +x "$MESA_DIR/bin/"* 2>/dev/null || true
 			ln -sf "$MESA_DIR/bin/sgx-gl" /usr/local/bin/sgx-gl
-			log_msg "nand0p2: Mesa userspace unpacked from cache"
-		else
-			log_msg "nand0p2: the cached Mesa tarball did not unpack"
+			log_msg "nand0p2: unpacked Mesa into /usr/local"
+		fi
+		if [ -s "$WESTON_TAR" ] && tar -xf "$WESTON_TAR" -C / 2>/dev/null; then
+			log_msg "nand0p2: unpacked Weston into /usr/local"
 		fi
 	fi
 	if [ -s "$MESA_DIR/lib/libEGL.so.1" ] &&
@@ -286,16 +292,6 @@ if [ "$DATA" = 1 ]; then
 		mkdir -p /etc
 		printf '%s\n' "$MESA_DIR/lib:/usr/local/lib:/lib:/usr/lib" > /etc/ld-musl-armhf.path
 		log_msg "nand0p2: Mesa is the system's GL"
-	fi
-	# Weston (tools/weston) is installed the same way: a tarball on Data,
-	# unpacked under /usr/local at boot (its Mesa is the one above).
-	WESTON_TAR=/mnt/data/linux/lib/weston-armv7.tar
-	if [ -s "$WESTON_TAR" ] && [ ! -s /usr/local/bin/weston ]; then
-		if tar -xf "$WESTON_TAR" -C / 2>/dev/null; then
-			log_msg "nand0p2: Weston unpacked from cache"
-		else
-			log_msg "nand0p2: the cached Weston tarball did not unpack"
-		fi
 	fi
 	if [ -s "$PDIR/dropbear/dropbear_ed25519_host_key" ]; then
 		mkdir -p /etc/dropbear
@@ -338,7 +334,7 @@ fi
 
 # Bring up Fast Ethernet (eth0) via DHCP in background
 if [ -d /sys/class/net/eth0 ] || ip link show eth0 >/dev/null 2>&1; then
-	EMAC=$(cat /sys/block/nand0/emac 2>/dev/null)
+	EMAC=$(cat /sys/bus/platform/devices/31200000.nand-controller/emac /sys/block/nand0/emac 2>/dev/null | head -n 1)
 	if [ -n "$EMAC" ]; then
 		ip link set eth0 down 2>/dev/null || true
 		ip link set eth0 address "$EMAC" 2>/dev/null || true
@@ -361,7 +357,8 @@ if [ -s /lib/firmware/brcm/brcmfmac4334.bin ] && [ ! -d /sys/class/net/wlan0 ]; 
 		fi
 	done
 fi
-if [ "$BT_REBIND" = 1 ] || [ -n "$(cat /sys/block/nand0/bmac 2>/dev/null)" ]; then
+BMAC=$(cat /sys/bus/platform/devices/31200000.nand-controller/bmac /sys/block/nand0/bmac 2>/dev/null | head -n 1)
+if [ "$BT_REBIND" = 1 ] || [ -n "$BMAC" ]; then
 	for sdev in /sys/bus/serial/drivers/hci_uart_bcm/serial*-*; do
 		[ -e "$sdev" ] || continue
 		echo "${sdev##*/}" >/sys/bus/serial/drivers/hci_uart_bcm/unbind 2>/dev/null || true
