@@ -11,8 +11,8 @@ brought over unchanged except for the two things this port does differently
 | `files/src/gallium/drivers/sgx/` | the Gallium driver: screen, context, VDM streams, the template frame, render target data, the USSE compiler, textures | MIT |
 | `files/src/gallium/winsys/sgx/drm/` | the winsys: one screen for the render node's fd | MIT |
 | `files/src/gallium/drivers/sgx/drm-shim/` | a pretend render node, for running the driver on a PC (optional) | MIT |
-| `mesa.patch` | the lines that register the driver with Mesa (a meson option, the subdirectories, the DRM descriptor, the pipe loader, dril) | MIT |
-| `gl/` | the test programs: `glclear`, `gltri`, `glfs`, `gltex`, `glblend`, `gldepth`, `glsize` | GPL-2.0-only |
+| `mesa.patch` | the lines that register the driver with Mesa (a meson option, the subdirectories, the DRM descriptor, the pipe loader, dril, and kmsro) | MIT |
+| `gl/` | the test programs: `glclear`, `gltri`, `glfs`, `gltex`, `glblend`, `gldepth`, `glsize`, `gbmtest`, `glclear-gl` | GPL-2.0-only |
 | `container.conf` | the image Mesa is built in: Alpine armv7, musl, the same libraries the device has | — |
 | `fetch.sh` | Mesa at the pinned tag into `build/mesa/src` (on the host: git under emulation is far too slow) | GPL-2.0-only |
 | `build.sh` | the driver in, configure, build, install, pack (inside the image) | GPL-2.0-only |
@@ -25,7 +25,7 @@ allows only the file types `scripts/check-no-proprietary.sh` lists — and
 
 ## What this port changed
 
-Three files, and nothing else:
+The driver came over unchanged.  What this port adds around it:
 
 - **`sgx_frame.c`** — `event_template()` reads the 3D pass's event program
   from `/lib/firmware/s5l8947x/gl-event.pds` (`SGX_EVENT` names another
@@ -42,6 +42,15 @@ Three files, and nothing else:
   where the event program is; and `GL_RENDERER` names the part the kernel
   found ("PowerVR SGX543MP1" here) instead of the reference's fixed
   "SGX543MP2".
+- **kmsro** — `sgx_screen.c`, `sgx_resource.c` and the winsys take the
+  `struct renderonly` a display's GBM device hands them: a resource bound for
+  scanout is allocated contiguous (`APPLE_SGX_BO_CONTIGUOUS`, so its dma-buf
+  has a one-entry scatter/gather table), imported into the display at
+  creation, and `WINSYS_HANDLE_TYPE_KMS` returns the display's handle.  The
+  winsys also exports `sgx_drm_screen_create_renderonly()`, and
+  `mesa.patch` teaches kmsro that the `apple_sgx` render node pairs with
+  this port's display (`s5l8947x`), including the DRI name the GLX loader
+  asks for.
 
 The kernel's interface header is **not** copied from the reference: the
 build puts `include/uapi/drm/apple_sgx_drm.h` from this tree into Mesa's
@@ -114,6 +123,75 @@ sgx: SGX543MP1 rev 1.2.2, clears on the CPU     <- no event program (see dmesg)
 template-frame directory.  The driver's own knobs (`SGX_DEBUG`,
 `SGX_FRAME`, `SGX_NOCC`, `SGX_DEBUG_DRAW`, ...) are documented in the
 reference's `mesa/README.md` and in the headers.
+
+## On the display: EGL/GBM and kmsro
+
+The display device (`/dev/dri/card1`, kernel driver `s5l8947x`) has no 3D
+driver of its own.  Mesa's kmsro pairs it with the `apple_sgx` render node:
+GBM opens the display, EGL gets a screen that allocates on the render node
+and imports the scanout buffers into the display, and a page flip shows
+them.  The pairing is in `mesa.patch` (the pipe loader's platform render
+devices, kmsro's `apple_sgx` branch, and the `s5l8947x` DRI name for GLX).
+
+`gbmtest` exercises it end to end:
+
+```sh
+sgx-gl gbmtest 120                    # 120 frames on HDMI, then the console
+sgx-gl gbmtest 120 /dev/dri/card1
+```
+
+It keeps the console's mode (it sets none), clears and draws into each
+GBM surface buffer, checks one pixel through `glReadPixels`, and flips with
+`DRM_MODE_PAGE_FLIP_EVENT`; on exit it puts the console's framebuffer back.
+The buffers are SGX render targets the display scans out -- no CPU copy and
+no `/dev/fb0`.
+
+Scanout resources are allocated with `APPLE_SGX_BO_CONTIGUOUS`, because the
+display's DMA-GEM import accepts only a one-entry scatter/gather table;
+the SGX side needs no change to render into one.  `sgx_resource_get_param()`
+reports the stride, offset and the linear modifier kmsro asks for.
+
+## The desktop build
+
+The default image is OpenGL ES only (`-Dplatforms= -Dglx=disabled
+-Dopengl=false`), because the device has neither X nor Wayland.  The
+desktop variant adds them:
+
+```sh
+MESA_BUILD=desktop bash tools/mesa-sgx/build.sh      # in the container
+# or, on the host:
+MESA_BUILD=desktop ./scripts/velliangiri.sh mesa
+```
+
+It packs `build/mesa-sgx-install-desktop.tar` with `libGL`, GLX, the X11 and
+Wayland EGL platforms, desktop OpenGL, and the X11/Wayland libraries they
+link against.  `MESA_BUILD=desktop tools/mesa-sgx/install.sh --system`
+installs it; `sgx-gl glclear-gl` checks desktop OpenGL through EGL (GLX
+itself needs an X server, which this image does not have).  For GLX the
+loader needs the megadriver directory:
+
+```sh
+LIBGL_DRIVERS_PATH=/usr/local/lib/sgx-mesa/lib/dri
+```
+
+`sgx-gl` sets it, along with `GBM_BACKENDS_PATH`.  Verified on the device:
+`glclear-gl` reports `GL_VERSION 2.1 Mesa 26.1.8`, `GL_RENDERER PowerVR
+SGX543MP1` and clears 0 pixels wrong; `libGL` loads with every dependency
+bundled (`libxcb-*`, `libX11`, `libXext`, `libXxf86vm`, `libxshmfence`,
+`libbsd`, `libwayland-client`), and `lib/dri/s5l8947x_dri.so` points at the
+megadriver.  The desktop tarball is a superset: its `libEGL`/`libGLESv2`
+still run the GLES and GBM tests.
+
+## Surviving a reboot
+
+The root filesystem is a ramfs, so `/usr/local/lib/sgx-mesa` is gone after
+a reboot.  `install.sh` leaves the same tarball on Data
+(`/mnt/data/linux/lib/sgx-mesa-install.tar`, with `--no-cache` to skip it),
+and `stage2` unpacks it before any GL program runs and makes its `lib` the
+system's GL.  The unpack is skipped when the install is already there, which
+is the case only if a boot somehow kept the ramfs.  Verified on hardware
+after a DFU boot: stage2 logged "Mesa userspace unpacked from cache" and
+`sgx-gl glclear`, `gbmtest` and `glclear-gl` ran with no reinstall.
 
 ## What it needs from the kernel
 

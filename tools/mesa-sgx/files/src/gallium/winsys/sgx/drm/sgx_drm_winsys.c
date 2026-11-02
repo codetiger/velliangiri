@@ -14,3 +14,11 @@ sgx_drm_screen_create(int fd, const struct pipe_screen_config *config)
    return u_pipe_screen_lookup_or_create(os_dupfd_cloexec(fd), config, NULL,
                                          sgx_screen_create);
 }
+
+struct pipe_screen *
+sgx_drm_screen_create_renderonly(int fd, struct renderonly *ro,
+                                 const struct pipe_screen_config *config)
+{
+   return u_pipe_screen_lookup_or_create(os_dupfd_cloexec(fd), config, ro,
+                                         sgx_screen_create);
+}

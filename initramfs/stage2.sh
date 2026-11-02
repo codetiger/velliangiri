@@ -265,6 +265,28 @@ if [ "$missing" = 1 ] && [ -b /dev/nand0p1 ]; then
 fi
 
 if [ "$DATA" = 1 ]; then
+	# The Mesa userspace (tools/mesa-sgx) is not in the initramfs: the root
+	# is a ramfs, and a GL install is too large to carry there.  install.sh
+	# leaves the same tarball on Data, so every boot unpacks it before any
+	# GL program can run.
+	MESA_TAR=/mnt/data/linux/lib/sgx-mesa-install.tar
+	MESA_DIR=/usr/local/lib/sgx-mesa
+	if [ -s "$MESA_TAR" ] && [ ! -s "$MESA_DIR/lib/libEGL.so.1" ]; then
+		if tar -xf "$MESA_TAR" -C / 2>/dev/null; then
+			chmod +x "$MESA_DIR/bin/"* 2>/dev/null
+			mkdir -p /usr/local/bin
+			ln -sf "$MESA_DIR/bin/sgx-gl" /usr/local/bin/sgx-gl
+			log_msg "nand0p2: Mesa userspace unpacked from cache"
+		else
+			log_msg "nand0p2: the cached Mesa tarball did not unpack"
+		fi
+	fi
+	if [ -s "$MESA_DIR/lib/libEGL.so.1" ] &&
+	   ! grep -q "$MESA_DIR/lib" /etc/ld-musl-armhf.path 2>/dev/null; then
+		mkdir -p /etc
+		printf '%s\n' "$MESA_DIR/lib:/usr/local/lib:/lib:/usr/lib" > /etc/ld-musl-armhf.path
+		log_msg "nand0p2: Mesa is the system's GL"
+	fi
 	if [ -s "$PDIR/dropbear/dropbear_ed25519_host_key" ]; then
 		mkdir -p /etc/dropbear
 		cp "$PDIR/dropbear/dropbear_ed25519_host_key" /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null

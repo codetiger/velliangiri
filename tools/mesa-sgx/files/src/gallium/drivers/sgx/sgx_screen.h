@@ -18,6 +18,11 @@ struct sgx_screen {
    struct pipe_screen base;
    struct sgx_device dev;
 
+   /* The display's side of a kmsro pairing: scanout resources are made as
+    * dma-bufs here and imported there, and their KMS handles belong to the
+    * display's fd (sgx_resource.c).  NULL when there is no display. */
+   struct renderonly *ro;
+
    /* the template frame, for clears; NULL without one */
    struct sgx_frame *frame;
    simple_mtx_t frame_lock;

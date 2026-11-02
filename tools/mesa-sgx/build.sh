@@ -66,16 +66,29 @@ fi
 # and on 32-bit ARM the current GL context then comes back wrong: garbage
 # (glGetString NULL, "Inside glBegin/glEnd", a bus error), a crash in
 # _mesa_make_current.  The classic dialect is right.
+# a buffer the display can scan out on the SGX is contiguous (CMA), and
+# kmsro pairs the render node with the display device for EGL/GBM; the
+# desktop build adds X11/Wayland platforms, GLX and desktop OpenGL
 if [ "${MESA_BUILD:-}" = release ]; then
 	BT="--buildtype=release -Db_ndebug=true"; BD=$B/build-release; ID=$B/install-release
+	TAR=${TARBALL:-/workspace/build/mesa-sgx-install-release.tar}
+elif [ "${MESA_BUILD:-}" = desktop ]; then
+	BT="--buildtype=release -Db_ndebug=true"; BD=$B/build-desktop; ID=$B/install-desktop
+	TAR=${TARBALL:-/workspace/build/mesa-sgx-install-desktop.tar}
 else
 	BT=--buildtype=debugoptimized; BD=$B/build; ID=$B/install
+	TAR=${TARBALL:-/workspace/build/mesa-sgx-install.tar}
+fi
+if [ "${MESA_BUILD:-}" = desktop ]; then
+	PLATFORM="-Dplatforms=x11,wayland -Dglx=dri -Dopengl=true"
+else
+	PLATFORM="-Dplatforms= -Dglx=disabled -Dopengl=false"
 fi
 OPTS="--prefix=$PREFIX --libdir=lib $BT
     -Dc_args=-mtls-dialect=gnu -Dcpp_args=-mtls-dialect=gnu
-    -Dgallium-drivers=sgx,softpipe -Dvulkan-drivers= -Dplatforms=
-    -Dglx=disabled -Degl=enabled -Dgbm=enabled -Dgles1=enabled -Dgles2=enabled
-    -Dopengl=false -Dglvnd=disabled -Dllvm=disabled -Dvalgrind=disabled
+    -Dgallium-drivers=sgx,softpipe -Dvulkan-drivers= $PLATFORM
+    -Degl=enabled -Dgbm=enabled -Dgles1=enabled -Dgles2=enabled
+    -Dglvnd=disabled -Dllvm=disabled -Dvalgrind=disabled
     -Dlibunwind=disabled -Dzstd=disabled -Dxmlconfig=enabled -Dexpat=enabled
     -Dshader-cache=disabled -Dtools= -Dbuild-tests=false -Dgallium-va=disabled
     -Dgallium-rusticl=false -Dvideo-codecs= -Dteflon=false -Dlmsensors=disabled
@@ -105,6 +118,20 @@ find "$I/lib" -type f -name '*.so*' -exec strip --strip-debug {} + 2>/dev/null |
 for l in libdrm.so.2 libexpat.so.1 libgcc_s.so.1 libstdc++.so.6 libz.so.1; do
 	cp -L "/usr/lib/$l" "$I/lib/" 2>/dev/null || true
 done
+if [ "${MESA_BUILD:-}" = desktop ]; then
+	# the X11 and Wayland libraries libGL/libEGL link against: the device
+	# has neither (GLX needs an X server in any case, but libGL has to
+	# load, and EGL's X11/Wayland platforms have to find their clients)
+	for l in libX11.so.6 libX11-xcb.so.1 libXau.so.6 libXdmcp.so.6 \
+	         libXext.so.6 libXfixes.so.3 libXxf86vm.so.1 \
+	         libxcb.so.1 libxcb-glx.so.0 libxcb-randr.so.0 libxcb-shm.so.0 \
+	         libxcb-dri3.so.0 libxcb-present.so.0 libxcb-sync.so.1 \
+	         libxcb-xfixes.so.0 libxshmfence.so.1 libbsd.so.0 libmd.so.0 \
+	         libxkbcommon.so.0 libwayland-client.so.0 \
+	         libwayland-server.so.0 libffi.so.8; do
+		cp -L "/usr/lib/$l" "$I/lib/" 2>/dev/null || true
+	done
+fi
 mkdir -p "$I/bin"
 say "the test programs"
 for t in glclear gltri glfs gltex glblend gldepth glsize; do
@@ -112,8 +139,20 @@ for t in glclear gltri glfs gltex glblend gldepth glsize; do
 	   -L"$I/lib" -lEGL -lGLESv2 -lm \
 	   -Wl,-rpath-link,"$I/lib" -Wl,-rpath,"$PREFIX/lib" -o "$I/bin/$t"
 done
+# the EGL/GBM surface test (kmsro): libgbm and libdrm are in every build
+cc -O2 -Wall -I"$I/include" -I/usr/include/libdrm \
+   "$ROOT/tools/mesa-sgx/gl/gbmtest.c" \
+   -L"$I/lib" -lEGL -lGLESv2 -lgbm -ldrm -lm \
+   -Wl,-rpath-link,"$I/lib" -Wl,-rpath,"$PREFIX/lib" -o "$I/bin/gbmtest"
+if [ "${MESA_BUILD:-}" = desktop ]; then
+	# desktop GL through EGL: GLX itself needs an X server, which the
+	# device does not have (the libraries are installed all the same)
+	cc -O2 -Wall -I"$I/include" "$ROOT/tools/mesa-sgx/gl/glclear-gl.c" \
+	   -L"$I/lib" -lEGL -lGL -lm \
+	   -Wl,-rpath-link,"$I/lib" -Wl,-rpath,"$PREFIX/lib" -o "$I/bin/glclear-gl"
+fi
 cp "$ROOT/tools/mesa-sgx/sgx-gl.sh" "$I/bin/sgx-gl"
 # out of the volume and onto the host, for tools/mesa-sgx/install.sh
-tar -C "$ID" -cf "${TARBALL:-/workspace/build/mesa-sgx-install.tar}" usr
+tar -C "$ID" -cf "$TAR" usr
 say "built: $I"
-say "packed: ${TARBALL:-/workspace/build/mesa-sgx-install.tar}"
+say "packed: $TAR"

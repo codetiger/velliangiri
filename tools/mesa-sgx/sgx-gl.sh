@@ -11,6 +11,7 @@
 P=${SGX_MESA:-/usr/local/lib/sgx-mesa}
 export LD_LIBRARY_PATH="$P/lib${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"
 export GBM_BACKENDS_PATH="$P/lib/gbm"
+export LIBGL_DRIVERS_PATH="$P/lib/dri${LIBGL_DRIVERS_PATH:+:$LIBGL_DRIVERS_PATH}"
 export PATH="$P/bin:$PATH"
 if [ "$SGX_PRELOAD" = 1 ]; then
 	export LD_PRELOAD="$(ls "$P"/lib/libgallium-*.so) $P/lib/libEGL.so.1 $P/lib/libGLESv2.so.2${LD_PRELOAD:+ $LD_PRELOAD}"

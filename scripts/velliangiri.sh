@@ -85,7 +85,9 @@ case "${CMD}" in
 		;;
 	mesa)
 		# Mesa with the SGX543's driver: fetched on the host, built in the
-		# Alpine armv7 image, packed into build/mesa-sgx-install.tar
+		# Alpine armv7 image, packed into build/mesa-sgx-install.tar.
+		# MESA_BUILD=desktop builds the X11/Wayland/GLX variant instead
+		# (build/mesa-sgx-install-desktop.tar).
 		if [ ! -d "${ROOT}/build/mesa/src" ]; then
 			bash "${ROOT}/tools/mesa-sgx/fetch.sh"
 		fi
@@ -98,6 +100,7 @@ case "${CMD}" in
 			-v "${ROOT}/build/mesa/src":/from:ro -v velliangiri-mesa:/to \
 			alpine:3.21 sh -c '[ -d /to/src/.git ] || { rm -rf /to/src && cp -a /from /to/src; }'
 		docker run --rm --platform linux/arm/v7 -v "${ROOT}":/workspace \
+			-e MESA_BUILD \
 			-v velliangiri-mesa:/workspace/build/mesa -w /workspace \
 			velliangiri-mesa sh tools/mesa-sgx/build.sh
 		;;

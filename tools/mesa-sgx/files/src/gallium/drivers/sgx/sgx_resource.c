@@ -17,6 +17,7 @@
 #include "drm-uapi/apple_sgx_drm.h"
 #include "drm-uapi/drm_fourcc.h"
 #include "frontend/winsys_handle.h"
+#include "renderonly/renderonly.h"
 #include "util/format/u_format.h"
 #include "util/half_float.h"
 #include "util/log.h"
@@ -51,6 +52,11 @@ sgx_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *tem
    struct sgx_screen *screen = sgx_screen(pscreen);
    struct sgx_resource *res = CALLOC_STRUCT(sgx_resource);
    uint32_t size = 0;
+   /* With kmsro, a buffer the display shows is allocated here and imported
+    * there, so it must be physically contiguous for the display's DMA-GEM
+    * import -- which is what APPLE_SGX_BO_CONTIGUOUS gives it. */
+   bool scanout = screen->ro &&
+                  (templ->bind & (PIPE_BIND_SCANOUT | PIPE_BIND_DISPLAY_TARGET));
 
    if (!res)
       return NULL;
@@ -87,7 +93,8 @@ sgx_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *tem
       return &res->base;
    }
    size = align(MAX2(size, 1), 4096);
-   if ((templ->bind & PIPE_BIND_RENDER_TARGET) && templ->target != PIPE_BUFFER &&
+   if (!scanout &&
+       (templ->bind & PIPE_BIND_RENDER_TARGET) && templ->target != PIPE_BUFFER &&
        (sgx_frame_options() & SGX_FRAME_ALIGN))
       res->bo = aligned_bo(&screen->dev, size);
    /* (M45) a texture or a target of this process's alone from the cache,
@@ -102,8 +109,15 @@ sgx_resource_create(struct pipe_screen *pscreen, const struct pipe_resource *tem
        !util_format_is_depth_or_stencil(templ->format))
       res->bo = sgx_bo_cache_get(&screen->dev, size);
    if (!res->bo)
-      res->bo = sgx_bo_create(&screen->dev, size, 0, 0);
+      res->bo = sgx_bo_create(&screen->dev, size,
+                              scanout ? APPLE_SGX_BO_CONTIGUOUS : 0, 0);
    if (!res->bo) {
+      FREE(res);
+      return NULL;
+   }
+   if (scanout &&
+       !(res->scanout = renderonly_scanout_for_resource(&res->base, screen->ro, NULL))) {
+      sgx_bo_destroy(res->bo);
       FREE(res);
       return NULL;
    }
@@ -122,6 +136,9 @@ sgx_resource_destroy(struct pipe_screen *pscreen, struct pipe_resource *prsc)
       sgx_bo_destroy(res->zls[i].bo);
    FREE(res->zls);
    sgx_bo_destroy(res->bo);
+   /* (the display's handle on the same dma-buf; the GPU one is gone now) */
+   if (res->scanout)
+      renderonly_scanout_destroy(res->scanout, sgx_screen(pscreen)->ro);
    if (res->data)
       simple_mtx_destroy(&res->dirty_lock);
    align_free(res->data);
@@ -133,6 +150,7 @@ sgx_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *pctx,
                         struct pipe_resource *prsc, struct winsys_handle *handle,
                         unsigned usage)
 {
+   struct sgx_screen *screen = sgx_screen(pscreen);
    struct sgx_resource *res = sgx_resource(prsc);
    int fd;
 
@@ -146,6 +164,12 @@ sgx_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *pctx,
    handle->modifier = DRM_FORMAT_MOD_LINEAR;
    switch (handle->type) {
    case WINSYS_HANDLE_TYPE_KMS:
+      /* (kmsro) the handle has to be one of the display device's, not this
+       * device's: it is the dma-buf imported there at creation */
+      if (screen->ro) {
+         res->external = true;
+         return renderonly_get_handle(res->scanout, handle);
+      }
       handle->handle = res->bo->handle;
       res->external = true;
       return true;
@@ -154,6 +178,46 @@ sgx_resource_get_handle(struct pipe_screen *pscreen, struct pipe_context *pctx,
          return false;
       handle->handle = fd;
       res->external = true;
+      return true;
+   default:
+      return false;
+   }
+}
+
+/* What a winsys (GBM, a KMS client) asks about the resource before it makes
+ * a buffer of it: kmsro's rules ask for these three at least. */
+static bool
+sgx_resource_get_param(struct pipe_screen *pscreen, struct pipe_context *pctx,
+                       struct pipe_resource *prsc, unsigned plane,
+                       unsigned layer, unsigned level,
+                       enum pipe_resource_param param, unsigned usage,
+                       uint64_t *value)
+{
+   struct sgx_resource *res = sgx_resource(prsc);
+
+   if (plane > 0 || level > prsc->last_level)
+      return false;
+   switch (param) {
+   case PIPE_RESOURCE_PARAM_NPLANES:
+      *value = 1;
+      return true;
+   case PIPE_RESOURCE_PARAM_STRIDE:
+      *value = res->stride[level];
+      return true;
+   case PIPE_RESOURCE_PARAM_OFFSET:
+      *value = res->offset[level];
+      return true;
+   case PIPE_RESOURCE_PARAM_LAYER_STRIDE:
+      *value = res->layer_size[level];
+      return true;
+   case PIPE_RESOURCE_PARAM_MODIFIER:
+      *value = DRM_FORMAT_MOD_LINEAR;
+      return true;
+   case PIPE_RESOURCE_PARAM_HANDLE_TYPE_KMS:
+      *value = res->scanout != NULL;
+      return true;
+   case PIPE_RESOURCE_PARAM_HANDLE_TYPE_FD:
+      *value = res->bo != NULL;
       return true;
    default:
       return false;
@@ -203,6 +267,11 @@ sgx_resource_from_handle(struct pipe_screen *pscreen, const struct pipe_resource
       FREE(res);
       return NULL;
    }
+   /* (kmsro) the dma-buf came from the display; keep the handle to it, but
+    * an import is not required to be a scanout one */
+   if (screen->ro)
+      res->scanout = renderonly_create_gpu_import_for_resource(&res->base,
+                                                               screen->ro, NULL);
    return &res->base;
 }
 
@@ -780,6 +849,7 @@ sgx_resource_screen_init(struct sgx_screen *screen)
    screen->base.resource_create = sgx_resource_create;
    screen->base.resource_destroy = sgx_resource_destroy;
    screen->base.resource_get_handle = sgx_resource_get_handle;
+   screen->base.resource_get_param = sgx_resource_get_param;
    screen->base.resource_from_handle = sgx_resource_from_handle;
 }
 

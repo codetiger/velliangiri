@@ -13,6 +13,7 @@
 
 #include "compiler/nir/nir.h"
 #include "pipe/p_defines.h"
+#include "renderonly/renderonly.h"
 #include "util/format/u_format.h"
 #include "util/log.h"
 #include "util/os_time.h"
@@ -91,6 +92,8 @@ sgx_screen_destroy(struct pipe_screen *pscreen)
 
    sgx_frame_destroy(screen->frame);
    sgx_device_fini(&screen->dev);
+   if (screen->ro)
+      screen->ro->destroy(screen->ro);
    simple_mtx_destroy(&screen->frame_lock);
    slab_destroy_parent(&screen->transfer_pool);
    FREE(screen);
@@ -422,6 +425,7 @@ sgx_screen_create(int fd, const struct pipe_screen_config *config, struct render
    screen->base.is_format_supported = sgx_is_format_supported;
    screen->base.get_timestamp = sgx_get_timestamp;
    screen->base.context_create = sgx_context_create;
+   screen->ro = ro;
    for (unsigned i = 0; i <= MESA_SHADER_COMPUTE; i++)
       screen->base.nir_options[i] = &sgx_nir_options;
    sgx_resource_screen_init(screen);

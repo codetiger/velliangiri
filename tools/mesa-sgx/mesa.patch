@@ -159,11 +159,12 @@ diff --git a/src/gallium/targets/dril/dril_target.c b/src/gallium/targets/dril/d
 index b5ba518..4642458 100644
 --- a/src/gallium/targets/dril/dril_target.c
 +++ b/src/gallium/targets/dril/dril_target.c
-@@ -685,5 +685,6 @@ DEFINE_LOADER_DRM_ENTRYPOINT(sun4i_drm)
+@@ -685,5 +685,7 @@ DEFINE_LOADER_DRM_ENTRYPOINT(sun4i_drm)
  DEFINE_LOADER_DRM_ENTRYPOINT(udl)
  DEFINE_LOADER_DRM_ENTRYPOINT(zynqmp_dpsub)
  DEFINE_LOADER_DRM_ENTRYPOINT(lima)
 +DEFINE_LOADER_DRM_ENTRYPOINT(apple_sgx)
++DEFINE_LOADER_DRM_ENTRYPOINT(s5l8947x)
  DEFINE_LOADER_DRM_ENTRYPOINT(d3d12)
  DEFINE_LOADER_DRM_ENTRYPOINT(zink)
 diff --git a/src/gallium/targets/dril/meson.build b/src/gallium/targets/dril/meson.build
@@ -197,3 +198,81 @@ index bc2a9cd..1b70d7d 100644
     const struct gl_texture_object *texObj = att->Texture;
     const struct gl_texture_image *texImage =
        texObj->Image[att->CubeMapFace][att->TextureLevel];
+diff --git a/src/gallium/auxiliary/pipe-loader/meson.build b/src/gallium/auxiliary/pipe-loader/meson.build
+index a4a13c0..463f320 100644
+--- a/src/gallium/auxiliary/pipe-loader/meson.build
++++ b/src/gallium/auxiliary/pipe-loader/meson.build
+@@ -30,6 +30,9 @@ endif
+ if with_gallium_vc4
+   renderonly_drivers_c_args += '-DGALLIUM_VC4'
+ endif
++if with_gallium_sgx
++  renderonly_drivers_c_args += '-DGALLIUM_SGX'
++endif
+ if with_gallium_freedreno
+   renderonly_drivers_c_args += '-DGALLIUM_FREEDRENO'
+ endif
+diff --git a/src/gallium/auxiliary/pipe-loader/pipe_loader_drm.c b/src/gallium/auxiliary/pipe-loader/pipe_loader_drm.c
+index dc631b4..bdbaea9 100644
+--- a/src/gallium/auxiliary/pipe-loader/pipe_loader_drm.c
++++ b/src/gallium/auxiliary/pipe-loader/pipe_loader_drm.c
+@@ -396,6 +396,9 @@ pipe_loader_get_compatible_render_capable_device_fds(int kms_only_fd, unsigned i
+ #if defined GALLIUM_VC4
+       "vc4",
+ #endif
++#if defined GALLIUM_SGX
++      "apple_sgx",
++#endif
+ #if defined GALLIUM_ZINK
+       "zink",
+ #endif
+diff --git a/src/gallium/targets/dril/meson.build b/src/gallium/targets/dril/meson.build
+index 55f10dc..90d4850 100644
+--- a/src/gallium/targets/dril/meson.build
++++ b/src/gallium/targets/dril/meson.build
+@@ -94,6 +94,7 @@ foreach d : [[with_gallium_kmsro, [
+                'ssd130x',
+                'st7586',
+                'st7735r',
++               's5l8947x',
+                'sti',
+                'stm',
+                'sun4i-drm',
+diff --git a/src/gallium/winsys/kmsro/drm/kmsro_drm_winsys.c b/src/gallium/winsys/kmsro/drm/kmsro_drm_winsys.c
+index 2ead5db..1804461 100644
+--- a/src/gallium/winsys/kmsro/drm/kmsro_drm_winsys.c
++++ b/src/gallium/winsys/kmsro/drm/kmsro_drm_winsys.c
+@@ -32,6 +32,7 @@
+ #include "freedreno/drm/freedreno_drm_public.h"
+ #include "panfrost/drm/panfrost_drm_public.h"
+ #include "lima/drm/lima_drm_public.h"
++#include "sgx/drm/sgx_drm_public.h"
+ #include "asahi/drm/asahi_drm_public.h"
+ #include "zink/drm/zink_drm_public.h"
+ #include "xf86drm.h"
+@@ -106,6 +107,13 @@ struct pipe_screen *kmsro_drm_screen_create(int kms_fd,
+ #if defined(GALLIUM_LIMA)
+          ro->create_for_resource = renderonly_create_kms_dumb_buffer_for_resource;
+          screen = lima_drm_screen_create_renderonly(ro->gpu_fd, ro, config);
++#endif
++      } else if (strcmp(render_dev_name, "apple_sgx") == 0) {
++#if defined(GALLIUM_SGX)
++         /* the GPU allocates the scanout buffer (contiguous, from CMA), and
++          * its dma-buf is imported into the display */
++         ro->create_for_resource = renderonly_create_gpu_import_for_resource;
++         screen = sgx_drm_screen_create_renderonly(ro->gpu_fd, ro, config);
+ #endif
+       } else if (strcmp(render_dev_name, "panfrost") == 0 ||
+                strcmp(render_dev_name, "panthor") == 0) {
+diff --git a/meson.build b/meson.build
+index c18edad..cad68f2 100644
+--- a/meson.build
++++ b/meson.build
+@@ -258,6 +258,7 @@ with_gallium_drm = system_has_kms_drm and [
+   with_gallium_panfrost,
+   with_gallium_v3d,
+   with_gallium_vc4,
++  with_gallium_sgx,
+ ].contains(true)
+ 
+ _vulkan_drivers = get_option('vulkan-drivers')

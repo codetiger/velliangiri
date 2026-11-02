@@ -12,6 +12,7 @@
 struct sgx_bo;
 struct sgx_context;
 struct sgx_screen;
+struct renderonly_scanout;
 
 /* Every resource is linear: rows of stride bytes, levels and layers one
  * after another.  A texture the GPU samples also gets a twiddled copy, made
@@ -23,6 +24,10 @@ struct sgx_screen;
 struct sgx_resource {
    struct pipe_resource base;
    struct sgx_bo *bo;
+   /* a kmsro scanout resource's handle on the display's device (NULL
+    * otherwise): it is the buffer's dma-buf imported there, which is what
+    * the display scans out (sgx_resource_get_handle) */
+   struct renderonly_scanout *scanout;
    /* a buffer's (M26): data is the CPU's copy, what maps see; bo the
     * GPU's, made at the first draw that reads the buffer from there, and
     * behind data by the bytes [dirty_lo, dirty_hi) -- written since by maps
