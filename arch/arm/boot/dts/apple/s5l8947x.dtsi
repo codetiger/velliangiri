@@ -382,11 +382,21 @@
 			status = "disabled";
 		};
 
+		/*
+		 * PowerVR SGX543.  Six 16 KiB banks: 0 is broadcast and
+		 * write-only (a read hangs the bus), 1 is the master and
+		 * 2 + n is core n.  Gates 7 and 8 are the GFX_SYS and GFX
+		 * power states; gate 9 (HPERF-NRT) is not needed.  The
+		 * microkernel is carved from the device's own system image
+		 * by stage2.
+		 */
 		sgx0: gpu@5100000 {
-			compatible = "apple,s5l8947x-sgx", "img,sgx543";
-			reg = <0x5100000 0x18000>, <0xf10b000 0x1000>;
+			compatible = "apple,s5l8947x-sgx", "apple,s5l8940x-sgx";
+			reg = <0x5100000 0x18000>;
 			interrupts = <49>;
-			clocks = <&pmgr_gates 7>, <&pmgr_gates 8>, <&pmgr_gates 9>;
+			clocks = <&pmgr_gates 7>, <&pmgr_gates 8>;
+			clock-names = "gfx_sys", "gfx";
+			apple,brn-31195;
 			status = "disabled";
 		};
 

@@ -426,6 +426,9 @@ struct s5l_display {
 	struct hrtimer vblank_timer;
 	ktime_t vblank_period;
 	struct s5l_irq_probe probe;
+	/* the buffer the plane is scanning out now, for the GPU bring-up path */
+	phys_addr_t fb_pa;
+	u32 fb_stride, fb_w, fb_h;
 };
 
 static struct s5l_display *g_s5l_display;
@@ -1121,7 +1124,11 @@ static void s5l_pipe_update(struct drm_simple_display_pipe *pipe,
 	if (fb && pipe->crtc.state->active) {
 		void __iomem *p = d->rgbout + RGB_PLANE0;
 
-		writel(drm_fb_dma_get_gem_addr(fb, state, 0), p + PLANE_ADDR);
+		d->fb_pa = drm_fb_dma_get_gem_addr(fb, state, 0);
+		d->fb_stride = fb->pitches[0];
+		d->fb_w = fb->width;
+		d->fb_h = fb->height;
+		writel(d->fb_pa, p + PLANE_ADDR);
 		writel((readl(p + PLANE_STRIDE) & 0x3fU) | (fb->pitches[0] & ~0x3fU),
 		       p + PLANE_STRIDE);
 		writel(RGB_COMMIT_VAL, d->rgbout + RGB_COMMIT);
@@ -1370,6 +1377,21 @@ static ssize_t plane_phys_show(struct device *dev, struct device_attribute *a,
 }
 static DEVICE_ATTR_RO(plane_phys);
 
+/*
+ * The current scanout buffer as "physical stride width height".  The SGX
+ * bring-up path maps this physical range into the GPU and lets the 2D engine
+ * draw into the screen without a copy.
+ */
+static ssize_t plane_info_show(struct device *dev, struct device_attribute *a,
+			       char *buf)
+{
+	struct s5l_display *d = dev_get_drvdata(dev);
+
+	return sysfs_emit(buf, "0x%08x %u %u %u\n", (u32)d->fb_pa,
+			  d->fb_stride, d->fb_w, d->fb_h);
+}
+static DEVICE_ATTR_RO(plane_info);
+
 static ssize_t gamma_brightness_show(struct device *dev, struct device_attribute *a,
 				     char *buf)
 {
@@ -1616,6 +1638,7 @@ static struct attribute *s5l_attrs[] = {
 	&dev_attr_hpd_connected.attr,
 	&dev_attr_phy_ready.attr,
 	&dev_attr_plane_phys.attr,
+	&dev_attr_plane_info.attr,
 	&dev_attr_gamma_brightness.attr,
 	&dev_attr_irq_probe.attr,
 	&dev_attr_scaler_status.attr,

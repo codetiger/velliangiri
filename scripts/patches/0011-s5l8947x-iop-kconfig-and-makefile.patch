@@ -24,8 +24,7 @@ diff --git a/drivers/soc/apple/Makefile b/drivers/soc/apple/Makefile
 index 915ea84..a178763 100644
 --- a/drivers/soc/apple/Makefile
 +++ b/drivers/soc/apple/Makefile
-@@ -11,3 +11,4 @@ apple-sart-y = sart.o
+@@ -10,2 +10,3 @@ apple-sart-y = sart.o
  
- obj-$(CONFIG_APPLE_S5L8947X_SGX) += s5l8947x-sgx.o
  obj-$(CONFIG_APPLE_S5L8947X_VXD) += s5l8947x-vxd.o
 +obj-$(CONFIG_APPLE_S5L8947X_IOP) += s5l8947x-iop.o

@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-2.0-only
+config DRM_APPLE_SGX
+	tristate "S5L8947X PowerVR SGX543"
+	depends on DRM
+	depends on ARCH_APPLE_S5L || COMPILE_TEST
+	depends on COMMON_CLK && OF
+	select DRM_GEM_SHMEM_HELPER
+	select DRM_SCHED
+	help
+	  The GPU of the S5L8947X, a PowerVR SGX543.  Switches it on with
+	  the initialisation the stock driver runs, starts the GPU
+	  microkernel (from /lib/firmware/s5l8947x/sgx543.fw, which stage2
+	  carves from the device's own system image), and offers a render
+	  node for test programs and Mesa: GEM buffers in the GPU's address
+	  space and renders queued to the microkernel.  Research tools are
+	  in debugfs (apple-sgx/).
+
+	  The render node's interface is experimental and will change.
+
+	  If unsure, say N.

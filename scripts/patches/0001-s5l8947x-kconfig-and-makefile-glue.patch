@@ -20,8 +20,8 @@ existing Apple drivers.
  drivers/crypto/Makefile             |  2 ++
  drivers/dma/Kconfig                 | 12 ++++++++++++
  drivers/dma/Makefile                |  1 +
- drivers/gpu/drm/Kconfig             |  2 ++
- drivers/gpu/drm/Makefile            |  1 +
+ drivers/gpu/drm/Kconfig             |  3 +++
+ drivers/gpu/drm/Makefile            |  2 ++
  drivers/hwmon/Kconfig               |  8 ++++++++
  drivers/hwmon/Makefile              |  1 +
  drivers/i2c/busses/Kconfig          |  8 ++++++++
@@ -220,11 +220,12 @@ index ad6a03c..78888e8 100644
 diff --git a/drivers/gpu/drm/Kconfig b/drivers/gpu/drm/Kconfig
 --- a/drivers/gpu/drm/Kconfig
 +++ b/drivers/gpu/drm/Kconfig
-@@ -457,6 +457,8 @@
+@@ -457,6 +457,9 @@
  
  source "drivers/gpu/drm/tiny/Kconfig"
  
 +source "drivers/gpu/drm/s5l8947x/Kconfig"
++source "drivers/gpu/drm/apple-sgx/Kconfig"
 +
  source "drivers/gpu/drm/pl111/Kconfig"
  
@@ -232,11 +233,12 @@ diff --git a/drivers/gpu/drm/Kconfig b/drivers/gpu/drm/Kconfig
 diff --git a/drivers/gpu/drm/Makefile b/drivers/gpu/drm/Makefile
 --- a/drivers/gpu/drm/Makefile
 +++ b/drivers/gpu/drm/Makefile
-@@ -208,6 +208,7 @@
+@@ -208,6 +208,8 @@
  obj-y			+= hisilicon/
  obj-y			+= mxsfb/
  obj-y			+= tiny/
 +obj-$(CONFIG_DRM_S5L8947X) += s5l8947x/
++obj-$(CONFIG_DRM_APPLE_SGX) += apple-sgx/
  obj-$(CONFIG_DRM_PL111) += pl111/
  obj-$(CONFIG_DRM_TVE200) += tve200/
  obj-$(CONFIG_DRM_XEN) += xen/
@@ -622,19 +624,10 @@ index 6388cbe..6d72f9e 100644
  
  menu "Apple SoC drivers"
  
-@@ -41,6 +41,25 @@ config APPLE_SART
+@@ -41,6 +41,16 @@ config APPLE_SART
  
  	  Say 'y' here if you have an Apple SoC.
  
-+config APPLE_S5L8947X_SGX
-+	tristate "S5L8947X PowerVR SGX543 power domain and identification"
-+	depends on ARCH_APPLE_S5L || COMPILE_TEST
-+	depends on COMMON_CLK
-+	default ARCH_APPLE_S5L
-+	help
-+	  Switches the S5L8947X SGX543 GPU clock/power domain and exposes
-+	  the GPU core identification registers.
-+
 +config APPLE_S5L8947X_VXD
 +	tristate "S5L8947X VXD video decoder power and firmware upload"
 +	depends on ARCH_APPLE_S5L || COMPILE_TEST
@@ -652,12 +645,11 @@ diff --git a/drivers/soc/apple/Makefile b/drivers/soc/apple/Makefile
 index 4d9ab8f..e77a163 100644
 --- a/drivers/soc/apple/Makefile
 +++ b/drivers/soc/apple/Makefile
-@@ -8,3 +8,6 @@ apple-rtkit-y = rtkit.o rtkit-crashlog.o
+@@ -8,3 +8,5 @@ apple-rtkit-y = rtkit.o rtkit-crashlog.o
  
  obj-$(CONFIG_APPLE_SART) += apple-sart.o
  apple-sart-y = sart.o
 +
-+obj-$(CONFIG_APPLE_S5L8947X_SGX) += s5l8947x-sgx.o
 +obj-$(CONFIG_APPLE_S5L8947X_VXD) += s5l8947x-vxd.o
 diff --git a/sound/arm/Kconfig b/sound/arm/Kconfig
 index dea2c66..8175dcb 100644

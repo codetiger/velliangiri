@@ -15,7 +15,8 @@
  *      by its LC_UUID, so only a module build whose layout is known is used,
  *   4. copies the known regions (by virtual address) into <output>.
  *
- * Output format (all little endian), read by drivers/soc/apple/s5l8947x-sgx.c:
+ * Output format (all little endian), read by
+ * drivers/gpu/drm/apple-sgx/apple_sgx_hw.c:
  *   u32 magic 'SGXF', u32 version (1), u32 count, u32 header bytes
  *   u8  uuid[16]                         module build the data came from
  *   count x { u32 id, u32 offset, u32 size, u32 reserved }

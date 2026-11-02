@@ -30,6 +30,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 | Hardware | Status & Details |
 |---|---|
 | **CPU & Core SoC** | Single-core Cortex-A9 up to 850 MHz (VFPv3-D32 and ARM NEON), CPU frequency scaling (`212.5` / `425` / `850 MHz`), 512 KB PL310 L2 cache (~3.7 GB/s L2 and ~1.6 GB/s DRAM NEON streaming read), `aic,1` interrupt controller, 24 MHz timer, 42-channel central DMA (`dmaengine`), hardware watchdog, clean reboot and standby power-off |
+| **GPU (SGX543)** | PowerVR SGX543 (`apple-sgx`): GFX power states, GPU MMU, the device's own microkernel started from firmware carved at boot, the kernel command queue, a transfer queue and a TA/3D render queue, a DRM render node (`/dev/dri/renderD128`) with GEM buffers, syncobjs and a DRM scheduler, and a 2D engine ioctl (`DRM_APPLE_SGX_BLIT`, a scaled copy whose transfer the kernel builds). Verified on hardware: the microkernel handshake, a `HWPERF` CCB command, a dummy transfer, a real 2D blit through the transfer queue, the GEM create/map/info/wait path (`sgxgem`), a 2D transfer straight into the display's scanout buffer via the `map_phys` bring-up path, a contiguous SGX buffer exported as a dma-buf and scanned out by the display driver (`sgxpresent`), and the 2D engine drawing on HDMI (`sgxpresent -b`). `hwtest gpu` passes 11/11; `sgxinfo` prints the interface. Presentation is PRIME; the render node has no KMS plane of its own |
 | **Clocks, GPIO, I2C, PMU** | PMGR peripheral clock gates and audio oscillators, 144-pin GPIO and pinctrl controller (with IRQs), 3x I2C controllers, Dialog I2C PMU power switches, real-time clock (with alarm) and temperature sensors (four board thermistors, PMU junction) with a CPU thermal zone |
 | **HDMI Video** | DRM/KMS driver with EDID mode detection (up to 1920x1080@30; the board starts at 1280x720@60 for 60 Hz output with a synthesized vblank for frame pacing), framebuffer console, a 1080p logo boot splash drawn by the pre-kernel loader, and hardware gamma LUT |
 | **JPEG Decoder** | Hardware baseline JPEG decoder (`s5l8947x-jpeg`, `/dev/video2`) as a V4L2 mem2mem device: the core parses the headers itself and writes NV12, YUYV or UYVY. A 1080p photo decodes in 22 ms and, through the scaler, reaches the screen in about 32 ms at 1% CPU |
@@ -48,7 +49,7 @@ Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) i
 
 | Area | Current Limitation |
 |---|---|
-| **3D GPU acceleration** | The PowerVR SGX543 microkernel starts (firmware carved from the on-device System volume at boot), but there is no command submission, DRM render driver or OpenGL ES userspace. Graphics use the CPU-rendered KMS framebuffer. |
+| **3D GPU acceleration on screen** | The PowerVR SGX543 has command submission and a DRM render node (GEM buffers, syncobjs, a TA/3D queue), a 2D engine ioctl that scales and copies on the GPU, and PRIME presentation: `sgxpresent -b` has the 2D engine draw a buffer and the display driver scans it out, so pixels made on the GPU reach HDMI with no CPU copy. There is no Mesa/OpenGL ES userspace in the image yet and the TA/3D queue still needs a userspace command, so the desktop and console remain CPU-rendered. |
 | **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a CDC-ECM + CDC-ACM composite gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
 | **Audio sample rates** | HDMI plays `32`, `44.1` and `48 kHz` exactly. Optical is still clocked from the 24 MHz crystal and runs at `46,875 Hz`; use `wavplay` (which resamples automatically) or ALSA resampling there. The optical output has not been checked on a receiver yet. |
 | **Bluetooth** | The controller runs at 1.6 Mbaud rather than the stock 3 Mbaud (the UART clocks cannot produce 3 Mbaud), and pairing and connections through `bluetoothctl` have not been tested yet. |
@@ -116,6 +117,13 @@ m2mtest -c 160,0,960x720 nv12 640x480 xrgb 1280x720  # Letterbox into a rectangl
 m2mtest -z xrgb 1920x1080 xrgb 320x180  # Downscale a 1-pixel checkerboard; checks it averages to grey
 m2mshow                      # Scale a moving test frame straight into the display (zero-copy DMABUF)
 jpegtest -s 5 photo.jpg      # Decode a JPEG on the hardware and show it letterboxed through the scaler
+sgxinfo                      # Print the SGX render node's parameters and address windows
+sgxgem                       # Create, map and check a GEM buffer on the SGX render node
+sgxgem -c                    # Same, contiguous and exported as a dma-buf
+sgxgem -i /dev/dri/card1     # Import a display dumb buffer into the render node
+sgx2d                        # Scale a source over two destinations on the 2D engine
+sgxpresent 10                # Show an SGX buffer on HDMI through PRIME for 10 seconds
+sgxpresent -b 10             # ... with the 2D engine drawing it
 ```
 
 ---
@@ -143,6 +151,7 @@ Drivers that apply across the SoC family are already named `s5l8940x` and parame
 | **UART** | `scripts/patches/0002-*.patch`<br>`scripts/patches/0012-*.patch` | Hooks `ARCH_APPLE_S5L` into mainline `samsung_tty.c` (`apple,s5l-uart`) and raises its port count to five for this SoC: UART1 is the MCU link, UART2 Bluetooth, and UART0/3/4 are the test-point ports (MCU bootstrap/earlycon, stock boot console, Wi-Fi debug). UART0 requires dropping `keep_bootcon`, which otherwise keeps earlycon writing to the port the driver resets. |
 | **IOP coprocessor** | `drivers/soc/apple/s5l8947x-iop.c`<br>`scripts/tools/iopcarve.c` | Bring-up for the separate IOP core: clock gate (decoded from `pmgr:device-clocks`), firmware carved from the device's own kernel image, heap/page-table patching and the A5IOP start sequence. The core starts and runs its firmware, then aborts in its scheduler because the stock message-channel/endpoint setup is not implemented; there is no Linux client for it. |
 | **Display & HDMI** | `drivers/gpu/drm/s5l8947x/s5l8947x_drm.c` | DRM/KMS driver for the `rgbout` display pipe and HDMI 1.4 transmitter: EDID modes, PHY configuration per pixel clock, AVI and audio infoframes, gamma LUT. |
+| **GPU (SGX543)** | `drivers/gpu/drm/apple-sgx/` | Power, GPU MMU, microkernel boot, kernel CCB, transfer/render queues and a DRM render node; a contiguous buffer object can be exported as a dma-buf and scanned out by the display driver (PRIME). The firmware comes from `sgxcarve`; the UAPI is `include/uapi/drm/apple_sgx_drm.h`. The driver is derived from the clean-room SGX543 work in Project Cascadia. |
 | **JPEG Decoder** | `drivers/media/platform/apple/s5l8947x-jpeg.c` | V4L2 memory-to-memory baseline JPEG decoder (PMGR gate 13, IRQ 118): header phase, then body decode into NV12, YUYV or UYVY. |
 | **M2 Scaler** | `drivers/media/platform/apple/s5l8947x-m2sc.c` | V4L2 memory-to-memory scaling and colour-space conversion on both M2 instances (PMGR gates 11 and 12, IRQs 9 and 10), filters generated per job from the scaling ratio, crop and compose rectangles, and a debugfs self-test. |
 | **Central DMA** | `drivers/dma/s5l8947x-cdma.c` | 42-channel `dmaengine` provider: slave scatter-gather (both directions, audio `0x34000000` and NAND `0x31000000` windows) and cyclic transfers with per-channel interrupts. |
@@ -192,13 +201,14 @@ Instead of storing a full kernel source tree, this repository holds only the fil
 | `arch/arm/boot/dts/apple/` | SoC (`.dtsi`) and board (`.dts`) Device Trees |
 | `arch/arm/mach-apple/` | Machine init, CPU clock calibration, watchdog clocksource & reset |
 | `drivers/`, `sound/`, `include/` | Clean-room kernel drivers in their standard mainline paths |
-| `scripts/patches/` | 9 small, self-contained patches to mainline Linux 6.12 files |
+| `scripts/patches/` | 13 small, self-contained patches to mainline Linux 6.12 files |
 | `scripts/boot/` | Position-independent entry stub, pre-kernel C loader, HDMI init, boot splash and its generator |
 | `scripts/tests/` | On-device hardware test suite (`hwtest`) |
-| `scripts/tools/` | Userspace tools built into the image (`-mcpu=cortex-a9 -mfpu=neon`): diagnostics (`peek`, `i2cpoke`, `l2bench`, `fbtest`, `m2mtest`, `m2mshow`, `jpegtest`), `wavplay`, `btscan`, the firmware carvers (`hcdcarve`, `sgxcarve`), and the early entropy seeder `jitterseed` |
+| `scripts/tools/` | Userspace tools built into the image (`-mcpu=cortex-a9 -mfpu=neon`): diagnostics (`peek`, `i2cpoke`, `l2bench`, `fbtest`, `m2mtest`, `m2mshow`, `jpegtest`, `sgxinfo`, `sgxgem`, `sgx2d`, `sgxpresent`), `wavplay`, `btscan`, the firmware carvers (`hcdcarve`, `sgxcarve`), and the early entropy seeder `jitterseed` |
 | `config/` | Kernel configuration fragments layered on `multi_v7_defconfig` |
 | `initramfs/` | Init scripts, USB gadget / SSH setup, and the `wifi` helper |
 | `progress.md`, `benchmarks.md` | Per-block driver status / hardware notes and on-device ARM NEON / subsystem benchmark tables |
+| `SGX.md` | The SGX543 command submission and render-node port: firmware format, GPU address space, command flow, testing and next steps |
 
 ---
 
@@ -207,6 +217,8 @@ Instead of storing a full kernel source tree, this repository holds only the fil
 Contributions of any kind are welcome—whether that is a new board Device Tree, a driver for an unsupported hardware block, a bug fix, or hardware test coverage.
 
 High-impact open tasks on `S5L8947X` right now (see [progress.md](progress.md) for details):
+- **SGX userspace**: the USSE/PDS program packs and the Mesa Gallium driver from the clean-room SGX543 work, built for this board.
+- **More 2D engine**: a fill and a non-scaled copy are the same transfer with other programs; rotation and several transfers in flight come after that.
 - **USB OTG host mode** (role switching + OHCI companion controller at `0x36500000`) to allow plugging in external USB devices.
 - **Optical audio at exact rates**: clock the S/PDIF transmitter from PMGR audio oscillator 4 instead of the 24 MHz crystal.
 

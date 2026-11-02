@@ -1,6 +1,6 @@
 # Driver Progress (`S5L8947X` / `j33iap`)
 
-Status of every hardware block, checked against the drivers in the tree and the enabled nodes in `s5l8947x-j33iap.dts`. Last reviewed 2026-11-01 (`hwtest`: 106 passed, 0 failed, 2 skipped). For full cache, crypto, and ARM NEON benchmark tables, see [benchmarks.md](benchmarks.md).
+Status of every hardware block, checked against the drivers in the tree and the enabled nodes in `s5l8947x-j33iap.dts`. Last reviewed 2026-11-02 on hardware (`hwtest`: 125 passed, 0 failed, 2 skipped, including `hwtest gpu` 11/11). The SGX driver was booted from the final bundle: microkernel handshake, `HWPERF` CCB command, dummy and real 2D transfers, the render node's GEM path, the `BLIT` ioctl, and a contiguous buffer presented on HDMI through PRIME with the 2D engine drawing it all work. See [SGX.md](SGX.md). For full cache, crypto, and ARM NEON benchmark tables, see [benchmarks.md](benchmarks.md).
 
 ## Done
 
@@ -98,6 +98,15 @@ Status of every hardware block, checked against the drivers in the tree and the 
 - No source-change events: the capture size is set by the application, and a larger image fails the buffer.
 - Motion-JPEG frames without Huffman tables are untested.
 
+### SGX known limits
+
+- Presentation is PRIME, not a KMS plane on the render node: `APPLE_SGX_BO_CONTIGUOUS` allocates one CMA block so its dma-buf has a one-entry scatter/gather table, and the `s5l8947x` display driver imports it (`sgxpresent`, verified on HDMI). The render node itself has no connector, so `APPLE_SGX_PARAM_FB_*` returns 0. The 2D engine is usable from userspace through `DRM_APPLE_SGX_BLIT` (a scaled copy; the kernel builds the transfer), and the debugfs bring-up path still exists (`plane_info` plus `map_phys VA PA SIZE`).
+- No OpenGL ES userspace is in the image. The kernel interface is ready; the USSE/PDS program packs and the Mesa Gallium driver are separate work.
+- The firmware is the device's own microkernel, carved by `sgxcarve`; the loader accepts only the module build whose UUID and region sizes it knows. A different stock image needs a new layout entry in `sgxcarve` and the driver.
+- The SGX interrupt is not enabled by default (`apple_sgx.irq=1` turns it on at the next microkernel boot). Renders are polled by an hrtimer; the interrupt source has not been seen to fire.
+- The GPU core clock reported to the microkernel is 256.5 MHz, the measured value for this GPU family. It only scales the microkernel's timers.
+- Renders are serialised: one TA/3D job at a time, across all clients.
+
 ### NAND and FTL known limits
 
 - The system keybag is unlocked with an empty passcode; on a device with a passcode set, classes 1–3 stay locked (`/sys/block/nand0/keybag` reports it). Keybags of a type with bit 30 set use another hardware key and are not supported.
@@ -112,12 +121,13 @@ Status of every hardware block, checked against the drivers in the tree and the 
 
 | Block | Works | Pending |
 |---|---|---|
-| SGX543 GPU (`0x35100000`, `0x3f10b000`) — microkernel only | `drivers/soc/apple/s5l8947x-sgx.c`: gates 7/8/9, cores released from reset with automatic clock gating, two-level GPU page table over uncached buffers at the stock GPU-virtual ranges, and on request (`echo start > .../35100000.gpu/ukernel`) the GPU microkernel starts: it answers the start-up handshake about 110 µs after the kick and survives stop/start cycles (`hwtest gpu` 5/5). The microkernel is not part of the image: `stage2` carves it on first boot from the stock system image on `nand0p1` with `sgxcarve` (only a known build layout is accepted) and caches `sgx543.fw` on `nand0p2`, like the Wi-Fi and Bluetooth firmware | No command submission, no DRM render driver and no OpenGL ES userspace (none exists for SGX on Linux). The bus clock reported to the microkernel is a guess (`clock_khz`, default 256.5 MHz: the 513 MHz PLL halved, the core clock measured on the same SoC family); it only scales its timers. Bus-clock value, interrupt traffic and fault reporting are unverified |
+| SGX543 GPU (`0x35100000`) — command submission, render node, 2D engine and presentation | `drivers/gpu/drm/apple-sgx/`: GFX_SYS and GFX power states (gates 7 and 8), six 16 KiB register banks with guarded access, a two-level GPU MMU over uncached buffers, the microkernel boot sequence from the `SGXF` firmware that `sgxcarve` produces, the kernel CCB (power, performance counters, transfer and TA commands), a transfer queue, a render queue (TA then the 3D pass) and a DRM render node (`/dev/dri/renderD128`, driver `apple_sgx`) with GEM buffers, syncobjs and a DRM scheduler. The 2D engine has an ioctl of its own (`DRM_APPLE_SGX_BLIT`): the kernel builds the USSE/PDS programs and the transfer command (the reference's `tqgen.py`, ported) and only takes the two buffers' addresses from userspace. The driver is derived from the clean-room SGX543 work published in Project Cascadia and adapted to the S5L8947X. Verified on hardware (2026-11-02): SGX543MP1, one core, revision 1.2.2; the microkernel answers the handshake, a `HWPERF` CCB command is taken in 5–10 µs, a dummy transfer completes with its scratch value and no BIF fault, a real 2D transfer (a `tqgen.py`-generated 64x64-to-128x128 BGRA blit) produces the expected four quadrant colours with `PIXELBE_END_RENDER`, the display's scanout buffer can be mapped into the GPU with `map_phys` and drawn on directly, the render node's GEM create/map/info/wait path works (`sgxgem`), the `BLIT` ioctl scales a 64x64 source over 1280x720 and 640x360 destinations with every quadrant word right (`sgx2d`), and an `APPLE_SGX_BO_CONTIGUOUS` buffer exports as a one-entry dma-buf that the display driver imports and scans out while the 2D engine draws into it (`sgxpresent -b`, confirmed by reading the display's physical framebuffer). `hwtest gpu` passes 11/11; `sgxinfo` prints the interface parameters | There is no KMS plane on the render node itself (the `s5l8947x` driver owns HDMI; presentation is PRIME and `APPLE_SGX_PARAM_FB_*` returns 0) and no Mesa/OpenGL ES userspace in the image. `BLIT` is a scaled copy only (no fill, no rotation, one transfer at a time). The TA/3D render queue still needs a userspace command (the reference's frame packs or Mesa) to be exercised. The microkernel remains the device's own firmware; the USSE/PDS programs and the userspace stack are the next step |
 | USB OTG port host mode (`0x36100000`) | Device mode on `dwc2`; EHCI host serves only the internal HSIC port | `dr_mode` is `peripheral`; host on the OTG port needs a role switch. The OHCI companion (`0x36500000`, IRQ 13) is not described, so full/low-speed devices are unsupported. |
 | System MCU (`0x32600000`) | Button input, version/active handshake at probe, firmware query, raw commands and ACK-waited transactions, event trace (`hwtest mcu`), standby on halt, NMI counter and system-suspend wake (GPIO 2) | The PMU events named `mcu(menu)`/`mcu(hold)` are not mapped to event numbers. The MCU reset line (GPIO 0) is shared with the PMU external-shutdown line, so it is not driven. No bootstrap path over UART0. The recovery command is not decoded; `reboot recovery` only logs unless `apple,recovery-command` is set. |
 
 ## Suggested order
 
-1. NAND: reproduce the one-off CDMA completion timeout (stress reads across `ondemand` frequency changes) and make `s5l8947x-fmi` recover from it.
-2. Add host mode to the OTG port.
-3. Optical audio at exact rates: clock the S/PDIF transmitter from PMGR oscillator 4 and verify it on a receiver.
+1. SGX: the render node is on screen through PRIME and the 2D engine has an ioctl (`BLIT`); next bring up the USSE/PDS program packs and Mesa, and add fill/rotation to the engine.
+2. NAND: reproduce the one-off CDMA completion timeout (stress reads across `ondemand` frequency changes) and make `s5l8947x-fmi` recover from it.
+3. Add host mode to the OTG port.
+4. Optical audio at exact rates: clock the S/PDIF transmitter from PMGR oscillator 4 and verify it on a receiver.
