@@ -8,7 +8,8 @@
  *     (stride 7680) from reserved RAM at 0x9e400000
  *   - Output stage at 0x39600000 (gamma LUTs + timing)
  *   - HDMI transmitter & PHY bridge at 0x39700000 for 74.25 MHz
- *     (1080p@30Hz, VIC 34; the kernel driver keeps this mode on 1080p sinks)
+ *     (1080p@30Hz, VIC 34; the board DT asks the kernel for the same
+ *     mode through apple,preferred-mode, so the handover keeps the raster)
  */
 
 #ifndef VELLIANGIRI_HDMI_BOOT_H

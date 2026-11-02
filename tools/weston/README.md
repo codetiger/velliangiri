@@ -22,7 +22,7 @@ what this board needs:
 - no desktop shell (cairo/pango), no Xwayland, no pipewire/rdp/vnc/remoting,
   no lcms, no tests.
 
-The compositor keeps the console's 1280x720 mode.  `seatd` is started by
+The compositor keeps the console's 1920x1080@30 mode.  `seatd` is started by
 `run.sh` because the image's libseat has no built-in backend; it is the
 small daemon that grants the DRM/input seat to Weston.
 
