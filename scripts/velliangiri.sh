@@ -104,11 +104,19 @@ case "${CMD}" in
 			-v velliangiri-mesa:/workspace/build/mesa -w /workspace \
 			velliangiri-mesa sh tools/mesa-sgx/build.sh
 		;;
+	weston)
+		# Weston 14 (DRM + GL, kiosk shell) against the SGX Mesa; the
+		# result is build/weston-armv7.tar
+		bash "${ROOT}/tools/weston/fetch.sh"
+		docker run --rm --platform linux/arm/v7 \
+			-v "${ROOT}":/workspace -w /workspace \
+			alpine:3.21 sh tools/weston/build.sh
+		;;
 	shell)
 		docker_run -it /bin/bash
 		;;
 	*)
-		echo "Usage: $0 {all|image|rootfs|kernel|bundle|mesa|clean|check|shell}" >&2
+		echo "Usage: $0 {all|image|rootfs|kernel|bundle|mesa|weston|clean|check|shell}" >&2
 		exit 1
 		;;
 esac

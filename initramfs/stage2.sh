@@ -287,6 +287,16 @@ if [ "$DATA" = 1 ]; then
 		printf '%s\n' "$MESA_DIR/lib:/usr/local/lib:/lib:/usr/lib" > /etc/ld-musl-armhf.path
 		log_msg "nand0p2: Mesa is the system's GL"
 	fi
+	# Weston (tools/weston) is installed the same way: a tarball on Data,
+	# unpacked under /usr/local at boot (its Mesa is the one above).
+	WESTON_TAR=/mnt/data/linux/lib/weston-armv7.tar
+	if [ -s "$WESTON_TAR" ] && [ ! -s /usr/local/bin/weston ]; then
+		if tar -xf "$WESTON_TAR" -C / 2>/dev/null; then
+			log_msg "nand0p2: Weston unpacked from cache"
+		else
+			log_msg "nand0p2: the cached Weston tarball did not unpack"
+		fi
+	fi
 	if [ -s "$PDIR/dropbear/dropbear_ed25519_host_key" ]; then
 		mkdir -p /etc/dropbear
 		cp "$PDIR/dropbear/dropbear_ed25519_host_key" /etc/dropbear/dropbear_ed25519_host_key 2>/dev/null
