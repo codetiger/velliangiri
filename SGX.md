@@ -27,6 +27,8 @@ system image at first boot, as the Wi-Fi and Bluetooth firmware already are.
 | Mesa / OpenGL ES 2.0 | the SGX Gallium driver in `tools/mesa-sgx/`, built into Mesa 26.1.8 for Alpine armv7 (musl) and installed as the system GL; clears, draws, the fragment compiler, textures, blending, depth and render targets of any size verified on the device |
 | EGL/GBM on the display | kmsro pairs the render node with the `s5l8947x` display: GBM surfaces are contiguous SGX buffers the display imports and scans out, flipped with page-flip events (`gbmtest`, 300 frames on hardware) |
 | Desktop GL (opt-in build) | `MESA_BUILD=desktop`: GLX, the X11/Wayland EGL platforms and desktop OpenGL; desktop GL 2.1 verified through EGL on the device (GLX needs an X server, which the image has not) |
+| Compositor | Weston 14 (DRM backend, GL renderer, kiosk shell) built from source in `tools/weston/`, started by `weston-run`; composites shm clients on the SGX and scans them out (verified on HDMI) |
+| Implicit fences | the SGX render node's finished fence is on every submitted buffer's reservation, and the display's atomic commit waits on it: a 390 ms render without `glFinish` delays the flip by 390 ms |
 | Mesa install across reboots | `install.sh` keeps the tarball on Data; `stage2` unpacks it at boot and makes it the system GL |
 | Debug interface | `/sys/kernel/debug/apple-sgx/{regs,boot,cmd,mem}` |
 | Test tools | `sgxinfo` prints the render node's parameters; `sgxgem` creates, maps and checks a GEM buffer (`-c` for a contiguous, dma-buf-exportable one, `-i` to import a display buffer); `sgx2d` exercises the 2D engine; `sgxpresent` puts a buffer on the HDMI output (`-s` draws on the live screen); `sgxframe` runs one clear through the TA/3D queue; `hwtest gpu` checks the handshake, a CCB command, the render node and the screen blit |
@@ -57,6 +59,16 @@ system image at first boot, as the Wi-Fi and Bluetooth firmware already are.
   into the scanout buffer (a blue pixel read back at the triangle's top),
   and flipped 300 frames with `DRM_MODE_PAGE_FLIP_EVENT`; the console's
   framebuffer came back on exit.  No CPU copy and no `/dev/fb0`.
+- **The display waits on the render node's fence.**  With 100 full-screen
+  quads and no `glFinish`, the flip ioctl returns in 0.1 ms and the flip
+  completes 390 ms later, when the render's fence signals; with `--finish`,
+  the 390 ms is spent in `glFinish` and the flip completes in 9 ms.  This is
+  the shared dma reservation plus `drm_gem_plane_helper_prepare_fb()`.
+- **A compositor is on HDMI.**  Weston 14 with the DRM backend, the GL
+  renderer and the kiosk shell started on `card1` at 1280x720,
+  `weston-simple-shm` ran, the SGX composited it, and the display's scanout
+  buffer held the client's pattern (read with `peek`); the console returned
+  on exit.
 - **The Mesa install survives a reboot.**  After a DFU boot the initramfs
   has no `/usr/local/lib/sgx-mesa`; `stage2` unpacked the tarball left on
   Data ("Mesa userspace unpacked from cache"), made its `lib` the system's
@@ -247,10 +259,44 @@ sgx-gl gbmtest 300		# 300 frames on HDMI, then the console returns
 buffer, checks one pixel through `glReadPixels`, and flips with
 `DRM_MODE_PAGE_FLIP_EVENT`; the display's simulated vblank completes the
 event.  It ran 300 frames on the device, and the console's framebuffer came
-back on exit.  Rendering and scanning out are not implicitly ordered: the
-test calls `glFinish()` before the flip, and a compositor has to order its
-own commits (the render node's syncobjs export sync files, but the display
-driver's atomic commit does not wait on them yet).
+back on exit.
+
+Rendering and scanning out are ordered by the buffer's dma reservation: the
+SGX render node puts its job's finished fence on every buffer of a submit
+(`DMA_RESV_USAGE_WRITE`), the display's imported GEM object shares that
+reservation (drm_prime sets `obj->resv = dma_buf->resv`), and the simple
+pipe's `drm_gem_plane_helper_prepare_fb()` takes the exclusive fence into
+the plane state, which the atomic commit's worker waits on.  The client does
+not call `glFinish`; `--finish` and `--quads N` make the wait visible:
+
+```
+no glFinish, 100 full-screen quads: swap 1.6 ms, flip ioctl 0.1 ms,
+                                    flip done 390.0 ms  (the render)
+--finish,   100 full-screen quads: glFinish 390.9 ms, flip done 9.0 ms
+```
+
+### The compositor: Weston
+
+`tools/weston/` builds Weston 14 with the DRM backend, the GL renderer, the
+kiosk shell and the simple clients against the Mesa above.  `seatd` grants
+the DRM seat (the image's libseat has no built-in backend), and the
+compositor keeps the console's 1280x720 mode:
+
+```sh
+weston-run 20			# weston-simple-shm on HDMI
+```
+
+Verified on the device: Weston enabled `HDMI-A-1` at 1280x720, loaded
+`gl-renderer.so` on the SGX render node and `kiosk-shell.so`, composited the
+shm client on the GPU, and the display's scanout buffer (read back with
+`peek` at the address from `plane_info`) held the client's moving pattern.
+The console came back when the compositor exited.  The stock Alpine package
+has no `drm-backend.so`, so it is built from source.
+
+EGL clients (`weston-simple-egl`) are not there yet: the client's dmabufs
+reach Weston with a file descriptor that is not the buffer's (a duplicate of
+the client's stdout), so the import fails with `invalid stride`.  Shm
+clients work; the compositor itself renders through the SGX.
 
 ### Drawing into the display's own buffer (bring-up path)
 
@@ -310,13 +356,12 @@ What is not there yet:
   output and the render node has no connector; kmsro is how EGL/GBM pairs
   them.  The overlay ioctl still returns `-EOPNOTSUPP`, and the UAPI stays
   version 3.
-- **No compositor.**  The EGL/GBM path is there (`gbmtest`), but nothing
-  uses it as a display server yet.  A compositor also needs explicit
-  ordering: the display's atomic commit does not wait on the render node's
-  fence through the dma-buf yet.
-- **No implicit fencing on scanout buffers.**  The render node signals
-  syncobjs; the display driver waits on none of them, so a client finishes
-  its renders (`glFinish`/a fence wait) before the flip.
+- **EGL clients on the compositor.**  Weston runs with shm clients; an EGL
+  client's dmabufs arrive with a wrong fd (the compositor receives a
+  duplicate of the client's stdout), so the import fails.  This is in the
+  Wayland platform's image export, not the compositor or the display.
+- **No input.**  Weston starts with `--continue-without-input`; the board
+  has no USB host mode yet, so there is no keyboard or mouse.
 
 ## The route to OpenGL ES 2.0
 
@@ -348,27 +393,25 @@ everything else is userspace.
    that path, the same default directory for the frame, and the renderer
    string.  `glclear`, `gltri`, `glfs`, `glsize`, `gltex`, `glblend` and
    `gldepth` all pass on the device.
-3. **Put it on the screen.**  Done for an EGL/GBM client: kmsro pairs the
-   render node with the `s5l8947x` display driver, GBM allocates the
-   scanout buffer on the render node (contiguous, CMA), the display imports
-   its dma-buf, and page flips put it on HDMI (`gbmtest`, 300 frames on the
-   device).  For full-screen programs the screen blit above is the shorter
-   path.  A compositor is the next step; it needs explicit fence ordering
-   until the display waits on the render node's dma-buf.
+3. **Put it on the screen.**  Done: kmsro pairs the render node with the
+   `s5l8947x` display driver, GBM allocates the scanout buffer on the render
+   node (contiguous, CMA), the display imports its dma-buf, and page flips
+   put it on HDMI (`gbmtest`, 300 frames).  The display's atomic commit
+   waits on the render node's fence through the shared reservation, and
+   Weston runs on the path (`weston-run`, shm clients).  For full-screen
+   programs the screen blit above is the shorter path.
 4. **Then the 2D engine's leftovers** (fill and non-scaled copy), the
    interrupt and runtime PM.
 
 ## Next steps
 
-1. **A compositor.**  The EGL/GBM half works; a Wayland compositor with a
-   DRM backend (or an SDL client) would be the first real consumer.  The
-   open piece is ordering: the display's atomic commit does not wait on the
-   render node's fence, so a compositor has to wait explicitly (or the
-   kernel gains dma-fence waiting in the display's commit).
-2. **Implicit fencing between the render node and the display.**  The
-   render node signals syncobjs, and its dma-bufs could carry a fence the
-   display's atomic commit waits on.  Until then `gbmtest` calls
-   `glFinish()` before each flip.
+1. **EGL clients on Weston.**  Shm clients work; an EGL client's dmabufs
+   reach the compositor with a wrong fd, so the import fails.  The fix is in
+   the Wayland platform's image export (client-side Mesa), not the
+   compositor or the display.
+2. **Input for the compositor.**  Weston starts without one
+   (`--continue-without-input`); the board needs USB host mode for a
+   keyboard or mouse.
 3. **The desktop-GL half of the driver** (GLX and the x11/wayland
    platforms) is an opt-in build (`MESA_BUILD=desktop`) with the
    X11/Wayland libraries it needs; desktop GL 2.1 is verified through EGL
