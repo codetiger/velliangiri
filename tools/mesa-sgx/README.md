@@ -161,7 +161,12 @@ DRM backend and GL renderer; `weston-run`).
 Scanout resources are allocated with `APPLE_SGX_BO_CONTIGUOUS`, because the
 display's DMA-GEM import accepts only a one-entry scatter/gather table;
 the SGX side needs no change to render into one.  `sgx_resource_get_param()`
-reports the stride, offset and the linear modifier kmsro asks for.
+reports the stride, offset, layer stride, plane count and the linear
+modifier kmsro asks for.  It deliberately does not answer
+`PIPE_RESOURCE_PARAM_HANDLE_TYPE_*`: Mesa's DRI image query prefers that
+path and would take the boolean for a handle, giving a Wayland client fd 1
+instead of its dma-buf.  Without it the query falls through to
+`resource_get_handle`, which exports a real fd.
 
 ## The desktop build
 

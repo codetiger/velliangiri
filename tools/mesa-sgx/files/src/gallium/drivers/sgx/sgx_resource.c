@@ -213,12 +213,6 @@ sgx_resource_get_param(struct pipe_screen *pscreen, struct pipe_context *pctx,
    case PIPE_RESOURCE_PARAM_MODIFIER:
       *value = DRM_FORMAT_MOD_LINEAR;
       return true;
-   case PIPE_RESOURCE_PARAM_HANDLE_TYPE_KMS:
-      *value = res->scanout != NULL;
-      return true;
-   case PIPE_RESOURCE_PARAM_HANDLE_TYPE_FD:
-      *value = res->bo != NULL;
-      return true;
    default:
       return false;
    }

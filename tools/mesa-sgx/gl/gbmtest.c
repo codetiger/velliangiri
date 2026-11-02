@@ -348,6 +348,21 @@ main(int argc, char **argv)
 			fprintf(stderr, "gbmtest: lock_front_buffer: %s\n", strerror(errno));
 			goto out;
 		}
+		if (getenv("GBMTEST_FD")) {
+			int bfd = gbm_bo_get_fd(bo);
+			char lp[64], ln[128] = "?";
+			ssize_t nl;
+
+			snprintf(lp, sizeof(lp), "/proc/self/fd/%d", bfd);
+			nl = readlink(lp, ln, sizeof(ln) - 1);
+			if (nl > 0)
+				ln[nl] = 0;
+			printf("bo fd %d (%s), lseek %ld, handle %u\n", bfd, ln,
+			       bfd >= 0 ? (long)lseek(bfd, 0, SEEK_END) : -1L,
+			       gbm_bo_get_handle(bo).u32);
+			if (bfd > 2)
+				close(bfd);
+		}
 		if (drmModeAddFB(fd, gbm_bo_get_width(bo), gbm_bo_get_height(bo),
 				 24, 32, gbm_bo_get_stride(bo),
 				 gbm_bo_get_handle(bo).u32, &fb)) {
