@@ -135,7 +135,14 @@ sgx-gl glcubes                       # 1000 cubes, 1280x720, 300 frames
 sgx-gl glcubes --frames 1000         # a longer run
 sgx-gl glcubes --frames 0            # setup/load time only
 sgx-gl glcubes --grid 12 --width 1920 --height 1080
+sgx-gl glcubes --screen --frames 120 # ... and show it on HDMI
 ```
+
+`--screen` renders into the same offscreen FBO and presents it on the
+display through EGL/GBM (kmsro) and page flips, keeping the console's
+mode and restoring its buffer on exit.  It reports the render frame rate
+(offscreen, `glFinish` per frame) and the presented frame rate (bounded by
+the display's refresh).
 
 Example output (the frame rate is the device's; the shape is what the line
 looks like):

@@ -134,7 +134,7 @@ if [ "${MESA_BUILD:-}" = desktop ]; then
 fi
 mkdir -p "$I/bin"
 say "the test programs"
-for t in glclear gltri glfs gltex glblend gldepth glsize glcubes; do
+for t in glclear gltri glfs gltex glblend gldepth glsize; do
 	cc -O2 -Wall -I"$I/include" "$ROOT/tools/mesa-sgx/gl/$t.c" \
 	   -L"$I/lib" -lEGL -lGLESv2 -lm \
 	   -Wl,-rpath-link,"$I/lib" -Wl,-rpath,"$PREFIX/lib" -o "$I/bin/$t"
@@ -144,6 +144,11 @@ cc -O2 -Wall -I"$I/include" -I/usr/include/libdrm \
    "$ROOT/tools/mesa-sgx/gl/gbmtest.c" \
    -L"$I/lib" -lEGL -lGLESv2 -lgbm -ldrm -lm \
    -Wl,-rpath-link,"$I/lib" -Wl,-rpath,"$PREFIX/lib" -o "$I/bin/gbmtest"
+# the cube benchmark: the offscreen path needs EGL/GLES, --screen adds GBM/DRM
+cc -O2 -Wall -I"$I/include" -I/usr/include/libdrm \
+   "$ROOT/tools/mesa-sgx/gl/glcubes.c" \
+   -L"$I/lib" -lEGL -lGLESv2 -lgbm -ldrm -lm \
+   -Wl,-rpath-link,"$I/lib" -Wl,-rpath,"$PREFIX/lib" -o "$I/bin/glcubes"
 if [ "${MESA_BUILD:-}" = desktop ]; then
 	# desktop GL through EGL: GLX itself needs an X server, which the
 	# device does not have (the libraries are installed all the same)

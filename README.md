@@ -125,6 +125,7 @@ sgx2d                        # Scale a source over two destinations on the 2D en
 sgxpresent 10                # Show an SGX buffer on HDMI through PRIME for 10 seconds
 sgxpresent -b 10             # ... with the 2D engine drawing it
 sgx-gl glcubes               # 1000 textured cubes: load time and frame rate
+sgx-gl glcubes --screen      # ... and show them on HDMI through EGL/GBM
 ```
 
 ---

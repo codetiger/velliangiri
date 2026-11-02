@@ -259,7 +259,8 @@ reports the load time (process start to the first finished frame) and the
 frame rate, with `glFinish` after each frame so the number is GPU time:
 
 ```sh
-sgx-gl glcubes --frames 300
+sgx-gl glcubes --frames 300              # offscreen throughput
+sgx-gl glcubes --screen --frames 120     # the same cubes on HDMI
 ```
 
 Rendering and scanning out are ordered by the buffer's dma reservation: the
