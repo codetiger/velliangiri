@@ -83,4 +83,22 @@ t_gpu() {
 			fail "sgx2d failed"
 		fi
 	fi
+
+	if command -v sgxframe >/dev/null 2>&1 && [ -s /lib/firmware/s5l8947x/gl-event.pds ]; then
+		if sgxframe -e /lib/firmware/s5l8947x/gl-event.pds >/dev/null 2>&1; then
+			pass "TA/3D clear through the render node"
+		else
+			fail "sgxframe clear failed"
+		fi
+	else
+		skip "no GPU event program (/lib/firmware/s5l8947x/gl-event.pds)"
+	fi
+
+	if command -v sgxpresent >/dev/null 2>&1; then
+		if sgxpresent -s 1 >/dev/null 2>&1; then
+			pass "2D engine drew on the live screen (BLIT dst 0)"
+		else
+			skip "no live scanout for the screen blit (HDMI off?)"
+		fi
+	fi
 }

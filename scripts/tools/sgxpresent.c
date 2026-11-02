@@ -4,6 +4,7 @@
  *
  * Usage:
  *   sgxpresent [-b] [seconds] [gpu-va] [/dev/dri/renderD128] [/dev/dri/card1]
+ *   sgxpresent -s [seconds] [/dev/dri/renderD128]
  *
  * The clean presentation path, with no CPU copy and no debugfs:
  *
@@ -15,6 +16,11 @@
  * With -b the buffer is not filled by the CPU: the 2D engine draws a 64x64
  * four-quadrant source scaled over the whole screen (DRM_APPLE_SGX_BLIT),
  * so what the display shows came out of the GPU.
+ *
+ * With -s the display is left alone: the kernel maps what it is scanning
+ * out now (APPLE_SGX_PARAM_FB_*), and the 2D engine copies the quadrants
+ * straight onto it with dst_handle 0.  No modeset, no dma-buf, no restore:
+ * the console comes back by itself when the picture is drawn over.
  *
  * The render node is closed once the display holds the buffer: the GPU
  * mapping stays as long as the imported framebuffer exists, and the micro-
@@ -63,6 +69,19 @@ struct drm_apple_sgx_gem_info {
 	uint64_t size;
 };
 
+struct drm_apple_sgx_get_param {
+	uint32_t param;
+	uint32_t pad;
+	uint64_t value;
+};
+
+enum {
+	APPLE_SGX_PARAM_FB_VA = 11,
+	APPLE_SGX_PARAM_FB_WIDTH = 12,
+	APPLE_SGX_PARAM_FB_HEIGHT = 13,
+	APPLE_SGX_PARAM_FB_STRIDE = 14,
+};
+
 struct drm_apple_sgx_blit {
 	uint32_t src_handle;
 	uint32_t dst_handle;
@@ -75,8 +94,11 @@ struct drm_apple_sgx_blit {
 #define DRM_APPLE_SGX_GEM_CREATE	0x01
 #define DRM_APPLE_SGX_GEM_MMAP_OFFSET	0x02
 #define DRM_APPLE_SGX_GEM_INFO		0x05
+#define DRM_APPLE_SGX_GET_PARAM		0x00
 #define DRM_APPLE_SGX_BLIT		0x07
 
+#define DRM_IOCTL_APPLE_SGX_GET_PARAM \
+	DRM_IOWR(SGX_COMMAND_BASE + DRM_APPLE_SGX_GET_PARAM, struct drm_apple_sgx_get_param)
 #define DRM_IOCTL_APPLE_SGX_GEM_CREATE \
 	DRM_IOWR(SGX_COMMAND_BASE + DRM_APPLE_SGX_GEM_CREATE, struct drm_apple_sgx_gem_create)
 #define DRM_IOCTL_APPLE_SGX_GEM_MMAP_OFFSET \
@@ -107,6 +129,76 @@ static void xioctl(int fd, unsigned long req, void *arg, const char *what)
 		fail(what);
 }
 
+/*
+ * -s: the display keeps the buffer it has.  The kernel maps that buffer at
+ * APPLE_SGX_PARAM_FB_VA, and the 2D engine copies a 64x64 four-quadrant
+ * source over it with dst_handle 0 -- no modeset, no dma-buf, no restore.
+ */
+static int show_on_screen(const char *render, int seconds)
+{
+	struct drm_apple_sgx_get_param gp = { 0 };
+	struct drm_apple_sgx_gem_create gc = { 0 };
+	struct drm_apple_sgx_gem_mmap_offset gm = { 0 };
+	struct drm_apple_sgx_blit b = { 0 };
+	uint32_t fb_va = 0, fb_w = 0, fb_h = 0, fb_stride = 0;
+	uint32_t *sp, i;
+	int fd, ret = 1;
+
+	fd = open(render, O_RDWR);
+	if (fd < 0)
+		fail(render);
+
+	gp.param = APPLE_SGX_PARAM_FB_VA;
+	xioctl(fd, DRM_IOCTL_APPLE_SGX_GET_PARAM, &gp, "GET_PARAM(FB_VA)");
+	fb_va = (uint32_t)gp.value;
+	gp.param = APPLE_SGX_PARAM_FB_WIDTH;
+	xioctl(fd, DRM_IOCTL_APPLE_SGX_GET_PARAM, &gp, "GET_PARAM(FB_WIDTH)");
+	fb_w = (uint32_t)gp.value;
+	gp.param = APPLE_SGX_PARAM_FB_HEIGHT;
+	xioctl(fd, DRM_IOCTL_APPLE_SGX_GET_PARAM, &gp, "GET_PARAM(FB_HEIGHT)");
+	fb_h = (uint32_t)gp.value;
+	gp.param = APPLE_SGX_PARAM_FB_STRIDE;
+	xioctl(fd, DRM_IOCTL_APPLE_SGX_GET_PARAM, &gp, "GET_PARAM(FB_STRIDE)");
+	fb_stride = (uint32_t)gp.value;
+	if (!fb_va || !fb_w || !fb_h || !fb_stride) {
+		fprintf(stderr, "sgxpresent: the display is not scanning anything out\n");
+		goto out;
+	}
+	printf("screen: %ux%u, stride %u, at GPU 0x%08x\n", fb_w, fb_h,
+	       fb_stride, fb_va);
+
+	gc.size = 64 * 64 * 4;
+	xioctl(fd, DRM_IOCTL_APPLE_SGX_GEM_CREATE, &gc, "GEM_CREATE(source)");
+	gm.handle = gc.handle;
+	xioctl(fd, DRM_IOCTL_APPLE_SGX_GEM_MMAP_OFFSET, &gm, "GEM_MMAP_OFFSET(source)");
+	sp = mmap(NULL, gc.size, PROT_READ | PROT_WRITE, MAP_SHARED, fd, gm.offset);
+	if (sp == MAP_FAILED)
+		fail("mmap(source)");
+	for (i = 0; i < gc.size / 4; i++) {
+		unsigned int sx = i % 64, sy = i / 64;
+
+		sp[i] = sx < 32 ? (sy < 32 ? 0xffff0000u : 0xff0000ffu)
+				: (sy < 32 ? 0xff00ff00u : 0xffffffffu);
+	}
+
+	b.src_handle = gc.handle;
+	b.dst_handle = 0;		/* the screen */
+	b.src_width = b.src_height = 64;
+	b.src_stride = 64 * 4;
+	b.dst_width = fb_w;
+	b.dst_height = fb_h;
+	b.dst_stride = fb_stride;
+	xioctl(fd, DRM_IOCTL_APPLE_SGX_BLIT, &b, "BLIT(screen)");
+	printf("2D engine: 64x64 -> %ux%u on the live screen\n", fb_w, fb_h);
+	munmap(sp, gc.size);
+
+	sleep(seconds);
+	ret = 0;
+out:
+	close(fd);
+	return ret;
+}
+
 int main(int argc, char **argv)
 {
 	const char *render = "/dev/dri/renderD128";
@@ -124,15 +216,22 @@ int main(int argc, char **argv)
 	uint32_t conn_ids[8], crtc_ids[8], enc_ids[8];
 	uint32_t *px, x, y, pitch;
 	uint32_t va = DEFAULT_VA;
-	int seconds = 10, sgx, disp, dmabuf, blit = 0;
+	int seconds = 10, sgx, disp, dmabuf, blit = 0, screen = 0;
 
-	if (argc > 1 && !strcmp(argv[1], "-b")) {
+	if (argc > 1 && !strcmp(argv[1], "-s")) {
+		screen = 1;
+		argv++;
+		argc--;
+	} else if (argc > 1 && !strcmp(argv[1], "-b")) {
 		blit = 1;
 		argv++;
 		argc--;
 	}
 	if (argc > 1)
 		seconds = atoi(argv[1]);
+	if (screen)
+		return show_on_screen(argc > 2 ? argv[2] : "/dev/dri/renderD128",
+				      seconds);
 	if (argc > 2) {
 		va = strtoul(argv[2], NULL, 0);
 		if (va & 0xffff) {

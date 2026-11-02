@@ -82,6 +82,7 @@ BT_REBIND=0
 BOARD=monopoly
 GPUFW=/lib/firmware/s5l8947x
 GPU_FILE=sgx543.fw
+GLEVENT=gl-event.pds
 VXD_FILE=vxd390.fw
 IOP_FILE=iop.fw
 
@@ -144,6 +145,42 @@ provision_from_system() {
 			log_msg "nand0p1: no IOP firmware ($out)"
 		fi
 	fi
+	# The stock graphics driver keeps the 3D pass's event PDS program as a
+	# template in the system-wide code cache.  Two variants sit next to each
+	# other and only one draws, so every candidate is tried through the
+	# render node (sgxframe checks the pixels) and the one that works is
+	# kept.  A render that does not finish restarts the microkernel; that is
+	# expected for the candidates that are not the template.
+	SCACHE=/mnt/system/System/Library/Caches/com.apple.dyld/dyld_shared_cache_armv7
+	if [ ! -s "$GPUFW/$GLEVENT" ] && [ -r "$SCACHE" ] &&
+	   command -v glcarve >/dev/null && command -v sgxframe >/dev/null; then
+		CAND=/tmp/gl-candidates
+		mkdir -p "$GPUFW"
+		rm -rf "$CAND"
+		mkdir -p "$CAND"
+		# the driver's own image first (fast); the whole cache if it is
+		# not found under that name
+		if ! out=$(glcarve -i IMGSGX543GLDriver -a "$SCACHE" "$CAND" 2>&1); then
+			rm -rf "$CAND"
+			mkdir -p "$CAND"
+			out=$(glcarve -a "$SCACHE" "$CAND" 2>&1)
+		fi
+		found=""
+		for f in "$CAND"/gl-event-*.pds; do
+			[ -s "$f" ] || continue
+			if sgxframe -e "$f" >/dev/null 2>&1; then
+				cp "$f" "$GPUFW/$GLEVENT"
+				found="$f"
+				break
+			fi
+		done
+		if [ -n "$found" ]; then
+			log_msg "nand0p1: provisioned GPU event program ($(basename "$found"); $out)"
+		else
+			log_msg "nand0p1: no GPU event program drew a frame ($out)"
+		fi
+		rm -rf "$CAND"
+	fi
 	umount /mnt/system 2>/dev/null || true
 }
 
@@ -190,7 +227,7 @@ if [ "$DATA" = 1 ] && [ -d "$FWCACHE" ]; then
 	[ -n "$got" ] && log_msg "nand0p2: firmware from cache:$got"
 fi
 if [ "$DATA" = 1 ]; then
-	for f in $GPU_FILE $VXD_FILE $IOP_FILE; do
+	for f in $GPU_FILE $GLEVENT $VXD_FILE $IOP_FILE; do
 		if [ ! -s "$GPUFW/$f" ] && [ -s "$GPUCACHE/$f" ]; then
 			mkdir -p "$GPUFW"
 			cp "$GPUCACHE/$f" "$GPUFW/$f.tmp" 2>/dev/null &&
@@ -203,7 +240,7 @@ missing=0
 for f in $FW_FILES; do
 	[ -s "$FW/$f" ] || missing=1
 done
-for f in $GPU_FILE $VXD_FILE $IOP_FILE; do
+for f in $GPU_FILE $GLEVENT $VXD_FILE $IOP_FILE; do
 	[ -s "$GPUFW/$f" ] || missing=1
 done
 if [ "$missing" = 1 ] && [ -b /dev/nand0p1 ]; then
@@ -216,7 +253,7 @@ if [ "$missing" = 1 ] && [ -b /dev/nand0p1 ]; then
 				log_msg "nand0p2: cached $f"
 			fi
 		done
-		for f in $GPU_FILE $VXD_FILE $IOP_FILE; do
+		for f in $GPU_FILE $GLEVENT $VXD_FILE $IOP_FILE; do
 			if [ -s "$GPUFW/$f" ] && [ ! -s "$GPUCACHE/$f" ]; then
 				mkdir -p "$GPUCACHE"
 				cp "$GPUFW/$f" "$GPUCACHE/$f.tmp" 2>/dev/null &&

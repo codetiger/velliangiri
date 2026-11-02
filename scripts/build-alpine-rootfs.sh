@@ -52,11 +52,22 @@ python3 "${ROOT}/scripts/apk-unpack.py" \
 # Cross-compile the early entropy seeder, diagnostic tools, the WAV player, the BT patch/tools and the firmware carvers
 # ("<installed name>:<source in scripts/tools>")
 echo "[rootfs] Cross-compiling userspace tools (-O2 -mcpu=cortex-a9 -mfpu=neon) ..."
-for tool in jitterseed:jitterseed.c peek:mmio-peek.c i2cpoke:i2c-poke.c wavplay:wavplay.c l2bench:l2bench.c fbtest:fbtest.c btscan:btscan.c hcdcarve:hcdcarve.c sgxcarve:sgxcarve.c vxdcarve:vxdcarve.c iopcarve:iopcarve.c m2mtest:m2mtest.c m2mshow:m2mshow.c jpegtest:jpegtest.c sgxinfo:sgxinfo.c sgxgem:sgxgem.c sgx2d:sgx2d.c sgxpresent:sgxpresent.c; do
+for tool in jitterseed:jitterseed.c peek:mmio-peek.c i2cpoke:i2c-poke.c wavplay:wavplay.c l2bench:l2bench.c fbtest:fbtest.c btscan:btscan.c hcdcarve:hcdcarve.c sgxcarve:sgxcarve.c glcarve:glcarve.c vxdcarve:vxdcarve.c iopcarve:iopcarve.c m2mtest:m2mtest.c m2mshow:m2mshow.c jpegtest:jpegtest.c sgxinfo:sgxinfo.c sgxgem:sgxgem.c sgx2d:sgx2d.c sgxpresent:sgxpresent.c; do
 	"${CROSS_CC}" -O2 -mcpu=cortex-a9 -mfpu=neon -Wall -Wextra -static \
 		-o "${STAGE_DIR}/bin/${tool%%:*}" "${ROOT}/scripts/tools/${tool#*:}" -lm
 	chmod 755 "${STAGE_DIR}/bin/${tool%%:*}"
 done
+
+# The first render the port runs: a clear through the TA/3D queue, built
+# from the template-frame library in tools/sgx (no Mesa).
+if [ -f "${ROOT}/tools/sgx/sgxframe.c" ]; then
+	"${CROSS_CC}" -O2 -mcpu=cortex-a9 -mfpu=neon -Wall -Wextra -static \
+		-I "${ROOT}/tools/sgx" -o "${STAGE_DIR}/bin/sgxframe" \
+		"${ROOT}/tools/sgx/sgxframe.c" \
+		"${ROOT}/tools/sgx/sgx_template.c" \
+		"${ROOT}/tools/sgx/sgx_rt.c" -lm
+	chmod 755 "${STAGE_DIR}/bin/sgxframe"
+fi
 
 # Install on-demand hardware test suite (/bin/hwtest); nothing runs at boot
 TEST_DIR="${STAGE_DIR}/usr/share/velliangiri/tests"
