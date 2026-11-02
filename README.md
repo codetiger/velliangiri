@@ -11,50 +11,61 @@
 
 ---
 
-Velliangiri brings a current, mainline **Linux 6.12** kernel and an **Alpine Linux** userspace to retired ARMv7 hardware built around the **S5L8940X / S5L8947X** SoC family.
+Velliangiri brings a mainline **Linux 6.12** kernel and an **Alpine Linux (`armv7`)** userspace to retired ARMv7 hardware built around the **S5L8940X / S5L8947X** SoC family.
 
-Every driver in this repository is written from scratch based on observed hardware behaviour, uses standard Linux kernel subsystems, and is kept as a small overlay on top of a pristine kernel tree rather than a frozen vendor fork.
-
-This project is built for two groups of people:
-1. **Users and tinkerers** who want to boot Linux on the **S5L8947X (`j33iap`)** set-top box and use its hardware (HDMI video and audio, optical audio, Ethernet, Wi-Fi, Bluetooth, IR remote, USB networking, internal NAND storage, hardware AES and hardware SHA-2).
-2. **Developers and porters** who want to bring up mainline Linux on other devices in the same SoC family by reusing the interrupt controller, clock, GPIO, I2C, PMU, USB, DMA, crypto, NAND, display, and audio drivers already working here.
+The system boots over USB into RAM in ~20 seconds while using the internal NAND flash for persistent state: on first boot, required firmware is automatically extracted from the device's `System` volume and cached on the encrypted `Data` volume alongside SSH host keys, Wi-Fi configuration, Bluetooth pairings, and cached graphics packages.
 
 ---
 
 ## Hardware Support (`S5L8947X` / `j33iap`)
 
-Today, the system boots over USB into RAM (an embedded Alpine Linux initramfs) in about 20 seconds and exposes the internal NAND volumes (`/dev/nand0p1` and `/dev/nand0p2`) with full read-write HFS+ and hardware AES support. Nothing is installed to the device, but the internal flash is not left untouched: at every boot `stage2` mounts `Data` read-write at `/mnt/data` and keeps it mounted until shutdown: it loads the system keybag (which unlocks protected files) and keeps the SSH host key, Wi-Fi settings, Bluetooth pairings and a cache of the wireless firmware under `/linux` there; `System` is mounted read-only only on the first boot, to copy that firmware.
+### Supported
 
-### What works
-
-| Hardware | Status & Details |
+| Subsystem | Supported Capabilities |
 |---|---|
-| **CPU & Core SoC** | Single-core Cortex-A9 up to 850 MHz (VFPv3-D32 and ARM NEON), CPU frequency scaling (`212.5` / `425` / `850 MHz`), 512 KB PL310 L2 cache (~3.7 GB/s L2 and ~1.6 GB/s DRAM NEON streaming read), `aic,1` interrupt controller, 24 MHz timer, 42-channel central DMA (`dmaengine`), hardware watchdog, clean reboot and standby power-off |
-| **GPU (SGX543)** | PowerVR SGX543 (`apple-sgx`): GFX power states, GPU MMU, the device's own microkernel started from firmware carved at boot, the kernel command queue, a transfer queue and a TA/3D render queue, a DRM render node (`/dev/dri/renderD128`) with GEM buffers, syncobjs and a DRM scheduler, and a 2D engine ioctl (`DRM_APPLE_SGX_BLIT`, a scaled copy whose transfer the kernel builds). Verified on hardware: the microkernel handshake, a real 2D blit through the transfer queue, the GEM create/map/info/wait path (`sgxgem`), a contiguous SGX buffer exported as a dma-buf and scanned out by the display driver (`sgxpresent`), and the 2D engine drawing on HDMI (`sgxpresent -b`) or straight onto the live scanout (`sgxpresent -s`). `hwtest gpu` passes 10/10; `sgxinfo` prints the interface. Presentation is PRIME, or the 2D engine copying onto the display's live scanout (`sgxpresent -s`); the render node has no KMS plane of its own. `tools/sgx/sgxframe` runs one clear through the TA/3D queue (verified on hardware at 1280x720 and 640x360). OpenGL ES 2.0 runs on the GPU: `tools/mesa-sgx/` is the SGX Gallium driver built into Mesa 26.1.8 for Alpine armv7 (musl) and installed as the system GL — GFX clears, vertex and fragment shaders, textures, blending, depth and render targets of any size verified on the device. Mesa's kmsro pairs the render node with the display driver: EGL on a GBM surface renders into contiguous SGX scanout buffers that the display imports and page-flips (`gbmtest`, 300 frames on HDMI), with no CPU copy. The display's atomic commit waits on the render node's fence through the dma-buf (implicit sync, verified by timing). Weston 14 (DRM backend, GL renderer, kiosk shell, `tools/weston/`) runs on the path with EGL and shm clients (`weston-run`), composited on the SGX. The install is cached on Data and unpacked by `stage2` at boot. Desktop GL (GLX, X11/Wayland) is an opt-in build |
-| **Clocks, GPIO, I2C, PMU** | PMGR peripheral clock gates and audio oscillators, 144-pin GPIO and pinctrl controller (with IRQs), 3x I2C controllers, Dialog I2C PMU power switches, real-time clock (with alarm) and temperature sensors (four board thermistors, PMU junction) with a CPU thermal zone |
-| **HDMI Video** | DRM/KMS driver with EDID mode detection (up to 1920x1080@30; the board starts at 1280x720@60 for 60 Hz output with a synthesized vblank for frame pacing), framebuffer console, a 1080p logo boot splash drawn by the pre-kernel loader, and hardware gamma LUT |
-| **JPEG Decoder** | Hardware baseline JPEG decoder (`s5l8947x-jpeg`, `/dev/video2`) as a V4L2 mem2mem device: the core parses the headers itself and writes NV12, YUYV or UYVY. A 1080p photo decodes in 22 ms and, through the scaler, reaches the screen in about 32 ms at 1% CPU |
-| **Hardware Scaler** | Both M2 memory-to-memory scalers (`s5l8947x-m2sc`, `/dev/video0` and `/dev/video1`) as V4L2 mem2mem devices: scaling up to 8x down horizontally and 7x vertically with area-averaging filters, source crop and destination placement (letterboxing), NV12/NV16/YUYV to and from RGB565/XRGB1555/XRGB8888 with BT.601 or BT.709 matrices in limited or full range, MMAP and DMABUF buffers, including zero-copy output into DRM framebuffers. NV12 640x360 to XRGB8888 1280x720 takes 5 ms at under 10% CPU |
-| **Audio (HDMI & Optical)** | ALSA playback (`s5l8947x-audio`) on two PCM devices: HDMI over I2S (`pcmC0D0p`, 2/4/6/8-channel LPCM with one data line per channel pair) and optical S/PDIF (`pcmC0D1p`), each fed by a cyclic DMA transfer with period interrupts, with HDMI hot-plug mute/unmute and a `wavplay` CLI player |
-| **Ethernet** | 10/100 Fast Ethernet (`eth0`, `s5l_fe` MAC + SMSC PHY) with automatic DHCP at boot |
-| **USB Networking & Console** | Micro-USB port runs in USB device mode (`dwc2`), providing a virtual Ethernet link (`usb0` at `10.55.0.2`, SSH enabled) and a USB serial console (`/dev/ttyGS0`) |
-| **Wi-Fi (2.4 & 5 GHz)** | Broadcom BCM4334 over internal HSIC USB host (`ehci-platform` + custom PHY handshake); scans and joins WPA2 networks via `wpa_supplicant` and the built-in `wifi` helper; firmware, NVRAM, and the factory MAC address are read from the device's own NAND at boot; the regulatory country can be set with `iw reg set` or `country=` in `wpa_supplicant.conf` |
-| **Bluetooth** | BCM4334 Bluetooth 4.1 (`hci0` over `uart2` at 1.6 Mbaud); patch firmware and the factory device address are read from the device's own NAND at boot; LE scanning verified with `btscan`; BlueZ (`bluetoothd`, `bluetoothctl`) runs at boot and discovers nearby devices, with HID support for Classic (`hidp`) and LE (`uhid`) keyboards and pairings kept on `Data`; the controller sleeps when idle and wakes the host through the PMU's host-wake interrupt |
-| **IR Remote & System MCU** | Infrared remote buttons reported as a standard Linux input device (`S5L8947X IR Remote`, `/dev/input/event*`) via the MSP430 system microcontroller on `uart1`, with the stock version/active handshake at probe, ACK-waited raw commands, an event trace for further protocol work, and the MCU NMI line as a wake source. The board enables `apple,game-keys`, so the seven buttons report game keys (arrows, Ctrl, Space, Escape); `.../game_map` switches back to media codes |
-| **Hardware AES Engine** | CDMA AES crypto engine (`s5l8947x-aes` at `0x37801000`): `ecb(aes)` and `cbc(aes)` `skcipher` algorithms (128 / 192 / 256-bit keys) over CDMA channels 1 and 2, plus hardware device/group key operations (`s5l8947x_aes_hwkey_crypt()`) |
-| **Hardware SHA Engine & NEON Crypto** | SHA-2 engine (`s5l8947x-sha` at `0x30200000`): `sha224`, `sha256`, `sha384` and `sha512` hashes, alongside built-in ARMv7/NEON kernel crypto (`sha1-neon`, `sha256-neon`, `sha512-neon`, `blake2b-neon`, `blake2s-arm`, `chacha20-neon`, `poly1305-neon`, `aes-arm`, `aes-neonbs`) and `AF_ALG` userspace sockets |
-| **Internal NAND & Volumes** | Managed NAND controller (`s5l8947x-fmi`, 8.9 GB, read/write/erase on `/dev/mtd0`, ~47 MB/s reads over CDMA) and read-write translation layer (`s5l8947x-ftl`) exposing `/dev/nand0`, `/dev/nand0p1` (`System`, 1.4 GB), and `/dev/nand0p2` (`Data`, 6.5 GB, volume key and per-file `com.apple.system.cprotect` keys of all four protection classes, from the reserved SLC key store and the system keybag); both volumes mount read-write as `hfsplus` with journal verification/replay, transparent file encryption/decryption, and clean unmount handling |
+| **CPU & Core SoC** | Single-core Cortex-A9 up to 850 MHz (`VFPv3-D32` + `ARM NEON`), CPU frequency scaling (`212.5` / `425` / `850 MHz`), 512 KB L2 cache, interrupt controller, 24 MHz timer, 42-channel central DMA, hardware watchdog, clean reboot and standby power-off |
+| **Clocks, GPIO, I2C & PMU** | Peripheral clock gates and audio oscillators, 144-pin GPIO and pinctrl controller with interrupts, 3x I2C controllers, PMU power switches and event interrupts, persistent real-time clock (RTC) with wake alarm, 5 temperature sensors (4 board thermistors + PMU junction), and CPU thermal throttling |
+| **HDMI Display** | DRM/KMS display output with EDID mode detection (up to `1920x1080@30`; defaults to `1280x720@60` with synthesized vblank frame pacing), framebuffer console (`tty0`), 1080p pre-kernel boot splash, hardware gamma brightness control, and zero-copy `dma-buf` scanout |
+| **2D / 3D GPU (SGX543)** | PowerVR SGX543MP1 microkernel bring-up, GPU MMU, DRM render node (`/dev/dri/renderD128`), hardware 2D scaled blit engine, TA/3D rendering queue, **OpenGL ES 2.0** and opt-in **Desktop OpenGL 2.1** via Mesa 26.1.8, zero-copy HDMI presentation (`PRIME`, live-scanout blit, and `EGL/GBM` via `kmsro` with implicit fence sync), and **Weston 14** Wayland compositor |
+| **Hardware Scalers (M2)** | Dual V4L2 memory-to-memory scalers (`/dev/video0`, `/dev/video1`): up to 8x horizontal and 7x vertical downscaling with polyphase area-averaging filters, crop and compose letterboxing, `NV12`/`NV16`/`YUYV` ↔ `RGB565`/`XRGB1555`/`XRGB8888` colour-space conversion (`BT.601`/`BT.709`, limited/full range), and zero-copy `dma-buf` display output |
+| **Hardware JPEG Decoder** | Baseline JPEG V4L2 memory-to-memory decoder (`/dev/video2`): hardware header parsing and body decoding into `NV12`, `YUYV`, or `UYVY` (~22 ms for a 1080p image, ~32 ms scaled to HDMI at 1% CPU) |
+| **Audio (HDMI & Optical)** | ALSA playback over HDMI I2S (`pcmC0D0p`, 2/4/6/8-channel LPCM at exact `32` / `44.1` / `48 kHz` with hot-plug mute/unmute) and optical S/PDIF (`pcmC0D1p` at `46,875 Hz`), plus the `wavplay` CLI player with automatic NEON resampling |
+| **Ethernet & USB Gadget** | 10/100 Fast Ethernet (`eth0`, automatic DHCP) and Micro-USB peripheral gadget (`usb0` virtual Ethernet at `10.55.0.2` with Dropbear SSH + `/dev/ttyGS0` serial console) |
+| **Wi-Fi (2.4 & 5 GHz)** | Broadcom BCM4334 802.11a/b/g/n over internal HSIC USB host; WPA2 scanning and connection via `wpa_supplicant` and the `wifi` helper, with regulatory domain support and factory MAC provisioning |
+| **Bluetooth 4.1 + LE** | BCM4334 Bluetooth (`hci0` at 1.6 Mbaud) with factory address provisioning, BlueZ (`bluetoothd`, `bluetoothctl`), LE scanning (`btscan`), Classic (`hidp`) and LE (`uhid`) HID keyboard support, persistent pairings, and UART runtime sleep with PMU host-wake |
+| **IR Remote & System MCU** | Infrared remote input (`/dev/input/event*`) with switchable game/media keymaps, system MCU handshake, ACK-waited commands, NMI wake source, and standby power-off |
+| **Hardware & NEON Crypto** | Hardware DMA AES (`ecb(aes)`, `cbc(aes)` 128/192/256-bit at ~70 MB/s, plus hardware device/group keys), hardware SHA-2 (`sha224`, `sha256`, `sha384`, `sha512`), ARMv7/NEON kernel crypto (`sha1/256/512-neon`, `blake2b-neon`, `chacha20-neon`, `poly1305-neon`, `aes-neonbs`), and `AF_ALG` userspace sockets |
+| **Internal NAND & Volumes** | 8.9 GB managed NAND (`/dev/mtd0`, ~47 MB/s DMA reads), read-write Flash Translation Layer (`/dev/nand0`) with superblock rotation and garbage collection, hardware key-store and system keybag unwrapping (protection classes 1–4), and read-write `hfsplus` mounts for `System` (`/dev/nand0p1`) and `Data` (`/dev/nand0p2`) with journal replay, transparent per-file encryption, and `decmpfs` transparent decompression |
 
-### What doesn't work yet (honest limitations)
+### In-Progress & Pending Support
 
-| Area | Current Limitation |
+| Area | Status |
 |---|---|
-| **3D GPU acceleration on screen** | OpenGL ES 2.0 runs on the SGX543 and reaches HDMI through EGL/GBM (Mesa kmsro) with implicit fences; a Weston compositor runs on it. What is missing: input devices (no USB host mode), the desktop shell/Xwayland, and the console itself is still CPU-rendered. |
-| **USB host on the external port** | The external Micro-USB port is currently set to peripheral/device mode only (a CDC-ECM + CDC-ACM composite gadget). Plugging USB flash drives or keyboards into the Micro-USB port is not supported yet. |
-| **Audio sample rates** | HDMI plays `32`, `44.1` and `48 kHz` exactly. Optical is still clocked from the 24 MHz crystal and runs at `46,875 Hz`; use `wavplay` (which resamples automatically) or ALSA resampling there. The optical output has not been checked on a receiver yet. |
-| **Bluetooth** | The controller runs at 1.6 Mbaud rather than the stock 3 Mbaud (the UART clocks cannot produce 3 Mbaud), and pairing and connections through `bluetoothctl` have not been tested yet. |
+| **External USB Host Mode** | **Pending:** The external Micro-USB port currently runs in peripheral/gadget mode only. Supporting external USB keyboards, mice, and storage requires OTG role switching and the USB 1.1 OHCI companion controller. |
+| **H.264 / MPEG-4 Video Decoder (VXD)** | **In-Progress:** Power gate control, on-device firmware extraction, and DMA upload image assembly are in place; blocked on initializing the media clock source before reset/handshake and implementing the V4L2 decode interface. |
+| **GPU & Wayland Desktop Polish** | **In-Progress:** OpenGL ES 2.0, EGL/GBM, and Weston kiosk compositing work on HDMI. Remaining items: external input (awaiting USB host mode), full desktop shell / Xwayland, 2D solid fill and rotation, hardware IRQ completion (currently polled), and runtime PM. |
+| **Display >108 MHz & Hardware Vblank** | **In-Progress:** Pixel clocks are currently capped at 108 MHz (`1080p30` / `720p60`), and frame pacing uses a timer-synthesized vblank as no hardware vblank IRQ is wired. |
+| **Optical Audio Exact Sample Rates** | **In-Progress:** HDMI plays exact `32` / `44.1` / `48 kHz`. Optical S/PDIF currently runs at `46,875 Hz` from the 24 MHz crystal (`wavplay` resamples automatically) and awaits switching to the audio oscillator and receiver verification. |
+| **Bluetooth Pairing Verification** | **In-Progress:** Controller runs at 1.6 Mbaud (due to integer UART clock dividers); BlueZ and HID support are enabled, with end-to-end device pairing verification pending. |
+| **IOP Coprocessor** | **In-Progress:** Firmware extraction and core start work, but the EmbeddedIOP message channel is not implemented (not required on Linux since NAND is driven directly from the main CPU). |
+| **DART IOMMU, PKE & Dynamic Voltage Scaling** | **Pending:** DART stays in bypass mode (media blocks use contiguous buffers), the PKE public-key accelerator is unused, and CPU frequency scaling runs at fixed boot voltage. |
 
-For exact register addresses, driver file paths, and per-block notes, see [progress.md](progress.md). For cache/memory latency, kernel crypto, and ARM NEON SIMD benchmarks measured on the device, see [benchmarks.md](benchmarks.md).
+See [docs/progress.md](docs/progress.md) for the detailed support matrix, [docs/SGX.md](docs/SGX.md) for GPU and OpenGL details, and [docs/benchmarks.md](docs/benchmarks.md) for on-device cache, NEON, crypto, and storage benchmarks.
+
+### Documentation (`docs/`)
+
+| Document | Contents |
+|---|---|
+| [docs/progress.md](docs/progress.md) | Hardware and software support matrix (Supported, In-Progress, Pending, and Priority Roadmap) |
+| [docs/SGX.md](docs/SGX.md) | PowerVR SGX543MP1 GPU, Mesa 26.1.8 OpenGL ES 2.0 / GL 2.1, and Weston 14 Wayland status & usage |
+| [docs/benchmarks.md](docs/benchmarks.md) | On-device L1/L2/DRAM latency, NEON bandwidth, hardware AES/SHA, and NAND/HFS+ benchmarks |
+| [docs/drivers-and-porting.md](docs/drivers-and-porting.md) | Driver map, MMIO addresses, clock/IRQ bindings, boot bundle architecture, and SoC porting guide |
+| [docs/sgx-architecture.md](docs/sgx-architecture.md) | SGX543 register banks, `SGXF` firmware container, GPU MMU layout, TA/3D/2D queues, and `kmsro`/PRIME display integration |
+| [docs/audio-i2s-spdif.md](docs/audio-i2s-spdif.md) | I2S0–I2S3, I2S clock master, S/PDIF, PMGR NCOs, and 2/4/6/8-channel HDMI LPCM register specification |
+| [docs/cdma-registers.md](docs/cdma-registers.md) | 42-channel Central DMA (CDMA) register file, 32-byte segment descriptor ring, and peripheral request map |
+| [docs/nand-fmi-and-crypto.md](docs/nand-fmi-and-crypto.md) | FMI0/1 controller, PPN 1.5 command set, FTL superblocks/TOC, `LwVM` volumes, CDMA AES, and `Face`/`cprotect` key hierarchy |
+| [docs/media-scalers-and-jpeg.md](docs/media-scalers-and-jpeg.md) | Dual M2 Scaler/CSC engines, baseline JPEG decoder, DART IOMMU, and VXD390 video decoder register specification |
+| [docs/pmu-mcu-and-usb.md](docs/pmu-mcu-and-usb.md) | Dialog D1815 PMU (RTC & 12-bit ADC thermistors), UART1 System/IR MCU protocol, USB OTG/HSIC PHY ladder, SHA-2, and IOP |
 
 ---
 
@@ -62,192 +73,73 @@ For exact register addresses, driver file paths, and per-block notes, see [progr
 
 ### 1. Prerequisites
 
-- **On your computer:** Docker (the build runs inside a reproducible Debian cross-compile container on Linux or macOS).
-- **For the device:** A Micro-USB cable and a way to load and jump to a raw binary payload in RAM over USB.
+- **Host computer:** Docker (builds run inside a reproducible cross-compile container on Linux or macOS).
+- **Target device:** A Micro-USB cable and a way to load and jump to a raw binary payload in RAM over USB.
 
-### 2. Wi-Fi and Bluetooth firmware
-
-Nothing to do: on the first boot, `stage2` mounts the device's own `System` volume (`/dev/nand0p1`) read-only and copies the Wi-Fi firmware, NVRAM, and Bluetooth patch into `/lib/firmware/brcm/` (the Bluetooth patch is carved out of a system tool by `hcdcarve`, which picks the one patch naming this board). It keeps a copy on `Data` (`/linux/lib/firmware/brcm`), and later boots load the firmware from there; delete that folder to provision again from `System`. The Ethernet, Wi-Fi, and Bluetooth addresses come from the factory system configuration on the same NAND (`/sys/block/nand0/{emac,wmac,bmac}`).
-
-*(Optional)* To make the device join your Wi-Fi network automatically at boot, place a standard `wpa_supplicant.conf` at `research/wpa_supplicant.conf` (or point `WIFI_CONF` at another file inside the repository) before building. On first boot it is saved to the `Data` volume, and from then on the saved copy is used. To install your SSH key, pass a public key file inside the repository, for example `SSH_PUBKEY=research/id_ed25519.pub ./scripts/velliangiri.sh all`.
-
-### 3. Build the bootable bundle
+### 2. Build
 
 ```bash
 ./scripts/velliangiri.sh all
 ```
 
-This builds the Docker container, assembles the Alpine 3.21 `armv7` initramfs, fetches and patches mainline Linux 6.12, compiles the kernel and Device Tree, and packs everything into a single self-relocating image:
+This builds the Alpine `armv7` initramfs, compiles mainline Linux 6.12 and the Device Tree, and packs the self-relocating boot image:
 
 ```text
 out/boot-bundle-s5l8947x-j33iap.bin
 ```
 
-You can also run individual build stages with `./scripts/velliangiri.sh rootfs | kernel | bundle | clean`, or open an interactive cross-compile shell with `./scripts/velliangiri.sh shell`.
+Other build targets:
+```bash
+./scripts/velliangiri.sh rootfs | kernel | bundle | mesa | weston | clean | check | shell
+```
 
-### 4. Boot and connect
+*(Optional)* Place a `wpa_supplicant.conf` at `research/wpa_supplicant.conf` (or set `WIFI_CONF=...`) before building to auto-join Wi-Fi on boot, or pass `SSH_PUBKEY=path/to/key.pub` to embed an SSH authorized key.
 
-Load `out/boot-bundle-s5l8947x-j33iap.bin` into the device's RAM over USB and jump to its entry point. Within ~20 seconds:
+### 3. Boot and Connect
 
-1. **HDMI:** The Velliangiri boot splash appears on screen, followed by the Linux framebuffer console (`tty0`).
-2. **USB Network & SSH:** Your computer detects a USB Ethernet gadget. Assign your computer's side of the USB interface an IP in `10.55.0.0/24` (for example `10.55.0.1/24`) and SSH in as `root` (no password by default):
+Load `out/boot-bundle-s5l8947x-j33iap.bin` into RAM over USB and jump to its entry point. Within ~20 seconds:
+
+1. **HDMI:** The boot splash appears, followed by the Linux framebuffer console (`tty0`).
+2. **USB Network & SSH:** Assign your host USB interface an IP in `10.55.0.0/24` (e.g. `10.55.0.1/24`) and connect:
    ```bash
    ssh root@10.55.0.2
    ```
-3. **USB Serial Console:** A virtual serial port (`/dev/ttyACM0` or `/dev/cu.usbmodem*`) also appears over the same USB cable with a root login prompt.
-4. **Ethernet:** If an Ethernet cable is plugged in, `eth0` gets an IP via DHCP automatically.
+3. **USB Serial Console:** Available on `/dev/ttyACM0` or `/dev/cu.usbmodem*`.
+4. **Ethernet:** `eth0` acquires a DHCP lease automatically when plugged in.
 
-### 5. Useful commands on the device
+### 4. Useful Commands on the Device
 
 ```bash
-hwtest                       # Run the automated on-device hardware test suite
-hwtest -i display audio      # Run interactive display and audio checks
-mount -t hfsplus /dev/nand0p1 /mnt        # Mount the System volume read-write (-o ro for read-only)
-ls /mnt/data                 # The decrypted Data volume, mounted read-write by stage2 at boot
-cat /sys/block/nand0/keybag  # Show which file-protection classes are unlocked
-wifi scan                    # Scan for 2.4 GHz and 5 GHz Wi-Fi networks
-wifi connect "MySSID" "PSK"  # Connect to WPA2 Wi-Fi and obtain a DHCP lease
-wifi status                  # Check Wi-Fi link speed and IP address
-wavplay /path/to/file.wav    # Play a WAV file over HDMI (-d /dev/snd/pcmC0D1p for optical)
-btscan 10                    # Scan for Bluetooth LE advertisers for 10 seconds
-l2bench                      # Measure L1, L2, and DRAM latency and NEON streaming bandwidth
-fbtest -s 5                  # Measure framebuffer write throughput at the current mode
-m2mtest nv12 640x360 xrgb 1280x720  # Scale and convert on the hardware scaler; reports fps and CPU
-m2mtest -c 160,0,960x720 nv12 640x480 xrgb 1280x720  # Letterbox into a rectangle of the frame
-m2mtest -z xrgb 1920x1080 xrgb 320x180  # Downscale a 1-pixel checkerboard; checks it averages to grey
-m2mshow                      # Scale a moving test frame straight into the display (zero-copy DMABUF)
-jpegtest -s 5 photo.jpg      # Decode a JPEG on the hardware and show it letterboxed through the scaler
-sgxinfo                      # Print the SGX render node's parameters and address windows
-sgxgem                       # Create, map and check a GEM buffer on the SGX render node
-sgxgem -c                    # Same, contiguous and exported as a dma-buf
-sgxgem -i /dev/dri/card1     # Import a display dumb buffer into the render node
-sgx2d                        # Scale a source over two destinations on the 2D engine
-sgxpresent 10                # Show an SGX buffer on HDMI through PRIME for 10 seconds
-sgxpresent -b 10             # ... with the 2D engine drawing it
-sgx-gl glcubes               # 1000 textured cubes: load time and frame rate
-sgx-gl glcubes --screen      # ... and show them on HDMI through EGL/GBM
+hwtest                                # Run the automated on-device hardware test suite
+hwtest -i display audio               # Run interactive display and audio checks
+wifi scan                             # Scan for 2.4 GHz and 5 GHz Wi-Fi networks
+wifi connect "MySSID" "PSK"           # Connect to WPA2 Wi-Fi and obtain a DHCP lease
+wifi status                           # Check Wi-Fi link status and IP address
+btscan 10                             # Scan for Bluetooth LE advertisers for 10 seconds
+wavplay /path/to/file.wav             # Play WAV audio over HDMI (-d /dev/snd/pcmC0D1p for optical)
+jpegtest -s 5 photo.jpg               # Hardware-decode a JPEG and display it via the hardware scaler
+m2mshow                               # Stream zero-copy hardware-scaled test frames to HDMI
+sgxpresent -b 10                      # Present a 2D GPU-rendered buffer on HDMI for 10 seconds
+sgx-gl glcubes --screen               # Render 1,000 textured 3D cubes on the SGX543 and flip to HDMI
+weston-run 20                         # Run the Weston Wayland compositor on HDMI for 20 seconds
+l2bench                               # Measure L1, L2, and DRAM latency and NEON bandwidth
 ```
-
----
-
-## Porting to Similar Devices
-
-The `S5L8947X` is one chip in the **S5L8940X** family (alongside related dual-core and variant SoCs from the same generation). Most of the on-chip peripherals use the same register layout across the family, which makes bringing up another board much easier than starting from zero.
-
-### Reusable drivers in this repository
-
-Drivers that apply across the SoC family are already named `s5l8940x` and parameterized via Device Tree:
-
-| Subsystem | Driver Path | Notes for Porters |
-|---|---|---|
-| **Interrupts & Timer** | `drivers/irqchip/irq-apple-aic1.c` | `aic,1` controller and 24 MHz local timer. Already includes `CONFIG_SMP` IPI support and per-CPU register windows for multi-core chips. |
-| **Watchdog & Reset** | `arch/arm/mach-apple/` | 24 MHz watchdog timer, clocksource, and system restart handler (`apple,s5l8940x-wdt-timer`). |
-| **Clocks (PMGR)** | `drivers/clk/clk-s5l8940x-pmgr.c` | Linear table of 32-bit peripheral clock gate registers (`0xf` to enable, bits `7:4` status), and the seven audio oscillators (rate set to the hertz). |
-| **CPU Frequency** | `drivers/cpufreq/s5l8947x-cpufreq.c` | PMGR performance state switching without disturbing peripheral baud clocks. |
-| **GPIO & Pinctrl** | `drivers/pinctrl/pinctrl-s5l8940x-gpio.c` | Banked pin controller and GPIO IRQ chip (`apple,npins` set in DT). |
-| **I2C** | `drivers/i2c/busses/i2c-s5l8940x.c` | Master controller for `i2c0`..`i2c2`. |
-| **PMU & Regulators** | `drivers/mfd/apple-pmu-i2c.c`<br>`drivers/regulator/apple-pmu-pwrsw.c` | Dialog I2C PMU (`D1815` / `D1974` / `D2045`) regmap MFD with its event interrupts (used for Bluetooth host wake) and GPIO-backed power switches. |
-| **Real-time clock** | `drivers/rtc/rtc-apple-pmu.c` | PMU seconds counter plus a calendar offset in PMU registers, with an alarm on PMU event 32. |
-| **Temperature sensors** | `drivers/hwmon/apple-pmu-hwmon.c` | PMU ADC readings of the board thermistors and the PMU junction as hwmon channels; the SoC thermistor drives a thermal zone with cpufreq cooling. |
-| **USB 2.0 PHY** | `drivers/phy/phy-apple-s5l-usb.c` | OTG device PHY (paired with mainline `dwc2`) and EHCI HSIC host PHY with GPIO ready handshaking. |
-| **UART** | `scripts/patches/0002-*.patch`<br>`scripts/patches/0012-*.patch` | Hooks `ARCH_APPLE_S5L` into mainline `samsung_tty.c` (`apple,s5l-uart`) and raises its port count to five for this SoC: UART1 is the MCU link, UART2 Bluetooth, and UART0/3/4 are the test-point ports (MCU bootstrap/earlycon, stock boot console, Wi-Fi debug). UART0 requires dropping `keep_bootcon`, which otherwise keeps earlycon writing to the port the driver resets. |
-| **IOP coprocessor** | `drivers/soc/apple/s5l8947x-iop.c`<br>`scripts/tools/iopcarve.c` | Bring-up for the separate IOP core: clock gate (decoded from `pmgr:device-clocks`), firmware carved from the device's own kernel image, heap/page-table patching and the A5IOP start sequence. The core starts and runs its firmware, then aborts in its scheduler because the stock message-channel/endpoint setup is not implemented; there is no Linux client for it. |
-| **Display & HDMI** | `drivers/gpu/drm/s5l8947x/s5l8947x_drm.c` | DRM/KMS driver for the `rgbout` display pipe and HDMI 1.4 transmitter: EDID modes, PHY configuration per pixel clock, AVI and audio infoframes, gamma LUT. |
-| **GPU (SGX543)** | `drivers/gpu/drm/apple-sgx/` | Power, GPU MMU, microkernel boot, kernel CCB, transfer/render queues and a DRM render node; a contiguous buffer object can be exported as a dma-buf and scanned out by the display driver (PRIME), and Mesa pairs it with the display through kmsro for EGL/GBM. The firmware comes from `sgxcarve`; the UAPI is `include/uapi/drm/apple_sgx_drm.h`. The driver and the Gallium driver in `tools/mesa-sgx/` are derived from the clean-room SGX543 work in Project Cascadia. |
-| **JPEG Decoder** | `drivers/media/platform/apple/s5l8947x-jpeg.c` | V4L2 memory-to-memory baseline JPEG decoder (PMGR gate 13, IRQ 118): header phase, then body decode into NV12, YUYV or UYVY. |
-| **M2 Scaler** | `drivers/media/platform/apple/s5l8947x-m2sc.c` | V4L2 memory-to-memory scaling and colour-space conversion on both M2 instances (PMGR gates 11 and 12, IRQs 9 and 10), filters generated per job from the scaling ratio, crop and compose rectangles, and a debugfs self-test. |
-| **Central DMA** | `drivers/dma/s5l8947x-cdma.c` | 42-channel `dmaengine` provider: slave scatter-gather (both directions, audio `0x34000000` and NAND `0x31000000` windows) and cyclic transfers with per-channel interrupts. |
-| **Audio** | `sound/arm/s5l8947x-audio.c` | I2S0..I2S3 (HDMI, 2 to 8 channels over one data line per channel pair) and S/PDIF (optical) transmitters, each fed by a cyclic DMA transfer. |
-| **CDMA AES Engine** | `drivers/crypto/s5l8947x-aes.c`<br>`include/linux/s5l8947x-aes.h` | `ecb(aes)` and `cbc(aes)` `skcipher` algorithms over CDMA channels 1 and 2, plus `s5l8947x_aes_hwkey_crypt()` for the hardware device and group keys. |
-| **SHA Engine** | `drivers/crypto/s5l8947x-sha.c` | `sha224` / `sha256` / `sha384` / `sha512` `shash` algorithms on the SoC hash engine. |
-| **Managed NAND & FTL** | `drivers/mtd/devices/s5l8947x-fmi.c`<br>`drivers/mtd/s5l8947x-ftl.c`<br>`scripts/patches/0008-*.patch` | Managed NAND controller (`FMI0`), read-write translation layer (`/dev/nand0`), key-store and system keybag unwrapping, factory system configuration (MAC addresses into the DT), and encrypted volume + per-file `hfsplus` read/write encryption and journal handling (`/dev/nand0p1`, `/dev/nand0p2`). |
-
-### How the boot bundle works (`scripts/boot/`)
-
-Device bootloaders in this family do not boot standard Linux `zImage` + Device Tree pairs directly—they may enter with the MMU or caches active, leave peripheral clocks gated off, and pass custom boot arguments instead of a Flattened Device Tree.
-
-To solve this cleanly for any board, `scripts/build-bundle.sh` wraps the kernel in a tiny, self-relocating pre-kernel loader:
-
-1. **Position-independent entry stub (`scripts/boot/entry-stub.S`):** Runs from whatever RAM address the bootloader loads it at. It masks interrupts, cleanly flushes/invalidates L1 and PL310 L2 caches whether the MMU was on or off, disables the MMU, arms the hardware watchdog as a 120-second safety net, copies the payload to the start of RAM (`0x80000000`), and jumps there.
-2. **Pre-kernel C loader (`scripts/boot/boot-loader.c`):** Runs in the first 32 KB of RAM (`0x80000000..0x80007fff`), turns on essential PMGR clock gates, draws the boot splash and starts 1080p30 scanout for `simple-framebuffer` (8 MB reserved at `0x9e400000`), and jumps to `zImage` at `0x80008000` with `r2` pointing to the appended `.dtb`. Its stack grows down from `0x80007000` in the same slot, so the build rejects a loader image larger than 24 KB.
-3. **Boot splash (`scripts/boot/gen-splash.py`, `splash.c`):** At build time the generator flattens `logo.svg` and the wordmark into polygon tables with precomputed edge slopes, and the loader fills them into the framebuffer with no runtime division. To brand a port, replace `logo.svg`.
-
-### Step-by-step guide to porting a new board
-
-If you have another device with a serial console (or USB / framebuffer output) and a way to load code into RAM:
-
-1. **Adapt the pre-kernel stub (`scripts/boot/`):**
-   - Check the physical RAM base address (`0x80000000` on `S5L8947X`) and watchdog base in `entry-stub.S`.
-   - If the bootloader already sets up a display framebuffer, point a `simple-framebuffer` node at that physical address to get an instant early console (`earlycon` / `tty0`) before writing any platform drivers.
-2. **Create a SoC `.dtsi` and board `.dts` (`arch/arm/boot/dts/apple/`):**
-   - Copy `s5l8947x.dtsi` and `s5l8947x-j33iap.dts` as a template.
-   - Update the MMIO base addresses, IRQ numbers, and clock gate indices for your chip. Start with just `aic`, `wdt`, `uart0` (or `usb0` for USB gadget console/network), and `simple-framebuffer`.
-3. **Use the built-in hardware exploration tools:**
-   - Once the initramfs boots to a shell over serial or USB, the image includes static diagnostic utilities compiled from `scripts/tools/`:
-     - `peek <phys-addr> [count]` / `peek -w <phys-addr> <value>` — read or write 32-bit MMIO registers from userspace.
-     - `i2cpoke <bus> scan` / `i2cpoke <bus> <addr> <reg> [count]` — scan I2C buses and read or write device registers.
-     - `l2bench` — measure L1, L2 and DRAM latency to confirm the caches are on.
-4. **Enable peripherals incrementally:**
-   - Turn on `gpio`, `i2c`, `pmu`, `usb_phy`, `cdma`, `aes`, `fmi0`, `display_pipe`, and `audio` nodes one by one in your board's `.dts`, adding compatible strings or small register-offset tables to the existing drivers where your chip differs.
-
-If you are working on bringing up a related device, feel free to open an issue with your SoC and board details.
-
----
-
-## Repository Layout
-
-Instead of storing a full kernel source tree, this repository holds only the files added for the platform and a short patch series for existing kernel files. `scripts/apply-kernel-tree.py` overlays them onto a clean Linux 6.12 checkout (and can `--revert` back to a pristine tree at any time).
-
-| Path | Contents |
-|---|---|
-| `arch/arm/boot/dts/apple/` | SoC (`.dtsi`) and board (`.dts`) Device Trees |
-| `arch/arm/mach-apple/` | Machine init, CPU clock calibration, watchdog clocksource & reset |
-| `drivers/`, `sound/`, `include/` | Clean-room kernel drivers in their standard mainline paths |
-| `scripts/patches/` | 13 small, self-contained patches to mainline Linux 6.12 files |
-| `scripts/boot/` | Position-independent entry stub, pre-kernel C loader, HDMI init, boot splash and its generator |
-| `scripts/tests/` | On-device hardware test suite (`hwtest`) |
-| `scripts/tools/` | Userspace tools built into the image (`-mcpu=cortex-a9 -mfpu=neon`): diagnostics (`peek`, `i2cpoke`, `l2bench`, `fbtest`, `m2mtest`, `m2mshow`, `jpegtest`, `sgxinfo`, `sgxgem`, `sgx2d`, `sgxpresent`), `wavplay`, `btscan`, the firmware carvers (`hcdcarve`, `sgxcarve`), and the early entropy seeder `jitterseed` |
-| `config/` | Kernel configuration fragments layered on `multi_v7_defconfig` |
-| `initramfs/` | Init scripts, USB gadget / SSH setup, and the `wifi` helper |
-| `progress.md`, `benchmarks.md` | Per-block driver status / hardware notes and on-device ARM NEON / subsystem benchmark tables |
-| `SGX.md` | The SGX543 command submission and render-node port: firmware format, GPU address space, command flow, testing and next steps |
 
 ---
 
 ## Contributing & Clean-Room Rules
 
-Contributions of any kind are welcome—whether that is a new board Device Tree, a driver for an unsupported hardware block, a bug fix, or hardware test coverage.
-
-High-impact open tasks on `S5L8947X` right now (see [progress.md](progress.md) for details):
-- **SGX desktop**: USB host mode for input, and the desktop shell/Xwayland if the kiosk shell is not enough.
-- **More 2D engine**: a fill and a non-scaled copy are the same transfer with other programs; rotation and several transfers in flight come after that.
-- **USB OTG host mode** (role switching + OHCI companion controller at `0x36500000`) to allow plugging in external USB devices.
-- **Optical audio at exact rates**: clock the S/PDIF transmitter from PMGR audio oscillator 4 instead of the 24 MHz crystal.
-
-### Guardrails
-
-To keep the work upstreamable and legally clean, this repository enforces strict source-tree rules. Before making your first commit, install the git hooks:
+Before making your first commit, install the git hooks and verify the tree:
 
 ```bash
 ./scripts/setup-guardrails.sh
-```
-
-And run the verification check before submitting changes:
-
-```bash
 ./scripts/velliangiri.sh check
 ```
 
 1. **Clean-room & open-source (`GPL-2.0-only`) only:** Write code only from observed hardware behaviour and public specifications.
 2. **No binaries or blobs:** Never commit firmware, binary objects, archives, raw memory dumps, or cryptographic keys.
 3. **No proprietary terminology:** Do not use internal vendor codenames, proprietary bootloader names, or key names in code, comments, documentation, or commit messages.
-4. **Keep local research separate:** Store any local notes, firmware files, or non-distributable test material strictly inside the git-ignored `research/` directory.
-
----
-
-## The Name
-
-Velliangiri is a mountain range in the Western Ghats of South India; *velli* means white. The logo is that peak, with a white slope and a Linux penguin's beak for a summit.
+4. **Keep local research separate:** Store any local notes, verbose hardware documentation, firmware files, or non-distributable test material strictly inside the git-ignored `research/` directory.
 
 ## License
 
