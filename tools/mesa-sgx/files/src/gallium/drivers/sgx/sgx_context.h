@@ -106,6 +106,7 @@ struct sgx_batch {
    unsigned zs_level, zs_layer;         /* its level and layer (M43) */
    bool zs_cleared;                     /* its depth cleared at the render's start */
    bool zs_read, zs_written;            /* a draw tests depth, writes it */
+   bool bg_cleared;                     /* draw 0 is a full-screen colour clear */
    bool counted;                        /* a draw's samples counted (M37) */
    float *verts;
    unsigned nfloats, maxfloats;
@@ -161,6 +162,7 @@ struct sgx_vtx {
    unsigned nverts;
    unsigned count, max_index;
    bool indexed;
+   bool fullscreen;
    /* the buffers the draw reads: its attributes', and (M43) its uniform
     * buffers', both stages' */
    struct sgx_bo *bos[SGX_VS_MAX_ATTRIBS + 2 * SGX_FRAME_MAX_UBOS];
@@ -172,6 +174,17 @@ struct sgx_vtx {
    uint8_t *vdata;
    uint32_t vdata_va;
    unsigned vseq;
+   /* cached interleaved stream for static multi-VBO draws */
+   struct {
+      struct sgx_bo *bo;
+      unsigned nattrs, lo, nverts, stride;
+      struct pipe_resource *res[SGX_VS_MAX_ATTRIBS];
+      unsigned seq[SGX_VS_MAX_ATTRIBS];
+      uint32_t off[SGX_VS_MAX_ATTRIBS];
+      uint16_t src_stride[SGX_VS_MAX_ATTRIBS];
+      uint16_t src_format[SGX_VS_MAX_ATTRIBS];
+      uint8_t vs_attr[SGX_VS_MAX_ATTRIBS];
+   } cache;
 };
 
 struct sgx_context {

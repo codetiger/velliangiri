@@ -681,6 +681,10 @@ sgx_draw_fini(struct sgx_context *ctx)
    ctx->batch.nvchunks = ctx->batch.vat = 0;
    sgx_bo_destroy(ctx->vtx.vchunk);
    ctx->vtx.vchunk = NULL;
+   sgx_bo_destroy(ctx->vtx.cache.bo);
+   ctx->vtx.cache.bo = NULL;
+   for (unsigned a = 0; a < SGX_VS_MAX_ATTRIBS; a++)
+      pipe_resource_reference(&ctx->vtx.cache.res[a], NULL);
    FREE(ctx->verts);
    free(ctx->indices);
    ctx->verts = NULL;
@@ -1109,7 +1113,7 @@ sgx_batch_flush_at(struct sgx_context *ctx, const char *file, int line)
    /* a render that starts from a clear stores only the tiles it draws in:
     * a quad that draws nothing (depth NEVER) over the target puts every
     * tile in it, all stored at the clear's depth */
-   if (zls.store && !zls.load) {
+   if (zls.store && !zls.load && !b->bg_cleared) {
       const struct sgx_frame_state never = { .depth_func = PIPE_FUNC_NEVER };
 
       zs_quad(ctx, NULL, 0.5f, &never, false);
@@ -1142,7 +1146,7 @@ sgx_batch_flush_at(struct sgx_context *ctx, const char *file, int line)
    if ((fence = sgx_fence_create(&screen->dev, false))) {
       simple_mtx_lock(&screen->frame_lock);
       const struct sgx_frame_target t = { sgx_resource(b->rt), b->rt_level, b->rt_layer,
-                                          b->w, b->h };
+                                          b->w, b->h, b->bg_cleared };
 
       ret = sgx_frame_render(screen->frame, &t, d, b->ndraws, b->handles,
                              b->ntex + b->nbos + b->nvchunks, b->depth_clear,
@@ -1198,7 +1202,7 @@ sgx_batch_flush_at(struct sgx_context *ctx, const char *file, int line)
    sgx_fence_reference(&fence, NULL);
    pipe_resource_reference(&b->rt, NULL);
    pipe_resource_reference(&b->zs, NULL);
-   b->zs_cleared = b->zs_read = b->zs_written = false;
+   b->bg_cleared = b->zs_cleared = b->zs_read = b->zs_written = false;
    for (unsigned i = 0; i < b->ntex; i++) {
       pipe_resource_reference(&b->tex[i], NULL);
       if (!ret)
@@ -2010,8 +2014,22 @@ submit(struct sgx_context *ctx)
             v->bos[v->nbos++] = fs_bos[i];
       }
    }
-   for (unsigned k = 0; vs && k < npass; k++)
+   for (unsigned k = 0; vs && k < npass; k++) {
+      bool was_empty = !b->ndraws;
+
       add_vs_draw(ctx, vs, fs, sa, nsa, tex, &target, &pass[k]);
+      if (was_empty && b->ndraws == 1 && ctx->vtx.fullscreen && npass == 1 &&
+          !st.depth_write && st.depth_func == PIPE_FUNC_ALWAYS && !st.stencil_on &&
+          !st.cull && !st.count && fs && !fs->blend.enable && fs->blend.colormask == 0xf &&
+          !fs->blend.logicop && !fs->kills &&
+          fabsf(st.translate[0] - ctx->fb.width * 0.5f) < 1e-3f &&
+          fabsf(st.scale[0] * 3.0f - ctx->fb.width) < 1e-3f &&
+          fabsf(fabsf(ab[0]) - 1.5f) < 1e-4f && fabsf(ab[1]) < 1e-4f &&
+          fabsf(st.translate[1] - ctx->fb.height * 0.5f) < 1e-3f &&
+          fabsf(st.scale[1] * 3.0f - ctx->fb.height) < 1e-3f &&
+          fabsf(fabsf(ab[2]) - 1.5f) < 1e-4f && fabsf(ab[3]) < 1e-4f)
+         b->bg_cleared = true;
+   }
 
    max = sgx_frame_max_vertices(screen->frame, &ctx->layout);
    for (unsigned k = 0; !vs && k < npass; k++)
@@ -2188,7 +2206,11 @@ sgx_colour_clear(struct sgx_context *ctx, const union pipe_color_union *color,
          prog->nvaryings = 1;
          prog->nsa = 4;
       }
-      return quad(ctx, sc, 0.5f, &st, prog, (const uint32_t *)color->f, 4, true);
+      if (!quad(ctx, sc, 0.5f, &st, prog, (const uint32_t *)color->f, 4, true))
+         return false;
+      if (ctx->batch.ndraws == 1 && !sc)
+         ctx->batch.bg_cleared = true;
+      return true;
    }
    /* (an sRGB target's colour encoded, M43: what GL's clear writes there) */
    for (unsigned i = 0; i < 4; i++)
@@ -2196,7 +2218,11 @@ sgx_colour_clear(struct sgx_context *ctx, const union pipe_color_union *color,
                                  util_format_is_srgb(ctx->fb.cbufs[0].format) ?
                            util_format_linear_float_to_srgb_8unorm(color->f[i]) :
                            float_to_ubyte(color->f[i])) << 8 * i;
-   return quad(ctx, sc, 0.5f, &st, &ctx->colour_prog, &packed, 1, true);
+   if (!quad(ctx, sc, 0.5f, &st, &ctx->colour_prog, &packed, 1, true))
+      return false;
+   if (ctx->batch.ndraws == 1 && !sc)
+      ctx->batch.bg_cleared = true;
+   return true;
 }
 
 /* A render starts at the last depth clear's value and stencil 0 (or from
@@ -2500,6 +2526,29 @@ gpu_vs_draw(struct sgx_context *ctx, const struct pipe_draw_info *info,
          }
       }
    }
+   v->fullscreen = false;
+   if (!ctx->batch.ndraws && ntri == 2 && vs->pos_attr >= 0 && src[vs->pos_attr]) {
+      unsigned a = vs->pos_attr, es = ve->e[a].src_stride, corners = 0;
+
+      for (unsigned i = 0; i < 6; i++) {
+         unsigned idx = v->indexed ? vtx0 + ctx->indices[i] : draw->start + i;
+         const float *xy = (const float *)(src[a] + (idx + bias) * es);
+
+         if (xy[0] <= -1.0f && xy[1] <= -1.0f)
+            corners |= 1;
+         else if (xy[0] >= 1.0f && xy[1] <= -1.0f)
+            corners |= 2;
+         else if (xy[0] <= -1.0f && xy[1] >= 1.0f)
+            corners |= 4;
+         else if (xy[0] >= 1.0f && xy[1] >= 1.0f)
+            corners |= 8;
+         else {
+            corners = 0;
+            break;
+         }
+      }
+      v->fullscreen = corners == 0xf;
+   }
 
    /* the attributes: where the fetch finds them */
    v->nbos = 0;
@@ -2524,6 +2573,8 @@ gpu_vs_draw(struct sgx_context *ctx, const struct pipe_draw_info *info,
       }
    } else {
       unsigned n = hi - lo + 1, at = 0;
+      struct sgx_bo *cbo = NULL;
+      bool can_cache = n >= 64;
 
       v->repacked = true;
       v->nverts = n;
@@ -2531,10 +2582,41 @@ gpu_vs_draw(struct sgx_context *ctx, const struct pipe_draw_info *info,
          if (SGX_ATTR_KIND(vs->attr[a]) != SGX_ATTR_CONST) {
             v->base[a] = at;
             at += 4 * sgx_attr_words(vs->attr[a]);
+            if (!res[a])
+               can_cache = false;
          }
       v->stride = MAX2(at, 4);
-      /* (M42: written once, into the batch's GPU memory) */
-      if (n * v->stride > SGX_FRAME_MAX_BYTES || !(vdata = vtx_reserve(ctx, n * v->stride)))
+      if (n * v->stride > SGX_FRAME_MAX_BYTES)
+         return false;
+      if (can_cache && v->cache.bo && v->cache.nattrs == vs->nattrs &&
+          v->cache.lo == (unsigned)(lo + bias) && v->cache.nverts == n &&
+          v->cache.stride == v->stride) {
+         bool hit = true;
+
+         for (unsigned a = 0; hit && a < vs->nattrs; a++) {
+            if (SGX_ATTR_KIND(vs->attr[a]) == SGX_ATTR_CONST) {
+               hit = v->cache.vs_attr[a] == vs->attr[a];
+               continue;
+            }
+            hit = v->cache.res[a] == &res[a]->base && v->cache.seq[a] == res[a]->seq &&
+                  v->cache.off[a] == off[a] && v->cache.src_stride[a] == ve->e[a].src_stride &&
+                  v->cache.src_format[a] == ve->e[a].src_format &&
+                  v->cache.vs_attr[a] == vs->attr[a];
+         }
+         if (hit) {
+            v->repacked = false;
+            for (unsigned a = 0; a < vs->nattrs; a++)
+               if (SGX_ATTR_KIND(vs->attr[a]) != SGX_ATTR_CONST)
+                  v->base[a] += v->cache.bo->va;
+            v->bos[v->nbos++] = v->cache.bo;
+            goto copied;
+         }
+      }
+      /* (M42: written once, into GPU memory -- cached when all attributes
+       * come from static buffer resources) */
+      if (can_cache && (cbo = sgx_bo_cache_get(&screen->dev, n * v->stride)))
+         vdata = cbo->map;
+      else if (!(vdata = vtx_reserve(ctx, n * v->stride)))
          return false;
       /* the attributes one array of the application's laid out as the
        * stream is -- SDL's x y, r g b a, u v at stride 32 (M34): the
@@ -2556,14 +2638,14 @@ gpu_vs_draw(struct sgx_context *ctx, const struct pipe_draw_info *info,
          }
          if (whole && first) {
             memcpy(vdata, first + (lo + bias) * v->stride, n * v->stride);
-            goto copied;
+            goto done_copy;
          }
       }
       for (unsigned a = 0; a < vs->nattrs; a++) {
          const struct pipe_vertex_element *e = &ve->e[a];
          const uint8_t *in;
          uint8_t *out = vdata + v->base[a];
-         unsigned size;
+         unsigned size, pad;
 
          if (SGX_ATTR_KIND(vs->attr[a]) == SGX_ATTR_CONST)
             continue;
@@ -2571,14 +2653,42 @@ gpu_vs_draw(struct sgx_context *ctx, const struct pipe_draw_info *info,
          if (vs->attr[a] == ve->attr[a]) {
             /* as it is: its bytes (a word for RGB8, the fourth zero) */
             size = util_format_get_blocksize(e->src_format);
+            pad = 4 * sgx_attr_words(vs->attr[a]);
             for (unsigned i = 0; i < n; i++, in += e->src_stride, out += v->stride) {
-               memset(out, 0, 4 * sgx_attr_words(vs->attr[a]));
                memcpy(out, in, size);
+               if (size < pad)
+                  memset(out + size, 0, pad - size);
             }
          } else {
             for (unsigned i = 0; i < n; i++, in += e->src_stride, out += v->stride)
                util_format_unpack_rgba(e->src_format, (float *)out, in, 1);
          }
+      }
+   done_copy:
+      if (cbo) {
+         sgx_bo_destroy(v->cache.bo);
+         v->cache.bo = cbo;
+         v->cache.nattrs = vs->nattrs;
+         v->cache.lo = lo + bias;
+         v->cache.nverts = n;
+         v->cache.stride = v->stride;
+         for (unsigned a = 0; a < vs->nattrs; a++) {
+            v->cache.vs_attr[a] = vs->attr[a];
+            if (SGX_ATTR_KIND(vs->attr[a]) == SGX_ATTR_CONST) {
+               pipe_resource_reference(&v->cache.res[a], NULL);
+               continue;
+            }
+            pipe_resource_reference(&v->cache.res[a], &res[a]->base);
+            v->cache.seq[a] = res[a]->seq;
+            v->cache.off[a] = off[a];
+            v->cache.src_stride[a] = ve->e[a].src_stride;
+            v->cache.src_format[a] = ve->e[a].src_format;
+         }
+         v->repacked = false;
+         for (unsigned a = 0; a < vs->nattrs; a++)
+            if (SGX_ATTR_KIND(vs->attr[a]) != SGX_ATTR_CONST)
+               v->base[a] += cbo->va;
+         v->bos[v->nbos++] = cbo;
       }
    copied:;
    }

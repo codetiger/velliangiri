@@ -115,11 +115,11 @@ usse_fop(enum usse_nmad_op op, struct usse_reg dest, struct usse_reg src1,
  * operand, src1's swizzle xyzw (three bits a channel), src2's the table's
  * xyzw (4), the mask all four */
 uint64_t
-usse_hop(enum usse_nmad_op op, struct usse_reg dest, struct usse_reg src1,
-         struct usse_reg src2)
+usse_hop_swz(enum usse_nmad_op op, struct usse_reg dest, struct usse_reg src1,
+             unsigned sw1, struct usse_reg src2)
 {
    unsigned dext, dbank, ext1, bank1, ext2, bank2;
-   const unsigned sw1 = 0 | 1 << 3 | 2 << 6 | 3 << 9, sw2 = 4;
+   const unsigned sw2 = 4;
 
    assert(!(dest.num & 1) && !(src1.num & 1) && !(src2.num & 1) && !src2.neg);
    dest_bank(dest, &dext, &dbank);
@@ -132,6 +132,13 @@ usse_hop(enum usse_nmad_op op, struct usse_reg dest, struct usse_reg src1,
           bits(sw1 >> 7 & 3, 35, 34) | bits(dbank, 33, 32) | bits(bank1, 31, 30) |
           bits(bank2, 29, 28) | bits(pair(dest), 27, 22) | bits(sw1 & 0x7f, 21, 15) |
           bits(op, 14, 12) | bits(pair(src1), 11, 6) | bits(pair(src2), 5, 0);
+}
+
+uint64_t
+usse_hop(enum usse_nmad_op op, struct usse_reg dest, struct usse_reg src1,
+         struct usse_reg src2)
+{
+   return usse_hop_swz(op, dest, src1, 0 | 1 << 3 | 2 << 6 | 3 << 9, src2);
 }
 
 uint64_t

@@ -498,6 +498,11 @@ cpu_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
    uint8_t *dst;
    float *in0, *in1, *out;
    uint8_t *s8, *d8;
+   bool overwrite = !zs && !info->alpha_blend &&
+                    (info->mask & PIPE_MASK_RGBA) == PIPE_MASK_RGBA &&
+                    sb->x >= 0 && sb->y >= 0 && sb->width > 0 && sb->height > 0 &&
+                    sb->x + sb->width <= sw && sb->y + sb->height <= sh &&
+                    db->width > 0 && db->height > 0;
    bool ok;
 
    if (!info->mask || (zs && (info->mask & PIPE_MASK_RGBA)) ||
@@ -526,7 +531,8 @@ cpu_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
    src = pctx->texture_map(pctx, sres, info->src.level, PIPE_MAP_READ, &sbox, &st);
    if (!src)
       return false;
-   dst = pctx->texture_map(pctx, dres, info->dst.level, PIPE_MAP_READ_WRITE, &dbox, &dt);
+   dst = pctx->texture_map(pctx, dres, info->dst.level,
+                           overwrite ? PIPE_MAP_WRITE : PIPE_MAP_READ_WRITE, &dbox, &dt);
    if (!dst) {
       pctx->texture_unmap(pctx, st);
       return false;
@@ -567,7 +573,8 @@ cpu_blit(struct pipe_context *pctx, const struct pipe_blit_info *info)
          util_format_unpack_rgba(info->src.format, in0, src + r0 * st->stride, sw);
          if (linear)
             util_format_unpack_rgba(info->src.format, in1, src + r1 * st->stride, sw);
-         util_format_unpack_rgba(info->dst.format, out, drow, x1 - x0);
+         if (!overwrite)
+            util_format_unpack_rgba(info->dst.format, out, drow, x1 - x0);
       }
       for (int x = x0; x < x1; x++) {
          float fx = sb->x + (x + 0.5f - db->x) * sb->width / (float)db->width;

@@ -917,7 +917,8 @@ load_pack(struct sgx_frame *f, const char *dir)
 #define BUILT_STATE     0x400       /* the state area, */
 #define BUILT_WHITE     0xc00       /* the white texture, */
 #define BUILT_IDX       0x1000      /* the index buffer */
-#define BUILT_GL_SIZE   (BUILT_IDX + SGX_TMPL_IDX_COUNT * 2)
+#define BUILT_IDX_COUNT 65535       /* 0..65534 for non-indexed triangle lists */
+#define BUILT_GL_SIZE   (BUILT_IDX + align(BUILT_IDX_COUNT * 2, 16))
 #define BUILT_VDM_SIZE  0x1000      /* the template's own draws' stream */
 #define BUILT_EXT_SIZE  0x400000    /* the pack's 4 MiB */
 
@@ -933,7 +934,6 @@ new_bo(struct sgx_frame *f, uint32_t size, uint32_t flags)
       sgx_bo_destroy(bo);
       return NULL;
    }
-   memset(bo->map, 0, size);
    f->handles[f->nbo] = bo->handle;
    f->bo[f->nbo++] = bo;
    return bo;
@@ -1067,7 +1067,7 @@ build_frame(struct sgx_frame *f, const char *dir)
    state = (uint32_t *)(gl->map + BUILT_STATE);
    sgx_tmpl_pds(&t, ev, pds);
    sgx_tmpl_state(&t, state);
-   for (unsigned i = 0; i < SGX_TMPL_IDX_COUNT; i++)
+   for (unsigned i = 0; i < BUILT_IDX_COUNT; i++)
       ((uint16_t *)(gl->map + BUILT_IDX))[i] = i;
    sgx_tmpl_tail(&t, f->tail);
    f->ntail = 5;
@@ -1095,7 +1095,7 @@ build_frame(struct sgx_frame *f, const char *dir)
    f->kick[1] = f->kick[2] = 0;
    f->consts0 = t.state + 0xa0;
    f->idx = t.idx;
-   f->idx_count = SGX_TMPL_IDX_COUNT;
+   f->idx_count = BUILT_IDX_COUNT;
    f->vdm = vdm->va;
    f->vdm_size = BUILT_VDM_SIZE;
    f->max_draws = SGX_FRAME_MAX_DRAWS;
@@ -2131,14 +2131,21 @@ begin_render(struct sgx_frame *f, const struct sgx_frame_target *t, struct sgx_e
       rt_format(PIPE_FORMAT_B8G8R8A8_UNORM, &to);
    }
    eot = eot_program(f, &to);
-   bg[0] = (to.stride / 4 / 4 - 2) << 16 | 0x0e90;
-   bg[1] = 0xc0000000 | to.bg_fmt << 24 | (to.w - 1) << 12 | (to.h - 1);
-   /* (M43) four half floats: handed back as F16, two registers (R11G11B10F
-    * too: the tile's F16) */
-   if (to.kind == SGX_RT_F16X4)
-      bg[3] |= 0x80000000u;
-   bg[2] = to.va;
-   bg[3] = to.bg_swizzle << 28;
+   if (t->bg_cleared && to.kind == SGX_RT_UNORM8 && f->heap) {
+      /* draw 0 overwrites every pixel of every tile: sample the 4x4 white
+       * texture already in cache instead of reading the whole target */
+      bg[0] = 0x03fe0000;
+      bg[1] = 0x0c020002;
+      bg[2] = f->heap;
+      bg[3] = 0;
+   } else {
+      bg[0] = (to.stride / 4 / 4 - 2) << 16 | 0x0e90;
+      bg[1] = 0xc0000000 | to.bg_fmt << 24 | (to.w - 1) << 12 | (to.h - 1);
+      bg[2] = to.va;
+      /* (M43) four half floats: handed back as F16, two registers (R11G11B10F
+       * too: the tile's F16) */
+      bg[3] = to.bg_swizzle << 28 | (to.kind == SGX_RT_F16X4 ? 0x80000000u : 0);
+   }
    d0 = doutu(f, eot);
 
    if (o) {

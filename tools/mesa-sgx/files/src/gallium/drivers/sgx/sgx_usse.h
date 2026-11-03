@@ -120,9 +120,12 @@ uint64_t usse_pack_f32x2(struct usse_reg dest, struct usse_reg src);
 uint64_t usse_unpack_f16(struct usse_reg dest, struct usse_reg src, unsigned chan);
 
 /* (M38) four F16 at once, each a register pair (four F16): src1 op src2,
- * channel for channel */
+ * channel for channel (or src1 swizzled by sw1: 3 bits a channel,
+ * x y z w 0 1 2 0.5) */
 uint64_t usse_hop(enum usse_nmad_op op, struct usse_reg dest, struct usse_reg src1,
                   struct usse_reg src2);
+uint64_t usse_hop_swz(enum usse_nmad_op op, struct usse_reg dest, struct usse_reg src1,
+                      unsigned sw1, struct usse_reg src2);
 /* dest = the four F16 of the pair src packed to 8 bits each, scaled from
  * [0, 1] */
 uint64_t usse_pack_unorm8_f16(struct usse_reg dest, struct usse_reg src);

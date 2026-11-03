@@ -44,7 +44,14 @@ PREFIX=/usr/local/lib/sgx-mesa
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=8 $DEST"
 
 echo "==> installing $PREFIX on $DEST"
-$SSH "rm -rf $PREFIX && mkdir -p $PREFIX /usr/local/bin && tar -xf - -C / && chmod +x $PREFIX/bin/* && ln -sf $PREFIX/bin/sgx-gl /usr/local/bin/sgx-gl" < "$T"
+$SSH "if grep -q ' /usr/local squashfs ' /proc/mounts 2>/dev/null; then
+	mkdir -p /tmp/usr-local.rw
+	(cd /usr/local && tar -cf - --exclude=./lib/sgx-mesa .) | tar -xf - -C /tmp/usr-local.rw
+	umount -l /usr/local
+	cp -a /tmp/usr-local.rw/. /usr/local/
+	rm -rf /tmp/usr-local.rw
+fi
+rm -rf $PREFIX && mkdir -p $PREFIX /usr/local/bin && tar -xf - -C / && chmod +x $PREFIX/bin/* && ln -sf $PREFIX/bin/sgx-gl /usr/local/bin/sgx-gl" < "$T"
 
 if [ "$SYSTEM" = 1 ]; then
 	echo "==> $PREFIX/lib is the system's GL (alpine's stays installed)"
@@ -57,7 +64,7 @@ fi
 if [ "$CACHE" = 1 ]; then
 	if $SSH 'test -d /mnt/data/linux' &&
 	   $SSH 'cat > /mnt/data/linux/lib/sgx-mesa-install.tar.tmp' < "$T"; then
-		if $SSH 'mv /mnt/data/linux/lib/sgx-mesa-install.tar.tmp /mnt/data/linux/lib/sgx-mesa-install.tar'; then
+		if $SSH 'mv /mnt/data/linux/lib/sgx-mesa-install.tar.tmp /mnt/data/linux/lib/sgx-mesa-install.tar && rm -f /mnt/data/linux/lib/usr-local.sqsh'; then
 			echo "==> cached on Data (stage2 unpacks it at the next boot)"
 		else
 			echo "warning: could not rename the cached tarball" >&2

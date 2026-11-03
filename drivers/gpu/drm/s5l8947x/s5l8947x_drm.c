@@ -414,6 +414,7 @@ struct s5l_display {
 	struct clk_bulk_data clks[ARRAY_SIZE(s5l_clk_names)];
 	struct clk *scaler_clk;
 	struct i2c_adapter *ddc;
+	const struct drm_edid *cached_edid;
 	struct mutex lock;	/* HDMI registers shared with the audio bridge */
 	struct delayed_work hpd_work;
 	bool hpd_present;
@@ -1358,12 +1359,13 @@ static int s5l_add_1080p30(struct drm_connector *conn)
 
 static int s5l_conn_get_modes(struct drm_connector *conn)
 {
-	const struct drm_edid *edid = drm_edid_read(conn);
+	struct s5l_display *d = to_s5l(conn->dev);
 	int n;
 
-	drm_edid_connector_update(conn, edid);
+	if (!d->cached_edid && (readl(d->hdmi + HDMI_HPD_STATUS) & 1))
+		d->cached_edid = drm_edid_read(conn);
+	drm_edid_connector_update(conn, d->cached_edid);
 	n = drm_edid_connector_add_modes(conn);
-	drm_edid_free(edid);
 	if (n)
 		s5l_pick_preferred(conn);
 	if (!n) {
@@ -1451,6 +1453,8 @@ static void s5l_hpd_poll(struct work_struct *work)
 
 	if (present != d->hpd_present) {
 		d->hpd_present = present;
+		drm_edid_free(d->cached_edid);
+		d->cached_edid = NULL;
 		drm_info(&d->drm, "HDMI hot-plug %s\n", present ? "connected" : "lost");
 		mutex_lock(&d->lock);
 		if (!present) {
@@ -1916,6 +1920,8 @@ static void s5l_remove(struct platform_device *pdev)
 
 	hrtimer_cancel(&d->vblank_timer);
 	cancel_delayed_work_sync(&d->hpd_work);
+	drm_edid_free(d->cached_edid);
+	d->cached_edid = NULL;
 	drm_dev_unplug(&d->drm);
 	drm_atomic_helper_shutdown(&d->drm);
 	g_s5l_display = NULL;

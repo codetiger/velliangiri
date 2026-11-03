@@ -170,6 +170,7 @@ struct comp {
    unsigned nvaryings, nattrs;
    unsigned pa_base;                    /* a vertex program's temporaries: pa from here */
    const uint8_t *attr;                 /* how each attribute comes (M26) */
+   uint8_t attr_read[SGX_VS_MAX_ATTRIBS];
    struct operand vout[1 + SGX_FRAME_MAX_VARYINGS][4];
    bool have_vout[1 + SGX_FRAME_MAX_VARYINGS][4];
    char *why;
@@ -384,7 +385,7 @@ get(struct comp *c, struct operand o, unsigned takes, struct scratch *s)
 
 /* the value an instruction makes, in a temporary of its own */
 static struct usse_reg
-define(struct comp *c, nir_def *def)
+define_aligned(struct comp *c, nir_def *def, unsigned align)
 {
    unsigned id = def->index * 4, r;
 
@@ -400,7 +401,7 @@ define(struct comp *c, nir_def *def)
          c->owned[id] = false;
          return c->loc[id];
       }
-   r = take(c);
+   r = block(c, 1, align);
 
    c->loc[id] = treg(c, r);
    c->owned[id] = true;
@@ -409,6 +410,12 @@ define(struct comp *c, nir_def *def)
       c->owned[id] = false;
    }
    return c->loc[id];
+}
+
+static struct usse_reg
+define(struct comp *c, nir_def *def)
+{
+   return define_aligned(c, def, 2);
 }
 
 /* (M44) the same for a 32-bit word an integer instruction makes (VBW,
@@ -447,7 +454,35 @@ binary(struct comp *c, enum usse_nmad_op op, nir_alu_instr *alu, struct scratch 
       a.neg = b.neg = false;
    ra = get(c, a, TAKES_ALL, s);
    rb = get(c, b, TAKES_ALL & ~TAKES_NEG, s);
-   emit(c, usse_fop(op, define(c, &alu->def), ra, rb));
+   emit(c, usse_fop(op, define_aligned(c, &alu->def, 1), ra, rb));
+}
+
+static void
+ffma(struct comp *c, nir_alu_instr *alu, struct scratch *s)
+{
+   struct operand a = alu_operand(alu, 0), b = alu_operand(alu, 1), d = alu_operand(alu, 2), t;
+   struct usse_reg ra, rb, rd;
+
+   /* src0 takes temp or pa without negation, src1 any bank with negation */
+   if ((a.is_const || c->loc[a.id].bank == USSE_SA || (a.neg && !b.neg)) &&
+       !b.is_const && c->loc[b.id].bank != USSE_SA) {
+      t = a;
+      a = b;
+      b = t;
+   }
+   if (a.neg) {
+      a.neg = false;
+      if (b.is_const) {
+         b.u ^= 0x80000000u;
+         memcpy(&b.c, &b.u, 4);
+      } else {
+         b.neg = !b.neg;
+      }
+   }
+   ra = get(c, a, TAKES_ABS | TAKES_LANE_Y, s);
+   rb = get(c, b, TAKES_ALL, s);
+   rd = get(c, d, TAKES_ALL, s);
+   emit(c, usse_fmad(define_aligned(c, &alu->def, 1), ra, rb, rd));
 }
 
 static void
@@ -958,6 +993,7 @@ alu(struct comp *c, nir_alu_instr *alu, struct scratch *s)
    case nir_op_fmul: binary(c, USSE_NMAD_MUL, alu, s); return;
    case nir_op_fmin: binary(c, USSE_NMAD_MIN, alu, s); return;
    case nir_op_fmax: binary(c, USSE_NMAD_MAX, alu, s); return;
+   case nir_op_ffma: ffma(c, alu, s); return;
    case nir_op_frcp:
    case nir_op_frsq:
    case nir_op_flog2:
@@ -1641,9 +1677,14 @@ scan(struct comp *c, nir_function_impl *impl)
                 in->intrinsic == nir_intrinsic_demote_if)
                c->kills = true;
             if (c->vs && in->intrinsic == nir_intrinsic_load_input &&
-                nir_src_is_const(*nir_get_io_offset_src(in)))
-               c->nattrs = MAX2(c->nattrs, nir_intrinsic_base(in) +
-                                           nir_src_as_uint(*nir_get_io_offset_src(in)) + 1);
+                nir_src_is_const(*nir_get_io_offset_src(in))) {
+               unsigned a = nir_intrinsic_base(in) + nir_src_as_uint(*nir_get_io_offset_src(in));
+
+               c->nattrs = MAX2(c->nattrs, a + 1);
+               if (a < SGX_VS_MAX_ATTRIBS)
+                  c->attr_read[a] |= ((1u << in->def.num_components) - 1) <<
+                                     nir_intrinsic_component(in);
+            }
             if (in->intrinsic == nir_intrinsic_load_texture_scale)
                c->scales = true;
             if (in->intrinsic == nir_intrinsic_load_blend_const_color_r_float ||
@@ -2741,13 +2782,22 @@ vertex_output(struct comp *c)
          } else if (k == 0 && i < 2) {
             /* x and y as a x + b w, a and b the draw's (the TA's clip
              * rectangle, sgx_draw.c) */
-            struct usse_reg t = treg(c, scratch_take(c, &s)), u = treg(c, scratch_take(c, &s));
+            struct usse_reg a = usse_reg(USSE_SA, c->vs->clip_sa + 2 * i);
+            struct usse_reg b = usse_reg(USSE_SA, c->vs->clip_sa + 2 * i + 1), t, rx;
+            struct operand w = c->vout[0][3];
 
-            emit(c, usse_fop(USSE_NMAD_MUL, t, get(c, c->vout[0][3], TAKES_ALL, &s),
-                             usse_reg(USSE_SA, c->vs->clip_sa + 2 * i + 1)));
-            emit(c, usse_fop(USSE_NMAD_MUL, u, get(c, o, TAKES_ALL, &s),
-                             usse_reg(USSE_SA, c->vs->clip_sa + 2 * i)));
-            emit(c, usse_fop(USSE_NMAD_ADD, usse_reg(USSE_OUTPUT, i), u, t));
+            if (o.neg) {
+               o.neg = false;
+               a.neg = true;
+            }
+            rx = get(c, o, TAKES_ABS | TAKES_LANE_Y, &s);
+            if (w.is_const && w.u == f32_bits(1.0f)) {
+               t = b;
+            } else {
+               t = treg(c, scratch_take(c, &s));
+               emit(c, usse_fop(USSE_NMAD_MUL, t, get(c, w, TAKES_ALL, &s), b));
+            }
+            emit(c, usse_fmad(usse_reg(USSE_OUTPUT, i), rx, a, t));
          } else {
             move_into(c, usse_reg(USSE_OUTPUT, 4 * k + i), o, &s);
          }
@@ -3024,12 +3074,14 @@ vs_prologue(struct comp *c)
       if (kind == SGX_ATTR_CONST)
          continue;
       if (kind == SGX_ATTR_U8N) {
-         if (n > 2)
+         if (n > 2 && (c->attr_read[a] & 0xc))
             emit(c, usse_unpack_unorm8(usse_reg(USSE_PA, 4 * a + 2), r, 2));
-         emit(c, usse_unpack_unorm8(r, r, 0));
+         if (c->attr_read[a] & 0x3)
+            emit(c, usse_unpack_unorm8(r, r, 0));
       }
       for (unsigned i = n; i < 4; i++)
-         emit(c, usse_limm(usse_reg(USSE_PA, 4 * a + i), f32_bits(i == 3 ? 1.0f : 0.0f)));
+         if (c->attr_read[a] & (1u << i))
+            emit(c, usse_limm(usse_reg(USSE_PA, 4 * a + i), f32_bits(i == 3 ? 1.0f : 0.0f)));
    }
 }
 
@@ -3175,6 +3227,125 @@ f16_match(const struct comp *c, nir_scalar s, unsigned chan, struct f16_tree *t)
    return -1;
 }
 
+/* a leaf of an F16 pair: which leaf (0..ninputs-1 for inputs, ninputs.. for
+ * PDS texels) and which component (0..3) scalar s reads; -1 if not one */
+static int
+f16_leaf(const struct comp *c, nir_scalar s, unsigned *comp)
+{
+   s = nir_scalar_chase_movs(s);
+   if (nir_def_instr(s.def)->type == nir_instr_type_tex) {
+      for (unsigned k = 0; k < c->nfetch; k++)
+         if (&c->fetch[k]->instr == nir_def_instr(s.def) && s.comp < 4) {
+            *comp = s.comp;
+            return c->ninputs + k;
+         }
+      return -1;
+   }
+   if (nir_scalar_is_intrinsic(s) &&
+       nir_def_as_intrinsic(s.def)->intrinsic == nir_intrinsic_load_input) {
+      nir_intrinsic_instr *in = nir_def_as_intrinsic(s.def);
+      int slot = input_slot(in);
+      unsigned ch = nir_intrinsic_component(in) + s.comp;
+
+      if (slot >= 0 && c->input_of_slot[slot] >= 0 && ch < 4) {
+         *comp = ch;
+         return c->input_of_slot[slot];
+      }
+   }
+   return -1;
+}
+
+/* a single V16NMAD of an .xyzw leaf (src2) and a swizzled/constant leaf
+ * (src1, sw1: 0..3 x..w, 4 0.0, 5 1.0, 6 2.0, 7 0.5), such as glcubes's
+ * texture2D(u_tex, v_uv) * vec4(v_shade, v_shade, v_shade, 1.0) */
+static bool
+f16_swz_pair(const struct comp *c, nir_intrinsic_instr *out, enum usse_nmad_op *op_out,
+             struct usse_reg *src1_out, unsigned *sw1_out, struct usse_reg *src2_out)
+{
+   nir_op want_op = nir_num_opcodes;
+   int leaf1 = -1, leaf2 = -1;
+   unsigned sw1 = 0;
+
+   for (unsigned ch = 0; ch < 4; ch++) {
+      nir_scalar s = nir_scalar_chase_movs(nir_get_scalar(out->src[0].ssa, ch));
+
+      if (nir_scalar_is_alu(s)) {
+         nir_op op = nir_scalar_alu_op(s);
+
+         if (op != nir_op_fmul && op != nir_op_fadd)
+            return false;
+         if (want_op != nir_num_opcodes && want_op != op)
+            return false;
+         want_op = op;
+      }
+   }
+   if (want_op == nir_num_opcodes)
+      return false;
+
+   for (unsigned ch = 0; ch < 4; ch++) {
+      nir_scalar s = nir_scalar_chase_movs(nir_get_scalar(out->src[0].ssa, ch));
+      unsigned c0, c1, swz_c;
+      int l0, l1;
+
+      if (!nir_scalar_is_alu(s)) {
+         l0 = f16_leaf(c, s, &c0);
+         if (l0 < 0 || c0 != ch || (leaf2 >= 0 && leaf2 != l0))
+            return false;
+         leaf2 = l0;
+         sw1 |= (want_op == nir_op_fmul ? 5u : 4u) << (3 * ch);
+         continue;
+      }
+      nir_scalar u0 = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 0));
+      nir_scalar u1 = nir_scalar_chase_movs(nir_scalar_chase_alu_src(s, 1));
+
+      l0 = f16_leaf(c, u0, &c0);
+      l1 = f16_leaf(c, u1, &c1);
+      /* pick which side is leaf2 (.xyzw) and which is leaf1 (swizzled) */
+      if (l0 >= 0 && c0 == ch && (leaf2 < 0 || leaf2 == l0) &&
+          (l1 < 0 || l1 != l0 || c1 != ch)) {
+         leaf2 = l0;
+      } else if (l1 >= 0 && c1 == ch && (leaf2 < 0 || leaf2 == l1)) {
+         leaf2 = l1;
+         l1 = l0;
+         c1 = c0;
+         u1 = u0;
+      } else {
+         return false;
+      }
+      if (l1 >= 0) {
+         if (leaf1 >= 0 && leaf1 != l1)
+            return false;
+         leaf1 = l1;
+         swz_c = c1;
+      } else if (nir_scalar_is_const(u1)) {
+         float f = nir_scalar_as_float(u1);
+
+         if (f == 0.0f)
+            swz_c = 4;
+         else if (f == 1.0f)
+            swz_c = 5;
+         else if (f == 2.0f)
+            swz_c = 6;
+         else if (f == 0.5f)
+            swz_c = 7;
+         else
+            return false;
+      } else {
+         return false;
+      }
+      sw1 |= swz_c << (3 * ch);
+   }
+   if (leaf1 < 0 || leaf2 < 0)
+      return false;
+   if (((1u << leaf1) | (1u << leaf2)) != (1u << (c->ninputs + c->nfetch)) - 1)
+      return false;
+   *op_out = want_op == nir_op_fmul ? USSE_NMAD_MUL : USSE_NMAD_ADD;
+   *src1_out = usse_reg(USSE_PA, 2 * leaf1);
+   *sw1_out = sw1;
+   *src2_out = usse_reg(USSE_PA, 2 * leaf2);
+   return true;
+}
+
 static bool
 f16_colour(struct comp *c, nir_function_impl *impl)
 {
@@ -3221,8 +3392,19 @@ f16_colour(struct comp *c, nir_function_impl *impl)
    for (unsigned ch = 0; ch < 4; ch++) {
       if ((root[ch] = f16_match(c, nir_get_scalar(out->src[0].ssa, ch), ch, &t[ch])) < 0 ||
           t[ch].n != t[0].n || root[ch] != root[0] ||
-          memcmp(t[ch].node, t[0].node, t[0].n * sizeof(t[0].node[0])))
-         return false;
+          memcmp(t[ch].node, t[0].node, t[0].n * sizeof(t[0].node[0]))) {
+         enum usse_nmad_op op;
+         struct usse_reg src1, src2;
+         unsigned sw1;
+
+         if (!f16_swz_pair(c, out, &op, &src1, &sw1, &src2))
+            return false;
+         util_dynarray_init(&c->code, NULL);
+         emit(c, USSE_PHAS);
+         colour = treg(c, 2 * ntemp++);
+         emit(c, usse_hop_swz(op, colour, src1, sw1, src2));
+         goto pack_out;
+      }
    }
    /* every input and lookup the program reads is in the tree */
    {
@@ -3263,6 +3445,7 @@ f16_colour(struct comp *c, nir_function_impl *impl)
       }
    }
    colour = reg[root[0]] >= 0x100 ? treg(c, reg[root[0]] - 0x100) : usse_reg(USSE_PA, reg[root[0]]);
+pack_out:
    if (c->sop2) {
       struct usse_reg packed = treg(c, 2 * ntemp++);
 
@@ -3275,6 +3458,106 @@ f16_colour(struct comp *c, nir_function_impl *impl)
    c->top = MAX2(c->top, 2 * ntemp);
    c->f16 = true;
    return true;
+}
+
+static nir_alu_instr *
+as_single_fmul(nir_alu_src *src, bool *neg_out)
+{
+   nir_scalar s = { src->src.ssa, src->swizzle[0] };
+   bool neg = false;
+
+   for (;;) {
+      if (!list_is_singular(&s.def->uses) || !nir_scalar_is_alu(s))
+         return NULL;
+      nir_op op = nir_scalar_alu_op(s);
+      if (op == nir_op_mov) {
+         s = nir_scalar_chase_alu_src(s, 0);
+      } else if (op == nir_op_fneg) {
+         neg = !neg;
+         s = nir_scalar_chase_alu_src(s, 0);
+      } else if (op == nir_op_fmul && s.def->num_components == 1 && s.def->bit_size == 32) {
+         *neg_out = neg;
+         return nir_def_as_alu(s.def);
+      } else {
+         return NULL;
+      }
+   }
+}
+
+/* Fuse single-use fmul + fadd into ffma (V32MAD), and reassociate chains such
+ * as ((m0 + m1) + m2) + u3 or (m0 + m1) + (m2 + m3) so the base term starts
+ * the ffma accumulator chain. */
+static void
+fuse_ffma(nir_shader *s, nir_function_impl *impl)
+{
+   nir_builder b = nir_builder_create(impl);
+   bool progress = false;
+
+   nir_foreach_block(block, impl) {
+      nir_foreach_instr_safe(instr, block) {
+         nir_alu_instr *alu, *mul = NULL;
+         bool neg = false;
+         unsigned side = 0;
+
+         if (instr->type != nir_instr_type_alu)
+            continue;
+         alu = nir_instr_as_alu(instr);
+         if (alu->op != nir_op_fadd || alu->def.num_components != 1 || alu->def.bit_size != 32)
+            continue;
+         if ((mul = as_single_fmul(&alu->src[1], &neg)))
+            side = 1;
+         else if ((mul = as_single_fmul(&alu->src[0], &neg)))
+            side = 0;
+         if (mul) {
+            b.cursor = nir_before_instr(instr);
+            nir_def *a = nir_ssa_for_alu_src(&b, mul, 0);
+            nir_def *c = nir_ssa_for_alu_src(&b, mul, 1);
+            nir_def *d = nir_ssa_for_alu_src(&b, alu, 1 - side);
+            if (neg)
+               a = nir_fneg(&b, a);
+            nir_def_replace(&alu->def, nir_ffma(&b, a, c, d));
+            progress = true;
+            continue;
+         }
+         for (unsigned s_idx = 0; s_idx < 2; s_idx++) {
+            nir_alu_instr *chain[8];
+            unsigned nchain = 0;
+            nir_alu_src *cur = &alu->src[s_idx];
+
+            while (nchain < ARRAY_SIZE(chain) && list_is_singular(&cur->src.ssa->uses) &&
+                   nir_def_is_alu(cur->src.ssa)) {
+               nir_alu_instr *f = nir_def_as_alu(cur->src.ssa);
+               if (f->op != nir_op_ffma || f->def.num_components != 1)
+                  break;
+               chain[nchain++] = f;
+               if ((mul = as_single_fmul(&f->src[2], &neg)))
+                  break;
+               cur = &f->src[2];
+            }
+            if (!mul)
+               continue;
+            b.cursor = nir_before_instr(instr);
+            nir_def *acc = nir_ssa_for_alu_src(&b, alu, 1 - s_idx);
+            nir_def *ma = nir_ssa_for_alu_src(&b, mul, 0);
+            nir_def *mb = nir_ssa_for_alu_src(&b, mul, 1);
+            if (neg)
+               ma = nir_fneg(&b, ma);
+            acc = nir_ffma(&b, ma, mb, acc);
+            for (unsigned k = nchain; k > 0; k--) {
+               nir_alu_instr *f = chain[k - 1];
+               acc = nir_ffma(&b, nir_ssa_for_alu_src(&b, f, 0),
+                              nir_ssa_for_alu_src(&b, f, 1), acc);
+            }
+            nir_def_replace(&alu->def, acc);
+            progress = true;
+            break;
+         }
+      }
+   }
+   if (progress) {
+      nir_progress(true, impl, nir_metadata_control_flow);
+      NIR_PASS(_, s, nir_opt_dce);
+   }
 }
 
 static bool
@@ -3339,6 +3622,20 @@ translate(struct comp *c, nir_shader *s)
    /* control flow left: the phis' webs registers */
    if (exec_list_length(&impl->body) != 1)
       NIR_PASS(_, s, nir_convert_from_ssa, true, false);
+
+   /* SGX_DEBUG_NIR=1: the shader as the compiler takes it */
+   if (getenv("SGX_DEBUG_NIR"))
+      nir_print_shader(s, stderr);
+   if (c->fs)
+      plan_inputs(c, impl);
+   scan(c, impl);
+   if (c->failed)
+      return false;
+   /* M38: a colour of four F16 at once -- the whole program */
+   if (c->fs && f16_colour(c, impl))
+      return true;
+   if (!getenv("SGX_NO_FFMA"))
+      fuse_ffma(s, impl);
    nir_index_ssa_defs(impl);
    c->nvalues = n = impl->ssa_alloc * 4;
    c->loc = calloc(n, sizeof(*c->loc));
@@ -3354,18 +3651,6 @@ translate(struct comp *c, nir_shader *s)
    util_dynarray_init(&c->loops, NULL);
    c->nir = s;
    c->range = _mesa_pointer_hash_table_create(NULL);
-
-   /* SGX_DEBUG_NIR=1: the shader as the compiler takes it */
-   if (getenv("SGX_DEBUG_NIR"))
-      nir_print_shader(s, stderr);
-   if (c->fs)
-      plan_inputs(c, impl);
-   scan(c, impl);
-   if (c->failed)
-      return false;
-   /* M38: a colour of four F16 at once -- the whole program */
-   if (c->fs && f16_colour(c, impl))
-      return true;
 
    /* the numbering, the liveness, then the code, in the same order */
    index = 0;
@@ -3406,7 +3691,8 @@ translate(struct comp *c, nir_shader *s)
                if (comp >= 4 || !(nir_intrinsic_write_mask(in) & 1 << i) || o.is_const || o.neg ||
                    o.abs || !nir_scalar_is_alu(sc) ||
                    (nir_scalar_alu_op(sc) != nir_op_fmul && nir_scalar_alu_op(sc) != nir_op_fadd &&
-                    nir_scalar_alu_op(sc) != nir_op_fmin && nir_scalar_alu_op(sc) != nir_op_fmax) ||
+                    nir_scalar_alu_op(sc) != nir_op_fmin && nir_scalar_alu_op(sc) != nir_op_fmax &&
+                    nir_scalar_alu_op(sc) != nir_op_ffma) ||
                    (unsigned)o.id != sc.def->index * 4 + sc.comp || sc.def->num_components != 1)
                   continue;
                for (unsigned k = 0; k < 4; k++)
@@ -3691,6 +3977,7 @@ compile_fs(const nir_shader *fs, const struct sgx_blend_key *blend, char *why,
    c.fs->blend_sa = c.blend_sa;
    c.fs->scale_sa = c.scale_sa;
    c.fs->size_sa = c.size_sa;
+   c.fs->kills = c.kills;
 
 out:
    util_dynarray_fini(&c.code);
@@ -3796,6 +4083,20 @@ compile_vs(const nir_shader *vs, const unsigned *varying_slot, unsigned nvarying
    }
    c.vs->ntemps = c.top;
    c.vs->branches = c.branches;
+   c.vs->pos_attr = -1;
+   if (!c.branches && c.have_vout[0][0] && c.have_vout[0][1] &&
+       (!c.have_vout[0][2] || (c.vout[0][2].is_const && fabsf(c.vout[0][2].c) <= 1.0f)) &&
+       (!c.have_vout[0][3] || (c.vout[0][3].is_const && c.vout[0][3].u == f32_bits(1.0f)))) {
+      struct operand ox = c.vout[0][0], oy = c.vout[0][1];
+
+      if (!ox.is_const && !ox.neg && !ox.abs && !oy.is_const && !oy.neg && !oy.abs &&
+          c.loc[ox.id].bank == USSE_PA && (c.loc[ox.id].num & 3) == 0 &&
+          c.loc[oy.id].bank == USSE_PA && c.loc[oy.id].num == c.loc[ox.id].num + 1 &&
+          c.loc[ox.id].num / 4 < c.nattrs &&
+          SGX_ATTR_KIND(c.attr[c.loc[ox.id].num / 4]) == SGX_ATTR_F32 &&
+          SGX_ATTR_COMPS(c.attr[c.loc[ox.id].num / 4]) >= 2)
+         c.vs->pos_attr = c.loc[ox.id].num / 4;
+   }
    c.vs->nattrs = MAX2(c.nattrs, 1);
    c.vs->nuniforms = c.nuniforms;
    c.vs->nubuf = c.ubuf ? c.uwords : 0;

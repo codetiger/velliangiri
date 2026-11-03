@@ -62,6 +62,7 @@ struct sgx_frame_target {
    struct sgx_resource *res;
    unsigned level, layer;
    unsigned w, h;
+   bool bg_cleared;     /* draw 0 overwrites every pixel of every tile */
 };
 
 /* Whether a render through the frame can fill this surface: B8G8R8A8 or

@@ -95,6 +95,7 @@ struct sgx_fs {
    int blend_sa;                                  /* -1: no blend colour */
    int scale_sa;              /* -1, or each texture's 1 / width, 1 / height (rectangles) */
    int size_sa;               /* -1, or each texture's size words (M44) */
+   bool kills;                /* the shader discards */
    struct sgx_blend_key blend;                    /* what it was compiled for */
    /* (M39) each varying's SGX_FIX_*, in varying_slot[]'s order */
    uint8_t vary_fix[SGX_FRAME_MAX_VARYINGS];
@@ -155,6 +156,7 @@ struct sgx_vs {
    uint8_t vary_fix[SGX_FRAME_MAX_VARYINGS];
    unsigned fix_sa;
    bool branches;                   /* the code branches (M22) */
+   int8_t pos_attr;                 /* attribute copied as-is to gl_Position.xy (w=1), or -1 */
    uint32_t code_va;                /* where the frame put it */
 };
 
