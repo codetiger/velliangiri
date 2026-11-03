@@ -1226,6 +1226,13 @@ static void handle_turn_event(const struct shell_event *ev)
 		redraw_current_screen();
 		break;
 
+	case SHELL_EVT_KEY_PLAY:
+		if (shell_input_has_keyboard()) {
+			execute_action(SHELL_ACT_OPEN_ASK, 0);
+			break;
+		}
+		/* Fall through on remote so Play activates the focused choice/item */
+		/* fallthrough */
 	case SHELL_EVT_KEY_OK:
 	case SHELL_EVT_TEXT_ENTER:
 		if (t->focus_zone == SHELL_FOCUS_CONTENT) {
@@ -1257,14 +1264,6 @@ static void handle_turn_event(const struct shell_event *ev)
 			app.cur_turn = 0;
 		}
 		redraw_current_screen();
-		break;
-
-	case SHELL_EVT_KEY_PLAY:
-		if (shell_input_has_keyboard()) {
-			execute_action(SHELL_ACT_OPEN_ASK, 0);
-		} else {
-			launch_doom_app(0);
-		}
 		break;
 
 	default:
@@ -1419,6 +1418,7 @@ int main(int argc, char **argv)
 						SHELL_THEME_SIGNAL : SHELL_THEME_PAPER;
 				redraw_current_screen();
 			} else if (ev.type == SHELL_EVT_KEY_OK ||
+				   ev.type == SHELL_EVT_KEY_PLAY ||
 				   ev.type == SHELL_EVT_TEXT_ENTER) {
 				app.cfg.theme_set = true;
 				config_save(&app.cfg);
@@ -1445,6 +1445,7 @@ int main(int argc, char **argv)
 				open_image_viewer(next);
 				redraw_current_screen();
 			} else if (ev.type == SHELL_EVT_KEY_OK ||
+				   ev.type == SHELL_EVT_KEY_PLAY ||
 				   ev.type == SHELL_EVT_TEXT_ENTER) {
 				app.viewer_chip_visible = !app.viewer_chip_visible;
 				if (app.viewer_chip_visible)

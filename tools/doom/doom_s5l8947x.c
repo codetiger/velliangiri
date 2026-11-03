@@ -492,23 +492,60 @@ static void poll_linux_input(void)
 			}
 
 			if (evdevs[i].is_remote) {
+				bool in_menu = (menuactive || gamestate != GS_LEVEL);
+
 				switch (ev.code) {
 				case KEY_UP:
-					enqueue_key(pressed, DOOM_KEY_UPARROW);
+					if (in_menu) {
+						if (!pressed) {
+							enqueue_key(1, DOOM_KEY_UPARROW);
+							enqueue_key(0, DOOM_KEY_UPARROW);
+						}
+					} else {
+						enqueue_key(pressed, DOOM_KEY_UPARROW);
+					}
 					break;
 				case KEY_DOWN:
-					enqueue_key(pressed, DOOM_KEY_DOWNARROW);
+					if (in_menu) {
+						if (!pressed) {
+							enqueue_key(1, DOOM_KEY_DOWNARROW);
+							enqueue_key(0, DOOM_KEY_DOWNARROW);
+						}
+					} else {
+						enqueue_key(pressed, DOOM_KEY_DOWNARROW);
+					}
 					break;
 				case KEY_LEFT:
-					enqueue_key(pressed, DOOM_KEY_LEFTARROW);
+					if (in_menu) {
+						if (!pressed) {
+							enqueue_key(1, DOOM_KEY_LEFTARROW);
+							enqueue_key(0, DOOM_KEY_LEFTARROW);
+						}
+					} else {
+						enqueue_key(pressed, DOOM_KEY_LEFTARROW);
+					}
 					break;
 				case KEY_RIGHT:
-					enqueue_key(pressed, DOOM_KEY_RIGHTARROW);
+					if (in_menu) {
+						if (!pressed) {
+							enqueue_key(1, DOOM_KEY_RIGHTARROW);
+							enqueue_key(0, DOOM_KEY_RIGHTARROW);
+						}
+					} else {
+						enqueue_key(pressed, DOOM_KEY_RIGHTARROW);
+					}
 					break;
 				case KEY_LEFTCTRL:
 				case KEY_ENTER:
 				case KEY_OK:
-					if (pressed) {
+					if (in_menu) {
+						if (!pressed) {
+							unsigned char sk = pick_ir_select_key();
+							enqueue_key(1, sk);
+							enqueue_key(0, sk);
+							ir_select_active_key = 0;
+						}
+					} else if (pressed) {
 						ir_select_active_key = pick_ir_select_key();
 						enqueue_key(1, ir_select_active_key);
 					} else if (ir_select_active_key) {
@@ -1361,7 +1398,7 @@ void DG_DrawFrame(void)
 		scale = out_w / SCREENWIDTH;
 
 	view_h = SCREENHEIGHT * scale;
-	view_w = opt_widescreen ? ((view_h * 16U) / 9U) : (SCREENWIDTH * scale);
+	view_w = opt_widescreen ? out_w : (SCREENWIDTH * scale);
 	if (view_w > out_w)
 		view_w = out_w;
 
@@ -1619,7 +1656,7 @@ int main(int argc, char **argv)
 	}
 
 	I_HiresWidth = opt_widescreen
-		? ((SCREENHEIGHT * HIRES_SCALE * 16) / 9)
+		? FB_TARGET_W
 		: (SCREENWIDTH * HIRES_SCALE);
 
 	doomgeneric_Create(new_argc, new_argv);

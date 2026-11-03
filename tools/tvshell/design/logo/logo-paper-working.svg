@@ -1,10 +1,41 @@
 <!-- SPDX-License-Identifier: GPL-2.0-only -->
-<!-- Flat-colour shell logo, derived from the repository logo.svg. No gradients: it is drawn on a framebuffer whose gamma path posterizes smooth ramps. -->
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="26 62 460 380" width="49" height="40" role="img" aria-label="Shell logo, Paper theme, working">
   <title>Shell logo, Paper theme, working</title>
-  <path d="M184 156L130 228L106 216L38 414C34 425 42 436 54 436L152 436Z" fill="#475569"/>
-  <path d="M328 156L382 228L406 216L474 414C478 425 470 436 458 436L360 436Z" fill="#334155"/>
-  <path d="M184 156L328 156L398 436L114 436Z" fill="#1E293B"/>
-  <path d="M256 196C212 208 180 282 172 436L340 436C332 282 300 208 256 196Z" fill="#FFFFFF"/>
-  <path d="M256 76C265 76 274 82 280 92L328 156C307 178 282 198 256 214C230 198 205 178 184 156L232 92C238 82 247 76 256 76Z" fill="#F2EDE3" stroke="#F59E0B" stroke-width="20" stroke-linejoin="round"/>
+  <defs>
+    <linearGradient id="hill-dark-l" x1="15%" y1="0%" x2="85%" y2="100%">
+      <stop offset="0%" stop-color="#334155"/>
+      <stop offset="100%" stop-color="#1E293B"/>
+    </linearGradient>
+    <linearGradient id="hill-dark-r" x1="15%" y1="0%" x2="85%" y2="100%">
+      <stop offset="0%" stop-color="#1E293B"/>
+      <stop offset="100%" stop-color="#0F172A"/>
+    </linearGradient>
+    <linearGradient id="ridge-outer-l" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#475569"/>
+      <stop offset="100%" stop-color="#1E293B"/>
+    </linearGradient>
+    <linearGradient id="ridge-outer-r" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1E293B"/>
+      <stop offset="100%" stop-color="#090D16"/>
+    </linearGradient>
+    <linearGradient id="silver-glacier-l" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="100%" stop-color="#E2E8F0"/>
+    </linearGradient>
+    <linearGradient id="silver-glacier-r" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#E2E8F0"/>
+      <stop offset="100%" stop-color="#CBD5E1"/>
+    </linearGradient>
+  </defs>
+  <g>
+    <path d="M184,156 L130,228 L106,216 L38,414 C34,425 42,436 54,436 L152,436 Z" fill="url(#ridge-outer-l)"/>
+    <polygon points="106,216 130,228 152,436 92,436" fill="#1E293B" opacity="0.65"/>
+    <path d="M328,156 L382,228 L406,216 L474,414 C478,425 470,436 458,436 L360,436 Z" fill="url(#ridge-outer-r)"/>
+    <polygon points="406,216 382,228 360,436 420,436" fill="#334155" opacity="0.55"/>
+    <path d="M184,156 L256,156 L256,436 L114,436 Z" fill="url(#hill-dark-l)"/>
+    <path d="M328,156 L256,156 L256,436 L398,436 Z" fill="url(#hill-dark-r)"/>
+    <path d="M256,196 C212,208 180,282 172,436 L256,436 Z" fill="url(#silver-glacier-l)"/>
+    <path d="M256,196 C300,208 332,282 340,436 L256,436 Z" fill="url(#silver-glacier-r)"/>
+    <path d="M256,76 C265,76 274,82 280,92 L328,156 C307,178 282,198 256,214 C230,198 205,178 184,156 L232,92 C238,82 247,76 256,76 Z" fill="#F2EDE3" stroke="#F59E0B" stroke-width="20" stroke-linejoin="round"/>
+  </g>
 </svg>

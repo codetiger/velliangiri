@@ -56,13 +56,24 @@ def blend_linear(dst: int, src: int, alpha_256: int) -> int:
     return out
 
 
-def flatten_cubic(p0, p1, p2, p3, steps=16):
+def flatten_cubic(p0, p1, p2, p3, steps=24):
     out = []
     for i in range(1, steps + 1):
         t = i / steps
         u = 1.0 - t
         x = (u**3) * p0[0] + 3 * u * u * t * p1[0] + 3 * u * t * t * p2[0] + (t**3) * p3[0]
         y = (u**3) * p0[1] + 3 * u * u * t * p1[1] + 3 * u * t * t * p2[1] + (t**3) * p3[1]
+        out.append((x, y))
+    return out
+
+
+def flatten_quad(p0, p1, p2, steps=24):
+    out = []
+    for i in range(1, steps + 1):
+        t = i / steps
+        u = 1.0 - t
+        x = u * u * p0[0] + 2 * u * t * p1[0] + t * t * p2[0]
+        y = u * u * p0[1] + 2 * u * t * p1[1] + t * t * p2[1]
         out.append((x, y))
     return out
 
@@ -171,6 +182,16 @@ def parse_svg_path(d: str):
             p3 = (cur[0] + num(), cur[1] + num())
             poly.extend(flatten_cubic(cur, p1, p2, p3))
             cur = p3
+        elif cmd == "Q":
+            p1 = (num(), num())
+            p2 = (num(), num())
+            poly.extend(flatten_quad(cur, p1, p2))
+            cur = p2
+        elif cmd == "q":
+            p1 = (cur[0] + num(), cur[1] + num())
+            p2 = (cur[0] + num(), cur[1] + num())
+            poly.extend(flatten_quad(cur, p1, p2))
+            cur = p2
         elif cmd in ("Z", "z"):
             if poly:
                 contours.append((poly, True))
@@ -255,7 +276,30 @@ def rasterize_polygons(polys, width, height):
     return cov_img
 
 
+BAYER4 = (
+     0,  8,  2, 10,
+    12,  4, 14,  6,
+     3, 11,  1,  9,
+    15,  7, 13,  5,
+)
+
+
+def parse_pct(s: str, default: float) -> float:
+    if not s:
+        return default
+    s = s.strip()
+    return float(s[:-1]) / 100.0 if s.endswith("%") else float(s)
+
+
 def render_logo_svg(svg_path: str, out_w: int, out_h: int, bg_color: int):
+    """
+    Render the logo SVG using the same pipeline as the boot splash (scripts/boot/splash.c):
+      - Supports <defs><linearGradient> (objectBoundingBox), <polygon>, <path> (M/L/C/Q/Z),
+        opacity, stroke, and stroke-opacity.
+      - Evaluates shapes onto a 16x16 subpixel sample grid ((out_w*16) x (out_h*16)) in
+        16-bit linear light so adjacent facets sharing an edge have zero background bleed.
+      - Applies 4x4 Bayer ordered dithering on smooth gradients before 8-bit sRGB output.
+    """
     root = ET.parse(svg_path).getroot()
     vb = [float(v) for v in root.get("viewBox").split()]
     vx, vy, vw, vh = vb
@@ -268,35 +312,181 @@ def render_logo_svg(svg_path: str, out_w: int, out_h: int, bg_color: int):
     def X(p):
         return (p[0] * scale + ox, p[1] * scale + oy)
 
-    fb = [bg_color] * (out_w * out_h)
+    grads = {}
+    for el in root.iter():
+        if el.tag.replace(NS, "") == "linearGradient":
+            grad_id = el.get("id")
+            gx1 = parse_pct(el.get("x1"), 0.0)
+            gy1 = parse_pct(el.get("y1"), 0.0)
+            gx2 = parse_pct(el.get("x2"), 1.0)
+            gy2 = parse_pct(el.get("y2"), 0.0)
+            stops = []
+            for st in el:
+                if st.tag.replace(NS, "") == "stop":
+                    stops.append((
+                        parse_pct(st.get("offset"), 0.0),
+                        parse_hex_color(st.get("stop-color", "#000000")),
+                    ))
+            if grad_id and len(stops) >= 2:
+                grads[grad_id] = (gx1, gy1, gx2, gy2, stops[0][1], stops[-1][1])
+
+    sub_w = out_w * SUB
+    sub_h = out_h * SUB
+    bg_r = TO_LIN[(bg_color >> 16) & 0xFF]
+    bg_g = TO_LIN[(bg_color >> 8) & 0xFF]
+    bg_b = TO_LIN[bg_color & 0xFF]
+    sub_r = [bg_r] * (sub_w * sub_h)
+    sub_g = [bg_g] * (sub_w * sub_h)
+    sub_b = [bg_b] * (sub_w * sub_h)
+
+    def paint_polys_subpixel(polys, paint_spec, alpha_f):
+        edges = []
+        all_pts = []
+        for pts in polys:
+            q = [(round(x * SUB), round(y * SUB)) for x, y in orient(pts)]
+            q = [p for k, p in enumerate(q) if p != q[k - 1]]
+            if len(q) >= 3:
+                edges.append(q)
+                all_pts.extend(q)
+        if not edges:
+            return
+
+        min_sx = min(p[0] for p in all_pts)
+        max_sx = max(p[0] for p in all_pts)
+        min_sy = min(p[1] for p in all_pts)
+        max_sy = max(p[1] for p in all_pts)
+        bw = max(1.0, (max_sx - min_sx) / float(SUB))
+        bh = max(1.0, (max_sy - min_sy) / float(SUB))
+        bx0 = min_sx / float(SUB)
+        by0 = min_sy / float(SUB)
+
+        is_grad = isinstance(paint_spec, tuple)
+        if is_grad:
+            gx1, gy1, gx2, gy2, c0, c1 = paint_spec
+            x0 = bx0 + gx1 * bw
+            y0 = by0 + gy1 * bh
+            dx = (gx2 - gx1) * bw
+            dy = (gy2 - gy1) * bh
+            denom = dx * dx + dy * dy
+            c0_r, c0_g, c0_b = (c0 >> 16) & 0xFF, (c0 >> 8) & 0xFF, c0 & 0xFF
+            c1_r, c1_g, c1_b = (c1 >> 16) & 0xFF, (c1 >> 8) & 0xFF, c1 & 0xFF
+        else:
+            c_r = TO_LIN[(paint_spec >> 16) & 0xFF]
+            c_g = TO_LIN[(paint_spec >> 8) & 0xFF]
+            c_b = TO_LIN[paint_spec & 0xFF]
+
+        a256 = max(0, min(256, round(alpha_f * 256.0)))
+        if a256 == 0:
+            return
+        inv_a = 256 - a256
+
+        sy0 = max(0, min_sy)
+        sy1 = min(sub_h - 1, max_sy)
+        for sy in range(sy0, sy1 + 1):
+            crossings = []
+            for q in edges:
+                n = len(q)
+                for k in range(n):
+                    ax, ay = q[k]
+                    bx, by = q[(k + 1) % n]
+                    ylo, yhi = (ay, by) if ay < by else (by, ay)
+                    if sy < ylo or sy >= yhi:
+                        continue
+                    cx = ax + ((sy - ay) * (bx - ax)) // (by - ay)
+                    direction = 1 if by > ay else -1
+                    crossings.append((cx, direction))
+            if len(crossings) < 2:
+                continue
+            crossings.sort(key=lambda item: item[0])
+            wind = 0
+            py_px = sy // SUB
+            fy = (sy + 0.5) / float(SUB)
+            row_base = sy * sub_w
+            for k in range(len(crossings) - 1):
+                wind += crossings[k][1]
+                if wind != 0:
+                    xa = max(0, crossings[k][0])
+                    xb = min(sub_w, crossings[k + 1][0])
+                    for sx_i in range(xa, xb):
+                        idx = row_base + sx_i
+                        if is_grad:
+                            px_px = sx_i // SUB
+                            fx = (sx_i + 0.5) / float(SUB)
+                            if denom > 1e-6:
+                                t = ((fx - x0) * dx + (fy - y0) * dy) / denom
+                            else:
+                                t = 0.0
+                            t = max(0.0, min(1.0, t))
+                            dither = (BAYER4[(py_px & 3) * 4 + (px_px & 3)] - 7.5) / 255.0
+                            td = max(0.0, min(1.0, t + dither * 0.5))
+                            sr = TO_LIN[round(c0_r + (c1_r - c0_r) * td)]
+                            sg = TO_LIN[round(c0_g + (c1_g - c0_g) * td)]
+                            sb = TO_LIN[round(c0_b + (c1_b - c0_b) * td)]
+                        else:
+                            sr, sg, sb = c_r, c_g, c_b
+
+                        if a256 == 256:
+                            sub_r[idx] = sr
+                            sub_g[idx] = sg
+                            sub_b[idx] = sb
+                        else:
+                            sub_r[idx] = (sub_r[idx] * inv_a + sr * a256) >> 8
+                            sub_g[idx] = (sub_g[idx] * inv_a + sg * a256) >> 8
+                            sub_b[idx] = (sub_b[idx] * inv_a + sb * a256) >> 8
+
+    def resolve_paint(spec: str):
+        if not spec or spec == "none":
+            return None
+        spec = spec.strip()
+        if spec.startswith("url(#") and spec.endswith(")"):
+            return grads.get(spec[5:-1])
+        return parse_hex_color(spec)
+
     for el in root.iter():
         tag = el.tag.replace(NS, "")
-        if tag != "path":
+        if tag == "path":
+            contours = parse_svg_path(el.get("d"))
+        elif tag == "polygon":
+            nums = [float(v) for v in re.findall(r"-?\d+\.?\d*", el.get("points", ""))]
+            pts = [(nums[k], nums[k + 1]) for k in range(0, len(nums) - 1, 2)]
+            contours = [(pts, True)] if len(pts) >= 3 else []
+        else:
             continue
-        contours = parse_svg_path(el.get("d"))
-        fill = el.get("fill", "none")
-        if fill and fill != "none":
-            c = parse_hex_color(fill)
+
+        op = float(el.get("opacity", "1"))
+        fill_paint = resolve_paint(el.get("fill", "none"))
+        if fill_paint is not None:
+            fop = op * float(el.get("fill-opacity", "1"))
             polys = [[X(p) for p in pts] for pts, _ in contours]
-            cov = rasterize_polygons(polys, out_w, out_h)
-            for y in range(out_h):
-                for x in range(out_w):
-                    a = cov[y][x]
-                    if a:
-                        fb[y * out_w + x] = blend_linear(fb[y * out_w + x], c, a)
-        stroke = el.get("stroke", "none")
-        if stroke and stroke != "none":
-            c = parse_hex_color(stroke)
+            paint_polys_subpixel(polys, fill_paint, fop)
+
+        stroke_paint = resolve_paint(el.get("stroke", "none"))
+        if stroke_paint is not None:
+            sop = op * float(el.get("stroke-opacity", "1"))
             sw = float(el.get("stroke-width", "1")) * scale / 2.0
             polys = []
             for pts, closed in contours:
                 polys.extend(stroke_polyline([X(p) for p in pts], closed, sw))
-            cov = rasterize_polygons(polys, out_w, out_h)
-            for y in range(out_h):
-                for x in range(out_w):
-                    a = cov[y][x]
-                    if a:
-                        fb[y * out_w + x] = blend_linear(fb[y * out_w + x], c, a)
+            paint_polys_subpixel(polys, stroke_paint, sop)
+
+    fb = [bg_color] * (out_w * out_h)
+    samples_total = SUB * SUB
+    for y in range(out_h):
+        for x in range(out_w):
+            acc_r = 0
+            acc_g = 0
+            acc_b = 0
+            for sy in range(y * SUB, (y + 1) * SUB):
+                base = sy * sub_w + x * SUB
+                for sx_i in range(base, base + SUB):
+                    acc_r += sub_r[sx_i]
+                    acc_g += sub_g[sx_i]
+                    acc_b += sub_b[sx_i]
+            dither_lin = (BAYER4[(y & 3) * 4 + (x & 3)] - 7) * 16
+            r8 = to_srgb_byte(max(0, min(65535, (acc_r // samples_total) + dither_lin)))
+            g8 = to_srgb_byte(max(0, min(65535, (acc_g // samples_total) + dither_lin)))
+            b8 = to_srgb_byte(max(0, min(65535, (acc_b // samples_total) + dither_lin)))
+            fb[y * out_w + x] = 0xFF000000 | (r8 << 16) | (g8 << 8) | b8
     return fb
 
 

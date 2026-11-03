@@ -157,42 +157,22 @@ static void write_sysfs_str(const char *path, const char *val)
 	}
 }
 
-/* Nearest 8-bit sRGB value of a 16-bit linear value */
-static inline uint32_t linear_to_srgb8(uint32_t lin)
-{
-	uint32_t lo = 0, hi = 255;
-
-	while (lo < hi) {
-		uint32_t mid = (lo + hi + 1) >> 1;
-
-		if (shell_srgb_to_linear[mid] <= lin)
-			lo = mid;
-		else
-			hi = mid - 1;
-	}
-	if (lo < 255 &&
-	    lin - shell_srgb_to_linear[lo] > shell_srgb_to_linear[lo + 1] - lin)
-		lo++;
-	return lo;
-}
-
 static inline uint32_t blend_pixel_linear(uint32_t dst, uint32_t src, uint32_t a255)
 {
 	uint32_t out = 0xff000000U;
-	uint32_t a = a255 + (a255 >> 7); /* 0..255 -> 0..256 */
 	int sh;
 
-	if (a == 0)
+	if (a255 == 0)
 		return dst;
-	if (a >= 256)
+	if (a255 >= 255)
 		return src | 0xff000000U;
 
 	for (sh = 0; sh < 24; sh += 8) {
-		uint32_t d = shell_srgb_to_linear[(dst >> sh) & 0xffU];
-		uint32_t s = shell_srgb_to_linear[(src >> sh) & 0xffU];
-		uint32_t v = (d * (256 - a) + s * a) >> 8;
+		uint32_t d = (dst >> sh) & 0xffU;
+		uint32_t s = (src >> sh) & 0xffU;
+		uint32_t v = (d * (255U - a255) + s * a255 + 127U) / 255U;
 
-		out |= linear_to_srgb8(v) << sh;
+		out |= v << sh;
 	}
 	return out;
 }
@@ -622,13 +602,13 @@ void shell_draw_rect(int x, int y, int w, int h, uint32_t color)
 }
 
 /*
- * 4x4 subpixel coverage for a rounded rectangle of size (w, h) and corner
+ * 8x8 subpixel coverage for a rounded rectangle of size (w, h) and corner
  * radius r at local coordinates (lx, ly).
  */
 static inline uint32_t rounded_rect_cov255(int lx, int ly, int w, int h, int r)
 {
 	int cx, cy, sx, sy, inside = 0;
-	int r4;
+	int r8;
 
 	if (r <= 0)
 		return 255;
@@ -637,21 +617,21 @@ static inline uint32_t rounded_rect_cov255(int lx, int ly, int w, int h, int r)
 	if (ly >= r && ly < h - r)
 		return 255;
 
-	cx = (lx < r) ? (r * 4) : ((w - r) * 4);
-	cy = (ly < r) ? (r * 4) : ((h - r) * 4);
-	r4 = r * 4;
+	cx = (lx < r) ? (r * 8) : ((w - r) * 8);
+	cy = (ly < r) ? (r * 8) : ((h - r) * 8);
+	r8 = r * 8;
 
-	for (sy = 0; sy < 4; sy++) {
-		int dy = (ly * 4 + sy) * 2 + 1 - cy * 2;
+	for (sy = 0; sy < 8; sy++) {
+		int dy = (ly * 8 + sy) * 2 + 1 - cy * 2;
 
-		for (sx = 0; sx < 4; sx++) {
-			int dx = (lx * 4 + sx) * 2 + 1 - cx * 2;
+		for (sx = 0; sx < 8; sx++) {
+			int dx = (lx * 8 + sx) * 2 + 1 - cx * 2;
 
-			if (dx * dx + dy * dy <= (r4 * 2) * (r4 * 2))
+			if (dx * dx + dy * dy <= (r8 * 2) * (r8 * 2))
 				inside++;
 		}
 	}
-	return (uint32_t)((inside * 255 + 8) >> 4);
+	return (uint32_t)((inside * 255 + 32) >> 6);
 }
 
 void shell_draw_rounded_rect(int x, int y, int w, int h, int radius, uint32_t color)

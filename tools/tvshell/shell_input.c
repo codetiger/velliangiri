@@ -47,6 +47,7 @@ static struct {
 	bool menu_down;
 	bool menu_hold_fired;
 	uint64_t menu_down_ms;
+	uint16_t down_code;
 } inp = {
 	.inotify_fd = -1,
 };
@@ -269,9 +270,20 @@ static bool translate_ev_key(const struct evdev_slot *slot,
 		}
 	}
 
-	/* Only act on key press (1) or repeat (2) for navigation and typing */
-	if (ie->value == 0)
+	/*
+	 * Register button actions strictly on key release (press_up, value == 0)
+	 * after a matching press_down (value == 1), ignoring NEC repeat frames
+	 * (value == 2) so a single button press never double-triggers.
+	 */
+	if (ie->value == 1) {
+		inp.down_code = ie->code;
 		return false;
+	}
+	if (ie->value != 0)
+		return false;
+	if (inp.down_code != ie->code)
+		return false;
+	inp.down_code = 0;
 
 	switch (ie->code) {
 	case KEY_LEFT:
@@ -444,6 +456,7 @@ int shell_app_run(const char *const argv[], bool game_keys)
 
 	inp.menu_down = false;
 	inp.menu_hold_fired = false;
+	inp.down_code = 0;
 
 	for (;;) {
 		pid_t w = waitpid(pid, &status, WNOHANG);
@@ -467,6 +480,7 @@ int shell_app_run(const char *const argv[], bool game_keys)
 	shell_input_set_game_map(false);
 	inp.menu_down = false;
 	inp.menu_hold_fired = false;
+	inp.down_code = 0;
 
 #ifdef __linux__
 	/* Drain any residual button release events before returning to the shell */

@@ -21,8 +21,8 @@
 #include "tvshell.h"
 #include "shell_assets.h"
 
-#define SUB		8
-#define SAMPLES		8
+#define SUB		16
+#define SAMPLES		16
 
 struct ttf_font {
 	uint8_t *data;
@@ -44,6 +44,7 @@ struct glyph_entry {
 	uint16_t size_px;
 	uint8_t theme;
 	uint8_t bold;
+	uint8_t italic;
 	int16_t advance;
 	int16_t xoff;
 	int16_t yoff;
@@ -319,7 +320,7 @@ static void flatten_quad_to_buf(float x0, float y0, float x1, float y1,
 				float x2, float y2, float *xs, float *ys,
 				int *count, int max_pts)
 {
-	int steps = 6, i;
+	int steps = 16, i;
 
 	for (i = 1; i <= steps && *count < max_pts; i++) {
 		float t = (float)i / (float)steps;
@@ -688,13 +689,14 @@ static bool build_special_or_fallback_glyph(uint32_t cp, int size_px, bool bold,
 }
 
 static struct glyph_entry *rasterize_glyph(enum shell_theme_id theme, int size_px,
-					   bool bold, uint32_t cp)
+					   bool bold, bool italic, uint32_t cp)
 {
 	const struct ttf_font *f = &fonts[theme][bold ? 1 : 0];
 	struct poly_list pl = { 0 };
 	struct glyph_entry *ge;
 	int adv_px = 0;
 	bool used_special = false;
+	float shear_x = italic ? 0.18f : 0.0f;
 
 	if (!f->data && fonts[theme][0].data)
 		f = &fonts[theme][0];
@@ -707,6 +709,7 @@ static struct glyph_entry *rasterize_glyph(enum shell_theme_id theme, int size_p
 		ge->size_px = (uint16_t)size_px;
 		ge->theme = (uint8_t)theme;
 		ge->bold = bold ? 1 : 0;
+		ge->italic = italic ? 1 : 0;
 		ge->advance = (int16_t)(size_px * 28 / 100);
 		if (f->data) {
 			uint16_t glyph_id = ttf_find_glyph(f, ' ');
@@ -728,7 +731,7 @@ static struct glyph_entry *rasterize_glyph(enum shell_theme_id theme, int size_p
 
 		ttf_get_hmetrics(f, glyph_id, &adv, &lsb);
 		adv_px = (int)lrintf((float)adv * scale);
-		ttf_extract_glyph_polys(f, glyph_id, scale, 1.0f, 0.0f, 0.0f, 1.0f,
+		ttf_extract_glyph_polys(f, glyph_id, scale, 1.0f, 0.0f, shear_x, 1.0f,
 					0.0f, 0.0f, &pl, 0);
 	} else {
 		used_special = build_special_or_fallback_glyph(cp, size_px, bold, &pl, &adv_px);
@@ -744,7 +747,7 @@ static struct glyph_entry *rasterize_glyph(enum shell_theme_id theme, int size_p
 				int16_t lsb = 0;
 				ttf_get_hmetrics(f, glyph_id, &adv, &lsb);
 				adv_px = (int)lrintf((float)adv * scale);
-				ttf_extract_glyph_polys(f, glyph_id, scale, 1.0f, 0.0f, 0.0f, 1.0f,
+				ttf_extract_glyph_polys(f, glyph_id, scale, 1.0f, 0.0f, shear_x, 1.0f,
 							0.0f, 0.0f, &pl, 0);
 			}
 		}
@@ -760,6 +763,7 @@ static struct glyph_entry *rasterize_glyph(enum shell_theme_id theme, int size_p
 	ge->size_px = (uint16_t)size_px;
 	ge->theme = (uint8_t)theme;
 	ge->bold = bold ? 1 : 0;
+	ge->italic = italic ? 1 : 0;
 	ge->advance = (int16_t)(adv_px > 0 ? adv_px : (size_px / 2));
 
 	if (pl.ncontours == 0 || pl.npts == 0) {
@@ -881,7 +885,18 @@ static struct glyph_entry *rasterize_glyph(enum shell_theme_id theme, int size_p
 		for (i = 0; i < gw; i++) {
 			uint32_t v = (row_cov[i] * 255 + (SUB * SAMPLES / 2)) / (SUB * SAMPLES);
 
-			ge->bitmap[y * gw + i] = (uint8_t)(v > 255 ? 255 : v);
+			if (v > 255)
+				v = 255;
+			if (v > 0 && v < 255) {
+				/*
+				 * Stem-weight contrast curve (gamma ~1.3): preserves smooth
+				 * subpixel anti-aliasing on thin strokes straddling pixel columns.
+				 */
+				v = (uint32_t)lrintf(powf((float)v / 255.0f, 0.78f) * 255.0f);
+				if (v > 255)
+					v = 255;
+			}
+			ge->bitmap[y * gw + i] = (uint8_t)v;
 		}
 	}
 
@@ -892,20 +907,21 @@ static struct glyph_entry *rasterize_glyph(enum shell_theme_id theme, int size_p
 }
 
 static struct glyph_entry *get_glyph(enum shell_theme_id theme, int size_px,
-				     bool bold, uint32_t cp)
+				     bool bold, bool italic, uint32_t cp)
 {
 	uint32_t h = ((cp * 2654435761U) ^ ((uint32_t)size_px << 8) ^
-		      ((uint32_t)theme << 2) ^ (bold ? 1U : 0U)) &
+		      ((uint32_t)theme << 2) ^ (bold ? 1U : 0U) ^ (italic ? 8U : 0U)) &
 		     (GLYPH_HASH_BUCKETS - 1);
 	struct glyph_entry *e = glyph_cache[h];
 
 	while (e) {
 		if (e->codepoint == cp && e->size_px == size_px &&
-		    e->theme == theme && e->bold == (bold ? 1 : 0))
+		    e->theme == theme && e->bold == (bold ? 1 : 0) &&
+		    e->italic == (italic ? 1 : 0))
 			return e;
 		e = e->next;
 	}
-	e = rasterize_glyph(theme, size_px, bold, cp);
+	e = rasterize_glyph(theme, size_px, bold, italic, cp);
 	if (e) {
 		e->next = glyph_cache[h];
 		glyph_cache[h] = e;
@@ -967,8 +983,20 @@ int shell_font_init(void)
 			snprintf(path_reg, sizeof(path_reg), "%s", shell_themes[t].font_regular);
 			snprintf(path_bold, sizeof(path_bold), "%s", shell_themes[t].font_bold);
 		}
-		(void)ttf_load_file(&fonts[t][0], path_reg);
-		(void)ttf_load_file(&fonts[t][1], path_bold);
+		if (ttf_load_file(&fonts[t][0], path_reg) < 0 && (!env_dir || !env_dir[0])) {
+			const char *b_reg = strrchr(shell_themes[t].font_regular, '/');
+
+			snprintf(path_reg, sizeof(path_reg), "build/dl/fonts/%s",
+				 b_reg ? b_reg + 1 : shell_themes[t].font_regular);
+			(void)ttf_load_file(&fonts[t][0], path_reg);
+		}
+		if (ttf_load_file(&fonts[t][1], path_bold) < 0 && (!env_dir || !env_dir[0])) {
+			const char *b_bold = strrchr(shell_themes[t].font_bold, '/');
+
+			snprintf(path_bold, sizeof(path_bold), "build/dl/fonts/%s",
+				 b_bold ? b_bold + 1 : shell_themes[t].font_bold);
+			(void)ttf_load_file(&fonts[t][1], path_bold);
+		}
 	}
 
 	/* Pre-warm ASCII glyphs for the 10 unique sizes in tokens.json */
@@ -979,7 +1007,7 @@ int shell_font_init(void)
 	for (t = 0; t < 2; t++) {
 		for (si = 0; si < sizeof(sizes) / sizeof(sizes[0]); si++) {
 			for (cp = 32; cp <= 126; cp++)
-				(void)get_glyph((enum shell_theme_id)t, sizes[si], false, cp);
+				(void)get_glyph((enum shell_theme_id)t, sizes[si], false, false, cp);
 		}
 	}
 	return 0;
@@ -1016,7 +1044,7 @@ int shell_font_measure(enum shell_theme_id theme, int size_px, bool bold, const 
 	if (!p)
 		return 0;
 	while ((cp = utf8_next(&p)) != 0) {
-		struct glyph_entry *ge = get_glyph(theme, size_px, bold, cp);
+		struct glyph_entry *ge = get_glyph(theme, size_px, bold, false, cp);
 
 		if (ge)
 			w += ge->advance;
@@ -1024,26 +1052,8 @@ int shell_font_measure(enum shell_theme_id theme, int size_px, bool bold, const 
 	return w;
 }
 
-static inline uint32_t srgb8_from_lin(uint32_t lin)
-{
-	uint32_t lo = 0, hi = 255;
-
-	while (lo < hi) {
-		uint32_t mid = (lo + hi + 1) >> 1;
-
-		if (shell_srgb_to_linear[mid] <= lin)
-			lo = mid;
-		else
-			hi = mid - 1;
-	}
-	if (lo < 255 &&
-	    lin - shell_srgb_to_linear[lo] > shell_srgb_to_linear[lo + 1] - lin)
-		lo++;
-	return lo;
-}
-
 static void blit_glyph(const struct glyph_entry *ge, int pen_x, int baseline_y,
-		       bool italic, uint32_t fg)
+		       uint32_t fg)
 {
 	uint32_t *fb = shell_display_backbuffer();
 	int py, px;
@@ -1054,7 +1064,6 @@ static void blit_glyph(const struct glyph_entry *ge, int pen_x, int baseline_y,
 	for (py = 0; py < (int)ge->h; py++) {
 		int rel_y = ge->yoff + py;
 		int sy = baseline_y + rel_y;
-		int shear = italic ? (-rel_y / 5) : 0;
 
 		if (sy < 0 || sy >= SHELL_SCREEN_H)
 			continue;
@@ -1066,25 +1075,20 @@ static void blit_glyph(const struct glyph_entry *ge, int pen_x, int baseline_y,
 
 			if (!a255)
 				continue;
-			sx = pen_x + ge->xoff + px + shear;
+			sx = pen_x + ge->xoff + px;
 			if (sx < 0 || sx >= SHELL_SCREEN_W)
 				continue;
 			if (a255 == 255) {
 				row[sx] = fg | 0xff000000U;
 			} else {
-				uint32_t a = a255 + (a255 >> 7);
+				uint32_t a = a255;
+				uint32_t inv_a = 255U - a;
 				uint32_t dst = row[sx];
-				uint32_t out = 0xff000000U;
-				int sh;
+				uint32_t r = (((dst >> 16) & 0xffU) * inv_a + ((fg >> 16) & 0xffU) * a + 127U) / 255U;
+				uint32_t g = (((dst >> 8) & 0xffU) * inv_a + ((fg >> 8) & 0xffU) * a + 127U) / 255U;
+				uint32_t b = ((dst & 0xffU) * inv_a + (fg & 0xffU) * a + 127U) / 255U;
 
-				for (sh = 0; sh < 24; sh += 8) {
-					uint32_t d = shell_srgb_to_linear[(dst >> sh) & 0xffU];
-					uint32_t s = shell_srgb_to_linear[(fg >> sh) & 0xffU];
-					uint32_t v = (d * (256 - a) + s * a) >> 8;
-
-					out |= srgb8_from_lin(v) << sh;
-				}
-				row[sx] = out;
+				row[sx] = 0xff000000U | (r << 16) | (g << 8) | b;
 			}
 		}
 	}
@@ -1103,7 +1107,7 @@ int shell_font_draw(enum shell_theme_id theme, int size_px, bool bold, bool ital
 		return 0;
 
 	if (max_width > 0 && shell_font_measure(theme, size_px, bold, utf8) > max_width) {
-		struct glyph_entry *ell = get_glyph(theme, size_px, bold, 0x2026);
+		struct glyph_entry *ell = get_glyph(theme, size_px, bold, italic, 0x2026);
 
 		ell_w = ell ? ell->advance : size_px / 2;
 		need_ellipsis = true;
@@ -1112,20 +1116,20 @@ int shell_font_draw(enum shell_theme_id theme, int size_px, bool bold, bool ital
 	uint32_t cp;
 
 	while ((cp = utf8_next(&p)) != 0) {
-		struct glyph_entry *ge = get_glyph(theme, size_px, bold, cp);
+		struct glyph_entry *ge = get_glyph(theme, size_px, bold, italic, cp);
 
 		if (!ge)
 			continue;
 		if (need_ellipsis && (pen_x - x) + ge->advance + ell_w > max_width) {
-			struct glyph_entry *ell = get_glyph(theme, size_px, bold, 0x2026);
+			struct glyph_entry *ell = get_glyph(theme, size_px, bold, italic, 0x2026);
 
 			if (ell) {
-				blit_glyph(ell, pen_x, baseline_y, italic, fg);
+				blit_glyph(ell, pen_x, baseline_y, fg);
 				pen_x += ell->advance;
 			}
 			break;
 		}
-		blit_glyph(ge, pen_x, baseline_y, italic, fg);
+		blit_glyph(ge, pen_x, baseline_y, fg);
 		pen_x += ge->advance;
 	}
 
