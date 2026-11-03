@@ -105,4 +105,33 @@ Measured through `AF_ALG` sockets (`64 KiB` chunks over `16 MiB` per algorithm) 
 | **HFS+ `decmpfs` Transparent Inflate (`/usr/sbin` + `/usr/bin`, 64 MiB)** | `4.02 s` | **`15.87 MB/s`** | `s5l8947x-fmi` + `hfsplus` `decmpfs` (zlib/LZVN) |
 | **`sgxcarve` (LZSS inflate + NEON Adler-32 -> `sgx543.fw`)** | `324 ms` / iter | **`22.68 MB/s`** *(input)* | Unwraps and inflates 12.6 MB system image, verifies Adler-32, extracts 12 SGX regions (`92,328` B) |
 | **`hcdcarve` (`BCM4334B0.hcd` extraction)** | `209.6 ms` / iter | **`25.36 MB/s`** *(input)* | Scans binary for board-specific HCI patch (`49,316` B) |
-| **Total USB DFU -> Linux Console Boot Time** | `14.06 s` *(kernel+initramfs)* | **`26.36 s`** *(total from DFU)* | Pre-kernel 1080p splash + XZ decompress + kernel init + `stage1`/`stage2` + USB enumeration |
+| **Total USB DFU -> Linux Console Boot Time** | **`+2.20 s`** *(kernel -> `system ready`, fast `stage2`)* | **`26.36 s`** *(baseline cold DFU)* | Pre-kernel 1080p splash + seamless HDMI handover + SLC NAND (`18.6 MB/s`) + `usr-local.sqsh` loop mount |
+
+---
+
+## 6. SGX543 3D GPU & OpenGL ES 2.0 Benchmarks (`glcubes` at `1920x1080`)
+
+Measured with `sgx-gl glcubes` (10×10×10 grid = **1,000 textured, shaded 3D cubes**, **36,000 vertices / 12,000 triangles per frame**, trilinear mipmapped `64x64` RGBA texture, 24-bit depth buffer, `1920x1080` resolution over 120 frames):
+
+| Metric (`1920x1080`, 120 Frames) | Baseline | Optimized (`e427398`) | Improvement |
+|---|---:|---:|---|
+| **Startup & Asset Load (`--screen` `load_ms`)** | `1384.2 ms` | **`427.7 ms`** | **`3.24x` faster** (`-956.5 ms`) |
+| **EGL/GBM Context Init (`context`)** | `1137.7 ms` | **`266.5 ms`** | **`4.27x` faster** |
+| **Texture & Mipmap Setup (`assets`)** | `144.2 ms` | **`64.2 ms`** | **`2.25x` faster** |
+| **GPU Render Time (`avg_ms` / `min_ms`)** | `47.11 ms` / `46.50 ms` | **`20.59 ms` / `17.90 ms`** | **`2.29x` faster** |
+| **GPU Render Throughput (`render_fps`)** | `21.23 fps` | **`48.57 fps`** *(peak `55.9 fps`)* | **`2.29x` higher FPS** |
+| **HDMI Presented FPS (`--screen` at `1080p30`)** | `14.01 fps` (`8.566 s`) | **`25.00 fps`** (`4.800 s`) | **`1.78x` higher FPS** |
+| **Offscreen `1920x1080` (`avg_ms` / `min_ms`)** | ~`47.1 ms` (`21.2 fps`) | **`20.41 ms` / `17.39 ms` (`48.98 fps`)** | **`2.31x` higher FPS** |
+
+### Key Driver & Compiler Optimizations (`e427398`)
+
+1. **USSE Compiler (`F16` Vector Fragment Path, `V32MAD` Fusion & Register Packing):**
+   - Extended `f16_colour()` (`sgx_compiler.c`, `usse_hop_swz()`) to support 4-wide `F16` `V16NMAD` with arbitrary channel swizzles and hardware constants (`0.0, 1.0, 2.0, 0.5`), compiling `glcubes`'s fragment shader into **3 instructions and 2 temporaries** instead of 15 `F32` instructions and 14 temporaries.
+   - Added `nir_op_ffma` lowering (`usse_fmad()`) with single-use `fadd`+`fmul` chain reassociation (`fuse_ffma()`), reducing 4×4 matrix transforms (`u_mvp * vec4(a_pos, 1.0)`) from 24 instructions to 12 `FMAD`s, and eliminating unread attribute channel `LIMM`s in `vs_prologue()`.
+   - Packed scalar `V32NMAD` and `V32MAD` temporaries into both even and odd register lanes (`define_aligned(..., 1)`), halving register pressure.
+2. **TBDR Tile & Bandwidth Optimizations:**
+   - Pointed the hardware background object (`bg[0..3]`) at the cached 64-byte 4×4 dummy texture when a render starts with a full-screen clear or an opaque full-screen quad (`bg_cleared`), eliminating an **8.3 MiB DRAM read** per `1920x1080` pass and skipping the redundant `zs_quad` depth-fill pass.
+3. **Vertex & Index Streaming:**
+   - Expanded the pre-built identity index buffer (`BUILT_IDX_COUNT`) from `8,190` to `65,535` vertices and added a static repacked multi-VBO GPU BO cache in `gpu_vs_draw()`, eliminating per-frame CPU index generation and 1.15 MiB/frame of strided CPU vertex copies.
+4. **Startup, Mipmaps & DRM EDID Caching:**
+   - Removed redundant write-combined `memset` on freshly allocated kernel shmem GEM BOs, added a write-only `PIPE_MAP_WRITE` fast path in `cpu_blit()` for `glGenerateMipmap()`, and cached parsed HDMI EDID across `get_modes()` calls in `s5l8947x_drm.c`.

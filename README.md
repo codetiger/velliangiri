@@ -50,7 +50,7 @@ The system boots over USB into RAM in ~20 seconds while using the internal NAND 
 | **IOP Coprocessor** | **In-Progress:** Firmware extraction and core start work, but the EmbeddedIOP message channel is not implemented (not required on Linux since NAND is driven directly from the main CPU). |
 | **DART IOMMU, PKE & Dynamic Voltage Scaling** | **Pending:** DART stays in bypass mode (media blocks use contiguous buffers), the PKE public-key accelerator is unused, and CPU frequency scaling runs at fixed boot voltage. |
 
-See [docs/progress.md](docs/progress.md) for the detailed support matrix, [docs/SGX.md](docs/SGX.md) for GPU and OpenGL details, and [docs/benchmarks.md](docs/benchmarks.md) for on-device cache, NEON, crypto, and storage benchmarks.
+See [docs/progress.md](docs/progress.md) for the detailed support matrix, [docs/SGX.md](docs/SGX.md) for GPU and OpenGL details, and [docs/benchmarks.md](docs/benchmarks.md) for on-device cache, NEON, crypto, storage, and SGX543 3D GPU benchmarks.
 
 ### Documentation (`docs/`)
 
@@ -58,7 +58,7 @@ See [docs/progress.md](docs/progress.md) for the detailed support matrix, [docs/
 |---|---|
 | [docs/progress.md](docs/progress.md) | Hardware and software support matrix (Supported, In-Progress, Pending, and Priority Roadmap) |
 | [docs/SGX.md](docs/SGX.md) | PowerVR SGX543MP1 GPU, Mesa 26.1.8 OpenGL ES 2.0 / GL 2.1, and Weston 14 Wayland status & usage |
-| [docs/benchmarks.md](docs/benchmarks.md) | On-device L1/L2/DRAM latency, NEON bandwidth, hardware AES/SHA, and NAND/HFS+ benchmarks |
+| [docs/benchmarks.md](docs/benchmarks.md) | On-device L1/L2/DRAM latency, NEON bandwidth, hardware AES/SHA, NAND/HFS+, and SGX543 3D GPU benchmarks |
 | [docs/drivers-and-porting.md](docs/drivers-and-porting.md) | Driver map, MMIO addresses, clock/IRQ bindings, boot bundle architecture, and SoC porting guide |
 | [docs/sgx-architecture.md](docs/sgx-architecture.md) | SGX543 register banks, `SGXF` firmware container, GPU MMU layout, TA/3D/2D queues, and `kmsro`/PRIME display integration |
 | [docs/audio-i2s-spdif.md](docs/audio-i2s-spdif.md) | I2S0–I2S3, I2S clock master, S/PDIF, PMGR NCOs, and 2/4/6/8-channel HDMI LPCM register specification |

@@ -22,6 +22,15 @@ All kernel and OpenGL ES 2.0 / 2.1 test suites pass on `j33iap` hardware:
 - **Kernel & DRM (`hwtest gpu`)**: Microkernel boot/restart, GEM create/map/wait, contiguous `dma-buf` export (`sgxgem -c`), display `dma-buf` import (`sgxgem -i`), 2D scaled blit (`sgx2d`), TA/3D hardware clear (`sgxframe`), and live-screen blit (`sgxpresent -s`).
 - **Mesa OpenGL ES 2.0 & Desktop GL 2.1**: `glclear` (0 pixel errors), `gltri` (11/11), `glfs` (40/40 fragment compiler tests), `glsize` (15/15 sizes up to `4096x4096`), `gltex` (14/14), `glblend` (14/14), `gldepth` (12/12), `glclear-gl` (Desktop GL 2.1), `glcubes` (1,000 textured cubes benchmark), `gbmtest` (300 page-flipped frames on HDMI with implicit fence sync), and `weston-run` (`weston-simple-egl` and `weston-simple-shm` on HDMI).
 
+### Performance (`glcubes` at `1920x1080`)
+
+On-device benchmark rendering 1,000 textured, shaded 3D cubes (36,000 vertices / 12,000 triangles per frame) at `1920x1080` (see [benchmarks.md](benchmarks.md) for full details):
+
+| Mode (`1920x1080`, 120 Frames) | Startup (`load_ms`) | GPU Render (`avg` / `min`) | Render FPS | Presented FPS (`1080p30` HDMI) |
+|---|---:|---:|---:|---:|
+| **HDMI On-Screen (`--screen`)** | `427.7 ms` | `20.59 ms` / `17.90 ms` | **`48.57 fps`** *(peak `55.9 fps`)* | **`25.00 fps`** |
+| **Offscreen FBO** | `243.3 ms` | `20.41 ms` / `17.39 ms` | **`48.98 fps`** *(peak `57.5 fps`)* | — |
+
 ---
 
 ## 2. In-Progress & Pending Support
