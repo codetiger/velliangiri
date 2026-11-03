@@ -43,13 +43,13 @@
 		};
 	};
 
-	/* 1080p30 boot splash scanned out by the boot loader */
+	/* 720p30 boot splash scanned out by the boot loader */
 	framebuffer0: framebuffer@9e400000 {
 		compatible = "simple-framebuffer";
-		reg = <0x9e400000 0x7e9000>;
-		width = <1920>;
-		height = <1080>;
-		stride = <7680>;
+		reg = <0x9e400000 0x384000>;
+		width = <1280>;
+		height = <720>;
+		stride = <5120>;
 		format = "a8r8g8b8";
 		memory-region = <&fb_region>;
 		status = "okay";
@@ -171,13 +171,10 @@
 		compatible = "apple,j33-mcu";
 		current-speed = <250000>;
 		/*
-		 * The remote has seven buttons and no other input device is
-		 * present, so report them as the keys a game expects: the
-		 * arrows stay on movement, Select is fire (Ctrl), Play is
-		 * use (Space) and Menu is Escape. Clear the property for the
-		 * media key codes instead (or toggle .../game_map at runtime).
+		 * Report media key codes (arrows, Enter, Menu, Play/Pause) by
+		 * default for the TV shell; games toggle .../game_map to 1 at
+		 * runtime for Ctrl/Space/Escape.
 		 */
-		apple,game-keys;
 		/*
 		 * The MCU raises its NMI/SOS line on GPIO 2, normally high
 		 * and driven low to assert it. It is also the wake source for
@@ -216,12 +213,12 @@
 &display_pipe {
 	status = "okay";
 	/*
-	 * Start in 1080p30, the same raster the pre-kernel loader scans out,
-	 * so the handover does not change the mode. The PHY stops at
-	 * 108 MHz, so 1080p is only available at 30 Hz.
+	 * Start in 720p30, the same raster the pre-kernel loader scans out,
+	 * so the handover to the 1280x720 TV shell does not change the mode.
+	 * External apps can switch modes as needed, and
 	 * s5l8947x_drm.preferred_mode still overrides at runtime.
 	 */
-	apple,preferred-mode = "1920x1080@30";
+	apple,preferred-mode = "1280x720@30";
 };
 
 /* Audio (I2S0..I2S3 to HDMI, S/PDIF to optical) */

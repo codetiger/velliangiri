@@ -1,0 +1,10 @@
+<!-- SPDX-License-Identifier: GPL-2.0-only -->
+<!-- Flat-colour shell logo, derived from the repository logo.svg. No gradients: it is drawn on a framebuffer whose gamma path posterizes smooth ramps. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="26 62 460 380" width="49" height="40" role="img" aria-label="Shell logo, Signal theme, working">
+  <title>Shell logo, Signal theme, working</title>
+  <path d="M184 156L130 228L106 216L38 414C34 425 42 436 54 436L152 436Z" fill="#64748B"/>
+  <path d="M328 156L382 228L406 216L474 414C478 425 470 436 458 436L360 436Z" fill="#475569"/>
+  <path d="M184 156L328 156L398 436L114 436Z" fill="#334155"/>
+  <path d="M256 196C212 208 180 282 172 436L340 436C332 282 300 208 256 196Z" fill="#E2E8F0"/>
+  <path d="M256 76C265 76 274 82 280 92L328 156C307 178 282 198 256 214C230 198 205 178 184 156L232 92C238 82 247 76 256 76Z" fill="#0C0D10" stroke="#F59E0B" stroke-width="20" stroke-linejoin="round"/>
+</svg>

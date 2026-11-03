@@ -469,6 +469,9 @@ static int s5l_preferred_mode_set(const char *val, const struct kernel_param *kp
 	if (*mode && sscanf(mode, "%ux%u@%d", &w, &h, &hz) < 2)
 		return -EINVAL;
 
+	if (!strcmp(s5l_preferred_mode, mode))
+		return 0;
+
 	strscpy(s5l_preferred_mode, mode, sizeof(s5l_preferred_mode));
 
 	if (g_s5l_display)
@@ -1329,7 +1332,7 @@ static bool s5l_force_preferred(struct drm_connector *conn)
 			best = delta;
 		}
 	}
-	if (!pick)
+	if (!pick || (hz && best > 1))
 		return false;
 
 	list_for_each_entry(m, &conn->probed_modes, head)
@@ -1339,7 +1342,7 @@ static bool s5l_force_preferred(struct drm_connector *conn)
 	return true;
 }
 
-/* CEA-861 VIC 34: 1920x1080@30 (74.25 MHz), matching Stage-1 hdmi-boot.h */
+/* CEA-861 VIC 34: 1920x1080@30 (74.25 MHz) */
 static const struct drm_display_mode s5l_cea_1080p30 = {
 	DRM_MODE("1920x1080", DRM_MODE_TYPE_DRIVER, 74250,
 		 1920, 2008, 2052, 2200, 0,
@@ -1347,9 +1350,18 @@ static const struct drm_display_mode s5l_cea_1080p30 = {
 		 DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC),
 };
 
-static int s5l_add_1080p30(struct drm_connector *conn)
+/* CEA-861 VIC 62: 1280x720@30 (74.25 MHz), matching Stage-1 hdmi-boot.h */
+static const struct drm_display_mode s5l_cea_720p30 = {
+	DRM_MODE("1280x720", DRM_MODE_TYPE_DRIVER, 74250,
+		 1280, 3040, 3080, 3300, 0,
+		 720, 725, 730, 750, 0,
+		 DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC),
+};
+
+static int s5l_add_mode(struct drm_connector *conn,
+			const struct drm_display_mode *tmpl)
 {
-	struct drm_display_mode *m = drm_mode_duplicate(conn->dev, &s5l_cea_1080p30);
+	struct drm_display_mode *m = drm_mode_duplicate(conn->dev, tmpl);
 
 	if (!m)
 		return 0;
@@ -1369,8 +1381,9 @@ static int s5l_conn_get_modes(struct drm_connector *conn)
 	if (n)
 		s5l_pick_preferred(conn);
 	if (!n) {
-		/* No EDID: offer 1080p30 (Stage-1 mode) and 720p60 */
-		n = s5l_add_1080p30(conn);
+		/* No EDID: offer 720p30 (Stage-1 mode), 1080p30 and 720p60 */
+		n = s5l_add_mode(conn, &s5l_cea_720p30);
+		n += s5l_add_mode(conn, &s5l_cea_1080p30);
 		n += drm_add_modes_noedid(conn, 1280, 720);
 		drm_set_preferred_mode(conn, 1280, 720);
 	}
@@ -1380,11 +1393,14 @@ static int s5l_conn_get_modes(struct drm_connector *conn)
 
 		/*
 		 * The sink need not list the requested mode: add the
-		 * standard 60 Hz modes (and CEA 1080p30) the pipe can drive.
+		 * standard 60 Hz modes (and CEA 720p30 / 1080p30) the pipe
+		 * can drive.
 		 */
 		if (sscanf(s5l_preferred_mode, "%ux%u", &w, &h) == 2) {
+			if (w == 1280 && h == 720)
+				n += s5l_add_mode(conn, &s5l_cea_720p30);
 			if (w == 1920 && h == 1080)
-				n += s5l_add_1080p30(conn);
+				n += s5l_add_mode(conn, &s5l_cea_1080p30);
 			n += drm_add_modes_noedid(conn, w, h);
 		}
 		if (n && !s5l_force_preferred(conn))

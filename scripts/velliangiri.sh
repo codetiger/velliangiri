@@ -8,6 +8,8 @@
 #   ./scripts/velliangiri.sh kernel         # Build Linux 6.12 zImage + DTB
 #   ./scripts/velliangiri.sh bundle         # Pack self-relocating boot bundle
 #   ./scripts/velliangiri.sh all            # Run rootfs + kernel + bundle
+#   ./scripts/velliangiri.sh tvshell        # Build 1280x720@30 TV shell (/bin/tvshell)
+#   ./scripts/velliangiri.sh doom           # Fetch & build S5L8947X Doom port (/bin/doom)
 #   ./scripts/velliangiri.sh clean          # Clean build outputs (preserves downloaded tarballs)
 #   ./scripts/velliangiri.sh mesa           # Build Mesa with the SGX driver (tools/mesa-sgx)
 #   ./scripts/velliangiri.sh check          # Run clean-room guardrail verification
@@ -120,11 +122,31 @@ case "${CMD}" in
 			-v "${ROOT}":/workspace -w /workspace \
 			alpine:3.21 sh tools/weston/build.sh
 		;;
+	tvshell)
+		bash "${ROOT}/tools/tvshell/fetch-fonts.sh"
+		if command -v armv7-linux-musleabihf-gcc >/dev/null 2>&1 ||
+		   [ -x /opt/homebrew/bin/armv7-linux-musleabihf-gcc ] ||
+		   command -v arm-linux-gnueabihf-gcc >/dev/null 2>&1; then
+			bash "${ROOT}/tools/tvshell/build.sh" "$@"
+		else
+			run_in_container bash tools/tvshell/build.sh "$@"
+		fi
+		;;
+	doom)
+		bash "${ROOT}/tools/doom/fetch.sh"
+		if command -v armv7-linux-musleabihf-gcc >/dev/null 2>&1 ||
+		   [ -x /opt/homebrew/bin/armv7-linux-musleabihf-gcc ] ||
+		   command -v arm-linux-gnueabihf-gcc >/dev/null 2>&1; then
+			bash "${ROOT}/tools/doom/build.sh" "$@"
+		else
+			run_in_container bash tools/doom/build.sh "$@"
+		fi
+		;;
 	shell)
 		docker_run -it /bin/bash
 		;;
 	*)
-		echo "Usage: $0 {all|image|rootfs|kernel|bundle|mesa|weston|clean|check|shell}" >&2
+		echo "Usage: $0 {all|image|rootfs|kernel|bundle|tvshell|doom|mesa|weston|clean|check|shell}" >&2
 		exit 1
 		;;
 esac

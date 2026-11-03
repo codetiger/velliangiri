@@ -19,11 +19,11 @@ import re
 import sys
 import xml.etree.ElementTree as ET
 
-FB_W, FB_H = 1920, 1080
+FB_W, FB_H = 1280, 720
 SUB = 16                    # subpixel units per pixel
-LOGO_H = 225                # rendered logo content height in pixels
-GAP = 36                    # logo bottom to text cap line, pixels
-CAP_H = 63                  # wordmark cap height, pixels
+LOGO_H = 150                # rendered logo content height in pixels
+GAP = 24                    # logo bottom to text cap line, pixels
+CAP_H = 42                  # wordmark cap height, pixels
 FLAT_TOL = 0.3              # curve flattening tolerance, pixels
 
 BG = 0xfef3c7

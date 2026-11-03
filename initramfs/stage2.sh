@@ -12,9 +12,10 @@ log_msg() {
 
 clean_shutdown() {
 	log_msg "syncing and unmounting NAND filesystems before $1..."
+	touch /tmp/tvshell-stop 2>/dev/null || true
 	sync
-	# Stop the daemons that use or write to Data before unmounting it
-	killall weston seatd bluetoothd 2>/dev/null || true
+	# Stop the daemons and UI apps that use or write to Data before unmounting it
+	killall tvshell doom weston seatd bluetoothd 2>/dev/null || true
 	if [ -r /proc/mounts ]; then
 		awk '$1 ~ /^\/dev\/(nand|loop)/ || $3 == "hfsplus" || $3 == "squashfs" { print $2 }' /proc/mounts | sort -r | while read -r mp; do
 			if ! umount "$mp" 2>/dev/null; then
@@ -316,7 +317,10 @@ if [ "$DATA" = 1 ]; then
 	# its state directory lives on Data, which stays mounted for the session
 	# (clean_shutdown unmounts it before reboot, halt and power-off)
 	BTSTATE=/mnt/data/linux/var/lib/bluetooth
-	mkdir -p "$BTSTATE" /var/lib/bluetooth
+	mkdir -p "$BTSTATE" /var/lib/bluetooth \
+		/mnt/data/linux/etc /mnt/data/linux/models /mnt/data/linux/cache/thumbs \
+		/mnt/data/linux/notes /mnt/data/linux/media/photos /mnt/data/linux/media/videos \
+		/mnt/data/linux/media/music /mnt/data/linux/games/doom/saves
 	chmod 700 "$BTSTATE" 2>/dev/null || true
 	if mount --bind "$BTSTATE" /var/lib/bluetooth 2>/dev/null; then
 		log_msg "nand0p2: Bluetooth pairings kept in /linux/var/lib/bluetooth"
@@ -384,10 +388,21 @@ fi
 
 log_msg "system ready"
 
+# Launch the 1280x720@30 TV Shell on HDMI in a supervised loop
+if [ -x /bin/tvshell ]; then
+	(
+		while [ ! -f /tmp/tvshell-stop ]; do
+			/bin/tvshell 2>/dev/kmsg || true
+			sleep 1
+		done
+	) &
+	log_msg "tvshell started on 1280x720@30 display"
+fi
+
 # Keep PID 1 alive on tty0 / fallback loop and reap orphans via wait
 cd "$HOME" 2>/dev/null || cd /
 while true; do
-	if [ -c /dev/tty0 ]; then
+	if [ ! -x /bin/tvshell ] && [ -c /dev/tty0 ]; then
 		/bin/sh -l </dev/tty0 >/dev/tty0 2>&1 &
 		wait $!
 		sleep 1

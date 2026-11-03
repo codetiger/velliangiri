@@ -1,14 +1,14 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * S5L8947X 1080p30 HDMI + rgbout pre-kernel display initialization
+ * S5L8947X 720p30 HDMI + rgbout pre-kernel display initialization
  *
  * Configures:
  *   - PMGR display clock gates at 0x3f101008 + n * 4 (gates 15, 21, 20, 25, 80)
- *   - rgbout display pipe at 0x3a200000 scanning out 1920x1080x32bpp ARGB
- *     (stride 7680) from reserved RAM at 0x9e400000
+ *   - rgbout display pipe at 0x3a200000 scanning out 1280x720x32bpp ARGB
+ *     (stride 5120) from reserved RAM at 0x9e400000
  *   - Output stage at 0x39600000 (gamma LUTs + timing)
  *   - HDMI transmitter & PHY bridge at 0x39700000 for 74.25 MHz
- *     (1080p@30Hz, VIC 34; the board DT asks the kernel for the same
+ *     (720p@30Hz, VIC 62; the board DT asks the kernel for the same
  *     mode through apple,preferred-mode, so the handover keeps the raster)
  */
 
@@ -23,16 +23,16 @@
 #include "splash.h"
 #endif
 
-/* CEA-861 1920x1080p30: 74.25 MHz, positive syncs */
+/* CEA-861 1280x720p30 (VIC 62): 74.25 MHz, positive syncs */
 #define S5L_FB_PHYS		0x9e400000U
-#define S5L_FB_W		1920
-#define S5L_FB_H		1080
-#define S5L_HFP			88
-#define S5L_HSW			44
-#define S5L_HBP			148
-#define S5L_VFP			4
+#define S5L_FB_W		1280
+#define S5L_FB_H		720
+#define S5L_HFP			1760
+#define S5L_HSW			40
+#define S5L_HBP			220
+#define S5L_VFP			5
 #define S5L_VSW			5
-#define S5L_VBP			36
+#define S5L_VBP			20
 #define S5L_HTOTAL		(S5L_FB_W + S5L_HFP + S5L_HSW + S5L_HBP)
 #define S5L_VTOTAL		(S5L_FB_H + S5L_VFP + S5L_VSW + S5L_VBP)
 #define S5L_BPP			4
@@ -370,9 +370,9 @@ static void hdmi_color_init(void)
 	hdmi_hmask(HDMI_VIDEO_PATTERN_GEN, 0x01, 0);
 }
 
-/* RGB, 16:9, full quantization range (Q = 2), VIC 34 */
+/* RGB, 16:9, full quantization range (Q = 2), VIC 62 (1280x720p30) */
 static const uint8_t hdmi_avi[13] = {
-	0x10, 0x68, 0x08, 0x22, 0x00, 0, 0, 0, 0, 0, 0, 0, 0
+	0x10, 0x68, 0x08, 0x3e, 0x00, 0, 0, 0, 0, 0, 0, 0, 0
 };
 
 static const uint8_t hdmi_phy_74250[31] = {
@@ -417,7 +417,7 @@ static int hdmi_start_video(const uint8_t *phy_cfg, int hdmi_mode)
 		hdmi_hw(HDMI_AVI_HEADER0, 0x82, 1);
 		hdmi_hw(HCORE(0x714), 0x02, 1);
 		hdmi_hw(HCORE(0x718), 0x0d, 1);
-		hdmi_hw(HDMI_AVI_CHECK_SUM, 0xcd, 1);
+		hdmi_hw(HDMI_AVI_CHECK_SUM, 0xb1, 1);
 		for (i = 0; i < 13; i++)
 			hdmi_hw(HDMI_AVI_BYTE(i + 1), hdmi_avi[i], 1);
 		hdmi_hmask(HDMI_AVI_CON, 0x03, 0x02);
