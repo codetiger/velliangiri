@@ -18,6 +18,9 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 #ifdef __linux__
 #include <linux/videodev2.h>
 #endif
@@ -102,6 +105,17 @@ static uint32_t *scale_cover_bilinear(const uint32_t *src, int src_w, int src_h,
 		return dst;
 	}
 
+	uint16_t *x0_lut = malloc((size_t)dst_w * sizeof(uint16_t));
+	uint16_t *x1_lut = malloc((size_t)dst_w * sizeof(uint16_t));
+	uint16_t *fx_lut = malloc((size_t)dst_w * sizeof(uint16_t));
+	if (!x0_lut || !x1_lut || !fx_lut) {
+		free(x0_lut);
+		free(x1_lut);
+		free(fx_lut);
+		free(dst);
+		return NULL;
+	}
+
 	float scale_x = (float)dst_w / (float)src_w;
 	float scale_y = (float)dst_h / (float)src_h;
 	float scale = (scale_x > scale_y) ? scale_x : scale_y;
@@ -109,10 +123,25 @@ static uint32_t *scale_cover_bilinear(const uint32_t *src, int src_w, int src_h,
 	float crop_h = (float)dst_h / scale;
 	float off_x = ((float)src_w - crop_w) * 0.5f;
 	float off_y = ((float)src_h - crop_h) * 0.5f;
+	float step_x = crop_w / (float)dst_w;
+	float step_y = crop_h / (float)dst_h;
 	int y, x;
 
+	for (x = 0; x < dst_w; x++) {
+		float sx = off_x + ((float)x + 0.5f) * step_x - 0.5f;
+		if (sx < 0.0f)
+			sx = 0.0f;
+		if (sx > (float)(src_w - 1))
+			sx = (float)(src_w - 1);
+		int x0 = (int)sx;
+		int x1 = (x0 + 1 < src_w) ? (x0 + 1) : x0;
+		x0_lut[x] = (uint16_t)x0;
+		x1_lut[x] = (uint16_t)x1;
+		fx_lut[x] = (uint16_t)((sx - (float)x0) * 256.0f);
+	}
+
 	for (y = 0; y < dst_h; y++) {
-		float sy = off_y + ((float)y + 0.5f) * (crop_h / (float)dst_h) - 0.5f;
+		float sy = off_y + ((float)y + 0.5f) * step_y - 0.5f;
 		if (sy < 0.0f)
 			sy = 0.0f;
 		if (sy > (float)(src_h - 1))
@@ -126,43 +155,35 @@ static uint32_t *scale_cover_bilinear(const uint32_t *src, int src_w, int src_h,
 		uint32_t *drow = dst + (size_t)y * dst_w;
 
 		for (x = 0; x < dst_w; x++) {
-			float sx = off_x + ((float)x + 0.5f) * (crop_w / (float)dst_w) - 0.5f;
-			if (sx < 0.0f)
-				sx = 0.0f;
-			if (sx > (float)(src_w - 1))
-				sx = (float)(src_w - 1);
-			int x0 = (int)sx;
-			int x1 = (x0 + 1 < src_w) ? (x0 + 1) : x0;
-			uint32_t fx = (uint32_t)((sx - (float)x0) * 256.0f);
+			uint32_t fx = fx_lut[x];
 			uint32_t ifx = 256U - fx;
 
 			uint32_t w00 = (ifx * ify) >> 8;
 			uint32_t w10 = (fx * ify) >> 8;
 			uint32_t w01 = (ifx * fy) >> 8;
-			uint32_t w11 = (fx * fy) >> 8;
+			uint32_t w11 = 256U - w00 - w10 - w01;
 
-			uint32_t c00 = row0[x0];
-			uint32_t c10 = row0[x1];
-			uint32_t c01 = row1[x0];
-			uint32_t c11 = row1[x1];
+			uint32_t c00 = row0[x0_lut[x]];
+			uint32_t c10 = row0[x1_lut[x]];
+			uint32_t c01 = row1[x0_lut[x]];
+			uint32_t c11 = row1[x1_lut[x]];
 
-			uint32_t r = (((c00 >> 16) & 0xffU) * w00 +
-				      ((c10 >> 16) & 0xffU) * w10 +
-				      ((c01 >> 16) & 0xffU) * w01 +
-				      ((c11 >> 16) & 0xffU) * w11) >> 8;
-			uint32_t g = (((c00 >> 8) & 0xffU) * w00 +
-				      ((c10 >> 8) & 0xffU) * w10 +
-				      ((c01 >> 8) & 0xffU) * w01 +
-				      ((c11 >> 8) & 0xffU) * w11) >> 8;
-			uint32_t b = ((c00 & 0xffU) * w00 +
-				      (c10 & 0xffU) * w10 +
-				      (c01 & 0xffU) * w01 +
-				      (c11 & 0xffU) * w11) >> 8;
+			uint32_t rb = (((c00 & 0x00ff00ffU) * w00 +
+					(c10 & 0x00ff00ffU) * w10 +
+					(c01 & 0x00ff00ffU) * w01 +
+					(c11 & 0x00ff00ffU) * w11) >> 8) & 0x00ff00ffU;
+			uint32_t g  = (((c00 & 0x0000ff00U) * w00 +
+					(c10 & 0x0000ff00U) * w10 +
+					(c01 & 0x0000ff00U) * w01 +
+					(c11 & 0x0000ff00U) * w11) >> 8) & 0x0000ff00U;
 
-			drow[x] = 0xff000000U | (r << 16) | (g << 8) | b;
+			drow[x] = 0xff000000U | rb | g;
 		}
 	}
 
+	free(x0_lut);
+	free(x1_lut);
+	free(fx_lut);
 	return dst;
 }
 
@@ -350,11 +371,48 @@ out:
 	return rc;
 }
 
+static bool g_v4l2_probed;
+static char g_v4l2_jpeg_dev[32];
+static char g_v4l2_m2sc_dev[32];
+
+static void discover_v4l2_devices(void)
+{
+	int i;
+
+	if (g_v4l2_probed)
+		return;
+	g_v4l2_probed = true;
+
+	for (i = 0; i < 8; i++) {
+		char path[32];
+		struct v4l2_capability cap;
+		int fd;
+
+		snprintf(path, sizeof(path), "/dev/video%d", i);
+		fd = open(path, O_RDWR | O_CLOEXEC);
+		if (fd < 0)
+			continue;
+		memset(&cap, 0, sizeof(cap));
+		if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
+			if (!g_v4l2_jpeg_dev[0] &&
+			    strcmp((const char *)cap.driver, "s5l8947x-jpeg") == 0)
+				snprintf(g_v4l2_jpeg_dev, sizeof(g_v4l2_jpeg_dev), "%s", path);
+			else if (!g_v4l2_m2sc_dev[0] &&
+				 strcmp((const char *)cap.driver, "s5l8947x-m2sc") == 0)
+				snprintf(g_v4l2_m2sc_dev, sizeof(g_v4l2_m2sc_dev), "%s", path);
+		}
+		close(fd);
+	}
+}
+
 static uint32_t *hw_jpeg_decode_raw(const uint8_t *jpg, size_t jpg_len,
 				    int *out_w, int *out_h)
 {
 	int src_w = 0, src_h = 0;
 
+	discover_v4l2_devices();
+	if (!g_v4l2_jpeg_dev[0] || !g_v4l2_m2sc_dev[0])
+		return NULL;
 	if (!parse_jpeg_sof0_dims(jpg, jpg_len, &src_w, &src_h))
 		return NULL;
 	if (src_w > 4096 || src_h > 4096)
@@ -367,7 +425,7 @@ static uint32_t *hw_jpeg_decode_raw(const uint8_t *jpg, size_t jpg_len,
 	if (!nv12)
 		return NULL;
 
-	if (m2m_run_one("/dev/video2", V4L2_PIX_FMT_JPEG, aw, ah,
+	if (m2m_run_one(g_v4l2_jpeg_dev, V4L2_PIX_FMT_JPEG, aw, ah,
 			jpg, jpg_len, jpg_len + 4096,
 			V4L2_PIX_FMT_NV12, aw, ah, nv12, nv12_sz) < 0) {
 		free(nv12);
@@ -387,7 +445,7 @@ static uint32_t *hw_jpeg_decode_raw(const uint8_t *jpg, size_t jpg_len,
 		return NULL;
 	}
 
-	if (m2m_run_one("/dev/video0", V4L2_PIX_FMT_NV12, (uint32_t)(src_w & ~1), (uint32_t)(src_h & ~1),
+	if (m2m_run_one(g_v4l2_m2sc_dev, V4L2_PIX_FMT_NV12, (uint32_t)(src_w & ~1), (uint32_t)(src_h & ~1),
 			nv12, nv12_sz, nv12_sz,
 			V4L2_PIX_FMT_XRGB32, (uint32_t)dst_w, (uint32_t)dst_h,
 			xrgb, xrgb_sz) < 0) {
@@ -426,6 +484,8 @@ struct huff_tbl {
 	int32_t maxcode[17];
 	int32_t valptr[17];
 	uint8_t vals[256];
+	uint8_t fast_sym[256];
+	uint8_t fast_len[256];
 	bool valid;
 };
 
@@ -469,49 +529,112 @@ static inline uint8_t clamp_u8_int(int v)
 	return (uint8_t)v;
 }
 
-static void idct_8x8(const int16_t *in, uint8_t *out)
+static void idct_8x8(const int16_t *in, uint8_t *out, bool has_ac)
 {
-	/* Fast 1D float/fixed separable IDCT across rows then columns */
+	/* Fast fixed-point Q11 separable IDCT across rows then columns */
 	static bool cos_init;
-	static float c_tbl[8][8];
-	float tmp[64];
-	int u, v, x, y;
+	static int32_t c_tbl[8][8];
+	int32_t tmp[64];
+	int u, x, y;
 
 	if (!cos_init) {
 		for (u = 0; u < 8; u++) {
 			float cu = (u == 0) ? (1.0f / sqrtf(2.0f)) : 1.0f;
 			for (x = 0; x < 8; x++) {
-				c_tbl[u][x] = 0.5f * cu *
-					      cosf(((2.0f * (float)x + 1.0f) * (float)u * (float)M_PI) / 16.0f);
+				float c = 0.5f * cu *
+					  cosf(((2.0f * (float)x + 1.0f) * (float)u * (float)M_PI) / 16.0f);
+				c_tbl[u][x] = (int32_t)lrintf(c * 2048.0f);
 			}
 		}
 		cos_init = true;
 	}
 
+	if (!has_ac) {
+		uint8_t dc_u8 = clamp_u8_int(((in[0] + 4) >> 3) + 128);
+		memset(out, dc_u8, 64);
+		return;
+	}
+
 	for (y = 0; y < 8; y++) {
 		const int16_t *row = in + y * 8;
-		bool all_ac_zero = (row[1] == 0 && row[2] == 0 && row[3] == 0 &&
-				    row[4] == 0 && row[5] == 0 && row[6] == 0 && row[7] == 0);
-		if (all_ac_zero) {
-			float dc = (float)row[0] * c_tbl[0][0];
+		if ((row[1] | row[2] | row[3] | row[4] | row[5] | row[6] | row[7]) == 0) {
+			int32_t dc = ((int32_t)row[0] * c_tbl[0][0]) >> 6;
 			for (x = 0; x < 8; x++)
 				tmp[y * 8 + x] = dc;
 			continue;
 		}
 		for (x = 0; x < 8; x++) {
-			float s = 0.0f;
-			for (u = 0; u < 8; u++)
-				s += (float)row[u] * c_tbl[u][x];
-			tmp[y * 8 + x] = s;
+			int32_t s = (int32_t)row[0] * c_tbl[0][x] +
+				    (int32_t)row[1] * c_tbl[1][x] +
+				    (int32_t)row[2] * c_tbl[2][x] +
+				    (int32_t)row[3] * c_tbl[3][x] +
+				    (int32_t)row[4] * c_tbl[4][x] +
+				    (int32_t)row[5] * c_tbl[5][x] +
+				    (int32_t)row[6] * c_tbl[6][x] +
+				    (int32_t)row[7] * c_tbl[7][x];
+			tmp[y * 8 + x] = s >> 6;
 		}
 	}
 
-	for (x = 0; x < 8; x++) {
+#ifdef __ARM_NEON
+	{
+		int32x4_t t0_lo = vld1q_s32(&tmp[0 * 8 + 0]), t0_hi = vld1q_s32(&tmp[0 * 8 + 4]);
+		int32x4_t t1_lo = vld1q_s32(&tmp[1 * 8 + 0]), t1_hi = vld1q_s32(&tmp[1 * 8 + 4]);
+		int32x4_t t2_lo = vld1q_s32(&tmp[2 * 8 + 0]), t2_hi = vld1q_s32(&tmp[2 * 8 + 4]);
+		int32x4_t t3_lo = vld1q_s32(&tmp[3 * 8 + 0]), t3_hi = vld1q_s32(&tmp[3 * 8 + 4]);
+		int32x4_t t4_lo = vld1q_s32(&tmp[4 * 8 + 0]), t4_hi = vld1q_s32(&tmp[4 * 8 + 4]);
+		int32x4_t t5_lo = vld1q_s32(&tmp[5 * 8 + 0]), t5_hi = vld1q_s32(&tmp[5 * 8 + 4]);
+		int32x4_t t6_lo = vld1q_s32(&tmp[6 * 8 + 0]), t6_hi = vld1q_s32(&tmp[6 * 8 + 4]);
+		int32x4_t t7_lo = vld1q_s32(&tmp[7 * 8 + 0]), t7_hi = vld1q_s32(&tmp[7 * 8 + 4]);
+		int16x8_t bias_128 = vdupq_n_s16(128);
+
 		for (y = 0; y < 8; y++) {
-			float s = 0.0f;
-			for (v = 0; v < 8; v++)
-				s += tmp[v * 8 + x] * c_tbl[v][y];
-			out[y * 8 + x] = clamp_u8_int((int)(s + 128.5f));
+			int32x4_t s_lo = vdupq_n_s32(32768);
+			int32x4_t s_hi = vdupq_n_s32(32768);
+
+			s_lo = vmlaq_n_s32(s_lo, t0_lo, c_tbl[0][y]);
+			s_hi = vmlaq_n_s32(s_hi, t0_hi, c_tbl[0][y]);
+			s_lo = vmlaq_n_s32(s_lo, t1_lo, c_tbl[1][y]);
+			s_hi = vmlaq_n_s32(s_hi, t1_hi, c_tbl[1][y]);
+			s_lo = vmlaq_n_s32(s_lo, t2_lo, c_tbl[2][y]);
+			s_hi = vmlaq_n_s32(s_hi, t2_hi, c_tbl[2][y]);
+			s_lo = vmlaq_n_s32(s_lo, t3_lo, c_tbl[3][y]);
+			s_hi = vmlaq_n_s32(s_hi, t3_hi, c_tbl[3][y]);
+			s_lo = vmlaq_n_s32(s_lo, t4_lo, c_tbl[4][y]);
+			s_hi = vmlaq_n_s32(s_hi, t4_hi, c_tbl[4][y]);
+			s_lo = vmlaq_n_s32(s_lo, t5_lo, c_tbl[5][y]);
+			s_hi = vmlaq_n_s32(s_hi, t5_hi, c_tbl[5][y]);
+			s_lo = vmlaq_n_s32(s_lo, t6_lo, c_tbl[6][y]);
+			s_hi = vmlaq_n_s32(s_hi, t6_hi, c_tbl[6][y]);
+			s_lo = vmlaq_n_s32(s_lo, t7_lo, c_tbl[7][y]);
+			s_hi = vmlaq_n_s32(s_hi, t7_hi, c_tbl[7][y]);
+
+			int16x8_t v16 = vcombine_s16(vshrn_n_s32(s_lo, 16), vshrn_n_s32(s_hi, 16));
+			uint8x8_t u8 = vqmovun_s16(vaddq_s16(v16, bias_128));
+			vst1_u8(out + y * 8, u8);
+		}
+		return;
+	}
+#endif
+
+	for (x = 0; x < 8; x++) {
+		if ((tmp[1 * 8 + x] | tmp[2 * 8 + x] | tmp[3 * 8 + x] |
+		     tmp[4 * 8 + x] | tmp[5 * 8 + x] | tmp[6 * 8 + x] | tmp[7 * 8 + x]) == 0) {
+			uint8_t dc_u8 = clamp_u8_int(((tmp[0 * 8 + x] * c_tbl[0][0] + 32768) >> 16) + 128);
+			for (y = 0; y < 8; y++)
+				out[y * 8 + x] = dc_u8;
+			continue;
+		}
+		for (y = 0; y < 8; y++) {
+			int32_t s = tmp[0 * 8 + x] * c_tbl[0][y] +
+				    tmp[1 * 8 + x] * c_tbl[1][y] +
+				    tmp[2 * 8 + x] * c_tbl[2][y] +
+				    tmp[3 * 8 + x] * c_tbl[3][y] +
+				    tmp[4 * 8 + x] * c_tbl[4][y] +
+				    tmp[5 * 8 + x] * c_tbl[5][y] +
+				    tmp[6 * 8 + x] * c_tbl[6][y] +
+				    tmp[7 * 8 + x] * c_tbl[7][y];
+			out[y * 8 + x] = clamp_u8_int(((s + 32768) >> 16) + 128);
 		}
 	}
 }
@@ -520,7 +643,7 @@ static void build_huff_tbl(struct huff_tbl *ht, const uint8_t *bits, const uint8
 {
 	int code = 0;
 	int k = 0;
-	int i;
+	int i, j, p;
 
 	memset(ht, 0, sizeof(*ht));
 	for (i = 1; i <= 16; i++) {
@@ -538,17 +661,36 @@ static void build_huff_tbl(struct huff_tbl *ht, const uint8_t *bits, const uint8
 	if (k > 256)
 		k = 256;
 	memcpy(ht->vals, vals, (size_t)k);
+
+	/* Build 8-bit fast lookahead table for 1-step Huffman decode */
+	code = 0;
+	k = 0;
+	for (i = 1; i <= 8; i++) {
+		int cnt = bits[i - 1];
+		for (j = 0; j < cnt; j++) {
+			uint8_t sym = ht->vals[k < 256 ? k : 0];
+			int pad_bits = 8 - i;
+			int base_prefix = code << pad_bits;
+			int num_prefixes = 1 << pad_bits;
+			for (p = 0; p < num_prefixes; p++) {
+				ht->fast_sym[base_prefix + p] = sym;
+				ht->fast_len[base_prefix + p] = (uint8_t)i;
+			}
+			k++;
+			code++;
+		}
+		code <<= 1;
+	}
 	ht->valid = true;
 }
 
-static int jpeg_next_bit(struct jpeg_dec *jd)
+static inline void jpeg_fill_bits(struct jpeg_dec *jd)
 {
-	if (jd->bit_cnt == 0) {
-		if (jd->marker_hit || jd->pos >= jd->len) {
-			jd->bit_buf = 0;
-			jd->bit_cnt = 8;
-		} else {
-			uint8_t b = jd->data[jd->pos++];
+	while (jd->bit_cnt <= 24) {
+		uint8_t b = 0;
+
+		if (!jd->marker_hit && jd->pos < jd->len) {
+			b = jd->data[jd->pos++];
 			if (b == 0xff) {
 				while (jd->pos < jd->len && jd->data[jd->pos] == 0xff)
 					jd->pos++;
@@ -561,35 +703,44 @@ static int jpeg_next_bit(struct jpeg_dec *jd)
 					}
 				}
 			}
-			jd->bit_buf = b;
-			jd->bit_cnt = 8;
 		}
+		jd->bit_buf = (jd->bit_buf << 8) | b;
+		jd->bit_cnt += 8;
 	}
-	int bit = (jd->bit_buf >> 7) & 1;
-	jd->bit_buf = (jd->bit_buf << 1) & 0xffU;
-	jd->bit_cnt--;
-	return bit;
 }
 
-static int jpeg_read_bits(struct jpeg_dec *jd, int n)
+static inline int jpeg_read_bits(struct jpeg_dec *jd, int n)
 {
-	int val = 0;
-	int i;
-
-	for (i = 0; i < n; i++)
-		val = (val << 1) | jpeg_next_bit(jd);
-	return val;
+	if (n <= 0)
+		return 0;
+	if (jd->bit_cnt < n)
+		jpeg_fill_bits(jd);
+	jd->bit_cnt -= n;
+	return (int)((jd->bit_buf >> jd->bit_cnt) & ((1U << n) - 1U));
 }
 
-static int jpeg_huff_decode(struct jpeg_dec *jd, const struct huff_tbl *ht)
+static inline int jpeg_huff_decode(struct jpeg_dec *jd, const struct huff_tbl *ht)
 {
 	int code = 0;
 	int len;
 
 	if (!ht->valid)
 		return 0;
-	for (len = 1; len <= 16; len++) {
-		code = (code << 1) | jpeg_next_bit(jd);
+	if (jd->bit_cnt < 16)
+		jpeg_fill_bits(jd);
+
+	uint32_t top8 = (jd->bit_buf >> (jd->bit_cnt - 8)) & 0xffU;
+	uint8_t flen = ht->fast_len[top8];
+	if (flen > 0) {
+		jd->bit_cnt -= flen;
+		return ht->fast_sym[top8];
+	}
+
+	code = (int)top8;
+	jd->bit_cnt -= 8;
+	for (len = 9; len <= 16; len++) {
+		jd->bit_cnt--;
+		code = (code << 1) | (int)((jd->bit_buf >> jd->bit_cnt) & 1U);
 		if (code <= ht->maxcode[len]) {
 			int idx = code + ht->valptr[len];
 			if (idx >= 0 && idx < 256)
@@ -610,13 +761,14 @@ static int jpeg_extend(int v, int t)
 	return v;
 }
 
-static void jpeg_decode_block(struct jpeg_dec *jd, int comp_idx, int16_t *out_blk)
+static bool jpeg_decode_block(struct jpeg_dec *jd, int comp_idx, int16_t *out_blk)
 {
 	struct jpeg_comp *c = &jd->comp[comp_idx];
 	const uint16_t *qt = jd->qtbl[c->tq & 3];
 	const struct huff_tbl *dc_ht = &jd->dc_huff[c->td & 3];
 	const struct huff_tbl *ac_ht = &jd->ac_huff[c->ta & 3];
 	int k = 1;
+	bool has_ac = false;
 
 	memset(out_blk, 0, 64 * sizeof(int16_t));
 
@@ -642,8 +794,10 @@ static void jpeg_decode_block(struct jpeg_dec *jd, int comp_idx, int16_t *out_bl
 			break;
 		int ac = jpeg_extend(jpeg_read_bits(jd, s), s);
 		out_blk[jpeg_zigzag[k]] = (int16_t)(ac * (int)qt[k]);
+		has_ac = true;
 		k++;
 	}
+	return has_ac;
 }
 
 static uint32_t *sw_jpeg_decode_raw(const uint8_t *buf, size_t len,
@@ -763,7 +917,7 @@ static uint32_t *sw_jpeg_decode_raw(const uint8_t *buf, size_t len,
 				uint8_t cid = seg[1 + i * 2];
 				uint8_t td_ta = seg[1 + i * 2 + 1];
 				int c;
-				for (c = 0; c < jd->ncomp; c++) {
+				for (c = 0; c < jd->ncomp && c < 3; c++) {
 					if (jd->comp[c].id == cid) {
 						jd->comp[c].td = (td_ta >> 4) & 0x03;
 						jd->comp[c].ta = td_ta & 0x03;
@@ -828,21 +982,83 @@ static uint32_t *sw_jpeg_decode_raw(const uint8_t *buf, size_t len,
 				y_blocks = 4;
 			int b;
 			for (b = 0; b < y_blocks; b++) {
-				jpeg_decode_block(jd, 0, jd->comp[0].blocks[b]);
-				idct_8x8(jd->comp[0].blocks[b], y_plane[b]);
+				bool has_ac = jpeg_decode_block(jd, 0, jd->comp[0].blocks[b]);
+				idct_8x8(jd->comp[0].blocks[b], y_plane[b], has_ac);
 			}
 
 			if (jd->ncomp == 3) {
-				jpeg_decode_block(jd, 1, jd->comp[1].blocks[0]);
-				idct_8x8(jd->comp[1].blocks[0], cb_plane);
-				jpeg_decode_block(jd, 2, jd->comp[2].blocks[0]);
-				idct_8x8(jd->comp[2].blocks[0], cr_plane);
+				bool cb_ac = jpeg_decode_block(jd, 1, jd->comp[1].blocks[0]);
+				idct_8x8(jd->comp[1].blocks[0], cb_plane, cb_ac);
+				bool cr_ac = jpeg_decode_block(jd, 2, jd->comp[2].blocks[0]);
+				idct_8x8(jd->comp[2].blocks[0], cr_plane, cr_ac);
 			} else {
 				memset(cb_plane, 128, 64);
 				memset(cr_plane, 128, 64);
 			}
 
 			int py, px;
+			bool is_420 = (jd->ncomp == 3 && jd->max_h == 2 && jd->max_v == 2 &&
+				       jd->comp[0].h_samp == 2 && jd->comp[0].v_samp == 2);
+
+			if (is_420 && mx * 16 + 16 <= jd->width && my * 16 + 16 <= jd->height) {
+#ifdef __ARM_NEON
+				uint8x8_t u8_128 = vdup_n_u8(128);
+				int16x8_t s16_64 = vdupq_n_s16(64);
+				uint8x8_t ff_v   = vdup_n_u8(0xffU);
+#endif
+				for (py = 0; py < 16; py++) {
+					uint32_t *drow = pixels + (size_t)(my * 16 + py) * jd->width + mx * 16;
+					const uint8_t *y_row0 = y_plane[(py >> 3) * 2 + 0] + (py & 7) * 8;
+					const uint8_t *y_row1 = y_plane[(py >> 3) * 2 + 1] + (py & 7) * 8;
+					const uint8_t *cb_row = cb_plane + (py >> 1) * 8;
+					const uint8_t *cr_row = cr_plane + (py >> 1) * 8;
+
+#ifdef __ARM_NEON
+					int16x8_t cb = vreinterpretq_s16_u16(vsubl_u8(vld1_u8(cb_row), u8_128));
+					int16x8_t cr = vreinterpretq_s16_u16(vsubl_u8(vld1_u8(cr_row), u8_128));
+					int16x8_t r_off = vshrq_n_s16(vaddq_s16(vmulq_n_s16(cr, 179), s16_64), 7);
+					int16x8_t g_off = vshrq_n_s16(vaddq_s16(vaddq_s16(vmulq_n_s16(cb, 44),
+											  vmulq_n_s16(cr, 91)), s16_64), 7);
+					int16x8_t b_off = vshrq_n_s16(vaddq_s16(vmulq_n_s16(cb, 227), s16_64), 7);
+
+					int16x8x2_t r_dup = vzipq_s16(r_off, r_off);
+					int16x8x2_t g_dup = vzipq_s16(g_off, g_off);
+					int16x8x2_t b_dup = vzipq_s16(b_off, b_off);
+
+					int16x8_t y0 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(y_row0)));
+					int16x8_t y1 = vreinterpretq_s16_u16(vmovl_u8(vld1_u8(y_row1)));
+					uint8x8x4_t p0, p1;
+
+					p0.val[0] = vqmovun_s16(vaddq_s16(y0, b_dup.val[0]));
+					p0.val[1] = vqmovun_s16(vsubq_s16(y0, g_dup.val[0]));
+					p0.val[2] = vqmovun_s16(vaddq_s16(y0, r_dup.val[0]));
+					p0.val[3] = ff_v;
+					vst4_u8((uint8_t *)drow, p0);
+
+					p1.val[0] = vqmovun_s16(vaddq_s16(y1, b_dup.val[1]));
+					p1.val[1] = vqmovun_s16(vsubq_s16(y1, g_dup.val[1]));
+					p1.val[2] = vqmovun_s16(vaddq_s16(y1, r_dup.val[1]));
+					p1.val[3] = ff_v;
+					vst4_u8((uint8_t *)(drow + 8), p1);
+#else
+					for (px = 0; px < 16; px++) {
+						int y_val = (px < 8) ? y_row0[px] : y_row1[px - 8];
+						int cb = (int)cb_row[px >> 1] - 128;
+						int cr = (int)cr_row[px >> 1] - 128;
+						int r = y_val + ((359 * cr + 128) >> 8);
+						int g = y_val - ((88 * cb + 183 * cr + 128) >> 8);
+						int bl = y_val + ((454 * cb + 128) >> 8);
+
+						drow[px] = 0xff000000U |
+							   ((uint32_t)clamp_u8_int(r) << 16) |
+							   ((uint32_t)clamp_u8_int(g) << 8) |
+							   (uint32_t)clamp_u8_int(bl);
+					}
+#endif
+				}
+				continue;
+			}
+
 			for (py = 0; py < mcu_h; py++) {
 				int dst_y = my * mcu_h + py;
 				if (dst_y >= jd->height)
@@ -1317,7 +1533,6 @@ static const char *const preset_placeholder_names[GIRI_ART_COUNT] = {
 };
 
 struct art_cache_slot {
-	uint32_t *card_274;
 	uint32_t *card_275;
 	uint32_t *fs_720p;
 };
@@ -1327,7 +1542,6 @@ struct art_cache_slot {
 
 struct uri_cache_entry {
 	char path[256];
-	uint32_t *card_274;
 	uint32_t *card_275;
 	uint32_t *fs_720p;
 	uint64_t last_used;
@@ -1508,30 +1722,45 @@ bool shell_media_poll_async(void)
 	return updated;
 }
 
+static struct uri_cache_entry *find_uri_cache_entry(const char *resolved_path)
+{
+	int i;
+
+	for (i = 0; i < URI_CACHE_SLOTS; i++) {
+		if (g_uri_cache[i].path[0] &&
+		    strcmp(g_uri_cache[i].path, resolved_path) == 0) {
+			g_uri_cache[i].last_used = ++g_cache_clock;
+			return &g_uri_cache[i];
+		}
+	}
+	return NULL;
+}
+
 static struct uri_cache_entry *get_uri_cache_entry(const char *resolved_path, bool need_fs)
 {
 	int i, victim = 0;
 	uint64_t oldest = UINT64_MAX;
+	struct uri_cache_entry *hit = find_uri_cache_entry(resolved_path);
 
-	for (i = 0; i < URI_CACHE_SLOTS; i++) {
-		if (strcmp(g_uri_cache[i].path, resolved_path) == 0) {
-			g_uri_cache[i].last_used = ++g_cache_clock;
-			if (need_fs && !g_uri_cache[i].fs_720p) {
-				int rw = 0, rh = 0;
-				uint32_t *raw = decode_image_file_raw(resolved_path, &rw, &rh);
-				if (raw) {
-					if (rw == SHELL_SCREEN_W && rh == SHELL_SCREEN_H) {
-						g_uri_cache[i].fs_720p = raw;
-					} else {
-						g_uri_cache[i].fs_720p = scale_cover_bilinear(raw, rw, rh,
-											      SHELL_SCREEN_W,
-											      SHELL_SCREEN_H);
-						free(raw);
-					}
+	if (hit) {
+		if (need_fs && !hit->fs_720p) {
+			int rw = 0, rh = 0;
+			uint32_t *raw = decode_image_file_raw(resolved_path, &rw, &rh);
+			if (raw) {
+				if (rw == SHELL_SCREEN_W && rh == SHELL_SCREEN_H) {
+					hit->fs_720p = raw;
+				} else {
+					hit->fs_720p = scale_cover_bilinear(raw, rw, rh,
+									    SHELL_SCREEN_W,
+									    SHELL_SCREEN_H);
+					free(raw);
 				}
 			}
-			return &g_uri_cache[i];
 		}
+		return hit;
+	}
+
+	for (i = 0; i < URI_CACHE_SLOTS; i++) {
 		if (g_uri_cache[i].last_used < oldest) {
 			oldest = g_uri_cache[i].last_used;
 			victim = i;
@@ -1544,14 +1773,12 @@ static struct uri_cache_entry *get_uri_cache_entry(const char *resolved_path, bo
 		return NULL;
 
 	struct uri_cache_entry *e = &g_uri_cache[victim];
-	free(e->card_274);
 	free(e->card_275);
 	free(e->fs_720p);
 	memset(e, 0, sizeof(*e));
 
 	snprintf(e->path, sizeof(e->path), "%s", resolved_path);
 	e->last_used = ++g_cache_clock;
-	e->card_274 = scale_cover_bilinear(raw, rw, rh, 274, 312);
 	e->card_275 = scale_cover_bilinear(raw, rw, rh, 275, 312);
 	if (rw == SHELL_SCREEN_W && rh == SHELL_SCREEN_H) {
 		e->fs_720p = raw;
@@ -1563,40 +1790,49 @@ static struct uri_cache_entry *get_uri_cache_entry(const char *resolved_path, bo
 	return e;
 }
 
+static const uint32_t *ensure_preset_art_loaded(enum giri_preset_art preset)
+{
+	char ph_path[256];
+	const char *ph_name;
+
+	if (preset < 0 || preset >= GIRI_ART_COUNT)
+		preset = GIRI_ART_DAWN_RIDGE;
+	if (g_art_cache[preset].card_275)
+		return g_art_cache[preset].card_275;
+
+	ph_name = preset_placeholder_names[preset];
+	if (ph_name && resolve_placeholder_path(ph_name, ph_path, sizeof(ph_path))) {
+		int rw = 0, rh = 0;
+		uint32_t *raw = decode_image_file_raw(ph_path, &rw, &rh);
+		if (raw) {
+			g_art_cache[preset].card_275 = scale_cover_bilinear(raw, rw, rh, 275, 312);
+			if (rw == SHELL_SCREEN_W && rh == SHELL_SCREEN_H) {
+				g_art_cache[preset].fs_720p = raw;
+			} else {
+				g_art_cache[preset].fs_720p = scale_cover_bilinear(raw, rw, rh,
+										   SHELL_SCREEN_W,
+										   SHELL_SCREEN_H);
+				free(raw);
+			}
+			return g_art_cache[preset].card_275;
+		}
+	}
+
+	g_art_cache[preset].card_275 = rasterize_preset_surface(preset, 275, 312);
+	return g_art_cache[preset].card_275;
+}
+
 void shell_media_init(void)
 {
-	int i;
-
 	memset(g_art_cache, 0, sizeof(g_art_cache));
 	memset(g_uri_cache, 0, sizeof(g_uri_cache));
 	memset(g_fetches, 0, sizeof(g_fetches));
 
-	for (i = 0; i < GIRI_ART_COUNT; i++) {
-		char ph_path[256];
-		const char *ph_name = preset_placeholder_names[i];
-
-		if (ph_name && resolve_placeholder_path(ph_name, ph_path, sizeof(ph_path))) {
-			int rw = 0, rh = 0;
-			uint32_t *raw = decode_image_file_raw(ph_path, &rw, &rh);
-			if (raw) {
-				g_art_cache[i].card_274 = scale_cover_bilinear(raw, rw, rh, 274, 312);
-				g_art_cache[i].card_275 = scale_cover_bilinear(raw, rw, rh, 275, 312);
-				if (rw == SHELL_SCREEN_W && rh == SHELL_SCREEN_H) {
-					g_art_cache[i].fs_720p = raw;
-				} else {
-					g_art_cache[i].fs_720p = scale_cover_bilinear(raw, rw, rh,
-										      SHELL_SCREEN_W,
-										      SHELL_SCREEN_H);
-					free(raw);
-				}
-				continue;
-			}
-		}
-
-		g_art_cache[i].card_274 = rasterize_preset_surface((enum giri_preset_art)i, 274, 312);
-		g_art_cache[i].card_275 = rasterize_preset_surface((enum giri_preset_art)i, 275, 312);
-		g_art_cache[i].fs_720p = NULL;
-	}
+	/* Pre-warm only the 4 Home Screen card presets; others load on demand */
+	(void)ensure_preset_art_loaded(GIRI_ART_DAWN_RIDGE);
+	(void)ensure_preset_art_loaded(GIRI_ART_WEATHER_SKY);
+	(void)ensure_preset_art_loaded(GIRI_ART_MONSOON_VIDEO);
+	(void)ensure_preset_art_loaded(GIRI_ART_DOOM_GAME);
 }
 
 void shell_media_free(void)
@@ -1604,13 +1840,11 @@ void shell_media_free(void)
 	int i;
 
 	for (i = 0; i < GIRI_ART_COUNT; i++) {
-		free(g_art_cache[i].card_274);
 		free(g_art_cache[i].card_275);
 		free(g_art_cache[i].fs_720p);
 		memset(&g_art_cache[i], 0, sizeof(g_art_cache[i]));
 	}
 	for (i = 0; i < URI_CACHE_SLOTS; i++) {
-		free(g_uri_cache[i].card_274);
 		free(g_uri_cache[i].card_275);
 		free(g_uri_cache[i].fs_720p);
 		memset(&g_uri_cache[i], 0, sizeof(g_uri_cache[i]));
@@ -1650,6 +1884,7 @@ const uint32_t *shell_media_get_card_art(const struct giri_media_card *card,
 	char resolved[256];
 	enum giri_preset_art preset = GIRI_ART_DAWN_RIDGE;
 
+	(void)w;
 	(void)h;
 	if (card) {
 		if (card->preset_art >= 0 && card->preset_art < GIRI_ART_COUNT)
@@ -1657,18 +1892,74 @@ const uint32_t *shell_media_get_card_art(const struct giri_media_card *card,
 
 		if (resolve_card_image_path(card, resolved, sizeof(resolved))) {
 			struct uri_cache_entry *e = get_uri_cache_entry(resolved, false);
-			if (e) {
-				if (w == 275 && e->card_275)
-					return e->card_275;
-				if (e->card_274)
-					return e->card_274;
-			}
+			if (e && e->card_275)
+				return e->card_275;
 		}
 	}
 
-	if (w == 275 && g_art_cache[preset].card_275)
-		return g_art_cache[preset].card_275;
-	return g_art_cache[preset].card_274;
+	return ensure_preset_art_loaded(preset);
+}
+
+/*
+ * Non-blocking card art lookup: returns cached URI artwork immediately if
+ * already decoded in g_uri_cache, or falls back to the instant preset surface
+ * without stalling the UI thread on synchronous JPEG decoding.
+ */
+const uint32_t *shell_media_get_card_art_fast(const struct giri_media_card *card,
+					      int w, int h, bool *is_final_out)
+{
+	char resolved[256];
+	enum giri_preset_art preset = GIRI_ART_DAWN_RIDGE;
+
+	(void)w;
+	(void)h;
+	if (is_final_out)
+		*is_final_out = true;
+
+	if (card) {
+		if (card->preset_art >= 0 && card->preset_art < GIRI_ART_COUNT)
+			preset = card->preset_art;
+
+		if (resolve_card_image_path(card, resolved, sizeof(resolved))) {
+			struct uri_cache_entry *e = find_uri_cache_entry(resolved);
+			if (e && e->card_275)
+				return e->card_275;
+			if (is_final_out)
+				*is_final_out = false;
+		}
+	}
+
+	if (!g_art_cache[preset].card_275 && preset != GIRI_ART_DOOM_GAME) {
+		/* Rasterize fast procedural surface first if preset JPEG not yet loaded */
+		g_art_cache[preset].card_275 = rasterize_preset_surface(preset, 275, 312);
+	}
+	return ensure_preset_art_loaded(preset);
+}
+
+/*
+ * Incrementally decode and cache at most ONE uncached card image from @scr.
+ * Returns true if a card was decoded (or more cards remain), false when all
+ * 4 cards in @scr have their final artwork cached.
+ */
+bool shell_media_preload_next_card(const struct giri_screen *scr)
+{
+	int i;
+
+	if (!scr)
+		return false;
+
+	for (i = 0; i < SHELL_CARD_COUNT; i++) {
+		char resolved[256];
+		const struct giri_media_card *card = &scr->media_cards[i];
+
+		if (resolve_card_image_path(card, resolved, sizeof(resolved))) {
+			if (!find_uri_cache_entry(resolved)) {
+				(void)get_uri_cache_entry(resolved, false);
+				return true;
+			}
+		}
+	}
+	return false;
 }
 
 const uint32_t *shell_media_get_fullscreen_art(const struct giri_media_card *card)
@@ -1687,6 +1978,7 @@ const uint32_t *shell_media_get_fullscreen_art(const struct giri_media_card *car
 		}
 	}
 
+	(void)ensure_preset_art_loaded(preset);
 	if (!g_art_cache[preset].fs_720p) {
 		g_art_cache[preset].fs_720p = rasterize_preset_surface(preset,
 								       SHELL_SCREEN_W,

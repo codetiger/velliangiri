@@ -26,6 +26,7 @@
 #include <sys/file.h>
 #include <sys/stat.h>
 #include <sys/statvfs.h>
+#include <sys/time.h>
 #include <unistd.h>
 
 #include "tvshell.h"
@@ -72,6 +73,19 @@ static struct {
 	int logo_step_cursor;
 	int logo_frame_idx;
 	char pending_query[96];
+	bool has_pending_screen;
+	struct giri_screen pending_screen;
+
+	/* Incremental damage & non-blocking card art preload state */
+	bool allow_async_art;
+	bool cards_need_preload;
+	bool main_bg_valid;
+	uint8_t dirty_slots;	/* bit 0: Slot 1 header, bit 1: Slot 2 summary */
+	uint8_t dirty_cards;	/* bits 0..3: Slot 3 cards 0..3 */
+	uint8_t dirty_footer;	/* bits 0..3: Slot 4 buttons 0..3 */
+	int backbuf_modal_win;
+	int backbuf_modal_theme;
+	int backbuf_modal_hist_idx;
 
 	/* Summary read-aloud (Play/Pause button) state */
 	bool tts_speaking;
@@ -1297,6 +1311,15 @@ static const struct giri_screen *current_screen(void)
 	return &g_ui.history[g_ui.history_idx];
 }
 
+static void mark_full_redraw(void)
+{
+	g_ui.main_bg_valid = false;
+	g_ui.backbuf_modal_win = -1;
+	g_ui.dirty_slots = 0x03;
+	g_ui.dirty_cards = 0x0f;
+	g_ui.dirty_footer = 0x0f;
+}
+
 /* Draw the DOOM / E1M1 vector typography inside preset_art == GIRI_ART_DOOM_GAME */
 static void draw_doom_art_labels(int x, int y, int w, int h)
 {
@@ -1320,30 +1343,19 @@ static void draw_doom_art_labels(int x, int y, int w, int h)
 #endif
 }
 
-/*
- * Window 0: 4-Slot Main TV Screen (.tv-screen)
- *   Slot 1 (y=36,  h=44):  Header (49x40 logo + "Giri" + "—" + prompt_title)
- *   Slot 2 (y=108, h=148): Editorial Summary Box (title + source + <=250c body)
- *   Slot 3 (y=284, h=312): 4 Selectable Full-Bleed Visual Cards (gap 18px)
- *   Slot 4 (y=624, h=58):  4 Selectable Bottom Bar Buttons (188px 364px 364px 188px)
- */
-static void render_window_main(const struct shell_theme *th)
+static void render_slot1_header(const struct shell_theme *th, bool clear_bg)
 {
 	const struct giri_screen *scr = current_screen();
-	int i;
-
-	/* Full 1280x720 canvas background */
-	shell_draw_rect(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, th->bg);
-
-	/* -----------------------------------------------------------------
-	 * SLOT 1: Fixed 44px Header (x=64, y=36, w=1152, h=44, border: none)
-	 * ----------------------------------------------------------------- */
 	int hx = SHELL_SAFE_LEFT;
 	int hy = SHELL_SLOT1_Y;
 	int frame = g_ui.is_working ? g_ui.logo_frame_idx : 0;
 	const uint32_t *logo_px = (g_ui.theme_id == SHELL_THEME_SIGNAL)
 				  ? logo_signal_frames[frame]
 				  : logo_paper_frames[frame];
+
+	if (clear_bg)
+		shell_draw_rect(SHELL_SAFE_LEFT, SHELL_SLOT1_Y,
+				SHELL_USABLE_W, SHELL_HEADER_H, th->bg);
 
 	shell_draw_bitmap_xrgb(hx, hy + 2, SHELL_LOGO_W, SHELL_LOGO_H, logo_px);
 	hx += SHELL_LOGO_W + 14;
@@ -1358,15 +1370,22 @@ static void render_window_main(const struct shell_theme *th)
 	shell_font_draw_vcentered(SHELL_FONT_SANS_SEMIBOLD, 20,
 				  hx, hy, SHELL_HEADER_H, th->muted, ptitle,
 				  SHELL_SAFE_LEFT + SHELL_USABLE_W - hx);
+}
 
-	/* -----------------------------------------------------------------
-	 * SLOT 2: Fixed 148px Summary Box (x=64, y=108, w=1152, h=148, rx=12)
-	 * ----------------------------------------------------------------- */
+static void render_slot2_summary(const struct shell_theme *th, bool clear_corners)
+{
+	const struct giri_screen *scr = current_screen();
 	int sx = SHELL_SAFE_LEFT;
 	int sy = SHELL_SLOT2_Y;
 	int sw = SHELL_USABLE_W;
 	int sh = SHELL_SUMMARY_H;
 
+	if (clear_corners) {
+		shell_draw_rect(sx, sy, 12, 12, th->bg);
+		shell_draw_rect(sx + sw - 12, sy, 12, 12, th->bg);
+		shell_draw_rect(sx, sy + sh - 12, 12, 12, th->bg);
+		shell_draw_rect(sx + sw - 12, sy + sh - 12, 12, 12, th->bg);
+	}
 	shell_draw_rounded_rect(sx, sy, sw, sh, 12, th->surface);
 
 	int pad_x = sx + 22;
@@ -1410,163 +1429,222 @@ static void render_window_main(const struct shell_theme *th)
 					     active_sent, &total_sents);
 		g_ui.tts_total_sentences = total_sents;
 	}
+}
 
-	/* -----------------------------------------------------------------
-	 * SLOT 3: Fixed 312px Row of 4 Full-Bleed Media Cards
-	 * 1152px total width, 3 * 18px gaps = 54px -> 1098px across 4 cards:
-	 * Card widths: 274, 275, 275, 274
-	 * ----------------------------------------------------------------- */
+static void render_slot3_card(const struct shell_theme *th, int i, bool clear_bg)
+{
 	static const int card_xs[4] = { 64, 356, 649, 942 };
 	static const int card_ws[4] = { 274, 275, 275, 274 };
+	const struct giri_screen *scr = current_screen();
+	const struct giri_media_card *mc = &scr->media_cards[i];
+	bool focused = (g_ui.active_win == GIRI_WIN_MAIN &&
+			g_ui.focus_zone == GIRI_ZONE_CARDS &&
+			g_ui.card_focus_idx == i);
+	int cx = card_xs[i];
+	int cw = card_ws[i];
+	int ch = SHELL_CARD_H;
+	int cy = SHELL_SLOT3_Y - (focused ? 4 : 0);
 
-	for (i = 0; i < SHELL_CARD_COUNT; i++) {
-		const struct giri_media_card *mc = &scr->media_cards[i];
-		bool focused = (g_ui.active_win == GIRI_WIN_MAIN &&
-				g_ui.focus_zone == GIRI_ZONE_CARDS &&
-				g_ui.card_focus_idx == i);
-		int cx = card_xs[i];
-		int cw = card_ws[i];
-		int ch = SHELL_CARD_H;
-		int cy = SHELL_SLOT3_Y - (focused ? 4 : 0);
+	if (clear_bg)
+		shell_draw_rect(cx - 6, SHELL_SLOT3_Y - 8, cw + 12, ch + 24, th->bg);
 
-		if (focused) {
-			shell_draw_card_shadow(cx, cy, cw, ch, SHELL_CARD_RADIUS);
-			shell_draw_focus_glow(cx, cy, cw, ch, SHELL_CARD_RADIUS,
-					      3, 0xfff59e0bU, 77);
-		}
-
-		const uint32_t *art = shell_media_get_card_art(mc, cw, ch);
-		if (art)
-			shell_draw_rounded_bitmap(cx, cy, cw, ch, SHELL_CARD_RADIUS,
-						  art, focused);
-		else
-			shell_draw_rounded_rect(cx, cy, cw, ch, SHELL_CARD_RADIUS, th->card_bg);
-
-		if (mc->preset_art == GIRI_ART_DOOM_GAME)
-			draw_doom_art_labels(cx, cy, cw, ch);
-
-		/* Video center 46x46 play overlay circle */
-		bool is_video = (mc->kind == GIRI_CARD_PAGE_VIDEO ||
-				 mc->kind == GIRI_CARD_LOCAL_VIDEO ||
-				 strcmp(mc->action.type, "play_video") == 0);
-		if (is_video) {
-			int pcx = cx + cw / 2;
-			int pcy = cy + 128;
-
-			shell_draw_circle_alpha(pcx, pcy, 23, 0xff0c0d10U, 217);
-			shell_draw_symbol(SHELL_SYM_PLAY, pcx - 8, pcy - 9, 18, 0xfff59e0bU);
-		}
-
-		/* Top-left badge (border: none, rx=5, rgba(10,12,16,0.82)) */
-		if (mc->badge[0]) {
-			int bw = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 11, mc->badge) + 16;
-
-			shell_draw_rounded_rect_alpha(cx + 12, cy + 12, bw, 22, 5, 0xff0a0c10U, 209);
-			shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 11,
-						     cx + 12, cy + 12, bw, 22,
-						     0xfff2efe9U, mc->badge);
-		}
-
-		/* Top-right meta pill (border: none, rx=5, rgba(10,12,16,0.84), #F59E0B) */
-		if (mc->meta_pill[0]) {
-			int pw = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 11, mc->meta_pill) + 16;
-			int px0 = cx + cw - 12 - pw;
-
-			shell_draw_rounded_rect_alpha(px0, cy + 12, pw, 22, 5, 0xff0a0c10U, 214);
-			shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 11,
-						     px0, cy + 12, pw, 22,
-						     0xfff59e0bU, mc->meta_pill);
-		}
-
-		/* Bottom gradient scrim (148px tall) + overlaid title, subtitle, action row */
-		shell_draw_card_bottom_scrim(cx, cy, cw, ch, SHELL_CARD_RADIUS, 148);
-
-		int text_x = cx + 15;
-		int text_w = cw - 30;
-		int act_y = cy + ch - 27;
-		int sub_y = act_y - 22;
-		int title_y = sub_y - 24;
-
-		shell_font_draw_role(SHELL_FONT_SANS_BOLD, 17,
-				     text_x, title_y, 0xfff8fafcU, mc->title, text_w);
-		shell_font_draw_role(SHELL_FONT_SANS_MEDIUM, 13,
-				     text_x, sub_y, 0xffe2e8f0U, mc->subtitle, text_w);
-
-		uint32_t act_col = focused ? 0xfffbbf24U : 0xffcbd5e1U;
-		shell_font_draw_role(SHELL_FONT_MONO_SEMIBOLD, 12,
-				     text_x, act_y, act_col,
-				     mc->action_label[0] ? mc->action_label : "Open",
-				     text_w - 72);
-
-		if (focused) {
-			int sel_w = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 12, "Select ↵");
-			shell_font_draw_role(SHELL_FONT_MONO_SEMIBOLD, 12,
-					     cx + cw - 15 - sel_w, act_y,
-					     0xfffbbf24U, "Select ↵", sel_w + 4);
-		}
-
-		/* Selectable card border: 3px focus_ring when focused, 2px border otherwise */
-		shell_draw_rounded_outline(cx, cy, cw, ch, SHELL_CARD_RADIUS,
-					   focused ? SHELL_CARD_FOCUS_BORDER : SHELL_CARD_BORDER,
-					   focused ? th->focus_ring : th->border);
+	if (focused) {
+		shell_draw_card_shadow(cx, cy, cw, ch, SHELL_CARD_RADIUS);
+		shell_draw_focus_glow(cx, cy, cw, ch, SHELL_CARD_RADIUS,
+				      3, 0xfff59e0bU, 77);
 	}
 
-	/* -----------------------------------------------------------------
-	 * SLOT 4: Fixed 58px Row of 4 Bottom Bar Buttons
-	 * Grid: 188px 364px 364px 188px with 16px gaps = 1152px
-	 * ----------------------------------------------------------------- */
+	const uint32_t *art;
+	if (g_ui.allow_async_art) {
+		bool is_final = true;
+		art = shell_media_get_card_art_fast(mc, cw, ch, &is_final);
+		if (!is_final)
+			g_ui.cards_need_preload = true;
+	} else {
+		art = shell_media_get_card_art(mc, cw, ch);
+	}
+
+	if (art)
+		shell_draw_rounded_bitmap_stride(cx, cy, cw, ch, 275,
+						 SHELL_CARD_RADIUS, art, focused);
+	else
+		shell_draw_rounded_rect(cx, cy, cw, ch, SHELL_CARD_RADIUS, th->card_bg);
+
+	if (mc->preset_art == GIRI_ART_DOOM_GAME)
+		draw_doom_art_labels(cx, cy, cw, ch);
+
+	/* Video center 46x46 play overlay circle */
+	bool is_video = (mc->kind == GIRI_CARD_PAGE_VIDEO ||
+			 mc->kind == GIRI_CARD_LOCAL_VIDEO ||
+			 strcmp(mc->action.type, "play_video") == 0);
+	if (is_video) {
+		int pcx = cx + cw / 2;
+		int pcy = cy + 128;
+
+		shell_draw_circle_alpha(pcx, pcy, 23, 0xff0c0d10U, 217);
+		shell_draw_symbol(SHELL_SYM_PLAY, pcx - 8, pcy - 9, 18, 0xfff59e0bU);
+	}
+
+	/* Top-left badge (border: none, rx=5, rgba(10,12,16,0.82)) */
+	if (mc->badge[0]) {
+		int bw = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 11, mc->badge) + 16;
+
+		shell_draw_rounded_rect_alpha(cx + 12, cy + 12, bw, 22, 5, 0xff0a0c10U, 209);
+		shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 11,
+					     cx + 12, cy + 12, bw, 22,
+					     0xfff2efe9U, mc->badge);
+	}
+
+	/* Top-right meta pill (border: none, rx=5, rgba(10,12,16,0.84), #F59E0B) */
+	if (mc->meta_pill[0]) {
+		int pw = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 11, mc->meta_pill) + 16;
+		int px0 = cx + cw - 12 - pw;
+
+		shell_draw_rounded_rect_alpha(px0, cy + 12, pw, 22, 5, 0xff0a0c10U, 214);
+		shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 11,
+					     px0, cy + 12, pw, 22,
+					     0xfff59e0bU, mc->meta_pill);
+	}
+
+	/* Bottom gradient scrim (148px tall) + overlaid title, subtitle, action row */
+	shell_draw_card_bottom_scrim(cx, cy, cw, ch, SHELL_CARD_RADIUS, 148);
+
+	int text_x = cx + 15;
+	int text_w = cw - 30;
+	int act_y = cy + ch - 27;
+	int sub_y = act_y - 22;
+	int title_y = sub_y - 24;
+
+	shell_font_draw_role(SHELL_FONT_SANS_BOLD, 17,
+			     text_x, title_y, 0xfff8fafcU, mc->title, text_w);
+	shell_font_draw_role(SHELL_FONT_SANS_MEDIUM, 13,
+			     text_x, sub_y, 0xffe2e8f0U, mc->subtitle, text_w);
+
+	uint32_t act_col = focused ? 0xfffbbf24U : 0xffcbd5e1U;
+	shell_font_draw_role(SHELL_FONT_MONO_SEMIBOLD, 12,
+			     text_x, act_y, act_col,
+			     mc->action_label[0] ? mc->action_label : "Open",
+			     text_w - 72);
+
+	if (focused) {
+		int sel_w = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 12, "Select ↵");
+		shell_font_draw_role(SHELL_FONT_MONO_SEMIBOLD, 12,
+				     cx + cw - 15 - sel_w, act_y,
+				     0xfffbbf24U, "Select ↵", sel_w + 4);
+	}
+
+	/* Selectable card border: 3px focus_ring when focused, 2px border otherwise */
+	shell_draw_rounded_outline(cx, cy, cw, ch, SHELL_CARD_RADIUS,
+				   focused ? SHELL_CARD_FOCUS_BORDER : SHELL_CARD_BORDER,
+				   focused ? th->focus_ring : th->border);
+}
+
+static void render_slot4_footer_btn(const struct shell_theme *th, int i, bool clear_bg)
+{
 	static const int btn_xs[4] = { 64, 268, 648, 1028 };
 	static const int btn_ws[4] = { 188, 364, 364, 188 };
+	const struct giri_screen *scr = current_screen();
+	const struct giri_footer_link *fl = &scr->footer_links[i];
+	bool focused = (g_ui.active_win == GIRI_WIN_MAIN &&
+			g_ui.focus_zone == GIRI_ZONE_FOOTER &&
+			g_ui.footer_focus_idx == i);
+	int bx = btn_xs[i];
+	int bw = btn_ws[i];
+	int bh = SHELL_FOOTER_H;
+	int by = SHELL_SLOT4_Y - (focused ? 2 : 0);
 
-	for (i = 0; i < SHELL_FOOTER_COUNT; i++) {
-		const struct giri_footer_link *fl = &scr->footer_links[i];
-		bool focused = (g_ui.active_win == GIRI_WIN_MAIN &&
-				g_ui.focus_zone == GIRI_ZONE_FOOTER &&
-				g_ui.footer_focus_idx == i);
-		int bx = btn_xs[i];
-		int bw = btn_ws[i];
-		int bh = SHELL_FOOTER_H;
-		int by = SHELL_SLOT4_Y - (focused ? 2 : 0);
+	if (clear_bg)
+		shell_draw_rect(bx - 4, SHELL_SLOT4_Y - 6, bw + 8, bh + 10, th->bg);
 
-		if (focused) {
-			shell_draw_focus_glow(bx, by, bw, bh, SHELL_FOOTER_RADIUS,
-					      3, 0xfff59e0bU, 71);
-		}
-
-		shell_draw_rounded_rect(bx, by, bw, bh, SHELL_FOOTER_RADIUS,
-					focused ? th->btn_focus_bg : th->btn_bg);
-		shell_draw_rounded_outline(bx, by, bw, bh, SHELL_FOOTER_RADIUS,
-					   focused ? SHELL_FOOTER_FOCUS_BORDER : SHELL_FOOTER_BORDER,
-					   focused ? th->focus_ring : th->border);
-
-		/* 30x30 internal icon box (border: none, rx=8) */
-		int ibx = bx + 12;
-		int iby = by + (bh - 30) / 2;
-		if (focused) {
-			shell_draw_rounded_rect(ibx, iby, 30, 30, 8, th->accent);
-			shell_draw_symbol(fl->symbol, ibx + 6, iby + 6, 18, 0xffffffffU);
-		} else {
-			shell_draw_rounded_rect_alpha(ibx, iby, 30, 30, 8, th->accent, 36);
-			shell_draw_symbol(fl->symbol, ibx + 6, iby + 6, 18, th->accent);
-		}
-
-		/* Right keycap badge "↵" (border: none, rx=6, 24x22) */
-		int kw = 24, kh = 22;
-		int kx = bx + bw - 12 - kw;
-		int ky = by + (bh - kh) / 2;
-		shell_draw_rounded_rect(kx, ky, kw, kh, 6,
-					focused ? th->accent : th->surface);
-		shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 12,
-					     kx, ky, kw, kh,
-					     focused ? 0xffffffffU : th->muted, "↵");
-
-		/* Button label vertically centered on cap-height */
-		int lx = ibx + 30 + 10;
-		int lw = kx - lx - 8;
-		shell_font_draw_vcentered(SHELL_FONT_SANS_SEMIBOLD, 14,
-					  lx, by, bh, th->ink,
-					  fl->label, lw);
+	if (focused) {
+		shell_draw_focus_glow(bx, by, bw, bh, SHELL_FOOTER_RADIUS,
+				      3, 0xfff59e0bU, 71);
 	}
+
+	shell_draw_rounded_rect(bx, by, bw, bh, SHELL_FOOTER_RADIUS,
+				focused ? th->btn_focus_bg : th->btn_bg);
+	shell_draw_rounded_outline(bx, by, bw, bh, SHELL_FOOTER_RADIUS,
+				   focused ? SHELL_FOOTER_FOCUS_BORDER : SHELL_FOOTER_BORDER,
+				   focused ? th->focus_ring : th->border);
+
+	/* 30x30 internal icon box (border: none, rx=8) */
+	int ibx = bx + 12;
+	int iby = by + (bh - 30) / 2;
+	if (focused) {
+		shell_draw_rounded_rect(ibx, iby, 30, 30, 8, th->accent);
+		shell_draw_symbol(fl->symbol, ibx + 6, iby + 6, 18, 0xffffffffU);
+	} else {
+		shell_draw_rounded_rect_alpha(ibx, iby, 30, 30, 8, th->accent, 36);
+		shell_draw_symbol(fl->symbol, ibx + 6, iby + 6, 18, th->accent);
+	}
+
+	/* Right keycap badge "↵" (border: none, rx=6, 24x22) */
+	int kw = 24, kh = 22;
+	int kx = bx + bw - 12 - kw;
+	int ky = by + (bh - kh) / 2;
+	shell_draw_rounded_rect(kx, ky, kw, kh, 6,
+				focused ? th->accent : th->surface);
+	shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 12,
+				     kx, ky, kw, kh,
+				     focused ? 0xffffffffU : th->muted, "↵");
+
+	/* Button label vertically centered on cap-height */
+	int lx = ibx + 30 + 10;
+	int lw = kx - lx - 8;
+	shell_font_draw_vcentered(SHELL_FONT_SANS_SEMIBOLD, 14,
+				  lx, by, bh, th->ink,
+				  fl->label, lw);
+}
+
+/*
+ * Window 0: 4-Slot Main TV Screen (.tv-screen)
+ *   Slot 1 (y=36,  h=44):  Header (49x40 logo + "Giri" + "—" + prompt_title)
+ *   Slot 2 (y=108, h=148): Editorial Summary Box (title + source + <=250c body)
+ *   Slot 3 (y=284, h=312): 4 Selectable Full-Bleed Visual Cards (gap 18px)
+ *   Slot 4 (y=624, h=58):  4 Selectable Bottom Bar Buttons (188px 364px 364px 188px)
+ */
+static void render_window_main(const struct shell_theme *th)
+{
+	int i;
+
+	g_ui.backbuf_modal_win = -1;
+	shell_draw_rect(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, th->bg);
+	render_slot1_header(th, false);
+	render_slot2_summary(th, false);
+	for (i = 0; i < SHELL_CARD_COUNT; i++)
+		render_slot3_card(th, i, false);
+	for (i = 0; i < SHELL_FOOTER_COUNT; i++)
+		render_slot4_footer_btn(th, i, false);
+
+	g_ui.main_bg_valid = (g_ui.active_win == GIRI_WIN_MAIN);
+	g_ui.dirty_slots = 0;
+	g_ui.dirty_cards = 0;
+	g_ui.dirty_footer = 0;
+}
+
+static void render_window_main_incremental(const struct shell_theme *th)
+{
+	int i;
+
+	if (!g_ui.main_bg_valid || g_ui.backbuf_modal_win != -1) {
+		render_window_main(th);
+		return;
+	}
+	if (g_ui.dirty_slots & 0x01)
+		render_slot1_header(th, true);
+	if (g_ui.dirty_slots & 0x02)
+		render_slot2_summary(th, true);
+	for (i = 0; i < SHELL_CARD_COUNT; i++) {
+		if (g_ui.dirty_cards & (1U << i))
+			render_slot3_card(th, i, true);
+	}
+	for (i = 0; i < SHELL_FOOTER_COUNT; i++) {
+		if (g_ui.dirty_footer & (1U << i))
+			render_slot4_footer_btn(th, i, true);
+	}
+	g_ui.dirty_slots = 0;
+	g_ui.dirty_cards = 0;
+	g_ui.dirty_footer = 0;
 }
 
 /*
@@ -1574,6 +1652,8 @@ static void render_window_main(const struct shell_theme *th)
  */
 static void render_window_media_overlay(const struct shell_theme *th)
 {
+	g_ui.main_bg_valid = false;
+	g_ui.backbuf_modal_win = -1;
 	const uint32_t *fs_art = g_ui.overlay_is_video
 				 ? shell_media_get_video_frame(&g_ui.overlay_card,
 							       g_ui.overlay_frame_idx)
@@ -1700,11 +1780,21 @@ static void get_modal_palette(const struct shell_theme *th, struct modal_palette
 static void draw_modal_backdrop_and_frame(const struct modal_palette *mp,
 					  int dx, int dy, int dw, int dh)
 {
-	/* Dim underlying Window 0 so the modal floats in the foreground */
-	if (g_ui.theme_id == SHELL_THEME_SIGNAL)
-		shell_draw_rect_alpha(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, 0xff020305U, 226);
-	else
-		shell_draw_rect_alpha(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, 0xff08090cU, 214);
+	uint32_t dim_c = (g_ui.theme_id == SHELL_THEME_SIGNAL) ? 0xff020305U : 0xff08090cU;
+	uint8_t dim_a = (g_ui.theme_id == SHELL_THEME_SIGNAL) ? 226 : 214;
+	int ix0 = dx + 14;
+	int iy0 = dy + 14;
+	int ix1 = dx + dw - 14;
+	int iy1 = dy + dh - 14;
+
+	/*
+	 * Dim the 4 visible strips of Window 0 around the opaque dialog body
+	 * instead of dimming the ~600,000 pixels underneath the dialog.
+	 */
+	shell_draw_rect_alpha(0, 0, SHELL_SCREEN_W, iy0, dim_c, dim_a);
+	shell_draw_rect_alpha(0, iy1, SHELL_SCREEN_W, SHELL_SCREEN_H - iy1, dim_c, dim_a);
+	shell_draw_rect_alpha(0, iy0, ix0, iy1 - iy0, dim_c, dim_a);
+	shell_draw_rect_alpha(ix1, iy0, SHELL_SCREEN_W - ix1, iy1 - iy0, dim_c, dim_a);
 
 	/* Multi-layer elevation shadow + subtle outer halo */
 	shell_draw_card_shadow(dx, dy + 2, dw, dh, 16);
@@ -1725,9 +1815,20 @@ static void render_window_ask_modal(const struct shell_theme *th)
 	struct modal_palette mp;
 	int dx = 180, dy = 152, dw = 920, dh = 416;
 
-	render_window_main(th);
 	get_modal_palette(th, &mp);
-	draw_modal_backdrop_and_frame(&mp, dx, dy, dw, dh);
+	if (g_ui.backbuf_modal_win != GIRI_WIN_ASK_MODAL ||
+	    g_ui.backbuf_modal_theme != (int)g_ui.theme_id ||
+	    g_ui.backbuf_modal_hist_idx != g_ui.history_idx) {
+		if (!g_ui.main_bg_valid)
+			render_window_main(th);
+		draw_modal_backdrop_and_frame(&mp, dx, dy, dw, dh);
+		g_ui.main_bg_valid = false;
+		g_ui.backbuf_modal_win = GIRI_WIN_ASK_MODAL;
+		g_ui.backbuf_modal_theme = (int)g_ui.theme_id;
+		g_ui.backbuf_modal_hist_idx = g_ui.history_idx;
+	} else {
+		shell_draw_rounded_rect(dx + 4, dy + 4, dw - 8, dh - 8, 12, mp.dlg_bg);
+	}
 
 	int ix = dx + 34;
 	int iy = dy + 28;
@@ -1898,9 +1999,20 @@ static void render_window_settings_modal(const struct shell_theme *th)
 	struct modal_palette mp;
 	int dx = 160, dy = 42, dw = 960, dh = 636;
 
-	render_window_main(th);
 	get_modal_palette(th, &mp);
-	draw_modal_backdrop_and_frame(&mp, dx, dy, dw, dh);
+	if (g_ui.backbuf_modal_win != GIRI_WIN_SETTINGS_MODAL ||
+	    g_ui.backbuf_modal_theme != (int)g_ui.theme_id ||
+	    g_ui.backbuf_modal_hist_idx != g_ui.history_idx) {
+		if (!g_ui.main_bg_valid)
+			render_window_main(th);
+		draw_modal_backdrop_and_frame(&mp, dx, dy, dw, dh);
+		g_ui.main_bg_valid = false;
+		g_ui.backbuf_modal_win = GIRI_WIN_SETTINGS_MODAL;
+		g_ui.backbuf_modal_theme = (int)g_ui.theme_id;
+		g_ui.backbuf_modal_hist_idx = g_ui.history_idx;
+	} else {
+		shell_draw_rounded_rect(dx + 4, dy + 4, dw - 8, dh - 8, 12, mp.dlg_bg);
+	}
 
 	int ix = dx + 28;
 	int iy = dy + 22;
@@ -2028,7 +2140,7 @@ static void render_frame(void)
 	switch (g_ui.active_win) {
 	case GIRI_WIN_MAIN:
 	default:
-		render_window_main(th);
+		render_window_main_incremental(th);
 		break;
 	case GIRI_WIN_MEDIA_OVERLAY:
 		render_window_media_overlay(th);
@@ -2040,7 +2152,6 @@ static void render_frame(void)
 		render_window_settings_modal(th);
 		break;
 	}
-	shell_display_damage_all();
 	shell_display_present();
 }
 
@@ -2050,6 +2161,8 @@ static void render_frame(void)
 
 static void start_topic_transition(const char *query)
 {
+	bool was_main = (g_ui.active_win == GIRI_WIN_MAIN);
+
 	g_ui.active_win = GIRI_WIN_MAIN;
 	g_ui.tts_speaking = false;
 	g_ui.is_working = true;
@@ -2059,22 +2172,34 @@ static void start_topic_transition(const char *query)
 	g_ui.logo_frame_idx = 0;
 	shell_font_fit_clean_phrase(query, g_ui.pending_query,
 				    sizeof(g_ui.pending_query), SHELL_LIMIT_PROMPT_TITLE);
+
+	/* Build target screen structure immediately (<0.05ms) for background preload */
+	build_topic_screen(g_ui.pending_query, &g_ui.pending_screen);
+	g_ui.has_pending_screen = true;
+
+	if (!was_main || !g_ui.main_bg_valid)
+		mark_full_redraw();
+	else
+		g_ui.dirty_slots |= 0x03;
 }
 
 static void complete_topic_transition(void)
 {
-	struct giri_screen next_scr;
+	if (!g_ui.has_pending_screen)
+		build_topic_screen(g_ui.pending_query, &g_ui.pending_screen);
 
-	build_topic_screen(g_ui.pending_query, &next_scr);
 	if (g_ui.history_idx + 1 < HISTORY_MAX) {
 		g_ui.history_idx++;
 		g_ui.history_len = g_ui.history_idx + 1;
 	}
-	g_ui.history[g_ui.history_idx] = next_scr;
+	g_ui.history[g_ui.history_idx] = g_ui.pending_screen;
+	g_ui.has_pending_screen = false;
 	g_ui.is_working = false;
 	g_ui.logo_frame_idx = 0;
 	g_ui.focus_zone = GIRI_ZONE_CARDS;
 	g_ui.card_focus_idx = 0;
+	g_ui.cards_need_preload = true;
+	mark_full_redraw();
 
 	if (g_ui.auto_read_aloud) {
 		g_ui.tts_speaking = true;
@@ -2165,6 +2290,10 @@ static void execute_action(const struct giri_action *act, const struct giri_medi
 	if (strcmp(act->type, "gallery_next_page") == 0) {
 		populate_gallery_screen(&g_ui.history[g_ui.history_idx],
 					g_ui.gallery_page + 1);
+		g_ui.cards_need_preload = true;
+		g_ui.dirty_slots |= 0x02;
+		g_ui.dirty_cards = 0x0f;
+		g_ui.dirty_footer |= (1U << 1);
 		return;
 	}
 
@@ -2193,6 +2322,7 @@ static void execute_action(const struct giri_action *act, const struct giri_medi
 		if (strcmp(act->app_id, "doom") == 0 && access("/bin/doom", X_OK) == 0) {
 			const char *const argv[] = { "/bin/doom", NULL };
 			shell_app_run(argv, true);
+			mark_full_redraw();
 			return;
 		}
 		if (card) {
@@ -2228,9 +2358,23 @@ static void execute_action(const struct giri_action *act, const struct giri_medi
 
 static void handle_key_event(const struct shell_input_event *ev)
 {
-	/* Complete any in-flight topic shimmer transition immediately on user input */
-	if (g_ui.is_working)
+	/*
+	 * If a topic shimmer transition is in flight:
+	 *   - Pressing Menu/Back cancels the loading immediately in <0.5ms.
+	 *   - Pressing any navigation/select key completes the transition
+	 *     immediately (using non-blocking card art) and applies the key
+	 *     to the new screen without dropping user input.
+	 */
+	if (g_ui.is_working) {
+		if (ev->key == SHELL_KEY_MENU) {
+			g_ui.is_working = false;
+			g_ui.has_pending_screen = false;
+			g_ui.logo_frame_idx = 0;
+			g_ui.dirty_slots |= 0x03;
+			return;
+		}
 		complete_topic_transition();
+	}
 
 	/* Global 2-second Menu hold returns to Home Screen from any state */
 	if (ev->key == SHELL_KEY_MENU_HOLD) {
@@ -2239,6 +2383,7 @@ static void handle_key_event(const struct shell_input_event *ev)
 		g_ui.focus_zone = GIRI_ZONE_CARDS;
 		g_ui.card_focus_idx = 0;
 		g_ui.tts_speaking = false;
+		mark_full_redraw();
 		return;
 	}
 
@@ -2261,6 +2406,7 @@ static void handle_key_event(const struct shell_input_event *ev)
 		switch (ev->key) {
 		case SHELL_KEY_MENU:
 			g_ui.active_win = GIRI_WIN_MAIN;
+			mark_full_redraw();
 			break;
 		case SHELL_KEY_DOWN:
 		case SHELL_KEY_RIGHT:
@@ -2281,6 +2427,7 @@ static void handle_key_event(const struct shell_input_event *ev)
 				start_topic_transition(quick_prompts[g_ui.ask_focus_idx - 1].query);
 			} else {
 				g_ui.active_win = GIRI_WIN_MAIN;
+				mark_full_redraw();
 			}
 			break;
 		default:
@@ -2297,6 +2444,7 @@ static void handle_key_event(const struct shell_input_event *ev)
 		switch (ev->key) {
 		case SHELL_KEY_MENU:
 			g_ui.active_win = GIRI_WIN_MAIN;
+			mark_full_redraw();
 			break;
 		case SHELL_KEY_LEFT:
 			g_ui.settings_focus_idx = (g_ui.settings_focus_idx - 1 + total) % total;
@@ -2350,6 +2498,7 @@ static void handle_key_event(const struct shell_input_event *ev)
 				}
 			} else if (g_ui.settings_focus_idx == last_idx) {
 				g_ui.active_win = GIRI_WIN_MAIN;
+				mark_full_redraw();
 			}
 			break;
 		default:
@@ -2364,6 +2513,7 @@ static void handle_key_event(const struct shell_input_event *ev)
 		case SHELL_KEY_MENU:
 		case SHELL_KEY_SELECT:
 			g_ui.active_win = GIRI_WIN_MAIN;
+			mark_full_redraw();
 			break;
 		case SHELL_KEY_PLAY_PAUSE:
 			if (g_ui.overlay_is_video)
@@ -2405,27 +2555,44 @@ static void handle_key_event(const struct shell_input_event *ev)
 
 	/* Window 0: Main 4-Slot Screen navigation */
 	const struct giri_screen *scr = current_screen();
+	int prev_idx;
 
 	switch (ev->key) {
 	case SHELL_KEY_LEFT:
-		if (g_ui.focus_zone == GIRI_ZONE_CARDS)
+		if (g_ui.focus_zone == GIRI_ZONE_CARDS) {
+			prev_idx = g_ui.card_focus_idx;
 			g_ui.card_focus_idx = (g_ui.card_focus_idx + SHELL_CARD_COUNT - 1) % SHELL_CARD_COUNT;
-		else
+			g_ui.dirty_cards |= (uint8_t)((1U << prev_idx) | (1U << g_ui.card_focus_idx));
+		} else {
+			prev_idx = g_ui.footer_focus_idx;
 			g_ui.footer_focus_idx = (g_ui.footer_focus_idx + SHELL_FOOTER_COUNT - 1) % SHELL_FOOTER_COUNT;
+			g_ui.dirty_footer |= (uint8_t)((1U << prev_idx) | (1U << g_ui.footer_focus_idx));
+		}
 		break;
 	case SHELL_KEY_RIGHT:
-		if (g_ui.focus_zone == GIRI_ZONE_CARDS)
+		if (g_ui.focus_zone == GIRI_ZONE_CARDS) {
+			prev_idx = g_ui.card_focus_idx;
 			g_ui.card_focus_idx = (g_ui.card_focus_idx + 1) % SHELL_CARD_COUNT;
-		else
+			g_ui.dirty_cards |= (uint8_t)((1U << prev_idx) | (1U << g_ui.card_focus_idx));
+		} else {
+			prev_idx = g_ui.footer_focus_idx;
 			g_ui.footer_focus_idx = (g_ui.footer_focus_idx + 1) % SHELL_FOOTER_COUNT;
+			g_ui.dirty_footer |= (uint8_t)((1U << prev_idx) | (1U << g_ui.footer_focus_idx));
+		}
 		break;
 	case SHELL_KEY_DOWN:
-		if (g_ui.focus_zone == GIRI_ZONE_CARDS)
+		if (g_ui.focus_zone == GIRI_ZONE_CARDS) {
 			g_ui.focus_zone = GIRI_ZONE_FOOTER;
+			g_ui.dirty_cards |= (uint8_t)(1U << g_ui.card_focus_idx);
+			g_ui.dirty_footer |= (uint8_t)(1U << g_ui.footer_focus_idx);
+		}
 		break;
 	case SHELL_KEY_UP:
-		if (g_ui.focus_zone == GIRI_ZONE_FOOTER)
+		if (g_ui.focus_zone == GIRI_ZONE_FOOTER) {
 			g_ui.focus_zone = GIRI_ZONE_CARDS;
+			g_ui.dirty_cards |= (uint8_t)(1U << g_ui.card_focus_idx);
+			g_ui.dirty_footer |= (uint8_t)(1U << g_ui.footer_focus_idx);
+		}
 		break;
 	case SHELL_KEY_PLAY_PAUSE:
 		if (g_ui.tts_speaking) {
@@ -2435,6 +2602,7 @@ static void handle_key_event(const struct shell_input_event *ev)
 			g_ui.tts_sentence_idx = 0;
 			g_ui.tts_last_step_ms = shell_now_ms();
 		}
+		g_ui.dirty_slots |= 0x02;
 		break;
 	case SHELL_KEY_SELECT:
 		if (g_ui.focus_zone == GIRI_ZONE_CARDS) {
@@ -2448,10 +2616,13 @@ static void handle_key_event(const struct shell_input_event *ev)
 	case SHELL_KEY_MENU:
 		if (g_ui.tts_speaking) {
 			g_ui.tts_speaking = false;
+			g_ui.dirty_slots |= 0x02;
 		} else if (g_ui.history_idx > 0) {
 			g_ui.history_idx--;
 			g_ui.focus_zone = GIRI_ZONE_CARDS;
 			g_ui.card_focus_idx = 0;
+			g_ui.cards_need_preload = true;
+			mark_full_redraw();
 		}
 		break;
 	default:
@@ -2466,13 +2637,15 @@ static bool tick_animations(uint64_t now)
 	int i;
 
 	if (g_ui.is_working) {
+		g_ui.dirty_slots |= 0x02; /* Shimmer bar animates in Slot 2 only */
+		dirty = true;
 		if (now - g_ui.last_logo_step_ms >= SHELL_LOGO_FRAME_MS) {
 			g_ui.last_logo_step_ms = now;
 			g_ui.logo_step_cursor = (g_ui.logo_step_cursor + 1) & 7;
 			g_ui.logo_frame_idx = logo_pingpong_steps[g_ui.logo_step_cursor];
-			dirty = true;
+			g_ui.dirty_slots |= 0x01;
 		}
-		if (now - g_ui.working_start_ms >= 360) {
+		if (now - g_ui.working_start_ms >= 260) {
 			complete_topic_transition();
 			dirty = true;
 		}
@@ -2483,6 +2656,7 @@ static bool tick_animations(uint64_t now)
 		g_ui.tts_sentence_idx++;
 		if (g_ui.tts_sentence_idx >= g_ui.tts_total_sentences)
 			g_ui.tts_speaking = false;
+		g_ui.dirty_slots |= 0x02;
 		dirty = true;
 	}
 
@@ -2550,11 +2724,141 @@ static int acquire_single_instance_lock(void)
 	return fd;
 }
 
+static uint64_t bench_now_us(void)
+{
+	struct timeval tv;
+
+	if (gettimeofday(&tv, NULL) == 0)
+		return (uint64_t)tv.tv_sec * 1000000ULL + (uint64_t)tv.tv_usec;
+	return shell_now_ms() * 1000ULL;
+}
+
+static void run_benchmark(uint64_t init_disp_us, uint64_t init_font_us, uint64_t init_media_us)
+{
+	uint64_t t0, t1;
+	int i;
+	const int N = 30;
+
+	printf("=== tvshell on-device benchmark (%d iterations per test) ===\n", N);
+	printf("init_display            : %8.2f ms\n", init_disp_us / 1000.0);
+	printf("init_font               : %8.2f ms\n", init_font_us / 1000.0);
+	printf("init_media              : %8.2f ms\n", init_media_us / 1000.0);
+
+	/* 1. Full 1280x720 Main Window Redraw */
+	g_ui.active_win = GIRI_WIN_MAIN;
+	g_ui.is_working = false;
+	t0 = bench_now_us();
+	for (i = 0; i < N; i++) {
+		mark_full_redraw();
+		render_frame();
+	}
+	t1 = bench_now_us();
+	printf("main_full_redraw        : %8.2f ms (%6.1f FPS)\n",
+	       (t1 - t0) / (1000.0 * N), (1000000.0 * N) / (double)(t1 - t0));
+
+	/* 2. Incremental Card Focus Move (2 cards redrawn) */
+	g_ui.focus_zone = GIRI_ZONE_CARDS;
+	t0 = bench_now_us();
+	for (i = 0; i < N; i++) {
+		int prev = g_ui.card_focus_idx;
+		int next = (prev + 1) & 3;
+		g_ui.card_focus_idx = next;
+		g_ui.dirty_cards = (uint8_t)((1u << prev) | (1u << next));
+		render_frame();
+	}
+	t1 = bench_now_us();
+	printf("card_focus_move (inc)   : %8.2f ms (%6.1f FPS)\n",
+	       (t1 - t0) / (1000.0 * N), (1000000.0 * N) / (double)(t1 - t0));
+
+	/* 3. Incremental Footer Button Focus Move (2 buttons redrawn) */
+	g_ui.focus_zone = GIRI_ZONE_FOOTER;
+	t0 = bench_now_us();
+	for (i = 0; i < N; i++) {
+		int prev = g_ui.footer_focus_idx;
+		int next = (prev + 1) & 3;
+		g_ui.footer_focus_idx = next;
+		g_ui.dirty_footer = (uint8_t)((1u << prev) | (1u << next));
+		render_frame();
+	}
+	t1 = bench_now_us();
+	printf("footer_focus_move (inc) : %8.2f ms (%6.1f FPS)\n",
+	       (t1 - t0) / (1000.0 * N), (1000000.0 * N) / (double)(t1 - t0));
+
+	/* 4. Working / Loading Shimmer Tick (Slots 1 + 2 only) */
+	g_ui.is_working = true;
+	t0 = bench_now_us();
+	for (i = 0; i < N; i++) {
+		g_ui.logo_frame_idx = i % 5;
+		g_ui.dirty_slots = 0x03;
+		render_frame();
+	}
+	t1 = bench_now_us();
+	g_ui.is_working = false;
+	printf("working_shimmer_tick    : %8.2f ms (%6.1f FPS)\n",
+	       (t1 - t0) / (1000.0 * N), (1000000.0 * N) / (double)(t1 - t0));
+
+	/* 5. Ask Giri Modal Open & D-Pad Navigation */
+	g_ui.active_win = GIRI_WIN_MAIN;
+	mark_full_redraw();
+	render_frame();
+	g_ui.active_win = GIRI_WIN_ASK_MODAL;
+	g_ui.backbuf_modal_win = -1;
+	t0 = bench_now_us();
+	render_frame();
+	t1 = bench_now_us();
+	printf("ask_modal_open          : %8.2f ms (%6.1f FPS)\n",
+	       (t1 - t0) / 1000.0, 1000000.0 / (double)(t1 - t0));
+
+	t0 = bench_now_us();
+	for (i = 0; i < N; i++) {
+		g_ui.ask_focus_idx = 1 + (i % 7);
+		render_frame();
+	}
+	t1 = bench_now_us();
+	printf("ask_modal_nav (inc)     : %8.2f ms (%6.1f FPS)\n",
+	       (t1 - t0) / (1000.0 * N), (1000000.0 * N) / (double)(t1 - t0));
+
+	/* 6. Settings Modal Open & D-Pad Navigation */
+	g_ui.active_win = GIRI_WIN_MAIN;
+	mark_full_redraw();
+	render_frame();
+	g_ui.active_win = GIRI_WIN_SETTINGS_MODAL;
+	g_ui.backbuf_modal_win = -1;
+	t0 = bench_now_us();
+	render_frame();
+	t1 = bench_now_us();
+	printf("settings_modal_open     : %8.2f ms (%6.1f FPS)\n",
+	       (t1 - t0) / 1000.0, 1000000.0 / (double)(t1 - t0));
+
+	t0 = bench_now_us();
+	for (i = 0; i < N; i++) {
+		g_ui.settings_focus_idx = 3 + (i % 6);
+		render_frame();
+	}
+	t1 = bench_now_us();
+	printf("settings_modal_nav (inc): %8.2f ms (%6.1f FPS)\n",
+	       (t1 - t0) / (1000.0 * N), (1000000.0 * N) / (double)(t1 - t0));
+
+	/* 7. Non-blocking Topic Transition + Progressive Card Preload */
+	g_ui.active_win = GIRI_WIN_MAIN;
+	g_ui.allow_async_art = true;
+	mark_full_redraw();
+	render_frame();
+	t0 = bench_now_us();
+	start_topic_transition("Tell me about the Western Ghats");
+	render_frame();
+	t1 = bench_now_us();
+	printf("topic_transition_start  : %8.2f ms (%6.1f FPS)\n",
+	       (t1 - t0) / 1000.0, 1000000.0 / (double)(t1 - t0));
+}
+
 int main(int argc, char **argv)
 {
 	bool headless = false;
+	bool bench_mode = false;
 	const char *dump_ppm_path = NULL;
 	const char *initial_topic = NULL;
+	uint64_t t0, init_disp_us = 0, init_font_us = 0, init_media_us = 0;
 	int lock_fd = -1;
 	int i;
 
@@ -2564,10 +2868,17 @@ int main(int argc, char **argv)
 	g_ui.focus_zone = GIRI_ZONE_CARDS;
 	g_ui.nav_sound_enabled = true;
 	g_ui.overlay_gallery_idx = -1;
+	mark_full_redraw();
 
 	for (i = 1; i < argc; i++) {
 		if (strcmp(argv[i], "--headless") == 0) {
 			headless = true;
+		} else if (strcmp(argv[i], "--bench") == 0) {
+			bench_mode = true;
+			headless = true;
+		} else if (strcmp(argv[i], "--bench-display") == 0) {
+			bench_mode = true;
+			headless = false;
 		} else if (strcmp(argv[i], "--theme") == 0 && i + 1 < argc) {
 			i++;
 			if (strcasecmp(argv[i], "signal") == 0)
@@ -2607,13 +2918,21 @@ int main(int argc, char **argv)
 	if (!headless)
 		lock_fd = acquire_single_instance_lock();
 
+	t0 = bench_now_us();
 	if (shell_display_init(headless) < 0)
 		return 1;
+	init_disp_us = bench_now_us() - t0;
+
+	t0 = bench_now_us();
 	if (shell_font_init() < 0) {
 		shell_display_close();
 		return 1;
 	}
+	init_font_us = bench_now_us() - t0;
+
+	t0 = bench_now_us();
 	shell_media_init();
+	init_media_us = bench_now_us() - t0;
 	shell_input_init(headless);
 
 	load_supported_models();
@@ -2635,6 +2954,17 @@ int main(int argc, char **argv)
 
 	render_frame();
 
+	if (bench_mode) {
+		run_benchmark(init_disp_us, init_font_us, init_media_us);
+		shell_input_close();
+		shell_media_free();
+		shell_font_free();
+		shell_display_close();
+		if (lock_fd >= 0)
+			close(lock_fd);
+		return 0;
+	}
+
 	if (dump_ppm_path) {
 		int rc = shell_display_dump_ppm(dump_ppm_path);
 		shell_input_close();
@@ -2644,9 +2974,11 @@ int main(int argc, char **argv)
 		return rc == 0 ? 0 : 1;
 	}
 
+	g_ui.allow_async_art = true;
 	while (g_running) {
 		struct shell_input_event ev;
-		int timeout_ms = (g_ui.is_working || g_ui.tts_speaking ||
+		int timeout_ms = (g_ui.is_working || g_ui.cards_need_preload) ? 16 :
+				 (g_ui.tts_speaking ||
 				  g_ui.active_win == GIRI_WIN_MEDIA_OVERLAY ||
 				  g_ui.active_win == GIRI_WIN_SETTINGS_MODAL) ? 30 : 250;
 		bool dirty = false;
@@ -2657,10 +2989,29 @@ int main(int argc, char **argv)
 				handle_key_event(&ev);
 			dirty = true;
 		}
-		if (shell_media_poll_async())
+		if (shell_media_poll_async()) {
+			g_ui.dirty_cards = 0x0f;
 			dirty = true;
+		}
 		if (tick_animations(shell_now_ms()))
 			dirty = true;
+
+		/*
+		 * Progressively decode at most 1 uncached card JPEG per idle
+		 * tick so button presses are never blocked by batch decoding.
+		 */
+		if (!dirty && g_ui.is_working && g_ui.has_pending_screen) {
+			(void)shell_media_preload_next_card(&g_ui.pending_screen);
+		} else if (!dirty && g_ui.cards_need_preload &&
+			   g_ui.active_win == GIRI_WIN_MAIN) {
+			if (shell_media_preload_next_card(current_screen())) {
+				g_ui.dirty_cards = 0x0f;
+				dirty = true;
+			} else {
+				g_ui.cards_need_preload = false;
+			}
+		}
+
 		if (dirty)
 			render_frame();
 	}

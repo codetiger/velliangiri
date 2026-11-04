@@ -10,6 +10,9 @@
 
 #include <errno.h>
 #include <fcntl.h>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 #ifdef __linux__
 #include <linux/fb.h>
 #include <linux/kd.h>
@@ -167,30 +170,196 @@ static void write_sysfs_str(const char *path, const char *val)
 
 static inline uint32_t blend_pixel(uint32_t dst, uint32_t src, uint32_t a255)
 {
-	uint32_t inv_a, rl, gl, bl;
+	uint32_t a, inv_a, rb, g;
 
 	if (a255 == 0)
 		return dst;
 	if (a255 >= 255)
 		return src | 0xff000000U;
 
-	inv_a = 255U - a255;
-	rl = (shell_srgb_to_linear[(dst >> 16) & 0xffU] * inv_a +
-	      shell_srgb_to_linear[(src >> 16) & 0xffU] * a255 + 127U) / 255U;
-	gl = (shell_srgb_to_linear[(dst >> 8) & 0xffU] * inv_a +
-	      shell_srgb_to_linear[(src >> 8) & 0xffU] * a255 + 127U) / 255U;
-	bl = (shell_srgb_to_linear[dst & 0xffU] * inv_a +
-	      shell_srgb_to_linear[src & 0xffU] * a255 + 127U) / 255U;
-	if (rl > 4095U)
-		rl = 4095U;
-	if (gl > 4095U)
-		gl = 4095U;
-	if (bl > 4095U)
-		bl = 4095U;
-	return 0xff000000U |
-	       ((uint32_t)shell_lin_to_srgb[rl] << 16) |
-	       ((uint32_t)shell_lin_to_srgb[gl] << 8) |
-	       (uint32_t)shell_lin_to_srgb[bl];
+	a = a255 + (a255 >> 7);
+	inv_a = 256U - a;
+	rb = (((dst & 0x00ff00ffU) * inv_a + (src & 0x00ff00ffU) * a) >> 8) & 0x00ff00ffU;
+	g  = (((dst & 0x0000ff00U) * inv_a + (src & 0x0000ff00U) * a) >> 8) & 0x0000ff00U;
+	return 0xff000000U | rb | g;
+}
+
+static inline void fill_span_u32(uint32_t *dst, uint32_t color, int count)
+{
+	int i = 0;
+
+#ifdef __ARM_NEON
+	uint32x4_t v = vdupq_n_u32(color);
+
+	for (; i + 8 <= count; i += 8) {
+		vst1q_u32(dst + i, v);
+		vst1q_u32(dst + i + 4, v);
+	}
+	for (; i + 4 <= count; i += 4)
+		vst1q_u32(dst + i, v);
+#endif
+	for (; i < count; i++)
+		dst[i] = color;
+}
+
+static inline void copy_span_u32(uint32_t *dst, const uint32_t *src, int count)
+{
+#ifdef __ARM_NEON
+	int i = 0;
+
+	for (; i + 16 <= count; i += 16) {
+		__builtin_prefetch(src + i + 32, 0, 1);
+		uint32x4_t v0 = vld1q_u32(src + i);
+		uint32x4_t v1 = vld1q_u32(src + i + 4);
+		uint32x4_t v2 = vld1q_u32(src + i + 8);
+		uint32x4_t v3 = vld1q_u32(src + i + 12);
+
+		vst1q_u32(dst + i, v0);
+		vst1q_u32(dst + i + 4, v1);
+		vst1q_u32(dst + i + 8, v2);
+		vst1q_u32(dst + i + 12, v3);
+	}
+	for (; i + 4 <= count; i += 4)
+		vst1q_u32(dst + i, vld1q_u32(src + i));
+	for (; i < count; i++)
+		dst[i] = src[i];
+#else
+	memcpy(dst, src, (size_t)count * sizeof(uint32_t));
+#endif
+}
+
+static inline void blend_span_const_alpha(uint32_t *dst, int count,
+					  uint32_t color, uint8_t alpha)
+{
+	int i = 0;
+
+	if (count <= 0 || alpha == 0)
+		return;
+	if (alpha == 255) {
+		fill_span_u32(dst, color | 0xff000000U, count);
+		return;
+	}
+
+#ifdef __ARM_NEON
+	if (count >= 8) {
+		uint16x8_t sb = vdupq_n_u16((uint16_t)((color & 0xffU) * alpha));
+		uint16x8_t sg = vdupq_n_u16((uint16_t)(((color >> 8) & 0xffU) * alpha));
+		uint16x8_t sr = vdupq_n_u16((uint16_t)(((color >> 16) & 0xffU) * alpha));
+		uint8x8_t inv_a = vdup_n_u8((uint8_t)(255U - alpha));
+		uint8x8_t ff_v = vdup_n_u8(0xffU);
+
+		for (; i + 8 <= count; i += 8) {
+			uint8x8x4_t d = vld4_u8((const uint8_t *)(dst + i));
+
+			d.val[0] = vrshrn_n_u16(vmlal_u8(sb, d.val[0], inv_a), 8);
+			d.val[1] = vrshrn_n_u16(vmlal_u8(sg, d.val[1], inv_a), 8);
+			d.val[2] = vrshrn_n_u16(vmlal_u8(sr, d.val[2], inv_a), 8);
+			d.val[3] = ff_v;
+			vst4_u8((uint8_t *)(dst + i), d);
+		}
+	}
+#endif
+	uint32_t a256 = (uint32_t)alpha + ((uint32_t)alpha >> 7);
+	uint32_t inv_a256 = 256U - a256;
+	uint32_t src_rb = (color & 0x00ff00ffU) * a256;
+	uint32_t src_g  = (color & 0x0000ff00U) * a256;
+
+	for (; i < count; i++) {
+		uint32_t d = dst[i];
+		uint32_t rb = (((d & 0x00ff00ffU) * inv_a256 + src_rb) >> 8) & 0x00ff00ffU;
+		uint32_t g  = (((d & 0x0000ff00U) * inv_a256 + src_g) >> 8) & 0x0000ff00U;
+
+		dst[i] = 0xff000000U | rb | g;
+	}
+}
+
+/*
+ * Precomputed 2x2 supersampled SDF corner coverage tables for radii 1..24 and
+ * outline stroke thicknesses 1..3, eliminating all per-pixel sqrtf() and float
+ * math during frame rendering.
+ */
+#define MAX_PRECOMP_RADIUS	24
+#define MAX_PRECOMP_THICK	3
+
+static bool g_corner_luts_ready;
+static uint8_t g_corner_cov_lut[MAX_PRECOMP_RADIUS + 1][MAX_PRECOMP_RADIUS][MAX_PRECOMP_RADIUS];
+static uint8_t g_corner_stroke_lut[MAX_PRECOMP_RADIUS + 1][MAX_PRECOMP_THICK + 1][MAX_PRECOMP_RADIUS][MAX_PRECOMP_RADIUS];
+
+static inline float sdf_corner_dist(float px, float py, float r)
+{
+	float qx = r - px;
+	float qy = r - py;
+	float ox = qx > 0.0f ? qx : 0.0f;
+	float oy = qy > 0.0f ? qy : 0.0f;
+	float outside = sqrtf(ox * ox + oy * oy);
+	float inside = (qx > qy ? qx : qy);
+
+	if (inside > 0.0f)
+		inside = 0.0f;
+	return outside + inside - r;
+}
+
+static void init_corner_luts(void)
+{
+	int r, t, cy, cx, sy, sx;
+
+	if (g_corner_luts_ready)
+		return;
+
+	for (r = 1; r <= MAX_PRECOMP_RADIUS; r++) {
+		float rf = (float)r;
+
+		for (cy = 0; cy < r; cy++) {
+			for (cx = 0; cx < r; cx++) {
+				float acc = 0.0f;
+
+				for (sy = 0; sy < 2; sy++) {
+					float py = (float)cy + 0.25f + 0.5f * (float)sy;
+
+					for (sx = 0; sx < 2; sx++) {
+						float px = (float)cx + 0.25f + 0.5f * (float)sx;
+						float d = sdf_corner_dist(px, py, rf);
+						float c = 0.5f - d;
+
+						if (c > 1.0f)
+							c = 1.0f;
+						else if (c < 0.0f)
+							c = 0.0f;
+						acc += c;
+					}
+				}
+				g_corner_cov_lut[r][cy][cx] = (uint8_t)(acc * 63.75f + 0.5f);
+
+				for (t = 1; t <= MAX_PRECOMP_THICK; t++) {
+					float tf = (float)t;
+					float sacc = 0.0f;
+
+					for (sy = 0; sy < 2; sy++) {
+						float py = (float)cy + 0.25f + 0.5f * (float)sy;
+
+						for (sx = 0; sx < 2; sx++) {
+							float px = (float)cx + 0.25f + 0.5f * (float)sx;
+							float d = sdf_corner_dist(px, py, rf);
+							float outer_c = 0.5f - d;
+							float inner_c = 0.5f + d + tf;
+
+							if (outer_c > 1.0f)
+								outer_c = 1.0f;
+							else if (outer_c < 0.0f)
+								outer_c = 0.0f;
+							if (inner_c > 1.0f)
+								inner_c = 1.0f;
+							else if (inner_c < 0.0f)
+								inner_c = 0.0f;
+							sacc += outer_c * inner_c;
+						}
+					}
+					g_corner_stroke_lut[r][t][cy][cx] = (uint8_t)(sacc * 63.75f + 0.5f);
+				}
+			}
+		}
+	}
+	g_corner_luts_ready = true;
 }
 
 static bool drm_find_720p30(int fd)
@@ -390,6 +559,7 @@ static void ensure_720p30_and_gamma(void)
 
 int shell_display_init(bool headless)
 {
+	init_corner_luts();
 	disp.headless = headless;
 	disp.backbuf = calloc((size_t)SHELL_SCREEN_W * SHELL_SCREEN_H, sizeof(uint32_t));
 	if (!disp.backbuf)
@@ -534,7 +704,7 @@ void shell_display_present(void)
 		const uint32_t *src = disp.backbuf + y * SHELL_SCREEN_W + x0;
 		uint32_t *dst = disp.scanout + (size_t)y * disp.scanout_pitch_px + x0;
 
-		memcpy(dst, src, (size_t)copy_w * sizeof(uint32_t));
+		copy_span_u32(dst, src, copy_w);
 	}
 }
 
@@ -596,7 +766,7 @@ int shell_display_dump_ppm(const char *path)
 
 void shell_draw_rect(int x, int y, int w, int h, uint32_t color)
 {
-	int x0, y0, x1, y1, py, px;
+	int x0, y0, x1, y1, py;
 
 	if (w <= 0 || h <= 0)
 		return;
@@ -611,15 +781,14 @@ void shell_draw_rect(int x, int y, int w, int h, uint32_t color)
 	for (py = y0; py < y1; py++) {
 		uint32_t *row = disp.backbuf + py * SHELL_SCREEN_W;
 
-		for (px = x0; px < x1; px++)
-			row[px] = color;
+		fill_span_u32(row + x0, color, x1 - x0);
 	}
 	shell_display_damage(x0, y0, x1 - x0, y1 - y0);
 }
 
 void shell_draw_rect_alpha(int x, int y, int w, int h, uint32_t color, uint8_t alpha)
 {
-	int x0, y0, x1, y1, py, px;
+	int x0, y0, x1, y1, py;
 
 	if (w <= 0 || h <= 0 || alpha == 0)
 		return;
@@ -637,8 +806,7 @@ void shell_draw_rect_alpha(int x, int y, int w, int h, uint32_t color, uint8_t a
 	for (py = y0; py < y1; py++) {
 		uint32_t *row = disp.backbuf + py * SHELL_SCREEN_W;
 
-		for (px = x0; px < x1; px++)
-			row[px] = blend_pixel(row[px], color, alpha);
+		blend_span_const_alpha(row + x0, x1 - x0, color, alpha);
 	}
 	shell_display_damage(x0, y0, x1 - x0, y1 - y0);
 }
@@ -666,20 +834,24 @@ static inline float sdf_rounded_rect_dist(float px, float py, float w, float h, 
 
 static inline uint32_t rounded_rect_cov255(int lx, int ly, int w, int h, int r)
 {
-	int sx, sy;
-	float acc = 0.0f;
-	float wf = (float)w, hf = (float)h, rf = (float)r;
-
 	if (r <= 0)
 		return 255;
 	if (lx < 0 || ly < 0 || lx >= w || ly >= h)
 		return 0;
-	if (lx >= r && lx < w - r)
-		return 255;
-	if (ly >= r && ly < h - r)
+	if ((lx >= r && lx < w - r) || (ly >= r && ly < h - r))
 		return 255;
 
-	/* 2x2 subpixel rotated-grid SDF evaluation for ultra-smooth corners */
+	int cx = (lx < r) ? lx : (w - 1 - lx);
+	int cy = (ly < r) ? ly : (h - 1 - ly);
+
+	if (r <= MAX_PRECOMP_RADIUS && g_corner_luts_ready)
+		return g_corner_cov_lut[r][cy][cx];
+
+	/* Fallback for radii > MAX_PRECOMP_RADIUS */
+	int sx, sy;
+	float acc = 0.0f;
+	float wf = (float)w, hf = (float)h, rf = (float)r;
+
 	for (sy = 0; sy < 2; sy++) {
 		float py = (float)ly + 0.25f + 0.5f * (float)sy;
 
@@ -720,22 +892,59 @@ void shell_draw_rounded_rect_alpha(int x, int y, int w, int h, int radius,
 		radius = h / 2;
 
 	color |= 0xff000000U;
+
 	for (py = 0; py < h; py++) {
 		int sy = y + py;
 
 		if (sy < 0 || sy >= SHELL_SCREEN_H)
 			continue;
 		uint32_t *row = disp.backbuf + sy * SHELL_SCREEN_W;
+		bool is_corner_row = (py < radius || py >= h - radius);
 
-		for (px = 0; px < w; px++) {
+		if (!is_corner_row) {
+			int sx0 = x < 0 ? 0 : x;
+			int sx1 = (x + w > SHELL_SCREEN_W) ? SHELL_SCREEN_W : (x + w);
+
+			if (sx1 > sx0)
+				blend_span_const_alpha(row + sx0, sx1 - sx0, color, alpha);
+			continue;
+		}
+
+		/* Left rounded corner [0, radius) */
+		for (px = 0; px < radius; px++) {
 			int sx = x + px;
 
 			if (sx < 0 || sx >= SHELL_SCREEN_W)
 				continue;
 			uint32_t cov = rounded_rect_cov255(px, py, w, h, radius);
-			uint32_t a = (cov * alpha + 127U) / 255U;
+			uint32_t a = (cov * alpha + 127U) >> 8;
 
-			if (a == 255)
+			if (a >= 255)
+				row[sx] = color;
+			else if (a > 0)
+				row[sx] = blend_pixel(row[sx], color, a);
+		}
+
+		/* Middle straight span [radius, w - radius) */
+		int mid_x0 = x + radius;
+		int mid_x1 = x + w - radius;
+		if (mid_x0 < 0)
+			mid_x0 = 0;
+		if (mid_x1 > SHELL_SCREEN_W)
+			mid_x1 = SHELL_SCREEN_W;
+		if (mid_x1 > mid_x0)
+			blend_span_const_alpha(row + mid_x0, mid_x1 - mid_x0, color, alpha);
+
+		/* Right rounded corner [w - radius, w) */
+		for (px = w - radius; px < w; px++) {
+			int sx = x + px;
+
+			if (sx < 0 || sx >= SHELL_SCREEN_W)
+				continue;
+			uint32_t cov = rounded_rect_cov255(px, py, w, h, radius);
+			uint32_t a = (cov * alpha + 127U) >> 8;
+
+			if (a >= 255)
 				row[sx] = color;
 			else if (a > 0)
 				row[sx] = blend_pixel(row[sx], color, a);
@@ -748,7 +957,7 @@ void shell_draw_rounded_outline(int x, int y, int w, int h, int radius,
 				int thickness, uint32_t color)
 {
 	int py, px;
-	float wf, hf, rf, tf;
+	bool use_lut;
 
 	if (w <= 0 || h <= 0 || thickness <= 0)
 		return;
@@ -756,11 +965,9 @@ void shell_draw_rounded_outline(int x, int y, int w, int h, int radius,
 		radius = w / 2;
 	if (radius * 2 > h)
 		radius = h / 2;
-	wf = (float)w;
-	hf = (float)h;
-	rf = (float)radius;
-	tf = (float)thickness;
 	color |= 0xff000000U;
+	use_lut = (g_corner_luts_ready && radius >= 1 && radius <= MAX_PRECOMP_RADIUS &&
+		   thickness >= 1 && thickness <= MAX_PRECOMP_THICK);
 
 	for (py = 0; py < h; py++) {
 		int sy = y + py;
@@ -770,57 +977,83 @@ void shell_draw_rounded_outline(int x, int y, int w, int h, int radius,
 		uint32_t *row = disp.backbuf + sy * SHELL_SCREEN_W;
 		bool in_y_mid = (py >= radius && py < h - radius);
 
-		for (px = 0; px < w; px++) {
-			int sx = x + px;
-
-			if (sx < 0 || sx >= SHELL_SCREEN_W)
-				continue;
-
-			/* Fast-path interior hollow region */
-			if (in_y_mid && px >= thickness && px < w - thickness)
-				continue;
-			if (px >= radius && px < w - radius &&
-			    py >= thickness && py < h - thickness)
-				continue;
-
-			/* Fast-path straight horizontal/vertical border segments */
-			if ((in_y_mid && (px < thickness || px >= w - thickness)) ||
-			    (px >= radius && px < w - radius &&
-			     (py < thickness || py >= h - thickness))) {
-				row[sx] = color;
-				continue;
+		if (in_y_mid) {
+			/* Only left [0, thickness) and right [w - thickness, w) vertical borders */
+			for (px = 0; px < thickness; px++) {
+				int sx = x + px;
+				if (sx >= 0 && sx < SHELL_SCREEN_W)
+					row[sx] = color;
 			}
+			for (px = w - thickness; px < w; px++) {
+				int sx = x + px;
+				if (sx >= 0 && sx < SHELL_SCREEN_W)
+					row[sx] = color;
+			}
+			continue;
+		}
 
-			/* Exact perpendicular Euclidean SDF stroke at rounded corners */
-			int sub_x, sub_y;
-			float acc = 0.0f;
+		/* Top or bottom straight horizontal border segment [radius, w - radius) */
+		if (py < thickness || py >= h - thickness) {
+			int sx0 = x + radius;
+			int sx1 = x + w - radius;
+			if (sx0 < 0)
+				sx0 = 0;
+			if (sx1 > SHELL_SCREEN_W)
+				sx1 = SHELL_SCREEN_W;
+			if (sx1 > sx0)
+				fill_span_u32(row + sx0, color, sx1 - sx0);
+		}
 
-			for (sub_y = 0; sub_y < 2; sub_y++) {
-				float fy = (float)py + 0.25f + 0.5f * (float)sub_y;
+		/* Left and right rounded corners */
+		int cy = (py < radius) ? py : (h - 1 - py);
+		int corner_side;
 
-				for (sub_x = 0; sub_x < 2; sub_x++) {
-					float fx = (float)px + 0.25f + 0.5f * (float)sub_x;
-					float d = sdf_rounded_rect_dist(fx, fy, wf, hf, rf);
-					float outer_c = 0.5f - d;
-					float inner_c = 0.5f + d + tf;
+		for (corner_side = 0; corner_side < 2; corner_side++) {
+			int px_start = (corner_side == 0) ? 0 : (w - radius);
+			int px_end   = (corner_side == 0) ? radius : w;
 
-					if (outer_c > 1.0f)
-						outer_c = 1.0f;
-					else if (outer_c < 0.0f)
-						outer_c = 0.0f;
-					if (inner_c > 1.0f)
-						inner_c = 1.0f;
-					else if (inner_c < 0.0f)
-						inner_c = 0.0f;
-					acc += outer_c * inner_c;
+			for (px = px_start; px < px_end; px++) {
+				int sx = x + px;
+				if (sx < 0 || sx >= SHELL_SCREEN_W)
+					continue;
+				int cx = (px < radius) ? px : (w - 1 - px);
+				uint32_t a;
+
+				if (use_lut) {
+					a = g_corner_stroke_lut[radius][thickness][cy][cx];
+				} else {
+					float wf = (float)w, hf = (float)h;
+					float rf = (float)radius, tf = (float)thickness;
+					int sub_x, sub_y;
+					float acc = 0.0f;
+
+					for (sub_y = 0; sub_y < 2; sub_y++) {
+						float fy = (float)py + 0.25f + 0.5f * (float)sub_y;
+						for (sub_x = 0; sub_x < 2; sub_x++) {
+							float fx = (float)px + 0.25f + 0.5f * (float)sub_x;
+							float d = sdf_rounded_rect_dist(fx, fy, wf, hf, rf);
+							float outer_c = 0.5f - d;
+							float inner_c = 0.5f + d + tf;
+
+							if (outer_c > 1.0f)
+								outer_c = 1.0f;
+							else if (outer_c < 0.0f)
+								outer_c = 0.0f;
+							if (inner_c > 1.0f)
+								inner_c = 1.0f;
+							else if (inner_c < 0.0f)
+								inner_c = 0.0f;
+							acc += outer_c * inner_c;
+						}
+					}
+					a = (uint32_t)(acc * 63.75f + 0.5f);
 				}
-			}
-			uint32_t a = (uint32_t)(acc * 63.75f + 0.5f);
 
-			if (a >= 255)
-				row[sx] = color;
-			else if (a > 0)
-				row[sx] = blend_pixel(row[sx], color, a);
+				if (a >= 255)
+					row[sx] = color;
+				else if (a > 0)
+					row[sx] = blend_pixel(row[sx], color, a);
+			}
 		}
 	}
 	shell_display_damage(x, y, w, h);
@@ -848,6 +1081,22 @@ void shell_draw_focus_glow(int x, int y, int w, int h, int radius,
 		if (sy < 0 || sy >= SHELL_SCREEN_H)
 			continue;
 		uint32_t *row = disp.backbuf + sy * SHELL_SCREEN_W;
+		bool in_inner_y_mid = (py >= spread + radius && py < gh - spread - radius);
+
+		if (in_inner_y_mid) {
+			/* Only left [0, spread) and right [gw - spread, gw) glow bands */
+			for (px = 0; px < spread; px++) {
+				int sx = gx + px;
+				if (sx >= 0 && sx < SHELL_SCREEN_W)
+					row[sx] = blend_pixel(row[sx], glow_color, max_alpha);
+			}
+			for (px = gw - spread; px < gw; px++) {
+				int sx = gx + px;
+				if (sx >= 0 && sx < SHELL_SCREEN_W)
+					row[sx] = blend_pixel(row[sx], glow_color, max_alpha);
+			}
+			continue;
+		}
 
 		for (px = 0; px < gw; px++) {
 			int sx = gx + px;
@@ -856,11 +1105,10 @@ void shell_draw_focus_glow(int x, int y, int w, int h, int radius,
 				continue;
 			/* Skip interior of the element itself */
 			if (px >= spread + radius && px < gw - spread - radius &&
-			    py >= spread && py < gh - spread)
+			    py >= spread && py < gh - spread) {
+				px = gw - spread - radius - 1;
 				continue;
-			if (py >= spread + radius && py < gh - spread - radius &&
-			    px >= spread && px < gw - spread)
-				continue;
+			}
 
 			uint32_t outer_a = rounded_rect_cov255(px, py, gw, gh, gr);
 			uint32_t inner_a = 0;
@@ -873,7 +1121,7 @@ void shell_draw_focus_glow(int x, int y, int w, int h, int radius,
 			}
 			if (outer_a > inner_a) {
 				uint32_t cov = outer_a - inner_a;
-				uint32_t a = (cov * max_alpha + 127U) / 255U;
+				uint32_t a = (cov * max_alpha + 127U) >> 8;
 
 				row[sx] = blend_pixel(row[sx], glow_color, a);
 			}
@@ -884,16 +1132,54 @@ void shell_draw_focus_glow(int x, int y, int w, int h, int radius,
 
 /*
  * Subtle drop shadow beneath elevated focused cards: 0 10px 22px rgba(0,0,0,0.22)
+ * Skips the opaque card interior [x, x+w) x [y, y+h) that the card/modal body
+ * immediately overwrites, cutting shadow pixel count by ~95%.
  */
 void shell_draw_card_shadow(int x, int y, int w, int h, int radius)
 {
-	int s;
+	int s, py, px;
 
 	for (s = 8; s >= 2; s -= 2) {
-		shell_draw_rounded_rect_alpha(x - s / 2, y + 4 + s,
-					      w + s, h, radius + s / 2,
-					      0xff06080cU, 14);
+		int sx0 = x - s / 2;
+		int sy0 = y + 4 + s;
+		int sw = w + s;
+		int sh = h;
+		int sr = radius + s / 2;
+
+		for (py = 0; py < sh; py++) {
+			int sy = sy0 + py;
+
+			if (sy < 0 || sy >= SHELL_SCREEN_H)
+				continue;
+			uint32_t *row = disp.backbuf + sy * SHELL_SCREEN_W;
+			bool in_card_y_mid = (sy >= y + radius && sy < y + h - radius);
+
+			for (px = 0; px < sw; px++) {
+				int sx = sx0 + px;
+
+				if (sx < 0 || sx >= SHELL_SCREEN_W)
+					continue;
+				/* Fast skip of opaque card interior */
+				if (in_card_y_mid && sx >= x && sx < x + w) {
+					px = (x + w - 1) - sx0;
+					continue;
+				}
+				if (sy >= y && sy < y + h &&
+				    sx >= x + radius && sx < x + w - radius) {
+					px = (x + w - radius - 1) - sx0;
+					continue;
+				}
+
+				uint32_t cov = rounded_rect_cov255(px, py, sw, sh, sr);
+				if (cov == 0)
+					continue;
+				uint32_t a = (cov * 14U + 127U) >> 8;
+				if (a > 0)
+					row[sx] = blend_pixel(row[sx], 0xff06080cU, a);
+			}
+		}
 	}
+	shell_display_damage(x - 4, y + 6, w + 8, h + 6);
 }
 
 /*
@@ -933,6 +1219,22 @@ void shell_draw_card_bottom_scrim(int card_x, int card_y, int card_w, int card_h
 			alpha_f = 0.32f * (1.0f - t);
 		}
 
+		int base_a = (int)(alpha_f * 255.0f);
+		if (base_a <= 0)
+			continue;
+		if (base_a > 255)
+			base_a = 255;
+		bool is_bottom_corner = (py >= card_h - radius);
+
+		if (!is_bottom_corner) {
+			int sx0 = card_x < 0 ? 0 : card_x;
+			int sx1 = (card_x + card_w > SHELL_SCREEN_W) ? SHELL_SCREEN_W : (card_x + card_w);
+
+			if (sx1 > sx0)
+				blend_span_const_alpha(row + sx0, sx1 - sx0, 0xff06080cU, (uint8_t)base_a);
+			continue;
+		}
+
 		for (px = 0; px < card_w; px++) {
 			int sx = card_x + px;
 
@@ -941,16 +1243,9 @@ void shell_draw_card_bottom_scrim(int card_x, int card_y, int card_w, int card_h
 			uint32_t cov = rounded_rect_cov255(px, py, card_w, card_h, radius);
 			if (cov == 0)
 				continue;
-
-			int dither = (int)bayer4x4[(sy & 3) * 4 + (sx & 3)] - 7;
-			int a255 = (int)(alpha_f * 255.0f) + (dither >> 2);
-			if (a255 < 0)
-				a255 = 0;
-			if (a255 > 255)
-				a255 = 255;
-			a255 = (int)((cov * (uint32_t)a255 + 127U) / 255U);
+			uint32_t a255 = (cov * (uint32_t)base_a + 127U) >> 8;
 			if (a255 > 0)
-				row[sx] = blend_pixel(row[sx], 0xff06080cU, (uint32_t)a255);
+				row[sx] = blend_pixel(row[sx], 0xff06080cU, a255);
 		}
 	}
 	shell_display_damage(card_x, card_y + y_start, card_w, scrim_h);
@@ -970,10 +1265,11 @@ void shell_draw_top_scrim(int w, int h)
 		float alpha_f = (t <= 0.65f) ?
 			(0.88f + (0.45f - 0.88f) * (t / 0.65f)) :
 			(0.45f * (1.0f - (t - 0.65f) / 0.35f));
+		int base_a = (int)(alpha_f * 255.0f);
+		const uint8_t *bayer_row = &bayer4x4[(py & 3) * 4];
 
 		for (px = 0; px < w && px < SHELL_SCREEN_W; px++) {
-			int dither = (int)bayer4x4[(py & 3) * 4 + (px & 3)] - 7;
-			int a = (int)(alpha_f * 255.0f) + (dither >> 2);
+			int a = base_a + (((int)bayer_row[px & 3] - 7) >> 2);
 
 			if (a > 0) {
 				if (a > 255)
@@ -1010,9 +1306,11 @@ void shell_draw_bottom_scrim(int y0, int w, int h)
 		else
 			alpha_f = 0.35f * (1.0f - (dist - 0.82f) / 0.18f);
 
+		int base_a = (int)(alpha_f * 255.0f);
+		const uint8_t *bayer_row = &bayer4x4[(sy & 3) * 4];
+
 		for (px = 0; px < w && px < SHELL_SCREEN_W; px++) {
-			int dither = (int)bayer4x4[(sy & 3) * 4 + (px & 3)] - 7;
-			int a = (int)(alpha_f * 255.0f) + (dither >> 2);
+			int a = base_a + (((int)bayer_row[px & 3] - 7) >> 2);
 
 			if (a > 0) {
 				if (a > 255)
@@ -1033,6 +1331,9 @@ void shell_draw_shimmer_bar(int x, int y, int w, int h, int radius,
 	int py, px;
 	int center_x = (w * phase_pct) / 100;
 	int band_w = w / 3 > 1 ? w / 3 : 1;
+
+	base_color |= 0xff000000U;
+	highlight_color |= 0xff000000U;
 
 	for (py = 0; py < h; py++) {
 		int sy = y + py;
@@ -1057,7 +1358,10 @@ void shell_draw_shimmer_bar(int x, int y, int w, int h, int radius,
 				uint32_t t = (uint32_t)((band_w - dist) * 180 / band_w);
 				bar_c = blend_pixel(base_color, highlight_color, t);
 			}
-			row[sx] = blend_pixel(row[sx], bar_c, cov);
+			if (cov >= 255)
+				row[sx] = bar_c;
+			else
+				row[sx] = blend_pixel(row[sx], bar_c, cov);
 		}
 	}
 	shell_display_damage(x, y, w, h);
@@ -1077,11 +1381,121 @@ void shell_draw_bitmap_xrgb(int x, int y, int w, int h, const uint32_t *pixels)
 		uint32_t *row = disp.backbuf + sy * SHELL_SCREEN_W;
 		const uint32_t *src = pixels + py * w;
 
+		if (x >= 0 && x + w <= SHELL_SCREEN_W) {
+			copy_span_u32(row + x, src, w);
+		} else {
+			for (px = 0; px < w; px++) {
+				int sx = x + px;
+
+				if (sx >= 0 && sx < SHELL_SCREEN_W)
+					row[sx] = src[px] | 0xff000000U;
+			}
+		}
+	}
+	shell_display_damage(x, y, w, h);
+}
+
+void shell_draw_rounded_bitmap_stride(int x, int y, int w, int h, int stride,
+				      int radius, const uint32_t *pixels,
+				      bool zoom_slightly)
+{
+	int py, px;
+	uint16_t x0_lut[512];
+
+	if (!pixels || w <= 0 || h <= 0 || stride < w)
+		return;
+	if (radius * 2 > w)
+		radius = w / 2;
+	if (radius * 2 > h)
+		radius = h / 2;
+
+	if (zoom_slightly && w <= 512) {
+		for (px = 0; px < w; px++) {
+			int x_q8 = (w << 7) + ((px * 2 - w) * 124) + 128;
+			if (x_q8 < 0)
+				x_q8 = 0;
+			if (x_q8 > ((w - 1) << 8))
+				x_q8 = (w - 1) << 8;
+			x0_lut[px] = (uint16_t)(x_q8 >> 8);
+		}
+	} else {
+		zoom_slightly = false;
+	}
+
+	for (py = 0; py < h; py++) {
+		int sy = y + py;
+
+		if (sy < 0 || sy >= SHELL_SCREEN_H)
+			continue;
+		uint32_t *row = disp.backbuf + sy * SHELL_SCREEN_W;
+		bool is_corner_row = (py < radius || py >= h - radius);
+
+		if (!zoom_slightly) {
+			const uint32_t *row0 = pixels + py * stride;
+
+			if (!is_corner_row && x >= 0 && x + w <= SHELL_SCREEN_W) {
+				copy_span_u32(row + x, row0, w);
+				continue;
+			}
+			if (is_corner_row && x >= 0 && x + w <= SHELL_SCREEN_W) {
+				for (px = 0; px < radius; px++) {
+					uint32_t a = rounded_rect_cov255(px, py, w, h, radius);
+					if (a >= 255)
+						row[x + px] = row0[px] | 0xff000000U;
+					else if (a > 0)
+						row[x + px] = blend_pixel(row[x + px], row0[px], a);
+				}
+				copy_span_u32(row + x + radius, row0 + radius, w - 2 * radius);
+				for (px = w - radius; px < w; px++) {
+					uint32_t a = rounded_rect_cov255(px, py, w, h, radius);
+					if (a >= 255)
+						row[x + px] = row0[px] | 0xff000000U;
+					else if (a > 0)
+						row[x + px] = blend_pixel(row[x + px], row0[px], a);
+				}
+				continue;
+			}
+
+			for (px = 0; px < w; px++) {
+				int sx = x + px;
+				if (sx < 0 || sx >= SHELL_SCREEN_W)
+					continue;
+				uint32_t a = rounded_rect_cov255(px, py, w, h, radius);
+				if (a >= 255)
+					row[sx] = row0[px] | 0xff000000U;
+				else if (a > 0)
+					row[sx] = blend_pixel(row[sx], row0[px], a);
+			}
+			continue;
+		}
+
+		/* Fast LUT-driven 1.03x center zoom on focused card artwork */
+		int y_q8 = (h << 7) + ((py * 2 - h) * 124) + 128;
+		if (y_q8 < 0)
+			y_q8 = 0;
+		if (y_q8 > ((h - 1) << 8))
+			y_q8 = (h - 1) << 8;
+		const uint32_t *row0 = pixels + (y_q8 >> 8) * stride;
+
+		if (!is_corner_row && x >= 0 && x + w <= SHELL_SCREEN_W) {
+			uint32_t *dst_row = row + x;
+			for (px = 0; px < w; px++)
+				dst_row[px] = row0[x0_lut[px]];
+			continue;
+		}
+
 		for (px = 0; px < w; px++) {
 			int sx = x + px;
 
-			if (sx >= 0 && sx < SHELL_SCREEN_W)
-				row[sx] = src[px] | 0xff000000U;
+			if (sx < 0 || sx >= SHELL_SCREEN_W)
+				continue;
+			uint32_t a = is_corner_row ? rounded_rect_cov255(px, py, w, h, radius) : 255U;
+			uint32_t sample = row0[x0_lut[px]];
+
+			if (a >= 255)
+				row[sx] = sample;
+			else if (a > 0)
+				row[sx] = blend_pixel(row[sx], sample, a);
 		}
 	}
 	shell_display_damage(x, y, w, h);
@@ -1090,79 +1504,7 @@ void shell_draw_bitmap_xrgb(int x, int y, int w, int h, const uint32_t *pixels)
 void shell_draw_rounded_bitmap(int x, int y, int w, int h, int radius,
 			       const uint32_t *pixels, bool zoom_slightly)
 {
-	int py, px;
-
-	if (!pixels || w <= 0 || h <= 0)
-		return;
-	for (py = 0; py < h; py++) {
-		int sy = y + py;
-
-		if (sy < 0 || sy >= SHELL_SCREEN_H)
-			continue;
-		uint32_t *row = disp.backbuf + sy * SHELL_SCREEN_W;
-		int y_q8 = py << 8;
-
-		if (zoom_slightly) {
-			/* Smooth bilinear 1.03x center zoom on focused card artwork */
-			y_q8 = (h << 7) + (((py * 2 - h) * 124) );
-			if (y_q8 < 0)
-				y_q8 = 0;
-			if (y_q8 > ((h - 1) << 8))
-				y_q8 = (h - 1) << 8;
-		}
-		int y0 = y_q8 >> 8;
-		int y1 = (y0 + 1 < h) ? (y0 + 1) : y0;
-		uint32_t fy = (uint32_t)(y_q8 & 0xff);
-		const uint32_t *row0 = pixels + y0 * w;
-		const uint32_t *row1 = pixels + y1 * w;
-
-		for (px = 0; px < w; px++) {
-			int sx = x + px;
-
-			if (sx < 0 || sx >= SHELL_SCREEN_W)
-				continue;
-			uint32_t sample;
-
-			if (!zoom_slightly) {
-				sample = row0[px] | 0xff000000U;
-			} else {
-				int x_q8 = (w << 7) + (((px * 2 - w) * 124));
-				if (x_q8 < 0)
-					x_q8 = 0;
-				if (x_q8 > ((w - 1) << 8))
-					x_q8 = (w - 1) << 8;
-				int x0 = x_q8 >> 8;
-				int x1 = (x0 + 1 < w) ? (x0 + 1) : x0;
-				uint32_t fx = (uint32_t)(x_q8 & 0xff);
-				uint32_t c00 = row0[x0], c10 = row0[x1];
-				uint32_t c01 = row1[x0], c11 = row1[x1];
-				uint32_t w00 = (256U - fx) * (256U - fy);
-				uint32_t w10 = fx * (256U - fy);
-				uint32_t w01 = (256U - fx) * fy;
-				uint32_t w11 = fx * fy;
-				uint32_t r = (((c00 >> 16) & 0xffU) * w00 +
-					      ((c10 >> 16) & 0xffU) * w10 +
-					      ((c01 >> 16) & 0xffU) * w01 +
-					      ((c11 >> 16) & 0xffU) * w11 + 32768U) >> 16;
-				uint32_t g = (((c00 >> 8) & 0xffU) * w00 +
-					      ((c10 >> 8) & 0xffU) * w10 +
-					      ((c01 >> 8) & 0xffU) * w01 +
-					      ((c11 >> 8) & 0xffU) * w11 + 32768U) >> 16;
-				uint32_t b = ((c00 & 0xffU) * w00 +
-					      (c10 & 0xffU) * w10 +
-					      (c01 & 0xffU) * w01 +
-					      (c11 & 0xffU) * w11 + 32768U) >> 16;
-				sample = 0xff000000U | (r << 16) | (g << 8) | b;
-			}
-			uint32_t a = rounded_rect_cov255(px, py, w, h, radius);
-
-			if (a == 255)
-				row[sx] = sample;
-			else if (a > 0)
-				row[sx] = blend_pixel(row[sx], sample, a);
-		}
-	}
-	shell_display_damage(x, y, w, h);
+	shell_draw_rounded_bitmap_stride(x, y, w, h, w, radius, pixels, zoom_slightly);
 }
 
 void shell_draw_circle_alpha(int cx, int cy, int r, uint32_t color, uint8_t alpha)

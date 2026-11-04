@@ -193,6 +193,9 @@ void shell_draw_shimmer_bar(int x, int y, int w, int h, int radius,
 void shell_draw_bitmap_xrgb(int x, int y, int w, int h, const uint32_t *pixels);
 void shell_draw_rounded_bitmap(int x, int y, int w, int h, int radius,
 			       const uint32_t *pixels, bool zoom_slightly);
+void shell_draw_rounded_bitmap_stride(int x, int y, int w, int h, int stride,
+				      int radius, const uint32_t *pixels,
+				      bool zoom_slightly);
 void shell_draw_circle_alpha(int cx, int cy, int r, uint32_t color, uint8_t alpha);
 void shell_draw_symbol(enum shell_symbol_id sym, int x, int y, int size, uint32_t fg);
 
@@ -236,6 +239,9 @@ void shell_media_init(void);
 void shell_media_free(void);
 const uint32_t *shell_media_get_card_art(const struct giri_media_card *card,
 					 int w, int h);
+const uint32_t *shell_media_get_card_art_fast(const struct giri_media_card *card,
+					      int w, int h, bool *is_final_out);
+bool shell_media_preload_next_card(const struct giri_screen *scr);
 const uint32_t *shell_media_get_fullscreen_art(const struct giri_media_card *card);
 const uint32_t *shell_media_get_video_frame(const struct giri_media_card *card,
 					    int frame_idx);

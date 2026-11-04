@@ -10,6 +10,9 @@
  */
 
 #include <ctype.h>
+#ifdef __ARM_NEON
+#include <arm_neon.h>
+#endif
 #include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
@@ -20,8 +23,8 @@
 #include "tvshell.h"
 #include "shell_assets.h"
 
-#define SUB		64
-#define SAMPLES		16
+#define SUB		32
+#define SAMPLES		4
 
 struct ttf_font {
 	uint8_t *data;
@@ -327,7 +330,7 @@ static void flatten_quad_to_buf(float x0, float y0, float x1, float y1,
 				float x2, float y2, float *xs, float *ys,
 				int *count, int max_pts)
 {
-	int steps = 32, i;
+	int steps = 5, i;
 
 	for (i = 1; i <= steps && *count < max_pts; i++) {
 		float t = (float)i / (float)steps;
@@ -362,14 +365,11 @@ static void ttf_extract_glyph_polys(const struct ttf_font *f, uint16_t glyph_id,
 		if (npts == 0 || npts > 2048 || p >= end_g)
 			return;
 
-		uint8_t *flags = malloc(npts);
-		int16_t *raw_x = malloc((size_t)npts * sizeof(int16_t));
-		int16_t *raw_y = malloc((size_t)npts * sizeof(int16_t));
-		float *cxs = malloc(4096 * sizeof(float));
-		float *cys = malloc(4096 * sizeof(float));
-
-		if (!flags || !raw_x || !raw_y || !cxs || !cys)
-			goto out_simple;
+		uint8_t flags[2048];
+		int16_t raw_x[2048];
+		int16_t raw_y[2048];
+		float cxs[2048];
+		float cys[2048];
 
 		uint16_t idx = 0;
 
@@ -480,9 +480,9 @@ static void ttf_extract_glyph_polys(const struct ttf_font *f, uint16_t glyph_id,
 				if (on) {
 					if (have_ctrl) {
 						flatten_quad_to_buf(cur_x, cur_y, ctrl_x, ctrl_y,
-								    px, py, cxs, cys, &out_n, 4090);
+								    px, py, cxs, cys, &out_n, 2040);
 						have_ctrl = false;
-					} else if (out_n < 4090) {
+					} else if (out_n < 2040) {
 						cxs[out_n] = px;
 						cys[out_n] = py;
 						out_n++;
@@ -495,7 +495,7 @@ static void ttf_extract_glyph_polys(const struct ttf_font *f, uint16_t glyph_id,
 						float my = 0.5f * (ctrl_y + py);
 
 						flatten_quad_to_buf(cur_x, cur_y, ctrl_x, ctrl_y,
-								    mx, my, cxs, cys, &out_n, 4090);
+								    mx, my, cxs, cys, &out_n, 2040);
 						cur_x = mx;
 						cur_y = my;
 					}
@@ -506,7 +506,7 @@ static void ttf_extract_glyph_polys(const struct ttf_font *f, uint16_t glyph_id,
 			}
 			if (have_ctrl) {
 				flatten_quad_to_buf(cur_x, cur_y, ctrl_x, ctrl_y,
-						    start_x, start_y, cxs, cys, &out_n, 4090);
+						    start_x, start_y, cxs, cys, &out_n, 2040);
 			}
 			#undef TX
 			#undef TY
@@ -514,13 +514,6 @@ static void ttf_extract_glyph_polys(const struct ttf_font *f, uint16_t glyph_id,
 			poly_add_contour(pl, cxs, cys, out_n);
 			start_pt = end_pt + 1;
 		}
-
-out_simple:
-		free(flags);
-		free(raw_x);
-		free(raw_y);
-		free(cxs);
-		free(cys);
 	} else if (ncontours < 0) {
 		/* Compound glyph */
 		const uint8_t *p = g + 10;
@@ -866,7 +859,7 @@ static struct glyph_entry *rasterize_glyph(enum shell_font_role role, int size_p
 		pl.pts[i].y -= py0 * SUB;
 	}
 
-	uint16_t *row_cov = calloc((size_t)gw, sizeof(uint16_t));
+	uint16_t row_cov[256];
 	struct {
 		int32_t x;
 		int dir;
@@ -885,13 +878,13 @@ static struct glyph_entry *rasterize_glyph(enum shell_font_role role, int size_p
 
 				for (k = 0; k < clen; k++) {
 					struct poly_pt a = pl.pts[pt_base + k];
-					struct poly_pt b = pl.pts[pt_base + ((k + 1) % clen)];
+					struct poly_pt b = pl.pts[pt_base + ((k + 1 == clen) ? 0 : (k + 1))];
 					int32_t ylo = a.y < b.y ? a.y : b.y;
 					int32_t yhi = a.y < b.y ? b.y : a.y;
 
 					if (sy < ylo || sy >= yhi || ncr >= 128)
 						continue;
-					int32_t cx = a.x + (int32_t)(((int64_t)(sy - a.y) * (b.x - a.x)) / (b.y - a.y));
+					int32_t cx = a.x + ((sy - a.y) * (b.x - a.x)) / (b.y - a.y);
 					int dir = (b.y > a.y) ? 1 : -1;
 					int m = ncr++;
 
@@ -915,8 +908,8 @@ static struct glyph_entry *rasterize_glyph(enum shell_font_role role, int size_p
 
 					if (xa >= xb)
 						continue;
-					int pa = xa / SUB;
-					int pb = xb / SUB;
+					int pa = xa >> 5;
+					int pb = xb >> 5;
 
 					if (pa == pb) {
 						row_cov[pa] += (uint16_t)(xb - xa);
@@ -932,15 +925,18 @@ static struct glyph_entry *rasterize_glyph(enum shell_font_role role, int size_p
 			}
 		}
 		for (i = 0; i < gw; i++) {
-			uint32_t v = (row_cov[i] * 255 + (SUB * SAMPLES / 2)) / (SUB * SAMPLES);
+			uint32_t v = ((uint32_t)row_cov[i] * 255U + 64U) >> 7;
 
-			if (v > 255)
-				v = 255;
+			if (v > 255U)
+				v = 255U;
+			/* Bake contrast-preserving gamma boost once at rasterization time */
+			v += (v * (255U - v)) >> 9;
+			if (v > 255U)
+				v = 255U;
 			ge->bitmap[y * gw + i] = (uint8_t)v;
 		}
 	}
 
-	free(row_cov);
 	free(pl.pts);
 	free(pl.contour_len);
 	return ge;
@@ -1028,30 +1024,40 @@ int shell_font_init(void)
 		(void)ttf_load_file(&fonts[r], path);
 	}
 
-	/* Pre-warm common v1.2 sizes */
+	/* Pre-warm all UI sizes so interactive navigation and modals never miss cache */
 	static const struct {
 		enum shell_font_role role;
 		int size_px;
 	} warmup[] = {
-		{ SHELL_FONT_SANS_BOLD,     22 },
-		{ SHELL_FONT_SANS_SEMIBOLD, 20 },
-		{ SHELL_FONT_SANS_BOLD,     21 },
-		{ SHELL_FONT_SANS_MEDIUM,   18 },
-		{ SHELL_FONT_MONO_MEDIUM,   13 },
-		{ SHELL_FONT_SANS_BOLD,     17 },
-		{ SHELL_FONT_SANS_MEDIUM,   13 },
-		{ SHELL_FONT_MONO_SEMIBOLD, 11 },
-		{ SHELL_FONT_MONO_SEMIBOLD, 12 },
-		{ SHELL_FONT_SANS_SEMIBOLD, 14 },
 		{ SHELL_FONT_SANS_BOLD,     24 },
-		{ SHELL_FONT_SANS_BOLD,     28 },
+		{ SHELL_FONT_SANS_BOLD,     22 },
+		{ SHELL_FONT_SANS_BOLD,     21 },
+		{ SHELL_FONT_SANS_BOLD,     18 },
+		{ SHELL_FONT_SANS_BOLD,     17 },
+		{ SHELL_FONT_SANS_BOLD,     15 },
+		{ SHELL_FONT_SANS_SEMIBOLD, 20 },
+		{ SHELL_FONT_SANS_SEMIBOLD, 19 },
+		{ SHELL_FONT_SANS_SEMIBOLD, 14 },
+		{ SHELL_FONT_SANS_MEDIUM,   18 },
+		{ SHELL_FONT_SANS_MEDIUM,   15 },
+		{ SHELL_FONT_SANS_MEDIUM,   13 },
+		{ SHELL_FONT_SANS_MEDIUM,   11 },
+		{ SHELL_FONT_MONO_SEMIBOLD, 12 },
+		{ SHELL_FONT_MONO_SEMIBOLD, 11 },
+		{ SHELL_FONT_MONO_MEDIUM,   13 },
+		{ SHELL_FONT_MONO_MEDIUM,   11 },
 	};
-	size_t wi;
+	static const uint32_t special_cps[] = {
+		0x21B5, 0x2014, 0x2013, 0x00B7, 0x00D7, 0x2026
+	};
+	size_t wi, si;
 	uint32_t cp;
 
 	for (wi = 0; wi < sizeof(warmup) / sizeof(warmup[0]); wi++) {
-		for (cp = 32; cp <= 126; cp++)
+		for (cp = 32; cp <= 122; cp++)
 			(void)get_glyph(warmup[wi].role, warmup[wi].size_px, cp);
+		for (si = 0; si < sizeof(special_cps) / sizeof(special_cps[0]); si++)
+			(void)get_glyph(warmup[wi].role, warmup[wi].size_px, special_cps[si]);
 	}
 	return 0;
 }
@@ -1108,14 +1114,25 @@ static void blit_glyph(const struct glyph_entry *ge, int pen_x, int baseline_y,
 {
 	uint32_t *fb = shell_display_backbuffer();
 	int py, px;
-	uint32_t fg_rl, fg_gl, fg_bl;
+	uint32_t fg_opaque, fg_rb, fg_g;
+	int x0, gw;
 
 	if (!ge || !ge->bitmap || !fb)
 		return;
 
-	fg_rl = shell_srgb_to_linear[(fg >> 16) & 0xffU];
-	fg_gl = shell_srgb_to_linear[(fg >> 8) & 0xffU];
-	fg_bl = shell_srgb_to_linear[fg & 0xffU];
+	fg_opaque = fg | 0xff000000U;
+	fg_rb = fg & 0x00ff00ffU;
+	fg_g  = fg & 0x0000ff00U;
+	x0 = pen_x + ge->xoff;
+	gw = (int)ge->w;
+
+#ifdef __ARM_NEON
+	uint8x8_t fg_b_v = vdup_n_u8((uint8_t)(fg & 0xffU));
+	uint8x8_t fg_g_v = vdup_n_u8((uint8_t)((fg >> 8) & 0xffU));
+	uint8x8_t fg_r_v = vdup_n_u8((uint8_t)((fg >> 16) & 0xffU));
+	uint8x8_t ff_v   = vdup_n_u8(0xffU);
+	bool inside_x    = (x0 >= 0 && x0 + gw <= SHELL_SCREEN_W);
+#endif
 
 	for (py = 0; py < (int)ge->h; py++) {
 		int rel_y = ge->yoff + py;
@@ -1124,39 +1141,46 @@ static void blit_glyph(const struct glyph_entry *ge, int pen_x, int baseline_y,
 		if (sy < 0 || sy >= SHELL_SCREEN_H)
 			continue;
 		uint32_t *row = fb + sy * SHELL_SCREEN_W;
+		const uint8_t *grow = ge->bitmap + py * gw;
 
-		for (px = 0; px < (int)ge->w; px++) {
-			uint8_t a255 = ge->bitmap[py * ge->w + px];
+		px = 0;
+#ifdef __ARM_NEON
+		if (inside_x) {
+			for (; px + 8 <= gw; px += 8) {
+				uint8x8_t a8 = vld1_u8(grow + px);
+
+				if (vget_lane_u64(vreinterpret_u64_u8(a8), 0) == 0)
+					continue;
+				uint8x8_t inv_a = vmvn_u8(a8);
+				uint8x8x4_t d = vld4_u8((const uint8_t *)(row + x0 + px));
+
+				d.val[0] = vrshrn_n_u16(vmlal_u8(vmull_u8(fg_b_v, a8), d.val[0], inv_a), 8);
+				d.val[1] = vrshrn_n_u16(vmlal_u8(vmull_u8(fg_g_v, a8), d.val[1], inv_a), 8);
+				d.val[2] = vrshrn_n_u16(vmlal_u8(vmull_u8(fg_r_v, a8), d.val[2], inv_a), 8);
+				d.val[3] = ff_v;
+				vst4_u8((uint8_t *)(row + x0 + px), d);
+			}
+		}
+#endif
+		for (; px < gw; px++) {
+			uint32_t a255 = grow[px];
 			int sx;
 
 			if (!a255)
 				continue;
-			sx = pen_x + ge->xoff + px;
+			sx = x0 + px;
 			if (sx < 0 || sx >= SHELL_SCREEN_W)
 				continue;
 			if (a255 == 255) {
-				row[sx] = fg | 0xff000000U;
+				row[sx] = fg_opaque;
 			} else {
-				uint32_t a = a255;
-				uint32_t inv_a = 255U - a;
+				uint32_t a = a255 + (a255 >> 7);
+				uint32_t inv_a = 256U - a;
 				uint32_t dst = row[sx];
-				uint32_t rl = (shell_srgb_to_linear[(dst >> 16) & 0xffU] * inv_a +
-					       fg_rl * a + 127U) / 255U;
-				uint32_t gl = (shell_srgb_to_linear[(dst >> 8) & 0xffU] * inv_a +
-					       fg_gl * a + 127U) / 255U;
-				uint32_t bl = (shell_srgb_to_linear[dst & 0xffU] * inv_a +
-					       fg_bl * a + 127U) / 255U;
-				if (rl > 4095U)
-					rl = 4095U;
-				if (gl > 4095U)
-					gl = 4095U;
-				if (bl > 4095U)
-					bl = 4095U;
+				uint32_t rb = (((dst & 0x00ff00ffU) * inv_a + fg_rb * a) >> 8) & 0x00ff00ffU;
+				uint32_t g  = (((dst & 0x0000ff00U) * inv_a + fg_g * a) >> 8) & 0x0000ff00U;
 
-				row[sx] = 0xff000000U |
-					  ((uint32_t)shell_lin_to_srgb[rl] << 16) |
-					  ((uint32_t)shell_lin_to_srgb[gl] << 8) |
-					  (uint32_t)shell_lin_to_srgb[bl];
+				row[sx] = 0xff000000U | rb | g;
 			}
 		}
 	}
@@ -1176,14 +1200,13 @@ static int draw_role_at_baseline(enum shell_font_role role, int size_px,
 		return 0;
 
 	while ((cp = utf8_next(&p)) != 0) {
-		uint8_t phase = (uint8_t)((pen_x_q6 >> 4) & 3);
-		struct glyph_entry *ge = get_glyph_phased(role, size_px, cp, phase);
+		struct glyph_entry *ge = get_glyph_phased(role, size_px, cp, 0);
 
 		if (!ge)
 			continue;
 		if (max_w_q6 > 0 && (pen_x_q6 - start_x_q6) + ge->advance_q6 > max_w_q6)
 			break;
-		blit_glyph(ge, pen_x_q6 >> 6, baseline_y, fg);
+		blit_glyph(ge, (pen_x_q6 + 32) >> 6, baseline_y, fg);
 		pen_x_q6 += ge->advance_q6;
 	}
 

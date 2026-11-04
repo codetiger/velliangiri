@@ -32,8 +32,8 @@
 
 #define MAX_EVDEVS		16
 #define SHELL_MENU_HOLD_MS	2000ULL
-#define SHELL_DPAD_REPEAT_DELAY	350ULL
-#define SHELL_DPAD_REPEAT_RATE	160ULL
+#define SHELL_DPAD_REPEAT_DELAY	260ULL
+#define SHELL_DPAD_REPEAT_RATE	110ULL
 
 struct evdev_slot {
 	int fd;
@@ -268,18 +268,19 @@ static bool translate_ev_key(const struct evdev_slot *slot,
 
 	uint64_t now = shell_now_ms();
 
-	/* Track 2-second Menu hold across press (1), repeat (2), and release (0) */
+	/*
+	 * Emit SHELL_KEY_MENU immediately on key-down (0ms latency for closing
+	 * modals or navigating back), while tracking a continuous 2-second hold
+	 * across repeats (value == 2) to emit SHELL_KEY_MENU_HOLD (returns to
+	 * Home Screen or terminates external apps in shell_app_run).
+	 */
 	if (ie->code == KEY_MENU || (!slot->is_keyboard && ie->code == KEY_ESC)) {
 		if (ie->value == 1 || (ie->value == 2 && is_new_ir_press)) {
-			bool rapid_retap = inp.menu_down && !inp.menu_hold_fired;
 			inp.menu_down = true;
 			inp.menu_hold_fired = false;
 			inp.menu_down_ms = now;
-			if (rapid_retap) {
-				out->key = SHELL_KEY_MENU;
-				return true;
-			}
-			return false;
+			out->key = SHELL_KEY_MENU;
+			return true;
 		} else if (ie->value == 2 && inp.menu_down) {
 			if (!inp.menu_hold_fired &&
 			    now - inp.menu_down_ms >= SHELL_MENU_HOLD_MS) {
@@ -288,14 +289,9 @@ static bool translate_ev_key(const struct evdev_slot *slot,
 				return true;
 			}
 			return false;
-		} else if (ie->value == 0 && inp.menu_down) {
-			bool emit_click = !inp.menu_hold_fired;
+		} else if (ie->value == 0) {
 			inp.menu_down = false;
 			inp.menu_hold_fired = false;
-			if (emit_click) {
-				out->key = SHELL_KEY_MENU;
-				return true;
-			}
 			return false;
 		}
 		return false;

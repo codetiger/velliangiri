@@ -34,7 +34,7 @@ fi
 
 echo "==> compiling tvshell with ${CC_BIN}"
 "${CC_BIN}" \
-	-O2 -mcpu=cortex-a9 -mfpu=neon \
+	-O3 -mcpu=cortex-a9 -mfpu=neon \
 	-Wall -Wextra -Werror \
 	-static -D_GNU_SOURCE \
 	-I"${ROOT}/tools/tvshell" \
