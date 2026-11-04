@@ -49,7 +49,7 @@ static const struct quick_prompt quick_prompts[QUICK_PROMPTS_COUNT] = {
 	{ "What is the weather right now?", "What is the weather right now?" },
 	{ "Search widescreen videos", "Search widescreen videos and streams" },
 	{ "Tell me about the Western Ghats", "Tell me about the Western Ghats" },
-	{ "Watch photos and videos on this device", "Watch photos and videos on this device" },
+	{ "Open Media Gallery", "Open Media Gallery" },
 	{ "Play Doom", "Play Doom" },
 };
 
@@ -677,6 +677,20 @@ static void load_apps_catalog(void)
 {
 	static const struct giri_app_info fallback_apps[4] = {
 		{
+			.id = "gallery",
+			.name = "Media Gallery",
+			.subtitle = "Photos & 720p Videos on Device",
+			.badge = "APP",
+			.meta_pill = "OPEN",
+			.version = "1.2",
+			.size_label = "640 KB",
+			.binary_path = "/bin/media-gallery",
+			.preset_art = GIRI_ART_MONSOON_VIDEO,
+			.installed = true,
+			.progress = 100,
+			.description = "Dedicated fullscreen 1280x720 Media Gallery for browsing and playing all photos and 720p videos stored in the device gallery folder.",
+		},
+		{
 			.id = "doom",
 			.name = "Doom (1993)",
 			.subtitle = "Installed · Direct Fullscreen Launch",
@@ -717,20 +731,6 @@ static void load_apps_catalog(void)
 			.installed = false,
 			.progress = 0,
 			.description = "Regional Tamil and English public radio streams, classical concerts, and hill weather bulletins.",
-		},
-		{
-			.id = "monsoon_radar",
-			.name = "Monsoon Radar",
-			.subtitle = "Noyyal Basin & Siruvani Dam Telemetry",
-			.badge = "UTILITY",
-			.meta_pill = "1.8 MB",
-			.version = "1.1",
-			.size_label = "1.8 MB",
-			.binary_path = "/usr/bin/monsoon-radar",
-			.preset_art = GIRI_ART_WEATHER_SKY,
-			.installed = false,
-			.progress = 0,
-			.description = "Live rainfall accumulation, reservoir inflow charts, and Western Ghats pass visibility.",
 		},
 	};
 
@@ -810,7 +810,10 @@ static void set_standard_footer(struct giri_screen *scr,
 	scr->footer_links[1].symbol = ctx1_sym;
 	snprintf(scr->footer_links[1].action.type, sizeof(scr->footer_links[1].action.type), "%s", ctx1_type);
 	snprintf(scr->footer_links[1].action.capability, sizeof(scr->footer_links[1].action.capability), "%s", ctx1_cap);
-	snprintf(scr->footer_links[1].action.query, sizeof(scr->footer_links[1].action.query), "%s", ctx1_query);
+	if (strcmp(ctx1_type, "launch_app") == 0)
+		snprintf(scr->footer_links[1].action.app_id, sizeof(scr->footer_links[1].action.app_id), "%s", ctx1_query);
+	else
+		snprintf(scr->footer_links[1].action.query, sizeof(scr->footer_links[1].action.query), "%s", ctx1_query);
 
 	/* [2] Contextual Follow-Up 2 */
 	snprintf(scr->footer_links[2].id, sizeof(scr->footer_links[2].id), "btn_ctx_2");
@@ -819,7 +822,10 @@ static void set_standard_footer(struct giri_screen *scr,
 	scr->footer_links[2].symbol = ctx2_sym;
 	snprintf(scr->footer_links[2].action.type, sizeof(scr->footer_links[2].action.type), "%s", ctx2_type);
 	snprintf(scr->footer_links[2].action.capability, sizeof(scr->footer_links[2].action.capability), "%s", ctx2_cap);
-	snprintf(scr->footer_links[2].action.query, sizeof(scr->footer_links[2].action.query), "%s", ctx2_query);
+	if (strcmp(ctx2_type, "launch_app") == 0)
+		snprintf(scr->footer_links[2].action.app_id, sizeof(scr->footer_links[2].action.app_id), "%s", ctx2_query);
+	else
+		snprintf(scr->footer_links[2].action.query, sizeof(scr->footer_links[2].action.query), "%s", ctx2_query);
 
 	/* [3] Fixed Bottom-Right: Settings */
 	snprintf(scr->footer_links[3].id, sizeof(scr->footer_links[3].id), "btn_settings");
@@ -879,17 +885,18 @@ static void build_home_screen(struct giri_screen *scr)
 	snprintf(scr->media_cards[1].action.query, sizeof(scr->media_cards[1].action.query), "What is the weather right now?");
 	derive_card_action_label(&scr->media_cards[1]);
 
-	/* Card 2: Search Videos */
-	snprintf(scr->media_cards[2].id, sizeof(scr->media_cards[2].id), "card_home_videos");
-	snprintf(scr->media_cards[2].title, sizeof(scr->media_cards[2].title), "Search Videos");
-	snprintf(scr->media_cards[2].subtitle, sizeof(scr->media_cards[2].subtitle), "Watch Widescreen Streams & Clips");
-	snprintf(scr->media_cards[2].badge, sizeof(scr->media_cards[2].badge), "VIDEOS");
-	snprintf(scr->media_cards[2].meta_pill, sizeof(scr->media_cards[2].meta_pill), "720P");
-	scr->media_cards[2].kind = GIRI_CARD_PAGE_VIDEO;
+	/* Card 2: Media Gallery (Separate Fullscreen App) */
+	snprintf(scr->media_cards[2].id, sizeof(scr->media_cards[2].id), "card_home_gallery");
+	snprintf(scr->media_cards[2].title, sizeof(scr->media_cards[2].title), "Media Gallery");
+	snprintf(scr->media_cards[2].subtitle, sizeof(scr->media_cards[2].subtitle), "Photos & 720p Videos on Device");
+	snprintf(scr->media_cards[2].badge, sizeof(scr->media_cards[2].badge), "GALLERY");
+	snprintf(scr->media_cards[2].meta_pill, sizeof(scr->media_cards[2].meta_pill), "OPEN");
+	scr->media_cards[2].kind = GIRI_CARD_APP_ICON;
 	scr->media_cards[2].preset_art = GIRI_ART_MONSOON_VIDEO;
-	snprintf(scr->media_cards[2].action.type, sizeof(scr->media_cards[2].action.type), "show_screen");
-	snprintf(scr->media_cards[2].action.capability, sizeof(scr->media_cards[2].action.capability), "media.get_library");
-	snprintf(scr->media_cards[2].action.query, sizeof(scr->media_cards[2].action.query), "Search widescreen videos and streams");
+	snprintf(scr->media_cards[2].uri, sizeof(scr->media_cards[2].uri), "GX016305.mov");
+	snprintf(scr->media_cards[2].action.type, sizeof(scr->media_cards[2].action.type), "launch_app");
+	snprintf(scr->media_cards[2].action.capability, sizeof(scr->media_cards[2].action.capability), "apps.launch");
+	snprintf(scr->media_cards[2].action.app_id, sizeof(scr->media_cards[2].action.app_id), "gallery");
 	derive_card_action_label(&scr->media_cards[2]);
 
 	/* Card 3: Play Doom */
@@ -906,8 +913,8 @@ static void build_home_screen(struct giri_screen *scr)
 	derive_card_action_label(&scr->media_cards[3]);
 
 	set_standard_footer(scr,
-		"Watch photos and videos on this device", SHELL_SYM_IMAGE,
-		"show_screen", "media.get_library", "Watch photos and videos on this device",
+		"Open Media Gallery on this device", SHELL_SYM_IMAGE,
+		"launch_app", "apps.launch", "gallery",
 		"Explore science and space discoveries", SHELL_SYM_GLOBE,
 		"ask_giri", "internet.search_and_extract", "What is top in BBC Science news?");
 }
@@ -1158,29 +1165,64 @@ static void build_topic_screen(const char *query, struct giri_screen *scr)
 			      "Trekkers gather at the historic Poondi foothills temple with bamboo walking sticks before ascending the seven hills.");
 
 		set_standard_footer(scr,
-			"Watch photos and videos on this device", SHELL_SYM_IMAGE,
-			"show_screen", "media.get_library", "Watch photos and videos on this device",
+			"Open Media Gallery on this device", SHELL_SYM_IMAGE,
+			"launch_app", "apps.launch", "gallery",
 			"What is the weather right now?", SHELL_SYM_SPARK,
 			"ask_giri", "internet.search_and_extract", "What is the weather right now?");
 		return;
 	}
 
-	if (strcasestr(query, "video") || strcasestr(query, "photo") ||
-	    strcasestr(query, "device") || strcasestr(query, "gallery")) {
-		populate_gallery_screen(scr, g_ui.gallery_page);
+	if (strcasestr(query, "video") || strcasestr(query, "stream")) {
+		snprintf(scr->screen_id, sizeof(scr->screen_id), "screen_video_streams");
+		snprintf(scr->page_type, sizeof(scr->page_type), "media");
+		snprintf(scr->prompt_title, sizeof(scr->prompt_title), "Widescreen Videos & Nature Streams");
+		snprintf(scr->summary.title, sizeof(scr->summary.title),
+			 "1280×720 Widescreen Nature Streams & Atmospheric Time-Lapses");
+		snprintf(scr->summary.text, sizeof(scr->summary.text),
+			 "Explore curated 1280×720 nature time-lapses from the Western Ghats, or open the dedicated Media Gallery app below to browse and play all photos and 720p videos stored on this device.");
+		snprintf(scr->summary.source_caption, sizeof(scr->summary.source_caption),
+			 "Velliangiri OS · Widescreen Streams");
+
+		fill_card_uri(&scr->media_cards[0], "vid_1", "Dawn Over Seventh Hill",
+			      "Golden Hour Ridge Time-Lapse", "VIDEO", "00:15",
+			      GIRI_CARD_PAGE_VIDEO, GIRI_ART_DAWN_RIDGE, "dawn_ridge.jpg",
+			      "play_video", "media.play_video", "Dawn Over Seventh Hill",
+			      "Widescreen 720p time-lapse capturing first light breaking across the seven hills of Velliangiri.");
+		fill_card_uri(&scr->media_cards[1], "vid_2", "Siruvani Gorge Cascade",
+			      "High-Altitude Forest Waterfall", "VIDEO", "00:18",
+			      GIRI_CARD_PAGE_VIDEO, GIRI_ART_WATERFALL_VIDEO, "waterfall_video.jpg",
+			      "play_video", "media.play_video", "Siruvani Gorge Cascade",
+			      "Crystal-clear mountain streams plunging down twin granite cliffs in the Western Ghats.");
+		fill_card_uri(&scr->media_cards[2], "vid_3", "Monsoon Cloud Sweep",
+			      "Palghat Gap Atmospheric Flow", "STREAM", "00:15",
+			      GIRI_CARD_PAGE_VIDEO, GIRI_ART_MONSOON_VIDEO, "monsoon_video.jpg",
+			      "play_video", "media.play_video", "Monsoon Cloud Sweep",
+			      "Dramatic southwest monsoon clouds rolling across the shola canopy and foothill valleys.");
+		fill_card_uri(&scr->media_cards[3], "card_open_gallery", "Media Gallery",
+			      "Photos & 720p Videos on Device", "GALLERY", "OPEN",
+			      GIRI_CARD_APP_ICON, GIRI_ART_MONSOON_VIDEO, "GX016305.mov",
+			      "launch_app", "apps.launch", "gallery",
+			      "Launch the standalone fullscreen Media Gallery app to browse all device photos and 720p videos.");
+
+		set_standard_footer(scr,
+			"Open Media Gallery on this device", SHELL_SYM_IMAGE,
+			"launch_app", "apps.launch", "gallery",
+			"Explore apps and Play Doom on TV", SHELL_SYM_GAME,
+			"ask_giri", "apps.list_and_install", "Play Doom");
 		return;
 	}
 
-	if (strcasestr(query, "doom") || strcasestr(query, "app") || strcasestr(query, "game")) {
+	if (strcasestr(query, "doom") || strcasestr(query, "app") ||
+	    strcasestr(query, "game") || strcasestr(query, "gallery")) {
 		int i;
 
 		snprintf(scr->screen_id, sizeof(scr->screen_id), "screen_apps_catalog");
 		snprintf(scr->page_type, sizeof(scr->page_type), "apps");
 		snprintf(scr->prompt_title, sizeof(scr->prompt_title), "Apps & Games on Velliangiri OS");
 		snprintf(scr->summary.title, sizeof(scr->summary.title),
-			 "On-Device TV Apps & Direct Fullscreen Doom (apps.json)");
+			 "On-Device TV Apps · Media Gallery & Fullscreen Doom (apps.json)");
 		snprintf(scr->summary.text, sizeof(scr->summary.text),
-			 "Launch installed native applications directly in 1280×720 fullscreen with automatic 6-button remote mapping. Hold the Menu button for 2 seconds at any time inside an external game to return to Giri.");
+			 "Launch installed native applications directly in 1280×720 fullscreen. Select Media Gallery to browse all on-device photos and 720p videos, or hold Menu for 2 seconds inside any app to return to Giri.");
 		snprintf(scr->summary.source_caption, sizeof(scr->summary.source_caption),
 			 "Velliangiri OS · On-Device App Catalog");
 
@@ -1197,8 +1239,8 @@ static void build_topic_screen(const char *query, struct giri_screen *scr)
 		}
 
 		set_standard_footer(scr,
-			"Watch photos and videos on this device", SHELL_SYM_IMAGE,
-			"show_screen", "media.get_library", "Watch photos and videos on this device",
+			"Open Media Gallery on this device", SHELL_SYM_IMAGE,
+			"launch_app", "apps.launch", "gallery",
 			"What is top in the news on BBC?", SHELL_SYM_GLOBE,
 			"ask_giri", "internet.search_and_extract", "What is top in the news on BBC?");
 		return;
@@ -2286,9 +2328,33 @@ static void render_frame(void)
  * 5. Action Execution & 6-Button Remote Navigation State Machine
  * ========================================================================= */
 
+static bool launch_media_gallery_app(void)
+{
+	g_ui.tts_speaking = false;
+	g_ui.is_working = false;
+	g_ui.has_pending_screen = false;
+	g_ui.main_bg_valid = false;
+	g_ui.backbuf_modal_win = -1;
+
+	/*
+	 * Run the Media Gallery app directly on the active DRM/V4L2/FreeType
+	 * session so there is zero DRM master drop and zero fbcon TUI flash.
+	 */
+	media_gallery_run(g_ui.theme_id);
+	mark_full_redraw();
+	return true;
+}
+
 static void start_topic_transition(const char *query)
 {
 	bool was_main = (g_ui.active_win == GIRI_WIN_MAIN);
+
+	if (query && (strcasestr(query, "gallery") ||
+		      strcasestr(query, "on this device") ||
+		      strcasestr(query, "photo"))) {
+		if (launch_media_gallery_app())
+			return;
+	}
 
 	g_ui.active_win = GIRI_WIN_MAIN;
 	g_ui.tts_speaking = false;
@@ -2465,8 +2531,19 @@ static void execute_action(const struct giri_action *act, const struct giri_medi
 		return;
 	}
 
+	if (strcmp(act->capability, "media.get_library") == 0) {
+		if (launch_media_gallery_app())
+			return;
+	}
+
 	if (strcmp(act->type, "launch_app") == 0 ||
 	    strcmp(act->capability, "apps.launch") == 0) {
+		if ((strcmp(act->app_id, "gallery") == 0 ||
+		     strcmp(act->app_id, "media_gallery") == 0 ||
+		     (card && strcasestr(card->title, "Gallery") != NULL)) &&
+		    launch_media_gallery_app()) {
+			return;
+		}
 		/* If /bin/doom exists on target TV, launch it directly with game_map=1 */
 		if (strcmp(act->app_id, "doom") == 0 && access("/bin/doom", X_OK) == 0) {
 			const char *const argv[] = { "/bin/doom", NULL };

@@ -138,6 +138,8 @@ static const uint8_t bayer4x4[16] = {
 	15,  7, 13,  5,
 };
 
+#define SHELL_DRM_BUF_COUNT		3
+
 struct drm_scanout_buf {
 	uint32_t handle;
 	uint32_t fb_id;
@@ -154,7 +156,7 @@ static struct {
 	uint32_t conn_id;
 	uint32_t crtc_id;
 	uint32_t fb_id;
-	struct drm_scanout_buf bufs[2];
+	struct drm_scanout_buf bufs[SHELL_DRM_BUF_COUNT];
 	int active_buf;
 	struct drm_mode_modeinfo mode_720p30;
 	bool have_mode;
@@ -172,6 +174,7 @@ static struct {
 	.fb_fd = -1,
 	.tty_fd = -1,
 	.bufs = {
+		{ .dmabuf_fd = -1 },
 		{ .dmabuf_fd = -1 },
 		{ .dmabuf_fd = -1 },
 	},
@@ -488,7 +491,7 @@ static int setup_drm_scanout(void)
 	if (disp.drm_fd < 0)
 		return -1;
 
-	for (i = 0; i < 2; i++) {
+	for (i = 0; i < SHELL_DRM_BUF_COUNT; i++) {
 		struct drm_mode_create_dumb creq = { 0 };
 		struct drm_mode_fb_cmd fbcmd = { 0 };
 		struct drm_mode_map_dumb mreq = { 0 };
@@ -551,8 +554,8 @@ static int setup_drm_scanout(void)
 	return 0;
 
 err:
-	destroy_drm_buf(0);
-	destroy_drm_buf(1);
+	for (i = 0; i < SHELL_DRM_BUF_COUNT; i++)
+		destroy_drm_buf(i);
 	close(disp.drm_fd);
 	disp.drm_fd = -1;
 	return -1;
@@ -656,8 +659,10 @@ void shell_display_close(void)
 		disp.tty_fd = -1;
 	}
 	if (disp.use_drm && disp.drm_fd >= 0) {
-		destroy_drm_buf(0);
-		destroy_drm_buf(1);
+		int i;
+
+		for (i = 0; i < SHELL_DRM_BUF_COUNT; i++)
+			destroy_drm_buf(i);
 		disp.scanout = NULL;
 		(void)ioctl(disp.drm_fd, DRM_IOCTL_DROP_MASTER, 0);
 		close(disp.drm_fd);
@@ -760,20 +765,23 @@ void shell_display_present(void)
 
 int shell_display_get_video_dmabuf(int buf_idx)
 {
-	if (buf_idx < 0 || buf_idx > 1 || !disp.use_drm)
+	if (buf_idx < 0 || buf_idx >= SHELL_DRM_BUF_COUNT || !disp.use_drm)
 		return -1;
 	return disp.bufs[buf_idx].dmabuf_fd;
 }
 
 int shell_display_prepare_video_backbuf(int *out_dmabuf_fd)
 {
-	int back;
+	int back, i;
 
-	if (disp.headless || !disp.use_drm || disp.drm_fd < 0 ||
-	    disp.bufs[0].dmabuf_fd < 0 || disp.bufs[1].dmabuf_fd < 0)
+	if (disp.headless || !disp.use_drm || disp.drm_fd < 0)
 		return -1;
+	for (i = 0; i < SHELL_DRM_BUF_COUNT; i++) {
+		if (disp.bufs[i].dmabuf_fd < 0)
+			return -1;
+	}
 
-	back = disp.active_buf ^ 1;
+	back = (disp.active_buf + 1) % SHELL_DRM_BUF_COUNT;
 	if (out_dmabuf_fd)
 		*out_dmabuf_fd = disp.bufs[back].dmabuf_fd;
 	return back;
@@ -787,7 +795,7 @@ void shell_display_present_video_backbuf(int buf_idx,
 	uint32_t *dst_base;
 	int i, y;
 
-	if (buf_idx < 0 || buf_idx > 1 || !disp.use_drm || disp.drm_fd < 0)
+	if (buf_idx < 0 || buf_idx >= SHELL_DRM_BUF_COUNT || !disp.use_drm || disp.drm_fd < 0)
 		return;
 
 	dst_base = disp.bufs[buf_idx].map;
@@ -1537,18 +1545,8 @@ void shell_draw_rounded_bitmap_stride(int x, int y, int w, int h, int stride,
 	if (radius * 2 > h)
 		radius = h / 2;
 
-	if (zoom_slightly && w <= 512) {
-		for (px = 0; px < w; px++) {
-			int x_q8 = (w << 7) + ((px * 2 - w) * 124) + 128;
-			if (x_q8 < 0)
-				x_q8 = 0;
-			if (x_q8 > ((w - 1) << 8))
-				x_q8 = (w - 1) << 8;
-			x0_lut[px] = (uint16_t)(x_q8 >> 8);
-		}
-	} else {
-		zoom_slightly = false;
-	}
+	(void)x0_lut;
+	zoom_slightly = false;
 
 	for (py = 0; py < h; py++) {
 		int sy = y + py;

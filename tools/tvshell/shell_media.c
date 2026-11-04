@@ -586,7 +586,7 @@ static size_t read_jpeg_or_mov_frame0(const char *path, uint8_t *dst_buf, size_t
 }
 
 #ifdef __linux__
-#define HW_JPG_MAX_BS		(512 * 1024)
+#define HW_JPG_MAX_BS		(1536 * 1024)
 #define HW_NV12_BUF_W		1280
 #define HW_NV12_BUF_H		960
 
@@ -667,13 +667,15 @@ static struct {
 	int last_src_w;
 	int last_src_h;
 
-	struct hw_m2sc_ctx sc_card;	/* 275 x 312 XRGB32 on scaler0 */
+	struct hw_m2sc_ctx sc_card;	/* 550 x 624 (2x SS -> 275 x 312) on scaler0 */
+	struct hw_m2sc_ctx sc_tile;	/* 550 x 328 (2x SS -> 275 x 164) on scaler0 */
 	struct hw_m2sc_ctx sc_fs;	/* 1280 x 720 XRGB32 on scaler1 (MMAP) */
 	struct hw_m2sc_ctx sc_vid;	/* 1280 x 720 XRGB32 on scaler1 (DRM DMABUF) */
 } g_hw_pipe = {
 	.jpg_fd = -1,
 	.nv12_dmabuf_fd = -1,
 	.sc_card = { .fd = -1 },
+	.sc_tile = { .fd = -1 },
 	.sc_fs = { .fd = -1 },
 	.sc_vid = { .fd = -1 },
 };
@@ -738,6 +740,7 @@ static void hw_m2sc_ctx_close(struct hw_m2sc_ctx *sc)
 static void hw_pipe_close(void)
 {
 	hw_m2sc_ctx_close(&g_hw_pipe.sc_card);
+	hw_m2sc_ctx_close(&g_hw_pipe.sc_tile);
 	hw_m2sc_ctx_close(&g_hw_pipe.sc_fs);
 	hw_m2sc_ctx_close(&g_hw_pipe.sc_vid);
 
@@ -815,7 +818,7 @@ static bool hw_m2sc_ctx_init(struct hw_m2sc_ctx *sc, const char *dev,
 		goto err;
 
 	memset(&req, 0, sizeof(req));
-	req.count = cap_dmabuf ? 2 : 1;
+	req.count = cap_dmabuf ? 3 : 1;
 	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
 	req.memory = cap_dmabuf ? V4L2_MEMORY_DMABUF : V4L2_MEMORY_MMAP;
 	if (xioctl_v4l2(sc->fd, VIDIOC_REQBUFS, &req) < 0 || req.count < 1)
@@ -936,7 +939,9 @@ static bool hw_pipe_init(void)
 	g_hw_pipe.jpg_streaming = true;
 
 	fs_dev = g_hw_pipe.m2sc_dev[g_hw_pipe.m2sc_count > 1 ? 1 : 0];
-	if (!hw_m2sc_ctx_init(&g_hw_pipe.sc_card, g_hw_pipe.m2sc_dev[0], 275, 312, false))
+	if (!hw_m2sc_ctx_init(&g_hw_pipe.sc_card, g_hw_pipe.m2sc_dev[0], 550, 624, false))
+		goto err;
+	if (!hw_m2sc_ctx_init(&g_hw_pipe.sc_tile, g_hw_pipe.m2sc_dev[0], 550, 328, false))
 		goto err;
 	if (!hw_m2sc_ctx_init(&g_hw_pipe.sc_fs, fs_dev, SHELL_SCREEN_W, SHELL_SCREEN_H, false))
 		goto err;
@@ -1061,6 +1066,33 @@ static bool hw_m2sc_wait_job(struct hw_m2sc_ctx *sc, uint32_t *dst_pixels)
 	return ok;
 }
 
+static void downsample_2x2_xrgb(const uint32_t *src, int dst_w, int dst_h, uint32_t *dst)
+{
+	int src_stride = dst_w * 2;
+	int y, x;
+
+	for (y = 0; y < dst_h; y++) {
+		const uint32_t *r0 = src + (size_t)(y * 2) * src_stride;
+		const uint32_t *r1 = r0 + src_stride;
+		uint32_t *out = dst + (size_t)y * dst_w;
+
+		for (x = 0; x < dst_w; x++) {
+			uint32_t p00 = r0[x * 2 + 0];
+			uint32_t p01 = r0[x * 2 + 1];
+			uint32_t p10 = r1[x * 2 + 0];
+			uint32_t p11 = r1[x * 2 + 1];
+			uint32_t rb = ((p00 & 0x00ff00ffU) + (p01 & 0x00ff00ffU) +
+				       (p10 & 0x00ff00ffU) + (p11 & 0x00ff00ffU) +
+				       0x00020002U) >> 2;
+			uint32_t g  = ((p00 & 0x0000ff00U) + (p01 & 0x0000ff00U) +
+				       (p10 & 0x0000ff00U) + (p11 & 0x0000ff00U) +
+				       0x00000200U) >> 2;
+
+			out[x] = 0xff000000U | (rb & 0x00ff00ffU) | (g & 0x0000ff00U);
+		}
+	}
+}
+
 /*
  * Run a zero-copy M2SC job that DMAs the scaled 1280x720 XRGB32 output
  * directly into the caller's DRM scanout DMABUF fd (zero CPU copies!).
@@ -1073,7 +1105,7 @@ static bool hw_m2sc_dmabuf_run(struct hw_m2sc_ctx *sc,
 	bool ok = true;
 
 	if (!sc || sc->fd < 0 || !sc->streaming || !sc->cap_dmabuf ||
-	    buf_idx < 0 || buf_idx > 1 || dst_dmabuf_fd < 0)
+	    buf_idx < 0 || buf_idx > 2 || dst_dmabuf_fd < 0)
 		return false;
 
 	if (crop->left != sc->last_crop.left ||
@@ -1183,18 +1215,21 @@ static bool hw_jpeg_run_bitstream(size_t jpg_len, int *out_w, int *out_h)
 /*
  * Decode a baseline JPEG file on s5l8947x-jpeg directly into the persistent
  * NV12 DMABUF, then crop & polyphase-scale on s5l8947x-m2sc (scaler0 for
- * 275x312 cards, scaler1 for 1280x720 fullscreen/video).
+ * 2x-supersampled 275x312 cards and 275x164 gallery tiles, scaler1 for
+ * 1280x720 fullscreen/video).
  */
 static bool hw_decode_and_scale_jpeg_file(const char *path,
 					  uint32_t **out_card_275,
+					  uint32_t **out_tile_275x164,
 					  uint32_t **out_fs_720p,
 					  uint32_t *fs_inplace_buf)
 {
 	int src_w = 0, src_h = 0;
 	bool need_card = (out_card_275 != NULL);
+	bool need_tile = (out_tile_275x164 != NULL);
 	bool need_fs = (out_fs_720p != NULL || fs_inplace_buf != NULL);
 
-	if (!path || !path[0] || (!need_card && !need_fs))
+	if (!path || !path[0] || (!need_card && !need_tile && !need_fs))
 		return false;
 	if (!hw_pipe_init())
 		return false;
@@ -1223,6 +1258,7 @@ static bool hw_decode_and_scale_jpeg_file(const char *path,
 	}
 
 	uint32_t *card_buf = NULL;
+	uint32_t *tile_buf = NULL;
 	uint32_t *fs_buf = fs_inplace_buf;
 
 	if (need_card) {
@@ -1230,20 +1266,28 @@ static bool hw_decode_and_scale_jpeg_file(const char *path,
 		if (!card_buf)
 			return false;
 	}
-	if (out_fs_720p) {
-		fs_buf = malloc((size_t)SHELL_SCREEN_W * SHELL_SCREEN_H * sizeof(uint32_t));
-		if (!fs_buf) {
+	if (need_tile) {
+		tile_buf = malloc(275 * 164 * sizeof(uint32_t));
+		if (!tile_buf) {
 			free(card_buf);
 			return false;
 		}
 	}
+	if (out_fs_720p) {
+		fs_buf = malloc((size_t)SHELL_SCREEN_W * SHELL_SCREEN_H * sizeof(uint32_t));
+		if (!fs_buf) {
+			free(card_buf);
+			free(tile_buf);
+			return false;
+		}
+	}
 
-	struct v4l2_rect card_crop, fs_crop;
+	struct v4l2_rect card_crop, tile_crop, fs_crop;
 	bool card_queued = false, fs_queued = false;
 	bool ok = true;
 
 	if (need_card) {
-		compute_cover_crop_rect(src_w, src_h, 275, 312, &card_crop);
+		compute_cover_crop_rect(src_w, src_h, 550, 624, &card_crop);
 		card_queued = hw_m2sc_queue_job(&g_hw_pipe.sc_card, &card_crop);
 		if (!card_queued)
 			ok = false;
@@ -1255,13 +1299,31 @@ static bool hw_decode_and_scale_jpeg_file(const char *path,
 			ok = false;
 	}
 
-	if (card_queued && !hw_m2sc_wait_job(&g_hw_pipe.sc_card, card_buf))
-		ok = false;
+	if (card_queued) {
+		if (hw_m2sc_wait_job(&g_hw_pipe.sc_card, NULL) && g_hw_pipe.sc_card.cap_ptr)
+			downsample_2x2_xrgb((const uint32_t *)g_hw_pipe.sc_card.cap_ptr,
+					    275, 312, card_buf);
+		else
+			ok = false;
+	}
+
+	if (ok && need_tile) {
+		compute_cover_crop_rect(src_w, src_h, 550, 328, &tile_crop);
+		if (hw_m2sc_queue_job(&g_hw_pipe.sc_tile, &tile_crop) &&
+		    hw_m2sc_wait_job(&g_hw_pipe.sc_tile, NULL) &&
+		    g_hw_pipe.sc_tile.cap_ptr)
+			downsample_2x2_xrgb((const uint32_t *)g_hw_pipe.sc_tile.cap_ptr,
+					    275, 164, tile_buf);
+		else
+			ok = false;
+	}
+
 	if (fs_queued && !hw_m2sc_wait_job(&g_hw_pipe.sc_fs, fs_buf))
 		ok = false;
 
 	if (!ok) {
 		free(card_buf);
+		free(tile_buf);
 		if (out_fs_720p)
 			free(fs_buf);
 		return false;
@@ -1269,6 +1331,8 @@ static bool hw_decode_and_scale_jpeg_file(const char *path,
 
 	if (out_card_275)
 		*out_card_275 = card_buf;
+	if (out_tile_275x164)
+		*out_tile_275x164 = tile_buf;
 	if (out_fs_720p)
 		*out_fs_720p = fs_buf;
 	return true;
@@ -2398,15 +2462,17 @@ static const char *const preset_placeholder_names[GIRI_ART_COUNT] = {
 
 struct art_cache_slot {
 	uint32_t *card_275;
+	uint32_t *tile_275x164;
 	uint32_t *fs_720p;
 };
 
-#define URI_CACHE_SLOTS		16
+#define URI_CACHE_SLOTS		40
 #define MAX_ASYNC_FETCHES	4
 
 struct uri_cache_entry {
 	char path[256];
 	uint32_t *card_275;
+	uint32_t *tile_275x164;
 	uint32_t *fs_720p;
 	uint64_t last_used;
 };
@@ -2609,7 +2675,7 @@ static struct uri_cache_entry *get_uri_cache_entry(const char *resolved_path, bo
 	if (hit) {
 		if (need_fs && !hit->fs_720p) {
 #ifdef __linux__
-			if (hw_decode_and_scale_jpeg_file(resolved_path, NULL,
+			if (hw_decode_and_scale_jpeg_file(resolved_path, NULL, NULL,
 							  &hit->fs_720p, NULL))
 				return hit;
 #endif
@@ -2639,18 +2705,21 @@ static struct uri_cache_entry *get_uri_cache_entry(const char *resolved_path, bo
 #ifdef __linux__
 	{
 		uint32_t *hw_card = NULL;
+		uint32_t *hw_tile = NULL;
 		uint32_t *hw_fs = NULL;
 
-		if (hw_decode_and_scale_jpeg_file(resolved_path, &hw_card,
+		if (hw_decode_and_scale_jpeg_file(resolved_path, &hw_card, &hw_tile,
 						  need_fs ? &hw_fs : NULL, NULL)) {
 			struct uri_cache_entry *e = &g_uri_cache[victim];
 
 			free(e->card_275);
+			free(e->tile_275x164);
 			free(e->fs_720p);
 			memset(e, 0, sizeof(*e));
 			snprintf(e->path, sizeof(e->path), "%s", resolved_path);
 			e->last_used = ++g_cache_clock;
 			e->card_275 = hw_card;
+			e->tile_275x164 = hw_tile;
 			e->fs_720p = hw_fs;
 			return e;
 		}
@@ -2664,12 +2733,14 @@ static struct uri_cache_entry *get_uri_cache_entry(const char *resolved_path, bo
 
 	struct uri_cache_entry *e = &g_uri_cache[victim];
 	free(e->card_275);
+	free(e->tile_275x164);
 	free(e->fs_720p);
 	memset(e, 0, sizeof(*e));
 
 	snprintf(e->path, sizeof(e->path), "%s", resolved_path);
 	e->last_used = ++g_cache_clock;
 	e->card_275 = scale_cover_bilinear(raw, rw, rh, 275, 312);
+	e->tile_275x164 = scale_cover_bilinear(raw, rw, rh, 275, 164);
 	if (rw == SHELL_SCREEN_W && rh == SHELL_SCREEN_H) {
 		e->fs_720p = raw;
 	} else {
@@ -2695,6 +2766,7 @@ static const uint32_t *ensure_preset_art_loaded(enum giri_preset_art preset)
 #ifdef __linux__
 		if (hw_decode_and_scale_jpeg_file(ph_path,
 						  &g_art_cache[preset].card_275,
+						  &g_art_cache[preset].tile_275x164,
 						  NULL, NULL))
 			return g_art_cache[preset].card_275;
 #endif
@@ -2702,6 +2774,7 @@ static const uint32_t *ensure_preset_art_loaded(enum giri_preset_art preset)
 		uint32_t *raw = decode_image_file_raw(ph_path, &rw, &rh);
 		if (raw) {
 			g_art_cache[preset].card_275 = scale_cover_bilinear(raw, rw, rh, 275, 312);
+			g_art_cache[preset].tile_275x164 = scale_cover_bilinear(raw, rw, rh, 275, 164);
 			if (rw == SHELL_SCREEN_W && rh == SHELL_SCREEN_H) {
 				g_art_cache[preset].fs_720p = raw;
 			} else {
@@ -2715,6 +2788,8 @@ static const uint32_t *ensure_preset_art_loaded(enum giri_preset_art preset)
 	}
 
 	g_art_cache[preset].card_275 = rasterize_preset_surface(preset, 275, 312);
+	if (!g_art_cache[preset].tile_275x164)
+		g_art_cache[preset].tile_275x164 = rasterize_preset_surface(preset, 275, 164);
 	return g_art_cache[preset].card_275;
 }
 
@@ -3101,6 +3176,15 @@ void shell_media_init(void)
 	(void)ensure_preset_art_loaded(GIRI_ART_DOOM_GAME);
 }
 
+void shell_media_release_hw(void)
+{
+	shell_media_audio_stop();
+	qt_mov_close();
+#ifdef __linux__
+	hw_pipe_close();
+#endif
+}
+
 void shell_media_free(void)
 {
 	int i;
@@ -3112,11 +3196,13 @@ void shell_media_free(void)
 #endif
 	for (i = 0; i < GIRI_ART_COUNT; i++) {
 		free(g_art_cache[i].card_275);
+		free(g_art_cache[i].tile_275x164);
 		free(g_art_cache[i].fs_720p);
 		memset(&g_art_cache[i], 0, sizeof(g_art_cache[i]));
 	}
 	for (i = 0; i < URI_CACHE_SLOTS; i++) {
 		free(g_uri_cache[i].card_275);
+		free(g_uri_cache[i].tile_275x164);
 		free(g_uri_cache[i].fs_720p);
 		memset(&g_uri_cache[i], 0, sizeof(g_uri_cache[i]));
 	}
@@ -3154,21 +3240,28 @@ const uint32_t *shell_media_get_card_art(const struct giri_media_card *card,
 {
 	char resolved[256];
 	enum giri_preset_art preset = GIRI_ART_DAWN_RIDGE;
+	bool want_tile = (h > 0 && h <= 200);
 
 	(void)w;
-	(void)h;
 	if (card) {
 		if (card->preset_art >= 0 && card->preset_art < GIRI_ART_COUNT)
 			preset = card->preset_art;
 
 		if (resolve_card_image_path(card, resolved, sizeof(resolved))) {
 			struct uri_cache_entry *e = get_uri_cache_entry(resolved, false);
-			if (e && e->card_275)
-				return e->card_275;
+			if (e) {
+				if (want_tile && e->tile_275x164)
+					return e->tile_275x164;
+				if (e->card_275)
+					return e->card_275;
+			}
 		}
 	}
 
-	return ensure_preset_art_loaded(preset);
+	(void)ensure_preset_art_loaded(preset);
+	if (want_tile && g_art_cache[preset].tile_275x164)
+		return g_art_cache[preset].tile_275x164;
+	return g_art_cache[preset].card_275;
 }
 
 /*
@@ -3181,9 +3274,9 @@ const uint32_t *shell_media_get_card_art_fast(const struct giri_media_card *card
 {
 	char resolved[256];
 	enum giri_preset_art preset = GIRI_ART_DAWN_RIDGE;
+	bool want_tile = (h > 0 && h <= 200);
 
 	(void)w;
-	(void)h;
 	if (is_final_out)
 		*is_final_out = true;
 
@@ -3193,18 +3286,26 @@ const uint32_t *shell_media_get_card_art_fast(const struct giri_media_card *card
 
 		if (resolve_card_image_path(card, resolved, sizeof(resolved))) {
 			struct uri_cache_entry *e = find_uri_cache_entry(resolved);
-			if (e && e->card_275)
-				return e->card_275;
+			if (e) {
+				if (want_tile && e->tile_275x164)
+					return e->tile_275x164;
+				if (e->card_275)
+					return e->card_275;
+			}
 			if (is_final_out)
 				*is_final_out = false;
 		}
 	}
 
-	if (!g_art_cache[preset].card_275 && preset != GIRI_ART_DOOM_GAME) {
-		/* Rasterize fast procedural surface first if preset JPEG not yet loaded */
+	if (!g_art_cache[preset].card_275 && preset != GIRI_ART_DOOM_GAME)
 		g_art_cache[preset].card_275 = rasterize_preset_surface(preset, 275, 312);
-	}
-	return ensure_preset_art_loaded(preset);
+	if (want_tile && !g_art_cache[preset].tile_275x164 && preset != GIRI_ART_DOOM_GAME)
+		g_art_cache[preset].tile_275x164 = rasterize_preset_surface(preset, 275, 164);
+
+	(void)ensure_preset_art_loaded(preset);
+	if (want_tile && g_art_cache[preset].tile_275x164)
+		return g_art_cache[preset].tile_275x164;
+	return g_art_cache[preset].card_275;
 }
 
 /*
@@ -3212,6 +3313,21 @@ const uint32_t *shell_media_get_card_art_fast(const struct giri_media_card *card
  * Returns true if a card was decoded (or more cards remain), false when all
  * 4 cards in @scr have their final artwork cached.
  */
+bool shell_media_preload_card_one(const struct giri_media_card *card)
+{
+	char resolved[256];
+
+	if (!card)
+		return false;
+	if (resolve_card_image_path(card, resolved, sizeof(resolved))) {
+		if (!find_uri_cache_entry(resolved)) {
+			(void)get_uri_cache_entry(resolved, false);
+			return true;
+		}
+	}
+	return false;
+}
+
 bool shell_media_preload_next_card(const struct giri_screen *scr)
 {
 	int i;
@@ -3256,7 +3372,7 @@ const uint32_t *shell_media_get_fullscreen_art(const struct giri_media_card *car
 
 #ifdef __linux__
 		if (ph_name && resolve_placeholder_path(ph_name, ph_path, sizeof(ph_path)))
-			(void)hw_decode_and_scale_jpeg_file(ph_path, NULL,
+			(void)hw_decode_and_scale_jpeg_file(ph_path, NULL, NULL,
 							    &g_art_cache[preset].fs_720p, NULL);
 #else
 		(void)ph_path;
@@ -3400,7 +3516,7 @@ bool shell_media_render_video_frame_dmabuf(const struct giri_media_card *card,
 	struct v4l2_rect crop;
 	int src_w = 0, src_h = 0;
 
-	if (!card || buf_idx < 0 || buf_idx > 1 || dst_dmabuf_fd < 0 ||
+	if (!card || buf_idx < 0 || buf_idx > 2 || dst_dmabuf_fd < 0 ||
 	    !hw_pipe_init() || g_hw_pipe.sc_vid.fd < 0)
 		return false;
 

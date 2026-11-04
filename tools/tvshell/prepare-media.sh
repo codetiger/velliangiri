@@ -19,7 +19,8 @@ GALLERY_OUT="$ROOT/build/dl/gallery"
 PLACEHOLDER_OUT="$ROOT/build/dl/placeholders"
 RAW_OUT="$PLACEHOLDER_OUT/.raw"
 
-mkdir -p "$GALLERY_OUT" "$GALLERY_OUT/.frames" "$PLACEHOLDER_OUT" "$RAW_OUT"
+mkdir -p "$GALLERY_OUT" "$PLACEHOLDER_OUT" "$RAW_OUT"
+rm -rf "$GALLERY_OUT/.frames"
 
 download_one() {
 	name="$1"
@@ -73,12 +74,36 @@ if [ -z "$FFMPEG" ]; then
 	exit 1
 fi
 
+SRGB_ICC="/System/Library/ColorSync/Profiles/sRGB Profile.icc"
+TMP_STAGE="$GALLERY_OUT/.srgb_stage.jpg"
+trap 'rm -f "$TMP_STAGE" /tmp/test_srgb.jpg /tmp/test_6452_out.jpg' EXIT
+
 to_baseline_720p() {
 	src="$1"
 	dst="$2"
-	"$FFMPEG" -y -hide_banner -loglevel error -i "$src" \
-		-vf "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,format=yuvj420p" \
-		-frames:v 1 -q:v 4 "$dst"
+	in_img="$src"
+	w=""
+	h=""
+
+	if command -v sips >/dev/null 2>&1 && [ -f "$SRGB_ICC" ]; then
+		if sips --matchTo "$SRGB_ICC" -s format jpeg -s formatOptions 100 "$src" --out "$TMP_STAGE" >/dev/null 2>&1 && [ -s "$TMP_STAGE" ]; then
+			in_img="$TMP_STAGE"
+		fi
+		w=$(sips -g pixelWidth "$in_img" 2>/dev/null | awk '/pixelWidth:/{print $2}')
+		h=$(sips -g pixelHeight "$in_img" 2>/dev/null | awk '/pixelHeight:/{print $2}')
+	fi
+
+	# Preserve full vertical framing on portrait (3:4, 2:3) and near-square (8:7) photos
+	if [ -n "$w" ] && [ -n "$h" ] && [ "$((w * 10))" -lt "$((h * 13))" ]; then
+		"$FFMPEG" -y -hide_banner -loglevel error -i "$in_img" \
+			-filter_complex "[0:v]scale=1280:720:force_original_aspect_ratio=increase:flags=lanczos,crop=1280:720,gblur=sigma=32,eq=brightness=-0.28:saturation=0.80[bg];[0:v]scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos+accurate_rnd+full_chroma_int,unsharp=3:3:0.35:3:3:0.0[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuvj420p" \
+			-frames:v 1 -q:v 1 -qmin 1 -qmax 1 "$dst"
+	else
+		"$FFMPEG" -y -hide_banner -loglevel error -i "$in_img" \
+			-vf "scale=1280:720:force_original_aspect_ratio=increase:flags=lanczos+accurate_rnd+full_chroma_int,crop=1280:720,unsharp=3:3:0.35:3:3:0.0,format=yuvj420p" \
+			-frames:v 1 -q:v 1 -qmin 1 -qmax 1 "$dst"
+	fi
+	rm -f "$TMP_STAGE"
 }
 
 # 1. Convert research/gallery photos and videos if present
@@ -90,34 +115,18 @@ if [ -d "$GALLERY_SRC" ]; then
 		case "$bn" in
 		*.jpeg|*.JPEG|*.jpg|*.JPG|*.png|*.PNG)
 			out_jpg="$GALLERY_OUT/$bn"
-			if [ ! -s "$out_jpg" ]; then
+			if [ "${FORCE_REBUILD:-0}" = "1" ] || [ ! -s "$out_jpg" ]; then
 				to_baseline_720p "$f" "$out_jpg"
 			fi
 			;;
 		*.mov|*.MOV|*.mp4|*.MP4)
 			out_vid="$GALLERY_OUT/$bn"
-			out_poster="$GALLERY_OUT/.frames/$bn.poster.jpg"
-			if [ ! -s "$out_poster" ]; then
-				"$FFMPEG" -y -hide_banner -loglevel error -ss 0.5 -i "$f" \
-					-vf "scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,format=yuvj420p" \
-					-frames:v 1 -q:v 4 "$out_poster"
-			fi
-			if [ ! -s "$GALLERY_OUT/.frames/$bn.f00.jpg" ]; then
-				"$FFMPEG" -y -hide_banner -loglevel error -i "$f" \
-					-vf "fps=2,scale=1280:720:force_original_aspect_ratio=increase,crop=1280:720,format=yuvj420p" \
-					-frames:v 15 -q:v 5 "$GALLERY_OUT/.frames/$bn.f%02d.jpg"
-				i=1
-				while [ "$i" -le 15 ]; do
-					src_f=$(printf "%s/.frames/%s.f%02d.jpg" "$GALLERY_OUT" "$bn" "$i")
-					dst_f=$(printf "%s/.frames/%s.f%02d.jpg" "$GALLERY_OUT" "$bn" "$((i - 1))")
-					if [ -f "$src_f" ]; then
-						mv "$src_f" "$dst_f"
-					fi
-					i=$((i + 1))
-				done
-			fi
 			if [ ! -s "$out_vid" ]; then
-				cp "$out_poster" "$out_vid"
+				"$FFMPEG" -y -hide_banner -loglevel error -i "$f" \
+					-vf "fps=24,scale=1280:720:force_original_aspect_ratio=increase:flags=lanczos,crop=1280:720,format=yuvj420p" \
+					-c:v mjpeg -q:v 3 -pix_fmt yuvj420p \
+					-c:a pcm_s16le -ar 48000 -ac 2 \
+					-f mov "$out_vid"
 			fi
 			;;
 		esac

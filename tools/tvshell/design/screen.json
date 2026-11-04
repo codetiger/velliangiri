@@ -53,22 +53,22 @@
       }
     },
     {
-      "id": "card_home_videos",
-      "title": "Search Videos",
-      "subtitle": "Watch Widescreen Streams & Clips",
-      "badge": "VIDEOS",
-      "meta_pill": "720P",
+      "id": "card_home_gallery",
+      "title": "Media Gallery",
+      "subtitle": "Photos & 720p Videos on Device",
+      "badge": "GALLERY",
+      "meta_pill": "OPEN",
       "thumbnail": {
-        "kind": "page_video",
-        "uri": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
+        "kind": "app_icon",
+        "uri": "GX016305.mov",
         "preset_art": "monsoon_video"
       },
       "action": {
-        "type": "show_screen",
-        "capability": "media.get_library",
+        "type": "launch_app",
+        "capability": "apps.launch",
         "parameters": {
-          "kind": "video",
-          "query": "Search widescreen videos and streams"
+          "app_id": "gallery",
+          "title": "Media Gallery"
         }
       }
     },
@@ -106,13 +106,13 @@
     },
     {
       "id": "btn_watch_device_media",
-      "label": "Watch photos and videos on this device",
+      "label": "Open Media Gallery on this device",
       "symbol": "image",
       "action": {
-        "type": "show_screen",
-        "capability": "media.get_library",
+        "type": "launch_app",
+        "capability": "apps.launch",
         "parameters": {
-          "kind": "all"
+          "app_id": "gallery"
         }
       }
     },

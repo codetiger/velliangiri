@@ -480,6 +480,7 @@ int shell_app_run(const char *const argv[], bool game_keys)
 	if (!argv || !argv[0])
 		return -EINVAL;
 
+	shell_media_release_hw();
 	shell_display_release();
 	if (game_keys)
 		shell_input_set_game_map(true);

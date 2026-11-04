@@ -2,6 +2,19 @@
   "schema_version": "1.2",
   "apps": [
     {
+      "id": "gallery",
+      "name": "Media Gallery",
+      "subtitle": "Photos & 720p Videos on Device",
+      "badge": "APP",
+      "meta_pill": "OPEN",
+      "version": "1.2",
+      "size_label": "640 KB",
+      "binary_path": "/bin/media-gallery",
+      "preset_art": "monsoon_video",
+      "installed": true,
+      "description": "Dedicated fullscreen 1280x720 Media Gallery for browsing and playing all photos and 720p videos stored in the device gallery folder."
+    },
+    {
       "id": "doom",
       "name": "Doom (1993)",
       "subtitle": "id Software · Shareware Episode 1",

@@ -12,6 +12,7 @@ set -eu
 HERE="$(cd "$(dirname "$0")" && pwd)"
 ROOT="$(cd "$HERE/../.." && pwd)"
 BIN="$ROOT/build/tvshell/tvshell"
+GALLERY_BIN="$ROOT/build/tvshell/media-gallery"
 BT_SH="$ROOT/initramfs/bt.sh"
 FONT_DIR="$ROOT/build/dl/fonts"
 DESIGN_DIR="$HERE/design"
@@ -21,8 +22,11 @@ DEST="${1:-root@192.168.68.112}"
 
 SSH="ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=8 $DEST"
 
-echo "==> installing /bin/tvshell and /bin/bt on $DEST"
-$SSH "cat > /bin/tvshell.tmp && chmod 0755 /bin/tvshell.tmp && mv /bin/tvshell.tmp /bin/tvshell" < "$BIN"
+echo "==> installing /bin/tvshell, /bin/media-gallery, and /bin/bt on $DEST"
+$SSH "cat > /bin/tvshell.tmp && chmod 0755 /bin/tvshell.tmp && cp -f /bin/tvshell.tmp /bin/tvshell.real && mv /bin/tvshell.tmp /bin/tvshell" < "$BIN"
+if [ -x "$GALLERY_BIN" ]; then
+	$SSH "cat > /bin/media-gallery.tmp && chmod 0755 /bin/media-gallery.tmp && mv /bin/media-gallery.tmp /bin/media-gallery" < "$GALLERY_BIN"
+fi
 if [ -f "$BT_SH" ]; then
 	$SSH "cat > /bin/bt.tmp && chmod 0755 /bin/bt.tmp && mv /bin/bt.tmp /bin/bt" < "$BT_SH"
 fi

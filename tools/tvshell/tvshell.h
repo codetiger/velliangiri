@@ -246,7 +246,9 @@ const uint32_t *shell_media_get_card_art(const struct giri_media_card *card,
 					 int w, int h);
 const uint32_t *shell_media_get_card_art_fast(const struct giri_media_card *card,
 					      int w, int h, bool *is_final_out);
+bool shell_media_preload_card_one(const struct giri_media_card *card);
 bool shell_media_preload_next_card(const struct giri_screen *scr);
+void shell_media_release_hw(void);
 const uint32_t *shell_media_get_fullscreen_art(const struct giri_media_card *card);
 void shell_media_get_video_info(const struct giri_media_card *card,
 				int *out_fps, int *out_frame_count,
@@ -270,5 +272,8 @@ void shell_input_close(void);
 bool shell_input_poll(struct shell_input_event *ev, int timeout_ms);
 int shell_app_run(const char *const argv[], bool game_keys);
 uint64_t shell_now_ms(void);
+
+/* media_gallery.c */
+int media_gallery_run(enum shell_theme_id theme_id);
 
 #endif /* TVSHELL_H */

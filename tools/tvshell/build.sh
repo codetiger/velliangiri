@@ -40,6 +40,7 @@ echo "==> compiling tvshell with ${CC_BIN}"
 	-I"${ROOT}/tools/tvshell" \
 	-I"${OUT_DIR}" \
 	"${ROOT}/tools/tvshell/tvshell.c" \
+	"${ROOT}/tools/tvshell/media_gallery.c" \
 	"${ROOT}/tools/tvshell/shell_display.c" \
 	"${ROOT}/tools/tvshell/shell_font.c" \
 	"${ROOT}/tools/tvshell/shell_input.c" \
@@ -49,3 +50,21 @@ echo "==> compiling tvshell with ${CC_BIN}"
 
 "${CC_BIN%-gcc}-strip" "${OUT_DIR}/tvshell" 2>/dev/null || true
 ls -lh "${OUT_DIR}/tvshell"
+
+echo "==> compiling media-gallery with ${CC_BIN}"
+"${CC_BIN}" \
+	-O3 -mcpu=cortex-a9 -mfpu=neon \
+	-Wall -Wextra -Werror \
+	-static -D_GNU_SOURCE -DMEDIA_GALLERY_STANDALONE \
+	-I"${ROOT}/tools/tvshell" \
+	-I"${OUT_DIR}" \
+	"${ROOT}/tools/tvshell/media_gallery.c" \
+	"${ROOT}/tools/tvshell/shell_display.c" \
+	"${ROOT}/tools/tvshell/shell_font.c" \
+	"${ROOT}/tools/tvshell/shell_input.c" \
+	"${ROOT}/tools/tvshell/shell_media.c" \
+	-o "${OUT_DIR}/media-gallery" \
+	-lm
+
+"${CC_BIN%-gcc}-strip" "${OUT_DIR}/media-gallery" 2>/dev/null || true
+ls -lh "${OUT_DIR}/media-gallery"
