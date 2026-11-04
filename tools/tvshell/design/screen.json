@@ -1,0 +1,142 @@
+{
+  "schema_version": "1.2",
+  "screen_id": "screen_home_welcome",
+  "page_type": "home",
+  "header": {
+    "assistant_name": "Giri",
+    "prompt_title": "Welcome to Velliangiri OS",
+    "os_label": "Velliangiri OS"
+  },
+  "summary": {
+    "title": "Hi, I am Giri, your living room assistant part of Velliangiri OS",
+    "text": "Do you know Velliangiri is a mountain range in southern India's Western Ghats near Coimbatore? Rising 1,778 meters across seven hills through shola forests, its 14 km trail is one of the region's most revered high-altitude trekking spots.",
+    "source_caption": "Velliangiri Hills · Western Ghats",
+    "char_count": 238
+  },
+  "media_cards": [
+    {
+      "id": "card_home_news",
+      "title": "Explore Top News",
+      "subtitle": "BBC Global & Regional Headlines",
+      "badge": "LIVE NEWS",
+      "meta_pill": "BBC",
+      "thumbnail": {
+        "kind": "page_image",
+        "uri": "https://images.unsplash.com/photo-1509391366360-2e959784a276?w=1280&q=80",
+        "preset_art": "dawn_ridge"
+      },
+      "action": {
+        "type": "ask_giri",
+        "capability": "internet.search_and_extract",
+        "parameters": {
+          "query": "What is top in the news on BBC?"
+        }
+      }
+    },
+    {
+      "id": "card_home_weather",
+      "title": "Check Live Weather",
+      "subtitle": "Foothills Forecast & Sky Radar",
+      "badge": "WEATHER",
+      "meta_pill": "LIVE",
+      "thumbnail": {
+        "kind": "page_image",
+        "uri": "https://images.unsplash.com/photo-1506744038136-46273834b3fb?w=1280&q=80",
+        "preset_art": "weather_sky"
+      },
+      "action": {
+        "type": "ask_giri",
+        "capability": "internet.search_and_extract",
+        "parameters": {
+          "query": "What is the weather right now?"
+        }
+      }
+    },
+    {
+      "id": "card_home_videos",
+      "title": "Search Videos",
+      "subtitle": "Watch Widescreen Streams & Clips",
+      "badge": "VIDEOS",
+      "meta_pill": "720P",
+      "thumbnail": {
+        "kind": "page_video",
+        "uri": "https://commondatastorage.googleapis.com/gtv-videos-bucket/sample/ForBiggerBlazes.mp4",
+        "preset_art": "monsoon_video"
+      },
+      "action": {
+        "type": "show_screen",
+        "capability": "media.get_library",
+        "parameters": {
+          "kind": "video",
+          "query": "Search widescreen videos and streams"
+        }
+      }
+    },
+    {
+      "id": "card_home_doom",
+      "title": "Play Doom",
+      "subtitle": "Installed · Direct Fullscreen Launch",
+      "badge": "GAME",
+      "meta_pill": "PLAY",
+      "thumbnail": {
+        "kind": "app_icon",
+        "uri": "",
+        "preset_art": "doom_game"
+      },
+      "action": {
+        "type": "launch_app",
+        "capability": "apps.launch",
+        "parameters": {
+          "app_id": "doom",
+          "title": "Doom"
+        }
+      }
+    }
+  ],
+  "footer_links": [
+    {
+      "id": "btn_ask_giri",
+      "label": "Ask Giri",
+      "symbol": "keyboard",
+      "action": {
+        "type": "open_prompt_box",
+        "capability": "ui.open_prompt",
+        "parameters": {}
+      }
+    },
+    {
+      "id": "btn_watch_device_media",
+      "label": "Watch photos and videos on this device",
+      "symbol": "image",
+      "action": {
+        "type": "show_screen",
+        "capability": "media.get_library",
+        "parameters": {
+          "kind": "all"
+        }
+      }
+    },
+    {
+      "id": "btn_explore_science",
+      "label": "Explore science and space discoveries",
+      "symbol": "globe",
+      "action": {
+        "type": "ask_giri",
+        "capability": "internet.search_and_extract",
+        "parameters": {
+          "query": "What is top in BBC Science news?"
+        }
+      }
+    },
+    {
+      "id": "btn_settings",
+      "label": "Settings",
+      "symbol": "settings",
+      "action": {
+        "type": "open_settings",
+        "capability": "system.open_settings",
+        "parameters": {}
+      }
+    }
+  ]
+}

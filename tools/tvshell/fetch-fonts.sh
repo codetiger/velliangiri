@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
 #
-# Fetch SIL Open Font License (OFL) static TrueType fonts for the TV Shell
-# into build/dl/fonts/:
-#   - Literata 400 (Regular) & 600 (SemiBold) for the Paper theme
-#   - Atkinson Hyperlegible 400 (Regular) & 700 (Bold) for the Signal theme
+# Fetch SIL Open Font License (OFL) static TrueType fonts for Giri on
+# Velliangiri OS (v1.2 TV Design System) into build/dl/fonts/:
+#   - Plus Jakarta Sans 500 (Medium), 600 (SemiBold), 700 (Bold)
+#   - JetBrains Mono 500 (Medium), 600 (SemiBold)
 #
 set -euo pipefail
 
@@ -18,18 +18,20 @@ fetch_font() {
 	local dst="${FONT_DIR}/${name}"
 	if [ ! -s "${dst}" ]; then
 		echo "[fonts] Downloading ${name} ..."
-		curl -fL --retry 3 -o "${dst}.part" "${url}"
+		curl -fsSL --retry 3 -o "${dst}.part" "${url}"
 		mv "${dst}.part" "${dst}"
 	fi
 }
 
-fetch_font "Literata-Regular.ttf" \
-	"https://raw.githubusercontent.com/googlefonts/literata/main/fonts/ttf/Literata-Regular.ttf"
-fetch_font "Literata-SemiBold.ttf" \
-	"https://raw.githubusercontent.com/googlefonts/literata/main/fonts/ttf/Literata-SemiBold.ttf"
-fetch_font "AtkinsonHyperlegible-Regular.ttf" \
-	"https://raw.githubusercontent.com/google/fonts/main/ofl/atkinsonhyperlegible/AtkinsonHyperlegible-Regular.ttf"
-fetch_font "AtkinsonHyperlegible-Bold.ttf" \
-	"https://raw.githubusercontent.com/google/fonts/main/ofl/atkinsonhyperlegible/AtkinsonHyperlegible-Bold.ttf"
+fetch_font "PlusJakartaSans-Medium.ttf" \
+	"https://raw.githubusercontent.com/tokotype/PlusJakartaSans/master/fonts/ttf/PlusJakartaSans-Medium.ttf"
+fetch_font "PlusJakartaSans-SemiBold.ttf" \
+	"https://raw.githubusercontent.com/tokotype/PlusJakartaSans/master/fonts/ttf/PlusJakartaSans-SemiBold.ttf"
+fetch_font "PlusJakartaSans-Bold.ttf" \
+	"https://raw.githubusercontent.com/tokotype/PlusJakartaSans/master/fonts/ttf/PlusJakartaSans-Bold.ttf"
+fetch_font "JetBrainsMono-Medium.ttf" \
+	"https://raw.githubusercontent.com/JetBrains/JetBrainsMono/master/fonts/ttf/JetBrainsMono-Medium.ttf"
+fetch_font "JetBrainsMono-SemiBold.ttf" \
+	"https://raw.githubusercontent.com/JetBrains/JetBrainsMono/master/fonts/ttf/JetBrainsMono-SemiBold.ttf"
 
 echo "[fonts] Ready in ${FONT_DIR}"

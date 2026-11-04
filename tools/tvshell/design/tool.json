@@ -1,0 +1,212 @@
+{
+  "schema_version": "1.0",
+  "os": {
+    "name": "Velliangiri",
+    "app_server": "https://apps.velliangiri.local/catalog.json"
+  },
+  "assistant": {
+    "name": "Giri",
+    "output_contract": "screen.json"
+  },
+  "capabilities": [
+    "media",
+    "apps",
+    "system",
+    "internet"
+  ],
+  "tools": [
+    {
+      "name": "internet.search_and_extract",
+      "domain": "internet",
+      "description": "Search the internet or fetch a live web page (e.g. BBC News, Open-Meteo weather, or Wikipedia topic), extract the top 4 images/videos into full-bleed media_cards, and summarize the page into a strict <=250-character summary in screen.json v1.2.",
+      "execution_mode": "context_screen",
+      "parameters": {
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+          "query": {
+            "type": "string",
+            "example": "What is top in the news on BBC?"
+          },
+          "url": {
+            "type": "string",
+            "example": "https://www.bbc.com/news"
+          },
+          "max_page_media": {
+            "type": "integer",
+            "const": 4
+          }
+        }
+      },
+      "returns": {
+        "type": "object",
+        "required": ["title", "summary_text", "source_caption", "page_media_cards"],
+        "properties": {
+          "title": { "type": "string", "maxLength": 64 },
+          "summary_text": { "type": "string", "maxLength": 250 },
+          "source_caption": { "type": "string", "maxLength": 48 },
+          "page_media_cards": {
+            "type": "array",
+            "maxItems": 4,
+            "description": "Top 4 images or videos extracted from the HTML page."
+          }
+        }
+      }
+    },
+    {
+      "name": "media.get_library",
+      "domain": "media",
+      "description": "Read photos and videos from the device's local library (kind='all') or widescreen 720p video streams (kind='video') to populate the 4 media_cards.",
+      "execution_mode": "context_screen",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "enum": ["all", "image", "video", "images", "videos"],
+            "default": "all"
+          }
+        }
+      },
+      "returns": {
+        "type": "object",
+        "properties": {
+          "media_cards": {
+            "type": "array",
+            "maxItems": 4
+          }
+        }
+      }
+    },
+    {
+      "name": "media.open_image",
+      "domain": "media",
+      "description": "Open a local photo or web-extracted image in the edge-to-edge fullscreen 1280x720 viewer with overlaid title (<=64c) and summary (<=250c).",
+      "execution_mode": "fullscreen_media",
+      "parameters": {
+        "type": "object",
+        "required": ["uri", "title"],
+        "properties": {
+          "uri": { "type": "string" },
+          "title": { "type": "string", "maxLength": 64 },
+          "summary": { "type": "string", "maxLength": 250 },
+          "source_caption": { "type": "string", "maxLength": 48 }
+        }
+      },
+      "returns": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "const": "viewing" }
+        }
+      }
+    },
+    {
+      "name": "media.play_video",
+      "domain": "media",
+      "description": "Play a local video file or widescreen 720p stream in the edge-to-edge fullscreen 1280x720 video player with overlaid title, summary, and progress bar.",
+      "execution_mode": "fullscreen_media",
+      "parameters": {
+        "type": "object",
+        "required": ["uri", "title"],
+        "properties": {
+          "uri": { "type": "string" },
+          "title": { "type": "string", "maxLength": 64 },
+          "summary": { "type": "string", "maxLength": 250 },
+          "source_caption": { "type": "string", "maxLength": 48 },
+          "duration_sec": { "type": "integer" }
+        }
+      },
+      "returns": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "const": "playing" }
+        }
+      }
+    },
+    {
+      "name": "apps.launch",
+      "domain": "apps",
+      "description": "Directly launch an installed app (such as Doom) in 1280x720 fullscreen mode without any intermediate mode menu.",
+      "execution_mode": "native_app",
+      "parameters": {
+        "type": "object",
+        "required": ["app_id"],
+        "properties": {
+          "app_id": {
+            "type": "string",
+            "example": "doom"
+          }
+        }
+      },
+      "returns": {
+        "type": "object",
+        "properties": {
+          "status": { "type": "string", "const": "launched" }
+        }
+      }
+    },
+    {
+      "name": "apps.list_and_install",
+      "domain": "apps",
+      "description": "List installed apps alongside apps available on the Velliangiri App Server, or install a selected app from the Velliangiri App Server.",
+      "execution_mode": "context_screen",
+      "parameters": {
+        "type": "object",
+        "properties": {
+          "install_app_id": {
+            "type": "string",
+            "description": "If provided, downloads and installs this app from the Velliangiri App Server."
+          }
+        }
+      },
+      "returns": {
+        "type": "object",
+        "properties": {
+          "app_cards": {
+            "type": "array",
+            "maxItems": 4
+          }
+        }
+      }
+    },
+    {
+      "name": "system.get_info",
+      "domain": "system",
+      "description": "Returns Velliangiri OS appliance status (Temperature, Free Storage, Memory, Network, Display) embedded at the top of the Settings modal alongside OS Preferences and Supported AI Models (supported_models.json).",
+      "execution_mode": "shell_setting",
+      "parameters": {
+        "type": "object",
+        "properties": {}
+      },
+      "returns": {
+        "type": "object",
+        "properties": {
+          "temperature": { "type": "string" },
+          "storage": { "type": "string" },
+          "memory": { "type": "string" },
+          "network": { "type": "string" },
+          "display": { "type": "string" }
+        }
+      }
+    },
+    {
+      "name": "system.set_theme",
+      "domain": "system",
+      "description": "Switch the TV appearance between Paper (warm daylight) and Signal (dark room).",
+      "execution_mode": "shell_setting",
+      "parameters": {
+        "type": "object",
+        "required": ["theme"],
+        "properties": {
+          "theme": { "type": "string", "enum": ["paper", "signal", "toggle"] }
+        }
+      },
+      "returns": {
+        "type": "object",
+        "properties": {
+          "active_theme": { "type": "string" }
+        }
+      }
+    }
+  ]
+}

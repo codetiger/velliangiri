@@ -1,1484 +1,2675 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Velliangiri 1280x720 TV Shell (/bin/tvshell) - Phase 1 Interface & Supervisor
+ * Giri on Velliangiri OS — 1280x720 TV Shell & 4-Window Compositor (Schema v1.2)
  *
- * Implements the 1280x720 flat-colour TV shell specified in
- * tools/tvshell/design/{tokens.json,design-system.html}:
- *   - Two themes: Paper (Literata 400/600) and Signal (Atkinson Hyperlegible 400/700)
- *   - First-start theme picker persisted to /mnt/data/linux/etc/shell.conf
- *   - Header (49x40 logo with 500 ms working blink, question, turn counter, rule)
- *   - Answer (<= 8 lines), Sources, Value (64px), Notice, Steps (working progress)
- *   - Item rows (<= 5), Media tiles (4 x 248x140), Full-screen 1280x720 photo viewer
- *   - Choices row with contextual item/tile action prefixing & Ask / More ideas
- *   - Ask line (44px) for Bluetooth keyboards
- *   - Native external app launcher for /bin/doom with 2-second Menu hold return
+ * Implements the exact pixel-by-pixel v1.2 TV Design System:
+ *   - Window 0: 4-Slot Fixed-Length Main TV Screen (.tv-screen)
+ *   - Window 1: 1280x720 Fullscreen Edge-to-Edge Media / Detail Viewer (.media-overlay)
+ *   - Window 2: Ask Giri Prompt & Suggested Topics Modal (#inputModal)
+ *   - Window 3: Velliangiri OS Settings & On-Device AI Models Modal (#settingsModal)
+ *
+ * Loads on-device JSON catalogs (screen.json, supported_models.json, apps.json)
+ * from /etc/tvshell/, /usr/share/tvshell/, or tools/tvshell/design/ with
+ * compiled-in fallbacks so the shell works completely standalone offline.
  */
 
 #include <ctype.h>
-#include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <signal.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <strings.h>
+#include <sys/file.h>
 #include <sys/stat.h>
-#include <time.h>
+#include <sys/statvfs.h>
 #include <unistd.h>
 
 #include "tvshell.h"
 #include "shell_assets.h"
 
-enum shell_mode {
-	MODE_THEME_PICKER = 0,
-	MODE_TURN_VIEW,
-	MODE_ASK_LINE,
-	MODE_IMAGE_VIEWER,
+#define HISTORY_MAX		12
+#define QUICK_PROMPTS_COUNT	7
+
+/* Ping-pong 5-frame logo animation steps at 65ms per step */
+static const int logo_pingpong_steps[8] = { 0, 1, 2, 3, 4, 3, 2, 1 };
+
+struct quick_prompt {
+	const char *label;
+	const char *query;
 };
 
+static const struct quick_prompt quick_prompts[QUICK_PROMPTS_COUNT] = {
+	{ "What is top in the news on BBC?", "What is top in the news on BBC?" },
+	{ "BBC Science & Space News", "What is top in BBC Science news?" },
+	{ "What is the weather right now?", "What is the weather right now?" },
+	{ "Search widescreen videos", "Search widescreen videos and streams" },
+	{ "Tell me about the Western Ghats", "Tell me about the Western Ghats" },
+	{ "Watch photos and videos on this device", "Watch photos and videos on this device" },
+	{ "Play Doom", "Play Doom" },
+};
+
+/* Global shell state */
 static struct {
-	struct shell_config cfg;
-	enum shell_mode mode;
-	struct shell_turn turns[SHELL_MAX_TURNS];
-	int num_turns;
-	int cur_turn;
+	enum shell_theme_id theme_id;
+	enum giri_window_id active_win;
+	enum giri_focus_zone focus_zone;
+	int card_focus_idx;
+	int footer_focus_idx;
 
-	/* Working / step animation state */
-	bool logo_blink_alt;
-	uint64_t last_blink_ms;
+	/* Screen history stack */
+	struct giri_screen history[HISTORY_MAX];
+	int history_len;
+	int history_idx;
+
+	/* Working / Stage-1 progressive shimmer state */
+	bool is_working;
 	uint64_t working_start_ms;
+	uint64_t last_logo_step_ms;
+	int logo_step_cursor;
+	int logo_frame_idx;
+	char pending_query[96];
 
-	/* Notice toast */
-	char notice_text[64];
-	enum shell_symbol_id notice_sym;
-	uint64_t notice_until_ms;
+	/* Summary read-aloud (Play/Pause button) state */
+	bool tts_speaking;
+	int tts_sentence_idx;
+	int tts_total_sentences;
+	uint64_t tts_last_step_ms;
 
-	/* Ask line buffer */
-	char ask_buf[SHELL_ASK_MAX_LEN];
-	int ask_len;
+	/* Window 1: Fullscreen Media / Detail Overlay state */
+	char overlay_badge[24];
+	char overlay_source[64];
+	char overlay_title[96];
+	char overlay_text[384];
+	struct giri_media_card overlay_card;
+	bool overlay_is_video;
+	bool overlay_playing;
+	int overlay_elapsed_sec;
+	int overlay_duration_sec;
+	int overlay_frame_idx;
+	int overlay_gallery_idx;
+	uint64_t overlay_last_tick_ms;
+	uint64_t overlay_frame_tick_ms;
 
-	/* Full-screen Image Viewer state */
-	int viewer_tile_idx;
-	bool viewer_chip_visible;
-	uint64_t viewer_chip_until_ms;
-	uint32_t *viewer_pixels;
-} app;
+	/* On-device Gallery Media state (research/gallery) */
+	struct shell_media_item gallery_items[SHELL_MAX_GALLERY_ITEMS];
+	int gallery_count;
+	int gallery_page;
 
-static uint64_t monotonic_ms(void)
+	/* Window 2: Ask Giri Modal state */
+	int ask_focus_idx;	/* 0 = input/submit, 1..7 = chips, 8 = Close */
+	char ask_input[96];
+	int ask_input_len;
+
+	/* Window 3: Velliangiri OS Settings Modal state */
+	int settings_focus_idx;	/* 0..2 = prefs, 3..8 = models, 9 = Close */
+	bool auto_read_aloud;
+	bool nav_sound_enabled;
+	struct giri_model_info models[GIRI_MAX_MODELS];
+	int model_count;
+	int active_model_idx;
+	uint64_t model_dl_tick_ms;
+
+	/* On-device App Catalog (apps.json) */
+	struct giri_app_info apps[GIRI_MAX_APPS];
+	int app_count;
+
+	/* Live system metrics for Settings strip */
+	char sys_temp[24];
+	char sys_storage[28];
+	char sys_memory[24];
+	char sys_network[24];
+	char sys_display[24];
+} g_ui;
+
+static volatile sig_atomic_t g_running = 1;
+
+static void handle_sig(int sig)
 {
-	struct timespec ts;
-
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
+	(void)sig;
+	g_running = 0;
 }
 
-static void mkdir_p(const char *path)
+/* =========================================================================
+ * 1. Minimal Clean-Room JSON Helpers & On-Device Catalog Loaders
+ * ========================================================================= */
+
+static char *read_file_text(const char *path)
 {
-	char tmp[256];
-	char *p = NULL;
-	size_t len;
+	FILE *fp = fopen(path, "rb");
+	long len;
+	char *buf;
 
-	snprintf(tmp, sizeof(tmp), "%s", path);
-	len = strlen(tmp);
-	if (len > 0 && tmp[len - 1] == '/')
-		tmp[len - 1] = '\0';
-	for (p = tmp + 1; *p; p++) {
-		if (*p == '/') {
-			*p = '\0';
-			(void)mkdir(tmp, 0755);
-			*p = '/';
-		}
-	}
-	(void)mkdir(tmp, 0755);
-}
-
-static void config_load(struct shell_config *cfg)
-{
-	FILE *fp;
-	char line[256];
-
-	memset(cfg, 0, sizeof(*cfg));
-	cfg->theme = SHELL_THEME_PAPER;
-	cfg->theme_set = false;
-	snprintf(cfg->llm_mode, sizeof(cfg->llm_mode), "auto");
-
-	fp = fopen(SHELL_CONF_PATH, "r");
 	if (!fp)
-		return;
-	while (fgets(line, sizeof(line), fp)) {
-		char *eq = strchr(line, '=');
-		char *nl;
+		return NULL;
+	if (fseek(fp, 0, SEEK_END) != 0) {
+		fclose(fp);
+		return NULL;
+	}
+	len = ftell(fp);
+	if (len <= 0 || len > 256 * 1024) {
+		fclose(fp);
+		return NULL;
+	}
+	rewind(fp);
+	buf = malloc((size_t)len + 1);
+	if (!buf) {
+		fclose(fp);
+		return NULL;
+	}
+	if (fread(buf, 1, (size_t)len, fp) != (size_t)len) {
+		free(buf);
+		fclose(fp);
+		return NULL;
+	}
+	buf[len] = '\0';
+	fclose(fp);
+	return buf;
+}
 
-		if (!eq || line[0] == '#')
+static char *read_catalog_file(const char *filename)
+{
+	char path[256];
+	char *txt;
+
+	snprintf(path, sizeof(path), "/etc/tvshell/%s", filename);
+	txt = read_file_text(path);
+	if (txt)
+		return txt;
+
+	snprintf(path, sizeof(path), "/usr/share/tvshell/%s", filename);
+	txt = read_file_text(path);
+	if (txt)
+		return txt;
+
+	snprintf(path, sizeof(path), "tools/tvshell/design/%s", filename);
+	return read_file_text(path);
+}
+
+/* Extract a JSON string value for `"key": "value"` within [start, end) */
+static bool json_extract_str(const char *start, const char *end,
+			     const char *key, char *out, size_t out_sz)
+{
+	char pat[64];
+	const char *p = start;
+	size_t pat_len;
+
+	if (!start || !end || !key || !out || out_sz == 0)
+		return false;
+	snprintf(pat, sizeof(pat), "\"%s\"", key);
+	pat_len = strlen(pat);
+
+	while (p < end) {
+		const char *hit = strstr(p, pat);
+
+		if (!hit || hit >= end)
+			return false;
+		p = hit + pat_len;
+		while (p < end && isspace((unsigned char)*p))
+			p++;
+		if (p >= end || *p != ':')
 			continue;
-		*eq++ = '\0';
-		nl = strpbrk(eq, "\r\n");
-		if (nl)
-			*nl = '\0';
-		if (!strcmp(line, "THEME")) {
-			cfg->theme = (!strcasecmp(eq, "signal")) ?
-				     SHELL_THEME_SIGNAL : SHELL_THEME_PAPER;
-			cfg->theme_set = true;
-		} else if (!strcmp(line, "LLM_MODE")) {
-			snprintf(cfg->llm_mode, sizeof(cfg->llm_mode), "%s", eq);
-		} else if (!strcmp(line, "LLM_URL")) {
-			snprintf(cfg->llm_url, sizeof(cfg->llm_url), "%s", eq);
-		} else if (!strcmp(line, "LLM_MODEL_PATH")) {
-			snprintf(cfg->llm_model_path, sizeof(cfg->llm_model_path), "%s", eq);
+		p++;
+		while (p < end && isspace((unsigned char)*p))
+			p++;
+		if (p >= end || *p != '"')
+			continue;
+		p++;
+
+		size_t w = 0;
+		while (p < end && *p != '"') {
+			if (*p == '\\' && p + 1 < end) {
+				p++;
+				if (*p == 'n' || *p == 'r' || *p == 't') {
+					if (w + 1 < out_sz)
+						out[w++] = ' ';
+					p++;
+					continue;
+				}
+			}
+			if (w + 1 < out_sz)
+				out[w++] = *p;
+			p++;
 		}
+		out[w] = '\0';
+		return true;
 	}
-	fclose(fp);
+	return false;
 }
 
-static void config_save(const struct shell_config *cfg)
+static bool json_extract_bool(const char *start, const char *end,
+			      const char *key, bool *out)
 {
-	char tmp_path[256];
-	FILE *fp;
+	char pat[64];
+	const char *p = start;
+	size_t pat_len;
 
-	mkdir_p("/mnt/data/linux/etc");
-	snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", SHELL_CONF_PATH);
-	fp = fopen(tmp_path, "w");
-	if (!fp)
+	snprintf(pat, sizeof(pat), "\"%s\"", key);
+	pat_len = strlen(pat);
+	while (p < end) {
+		const char *hit = strstr(p, pat);
+
+		if (!hit || hit >= end)
+			return false;
+		p = hit + pat_len;
+		while (p < end && isspace((unsigned char)*p))
+			p++;
+		if (p >= end || *p != ':')
+			continue;
+		p++;
+		while (p < end && isspace((unsigned char)*p))
+			p++;
+		if (end - p >= 4 && strncmp(p, "true", 4) == 0) {
+			*out = true;
+			return true;
+		}
+		if (end - p >= 5 && strncmp(p, "false", 5) == 0) {
+			*out = false;
+			return true;
+		}
+	}
+	return false;
+}
+
+/* Find matching closing brace/bracket starting at open_pos */
+static const char *json_find_matching(const char *open_pos, const char *limit,
+				      char open_ch, char close_ch)
+{
+	int depth = 0;
+	bool in_str = false;
+	const char *p;
+
+	for (p = open_pos; p < limit && *p; p++) {
+		if (*p == '"' && (p == open_pos || p[-1] != '\\'))
+			in_str = !in_str;
+		else if (!in_str) {
+			if (*p == open_ch)
+				depth++;
+			else if (*p == close_ch) {
+				depth--;
+				if (depth == 0)
+					return p;
+			}
+		}
+	}
+	return NULL;
+}
+
+static enum giri_preset_art parse_preset_art(const char *name)
+{
+	if (!name || !name[0])
+		return GIRI_ART_DAWN_RIDGE;
+	if (strcmp(name, "weather_sky") == 0)
+		return GIRI_ART_WEATHER_SKY;
+	if (strcmp(name, "monsoon_video") == 0)
+		return GIRI_ART_MONSOON_VIDEO;
+	if (strcmp(name, "waterfall_video") == 0)
+		return GIRI_ART_WATERFALL_VIDEO;
+	if (strcmp(name, "shola_mist") == 0)
+		return GIRI_ART_SHOLA_MIST;
+	if (strcmp(name, "doom_game") == 0)
+		return GIRI_ART_DOOM_GAME;
+	if (strcmp(name, "app_chess") == 0)
+		return GIRI_ART_APP_CHESS;
+	if (strcmp(name, "app_radio") == 0)
+		return GIRI_ART_APP_RADIO;
+	return GIRI_ART_DAWN_RIDGE;
+}
+
+static enum giri_card_kind parse_card_kind(const char *name)
+{
+	if (!name)
+		return GIRI_CARD_PAGE_IMAGE;
+	if (strcmp(name, "page_video") == 0)
+		return GIRI_CARD_PAGE_VIDEO;
+	if (strcmp(name, "local_photo") == 0)
+		return GIRI_CARD_LOCAL_PHOTO;
+	if (strcmp(name, "local_video") == 0)
+		return GIRI_CARD_LOCAL_VIDEO;
+	if (strcmp(name, "app_icon") == 0)
+		return GIRI_CARD_APP_ICON;
+	return GIRI_CARD_PAGE_IMAGE;
+}
+
+static enum shell_symbol_id parse_symbol_id(const char *name)
+{
+	if (!name)
+		return SHELL_SYM_GLOBE;
+	if (strcmp(name, "check") == 0)
+		return SHELL_SYM_CHECK;
+	if (strcmp(name, "folder") == 0)
+		return SHELL_SYM_FOLDER;
+	if (strcmp(name, "game") == 0)
+		return SHELL_SYM_GAME;
+	if (strcmp(name, "globe") == 0)
+		return SHELL_SYM_GLOBE;
+	if (strcmp(name, "image") == 0)
+		return SHELL_SYM_IMAGE;
+	if (strcmp(name, "keyboard") == 0)
+		return SHELL_SYM_KEYBOARD;
+	if (strcmp(name, "page") == 0)
+		return SHELL_SYM_PAGE;
+	if (strcmp(name, "play") == 0)
+		return SHELL_SYM_PLAY;
+	if (strcmp(name, "settings") == 0)
+		return SHELL_SYM_SETTINGS;
+	if (strcmp(name, "spark") == 0)
+		return SHELL_SYM_SPARK;
+	if (strcmp(name, "stream") == 0)
+		return SHELL_SYM_STREAM;
+	return SHELL_SYM_GLOBE;
+}
+
+static void derive_card_action_label(struct giri_media_card *mc)
+{
+	if (strcmp(mc->action.type, "play_video") == 0 ||
+	    mc->kind == GIRI_CARD_PAGE_VIDEO ||
+	    mc->kind == GIRI_CARD_LOCAL_VIDEO)
+		snprintf(mc->action_label, sizeof(mc->action_label), "Play Video");
+	else if (strcmp(mc->action.type, "open_image") == 0 ||
+		 mc->kind == GIRI_CARD_LOCAL_PHOTO)
+		snprintf(mc->action_label, sizeof(mc->action_label), "View Photo");
+	else if (strcmp(mc->action.type, "launch_app") == 0)
+		snprintf(mc->action_label, sizeof(mc->action_label), "Launch App");
+	else if (strcmp(mc->action.type, "install_app") == 0)
+		snprintf(mc->action_label, sizeof(mc->action_label), "Install App");
+	else
+		snprintf(mc->action_label, sizeof(mc->action_label), "Open");
+}
+
+/* Parse a screen.json v1.2 payload into struct giri_screen */
+static bool parse_screen_json(const char *json, struct giri_screen *scr)
+{
+	const char *end;
+	const char *arr_pos;
+
+	if (!json || !scr)
+		return false;
+	end = json + strlen(json);
+	memset(scr, 0, sizeof(*scr));
+
+	(void)json_extract_str(json, end, "schema_version",
+			       scr->schema_version, sizeof(scr->schema_version));
+	(void)json_extract_str(json, end, "screen_id",
+			       scr->screen_id, sizeof(scr->screen_id));
+	(void)json_extract_str(json, end, "page_type",
+			       scr->page_type, sizeof(scr->page_type));
+	(void)json_extract_str(json, end, "prompt_title",
+			       scr->prompt_title, sizeof(scr->prompt_title));
+
+	/* Summary object */
+	const char *sum_key = strstr(json, "\"summary\"");
+	if (sum_key) {
+		const char *b0 = strchr(sum_key, '{');
+		const char *b1 = b0 ? json_find_matching(b0, end, '{', '}') : NULL;
+
+		if (b0 && b1) {
+			(void)json_extract_str(b0, b1, "title",
+					       scr->summary.title, sizeof(scr->summary.title));
+			(void)json_extract_str(b0, b1, "text",
+					       scr->summary.text, sizeof(scr->summary.text));
+			(void)json_extract_str(b0, b1, "source_caption",
+					       scr->summary.source_caption,
+					       sizeof(scr->summary.source_caption));
+		}
+	}
+
+	/* Media cards array (4 cards) */
+	arr_pos = strstr(json, "\"media_cards\"");
+	if (arr_pos) {
+		const char *a0 = strchr(arr_pos, '[');
+		const char *a1 = a0 ? json_find_matching(a0, end, '[', ']') : NULL;
+
+		if (a0 && a1) {
+			const char *cur = a0 + 1;
+			int idx = 0;
+
+			while (cur < a1 && idx < SHELL_CARD_COUNT) {
+				const char *c0 = strchr(cur, '{');
+				if (!c0 || c0 >= a1)
+					break;
+				const char *c1 = json_find_matching(c0, a1, '{', '}');
+				if (!c1)
+					break;
+
+				struct giri_media_card *mc = &scr->media_cards[idx++];
+				char kind_str[24] = "";
+				char preset_str[24] = "";
+
+				(void)json_extract_str(c0, c1, "id", mc->id, sizeof(mc->id));
+				(void)json_extract_str(c0, c1, "title", mc->title, sizeof(mc->title));
+				(void)json_extract_str(c0, c1, "subtitle", mc->subtitle, sizeof(mc->subtitle));
+				(void)json_extract_str(c0, c1, "badge", mc->badge, sizeof(mc->badge));
+				(void)json_extract_str(c0, c1, "meta_pill", mc->meta_pill, sizeof(mc->meta_pill));
+				(void)json_extract_str(c0, c1, "kind", kind_str, sizeof(kind_str));
+				(void)json_extract_str(c0, c1, "uri", mc->uri, sizeof(mc->uri));
+				(void)json_extract_str(c0, c1, "preset_art", preset_str, sizeof(preset_str));
+				mc->kind = parse_card_kind(kind_str);
+				mc->preset_art = parse_preset_art(preset_str);
+
+				const char *act_key = strstr(c0, "\"action\"");
+				if (act_key && act_key < c1) {
+					const char *ac0 = strchr(act_key, '{');
+					const char *ac1 = ac0 ? json_find_matching(ac0, c1, '{', '}') : NULL;
+
+					if (ac0 && ac1) {
+						(void)json_extract_str(ac0, ac1, "type",
+								       mc->action.type, sizeof(mc->action.type));
+						(void)json_extract_str(ac0, ac1, "capability",
+								       mc->action.capability, sizeof(mc->action.capability));
+						(void)json_extract_str(ac0, ac1, "query",
+								       mc->action.query, sizeof(mc->action.query));
+						(void)json_extract_str(ac0, ac1, "kind",
+								       mc->action.kind, sizeof(mc->action.kind));
+						(void)json_extract_str(ac0, ac1, "app_id",
+								       mc->action.app_id, sizeof(mc->action.app_id));
+					}
+				}
+				derive_card_action_label(mc);
+				cur = c1 + 1;
+			}
+		}
+	}
+
+	/* Footer links array (4 buttons) */
+	arr_pos = strstr(json, "\"footer_links\"");
+	if (arr_pos) {
+		const char *a0 = strchr(arr_pos, '[');
+		const char *a1 = a0 ? json_find_matching(a0, end, '[', ']') : NULL;
+
+		if (a0 && a1) {
+			const char *cur = a0 + 1;
+			int idx = 0;
+
+			while (cur < a1 && idx < SHELL_FOOTER_COUNT) {
+				const char *c0 = strchr(cur, '{');
+				if (!c0 || c0 >= a1)
+					break;
+				const char *c1 = json_find_matching(c0, a1, '{', '}');
+				if (!c1)
+					break;
+
+				struct giri_footer_link *fl = &scr->footer_links[idx++];
+				char sym_str[24] = "";
+
+				(void)json_extract_str(c0, c1, "id", fl->id, sizeof(fl->id));
+				(void)json_extract_str(c0, c1, "label", fl->label, sizeof(fl->label));
+				(void)json_extract_str(c0, c1, "symbol", sym_str, sizeof(sym_str));
+				fl->symbol = parse_symbol_id(sym_str);
+
+				const char *act_key = strstr(c0, "\"action\"");
+				if (act_key && act_key < c1) {
+					const char *ac0 = strchr(act_key, '{');
+					const char *ac1 = ac0 ? json_find_matching(ac0, c1, '{', '}') : NULL;
+
+					if (ac0 && ac1) {
+						(void)json_extract_str(ac0, ac1, "type",
+								       fl->action.type, sizeof(fl->action.type));
+						(void)json_extract_str(ac0, ac1, "capability",
+								       fl->action.capability, sizeof(fl->action.capability));
+						(void)json_extract_str(ac0, ac1, "query",
+								       fl->action.query, sizeof(fl->action.query));
+						(void)json_extract_str(ac0, ac1, "kind",
+								       fl->action.kind, sizeof(fl->action.kind));
+					}
+				}
+				cur = c1 + 1;
+			}
+		}
+	}
+
+	return scr->summary.title[0] != '\0';
+}
+
+/* Load supported_models.json into g_ui.models */
+static void load_supported_models(void)
+{
+	static const struct giri_model_info fallback_models[6] = {
+		{
+			.id = "gemma4:e4b",
+			.name = "Gemma 4 E4B",
+			.family = "Gemma 4",
+			.params = "4B",
+			.quantization = "Q4_K_M",
+			.size_label = "3.1 GB",
+			.description = "Default Velliangiri OS edge model for fast TV summaries",
+			.default_model = true,
+			.installed = true,
+			.progress = 100,
+		},
+		{
+			.id = "gemma3:12b",
+			.name = "Gemma 3 12B",
+			.family = "Gemma 3",
+			.params = "12B",
+			.quantization = "Q4_K_M",
+			.size_label = "8.1 GB",
+			.description = "High-capacity model for deep editorial summarization",
+			.default_model = false,
+			.installed = true,
+			.progress = 100,
+		},
+		{
+			.id = "gemma3:4b",
+			.name = "Gemma 3 4B",
+			.family = "Gemma 3",
+			.params = "4B",
+			.quantization = "Q4_K_M",
+			.size_label = "3.3 GB",
+			.description = "Compact multimodal-ready model with low latency",
+			.default_model = false,
+			.installed = false,
+			.progress = 0,
+		},
+		{
+			.id = "qwen2.5:3b",
+			.name = "Qwen 2.5 3B",
+			.family = "Qwen 2.5",
+			.params = "3B",
+			.quantization = "Q4_K_M",
+			.size_label = "1.9 GB",
+			.description = "Fast instruction model tuned for strict JSON output",
+			.default_model = false,
+			.installed = false,
+			.progress = 0,
+		},
+		{
+			.id = "llama3.2:3b",
+			.name = "Llama 3.2 3B",
+			.family = "Llama 3.2",
+			.params = "3B",
+			.quantization = "Q4_K_M",
+			.size_label = "2.0 GB",
+			.description = "Balanced compact model for news and topic overviews",
+			.default_model = false,
+			.installed = false,
+			.progress = 0,
+		},
+		{
+			.id = "gemma3:1b",
+			.name = "Gemma 3 1B",
+			.family = "Gemma 3",
+			.params = "1B",
+			.quantization = "Q4_K_M",
+			.size_label = "815 MB",
+			.description = "Ultra-lightweight 1B model for instant responses",
+			.default_model = false,
+			.installed = false,
+			.progress = 0,
+		},
+	};
+
+	memcpy(g_ui.models, fallback_models, sizeof(fallback_models));
+	g_ui.model_count = 6;
+	g_ui.active_model_idx = 0;
+
+	char *json = read_catalog_file("supported_models.json");
+	if (!json)
 		return;
-	fprintf(fp, "THEME=%s\n",
-		cfg->theme == SHELL_THEME_SIGNAL ? "signal" : "paper");
-	fprintf(fp, "LLM_MODE=%s\n", cfg->llm_mode);
-	if (cfg->llm_url[0])
-		fprintf(fp, "LLM_URL=%s\n", cfg->llm_url);
-	if (cfg->llm_model_path[0])
-		fprintf(fp, "LLM_MODEL_PATH=%s\n", cfg->llm_model_path);
-	fflush(fp);
-	fsync(fileno(fp));
-	fclose(fp);
-	(void)rename(tmp_path, SHELL_CONF_PATH);
-}
 
-static void seed_sample_notes(void)
-{
-	struct stat st;
+	const char *end = json + strlen(json);
+	const char *arr = strstr(json, "\"models\"");
+	if (arr) {
+		const char *a0 = strchr(arr, '[');
+		const char *a1 = a0 ? json_find_matching(a0, end, '[', ']') : NULL;
 
-	mkdir_p(SHELL_NOTES_DIR);
-	mkdir_p(SHELL_PHOTOS_DIR);
-	mkdir_p(SHELL_THUMBS_DIR);
-	mkdir_p("/mnt/data/linux/games/doom/saves");
+		if (a0 && a1) {
+			const char *cur = a0 + 1;
+			int idx = 0;
 
-	if (stat(SHELL_NOTES_DIR "/shopping-list.txt", &st) != 0) {
-		FILE *f = fopen(SHELL_NOTES_DIR "/shopping-list.txt", "w");
-		if (f) {
-			fprintf(f, "Bread flour, whole rye flour, sea salt, olive oil, and parchment paper for the weekend bake.\n");
-			fclose(f);
+			while (cur < a1 && idx < GIRI_MAX_MODELS) {
+				const char *c0 = strchr(cur, '{');
+				if (!c0 || c0 >= a1)
+					break;
+				const char *c1 = json_find_matching(c0, a1, '{', '}');
+				if (!c1)
+					break;
+
+				struct giri_model_info *m = &g_ui.models[idx];
+				bool rec = false;
+
+				memset(m, 0, sizeof(*m));
+				(void)json_extract_str(c0, c1, "id", m->id, sizeof(m->id));
+				(void)json_extract_str(c0, c1, "name", m->name, sizeof(m->name));
+				(void)json_extract_str(c0, c1, "family", m->family, sizeof(m->family));
+				(void)json_extract_str(c0, c1, "params", m->params, sizeof(m->params));
+				(void)json_extract_str(c0, c1, "quantization", m->quantization, sizeof(m->quantization));
+				(void)json_extract_str(c0, c1, "size", m->size_label, sizeof(m->size_label));
+				(void)json_extract_str(c0, c1, "description", m->description, sizeof(m->description));
+				(void)json_extract_bool(c0, c1, "recommended", &rec);
+
+				m->default_model = rec;
+				/* First two models (gemma4:e4b, gemma3:12b) installed by default */
+				m->installed = (idx < 2) || rec;
+				m->progress = m->installed ? 100 : 0;
+				idx++;
+				cur = c1 + 1;
+			}
+			if (idx > 0)
+				g_ui.model_count = idx;
 		}
 	}
-	if (stat(SHELL_NOTES_DIR "/wifi-setup.txt", &st) != 0) {
-		FILE *f = fopen(SHELL_NOTES_DIR "/wifi-setup.txt", "w");
-		if (f) {
-			fprintf(f, "Use '/bin/wifi scan' and '/bin/wifi connect SSID PSK' over SSH or serial. Credentials persist in /mnt/data/linux/etc/wpa_supplicant.\n");
-			fclose(f);
-		}
-	}
+	free(json);
 }
 
-/* Read live system sensors for the System Status turn */
-static void update_system_status_turn(struct shell_turn *t)
+/* Load apps.json into g_ui.apps */
+static void load_apps_catalog(void)
 {
-	int temp_mc = 41000;
-	FILE *f;
+	static const struct giri_app_info fallback_apps[4] = {
+		{
+			.id = "doom",
+			.name = "Doom (1993)",
+			.subtitle = "Installed · Direct Fullscreen Launch",
+			.badge = "GAME",
+			.meta_pill = "PLAY",
+			.version = "1.10",
+			.size_label = "4.2 MB",
+			.binary_path = "/bin/doom",
+			.preset_art = GIRI_ART_DOOM_GAME,
+			.installed = true,
+			.progress = 100,
+			.description = "Classic id Software Doom (E1M1 Knee-Deep in the Dead) running natively on Velliangiri OS with 6-button remote game mapping.",
+		},
+		{
+			.id = "chess",
+			.name = "Temple Chess",
+			.subtitle = "Grandmaster AI · 6-Button Remote",
+			.badge = "BOARD GAME",
+			.meta_pill = "1.4 MB",
+			.version = "1.2",
+			.size_label = "1.4 MB",
+			.binary_path = "/usr/bin/temple-chess",
+			.preset_art = GIRI_ART_APP_CHESS,
+			.installed = true,
+			.progress = 100,
+			.description = "Offline living-room chess engine tuned for 10-foot viewing and D-pad navigation.",
+		},
+		{
+			.id = "fm_radio",
+			.name = "Western Ghats FM",
+			.subtitle = "Coimbatore & Nilgiri Community Radio",
+			.badge = "AUDIO APP",
+			.meta_pill = "2.1 MB",
+			.version = "1.0",
+			.size_label = "2.1 MB",
+			.binary_path = "/usr/bin/ghats-fm",
+			.preset_art = GIRI_ART_APP_RADIO,
+			.installed = false,
+			.progress = 0,
+			.description = "Regional Tamil and English public radio streams, classical concerts, and hill weather bulletins.",
+		},
+		{
+			.id = "monsoon_radar",
+			.name = "Monsoon Radar",
+			.subtitle = "Noyyal Basin & Siruvani Dam Telemetry",
+			.badge = "UTILITY",
+			.meta_pill = "1.8 MB",
+			.version = "1.1",
+			.size_label = "1.8 MB",
+			.binary_path = "/usr/bin/monsoon-radar",
+			.preset_art = GIRI_ART_WEATHER_SKY,
+			.installed = false,
+			.progress = 0,
+			.description = "Live rainfall accumulation, reservoir inflow charts, and Western Ghats pass visibility.",
+		},
+	};
 
-	f = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
-	if (!f)
-		f = fopen("/sys/class/hwmon/hwmon0/temp1_input", "r");
-	if (f) {
-		if (fscanf(f, "%d", &temp_mc) != 1)
-			temp_mc = 41000;
-		fclose(f);
+	memcpy(g_ui.apps, fallback_apps, sizeof(fallback_apps));
+	g_ui.app_count = 4;
+
+	char *json = read_catalog_file("apps.json");
+	if (!json)
+		return;
+
+	const char *end = json + strlen(json);
+	const char *arr = strstr(json, "\"apps\"");
+	if (arr) {
+		const char *a0 = strchr(arr, '[');
+		const char *a1 = a0 ? json_find_matching(a0, end, '[', ']') : NULL;
+
+		if (a0 && a1) {
+			const char *cur = a0 + 1;
+			int idx = 0;
+
+			while (cur < a1 && idx < GIRI_MAX_APPS) {
+				const char *c0 = strchr(cur, '{');
+				if (!c0 || c0 >= a1)
+					break;
+				const char *c1 = json_find_matching(c0, a1, '{', '}');
+				if (!c1)
+					break;
+
+				struct giri_app_info *ap = &g_ui.apps[idx];
+				char preset_str[24] = "";
+
+				memset(ap, 0, sizeof(*ap));
+				(void)json_extract_str(c0, c1, "id", ap->id, sizeof(ap->id));
+				(void)json_extract_str(c0, c1, "name", ap->name, sizeof(ap->name));
+				(void)json_extract_str(c0, c1, "subtitle", ap->subtitle, sizeof(ap->subtitle));
+				(void)json_extract_str(c0, c1, "badge", ap->badge, sizeof(ap->badge));
+				(void)json_extract_str(c0, c1, "meta_pill", ap->meta_pill, sizeof(ap->meta_pill));
+				(void)json_extract_str(c0, c1, "version", ap->version, sizeof(ap->version));
+				(void)json_extract_str(c0, c1, "size", ap->size_label, sizeof(ap->size_label));
+				(void)json_extract_str(c0, c1, "binary_path", ap->binary_path, sizeof(ap->binary_path));
+				(void)json_extract_str(c0, c1, "preset_art", preset_str, sizeof(preset_str));
+				(void)json_extract_str(c0, c1, "description", ap->description, sizeof(ap->description));
+				(void)json_extract_bool(c0, c1, "installed", &ap->installed);
+				ap->preset_art = parse_preset_art(preset_str);
+				ap->progress = ap->installed ? 100 : 0;
+				idx++;
+				cur = c1 + 1;
+			}
+			if (idx > 0)
+				g_ui.app_count = idx;
+		}
 	}
-	int temp_c = (temp_mc + 500) / 1000;
-	snprintf(t->value_big, sizeof(t->value_big), "%d \xc2\xb0""C", temp_c);
-	snprintf(t->value_label, sizeof(t->value_label),
-		 "System temperature \xc2\xb7 %s",
-		 temp_c < 70 ? "normal" : "warm");
+	free(json);
+}
 
-	/* Memory from /proc/meminfo */
-	long mem_total_kb = 512 * 1024, mem_avail_kb = 384 * 1024;
-	f = fopen("/proc/meminfo", "r");
-	if (f) {
+/* =========================================================================
+ * 2. Built-In Topic & Capability Screens (Schema v1.2)
+ * ========================================================================= */
+
+static void set_standard_footer(struct giri_screen *scr,
+				const char *ctx1_label, enum shell_symbol_id ctx1_sym,
+				const char *ctx1_type, const char *ctx1_cap, const char *ctx1_query,
+				const char *ctx2_label, enum shell_symbol_id ctx2_sym,
+				const char *ctx2_type, const char *ctx2_cap, const char *ctx2_query)
+{
+	/* [0] Fixed Bottom-Left: Ask Giri */
+	snprintf(scr->footer_links[0].id, sizeof(scr->footer_links[0].id), "btn_ask_giri");
+	snprintf(scr->footer_links[0].label, sizeof(scr->footer_links[0].label), "Ask Giri");
+	scr->footer_links[0].symbol = SHELL_SYM_KEYBOARD;
+	snprintf(scr->footer_links[0].action.type, sizeof(scr->footer_links[0].action.type), "open_prompt_box");
+	snprintf(scr->footer_links[0].action.capability, sizeof(scr->footer_links[0].action.capability), "ui.open_prompt");
+
+	/* [1] Contextual Follow-Up 1 */
+	snprintf(scr->footer_links[1].id, sizeof(scr->footer_links[1].id), "btn_ctx_1");
+	shell_font_fit_clean_phrase(ctx1_label, scr->footer_links[1].label,
+				    sizeof(scr->footer_links[1].label), SHELL_LIMIT_FOOTER_LABEL);
+	scr->footer_links[1].symbol = ctx1_sym;
+	snprintf(scr->footer_links[1].action.type, sizeof(scr->footer_links[1].action.type), "%s", ctx1_type);
+	snprintf(scr->footer_links[1].action.capability, sizeof(scr->footer_links[1].action.capability), "%s", ctx1_cap);
+	snprintf(scr->footer_links[1].action.query, sizeof(scr->footer_links[1].action.query), "%s", ctx1_query);
+
+	/* [2] Contextual Follow-Up 2 */
+	snprintf(scr->footer_links[2].id, sizeof(scr->footer_links[2].id), "btn_ctx_2");
+	shell_font_fit_clean_phrase(ctx2_label, scr->footer_links[2].label,
+				    sizeof(scr->footer_links[2].label), SHELL_LIMIT_FOOTER_LABEL);
+	scr->footer_links[2].symbol = ctx2_sym;
+	snprintf(scr->footer_links[2].action.type, sizeof(scr->footer_links[2].action.type), "%s", ctx2_type);
+	snprintf(scr->footer_links[2].action.capability, sizeof(scr->footer_links[2].action.capability), "%s", ctx2_cap);
+	snprintf(scr->footer_links[2].action.query, sizeof(scr->footer_links[2].action.query), "%s", ctx2_query);
+
+	/* [3] Fixed Bottom-Right: Settings */
+	snprintf(scr->footer_links[3].id, sizeof(scr->footer_links[3].id), "btn_settings");
+	snprintf(scr->footer_links[3].label, sizeof(scr->footer_links[3].label), "Settings");
+	scr->footer_links[3].symbol = SHELL_SYM_SETTINGS;
+	snprintf(scr->footer_links[3].action.type, sizeof(scr->footer_links[3].action.type), "open_settings");
+	snprintf(scr->footer_links[3].action.capability, sizeof(scr->footer_links[3].action.capability), "system.open_settings");
+}
+
+static void build_home_screen(struct giri_screen *scr)
+{
+	char *json = read_catalog_file("screen.json");
+	if (json) {
+		if (parse_screen_json(json, scr)) {
+			free(json);
+			return;
+		}
+		free(json);
+	}
+
+	memset(scr, 0, sizeof(*scr));
+	snprintf(scr->schema_version, sizeof(scr->schema_version), "1.2");
+	snprintf(scr->screen_id, sizeof(scr->screen_id), "screen_home_welcome");
+	snprintf(scr->page_type, sizeof(scr->page_type), "home");
+	snprintf(scr->prompt_title, sizeof(scr->prompt_title), "Welcome to Velliangiri OS");
+
+	snprintf(scr->summary.title, sizeof(scr->summary.title),
+		 "Hi, I am Giri, your living room assistant part of Velliangiri OS");
+	snprintf(scr->summary.text, sizeof(scr->summary.text),
+		 "Do you know Velliangiri is a mountain range in southern India's Western Ghats near Coimbatore? Rising 1,778 meters across seven hills through shola forests, its 14 km trail is one of the region's most revered high-altitude trekking spots.");
+	snprintf(scr->summary.source_caption, sizeof(scr->summary.source_caption),
+		 "Velliangiri Hills · Western Ghats");
+
+	/* Card 0: Explore Top News */
+	snprintf(scr->media_cards[0].id, sizeof(scr->media_cards[0].id), "card_home_news");
+	snprintf(scr->media_cards[0].title, sizeof(scr->media_cards[0].title), "Explore Top News");
+	snprintf(scr->media_cards[0].subtitle, sizeof(scr->media_cards[0].subtitle), "BBC Global & Regional Headlines");
+	snprintf(scr->media_cards[0].badge, sizeof(scr->media_cards[0].badge), "LIVE NEWS");
+	snprintf(scr->media_cards[0].meta_pill, sizeof(scr->media_cards[0].meta_pill), "BBC");
+	scr->media_cards[0].kind = GIRI_CARD_PAGE_IMAGE;
+	scr->media_cards[0].preset_art = GIRI_ART_DAWN_RIDGE;
+	snprintf(scr->media_cards[0].action.type, sizeof(scr->media_cards[0].action.type), "ask_giri");
+	snprintf(scr->media_cards[0].action.capability, sizeof(scr->media_cards[0].action.capability), "internet.search_and_extract");
+	snprintf(scr->media_cards[0].action.query, sizeof(scr->media_cards[0].action.query), "What is top in the news on BBC?");
+	derive_card_action_label(&scr->media_cards[0]);
+
+	/* Card 1: Check Live Weather */
+	snprintf(scr->media_cards[1].id, sizeof(scr->media_cards[1].id), "card_home_weather");
+	snprintf(scr->media_cards[1].title, sizeof(scr->media_cards[1].title), "Check Live Weather");
+	snprintf(scr->media_cards[1].subtitle, sizeof(scr->media_cards[1].subtitle), "Foothills Forecast & Sky Radar");
+	snprintf(scr->media_cards[1].badge, sizeof(scr->media_cards[1].badge), "WEATHER");
+	snprintf(scr->media_cards[1].meta_pill, sizeof(scr->media_cards[1].meta_pill), "LIVE");
+	scr->media_cards[1].kind = GIRI_CARD_PAGE_IMAGE;
+	scr->media_cards[1].preset_art = GIRI_ART_WEATHER_SKY;
+	snprintf(scr->media_cards[1].action.type, sizeof(scr->media_cards[1].action.type), "ask_giri");
+	snprintf(scr->media_cards[1].action.capability, sizeof(scr->media_cards[1].action.capability), "internet.search_and_extract");
+	snprintf(scr->media_cards[1].action.query, sizeof(scr->media_cards[1].action.query), "What is the weather right now?");
+	derive_card_action_label(&scr->media_cards[1]);
+
+	/* Card 2: Search Videos */
+	snprintf(scr->media_cards[2].id, sizeof(scr->media_cards[2].id), "card_home_videos");
+	snprintf(scr->media_cards[2].title, sizeof(scr->media_cards[2].title), "Search Videos");
+	snprintf(scr->media_cards[2].subtitle, sizeof(scr->media_cards[2].subtitle), "Watch Widescreen Streams & Clips");
+	snprintf(scr->media_cards[2].badge, sizeof(scr->media_cards[2].badge), "VIDEOS");
+	snprintf(scr->media_cards[2].meta_pill, sizeof(scr->media_cards[2].meta_pill), "720P");
+	scr->media_cards[2].kind = GIRI_CARD_PAGE_VIDEO;
+	scr->media_cards[2].preset_art = GIRI_ART_MONSOON_VIDEO;
+	snprintf(scr->media_cards[2].action.type, sizeof(scr->media_cards[2].action.type), "show_screen");
+	snprintf(scr->media_cards[2].action.capability, sizeof(scr->media_cards[2].action.capability), "media.get_library");
+	snprintf(scr->media_cards[2].action.query, sizeof(scr->media_cards[2].action.query), "Search widescreen videos and streams");
+	derive_card_action_label(&scr->media_cards[2]);
+
+	/* Card 3: Play Doom */
+	snprintf(scr->media_cards[3].id, sizeof(scr->media_cards[3].id), "card_home_doom");
+	snprintf(scr->media_cards[3].title, sizeof(scr->media_cards[3].title), "Play Doom");
+	snprintf(scr->media_cards[3].subtitle, sizeof(scr->media_cards[3].subtitle), "Installed · Direct Fullscreen Launch");
+	snprintf(scr->media_cards[3].badge, sizeof(scr->media_cards[3].badge), "GAME");
+	snprintf(scr->media_cards[3].meta_pill, sizeof(scr->media_cards[3].meta_pill), "PLAY");
+	scr->media_cards[3].kind = GIRI_CARD_APP_ICON;
+	scr->media_cards[3].preset_art = GIRI_ART_DOOM_GAME;
+	snprintf(scr->media_cards[3].action.type, sizeof(scr->media_cards[3].action.type), "launch_app");
+	snprintf(scr->media_cards[3].action.capability, sizeof(scr->media_cards[3].action.capability), "apps.launch");
+	snprintf(scr->media_cards[3].action.app_id, sizeof(scr->media_cards[3].action.app_id), "doom");
+	derive_card_action_label(&scr->media_cards[3]);
+
+	set_standard_footer(scr,
+		"Watch photos and videos on this device", SHELL_SYM_IMAGE,
+		"show_screen", "media.get_library", "Watch photos and videos on this device",
+		"Explore science and space discoveries", SHELL_SYM_GLOBE,
+		"ask_giri", "internet.search_and_extract", "What is top in BBC Science news?");
+}
+
+static void fill_card_uri(struct giri_media_card *mc, const char *id,
+			  const char *title, const char *subtitle,
+			  const char *badge, const char *meta_pill,
+			  enum giri_card_kind kind, enum giri_preset_art preset,
+			  const char *uri,
+			  const char *act_type, const char *act_cap,
+			  const char *query_or_app, const char *detail_text)
+{
+	memset(mc, 0, sizeof(*mc));
+	snprintf(mc->id, sizeof(mc->id), "%s", id);
+	shell_font_fit_clean_phrase(title, mc->title, sizeof(mc->title), SHELL_LIMIT_CARD_TITLE);
+	shell_font_fit_clean_phrase(subtitle, mc->subtitle, sizeof(mc->subtitle), SHELL_LIMIT_CARD_SUB);
+	snprintf(mc->badge, sizeof(mc->badge), "%s", badge);
+	snprintf(mc->meta_pill, sizeof(mc->meta_pill), "%s", meta_pill);
+	mc->kind = kind;
+	mc->preset_art = preset;
+	if (uri && uri[0])
+		snprintf(mc->uri, sizeof(mc->uri), "%s", uri);
+	snprintf(mc->action.type, sizeof(mc->action.type), "%s", act_type);
+	snprintf(mc->action.capability, sizeof(mc->action.capability), "%s", act_cap);
+	if (strcmp(act_type, "launch_app") == 0 || strcmp(act_type, "install_app") == 0)
+		snprintf(mc->action.app_id, sizeof(mc->action.app_id), "%s", query_or_app);
+	else
+		snprintf(mc->action.query, sizeof(mc->action.query), "%s", query_or_app);
+	if (detail_text)
+		snprintf(mc->detail_text, sizeof(mc->detail_text), "%s", detail_text);
+	derive_card_action_label(mc);
+}
+
+static void populate_gallery_screen(struct giri_screen *scr, int page)
+{
+	int i;
+
+	if (g_ui.gallery_count <= 0) {
+		g_ui.gallery_count = shell_media_scan_device(g_ui.gallery_items,
+							     SHELL_MAX_GALLERY_ITEMS,
+							     false);
+	}
+
+	int total_items = g_ui.gallery_count;
+	int total_pages = (total_items + 3) / 4;
+	if (total_pages < 1)
+		total_pages = 1;
+	page = ((page % total_pages) + total_pages) % total_pages;
+	g_ui.gallery_page = page;
+
+	memset(scr, 0, sizeof(*scr));
+	snprintf(scr->schema_version, sizeof(scr->schema_version), "1.2");
+	snprintf(scr->screen_id, sizeof(scr->screen_id), "screen_media_library");
+	snprintf(scr->page_type, sizeof(scr->page_type), "media");
+	snprintf(scr->prompt_title, sizeof(scr->prompt_title),
+		 "Photos & Videos on This Device");
+
+	if (total_items > 0) {
+		int first_num = page * 4 + 1;
+		int last_num = page * 4 + 4;
+		if (last_num > total_items)
+			last_num = total_items;
+
+		snprintf(scr->summary.title, sizeof(scr->summary.title),
+			 "On-Device Gallery · %d Photos & 720p Videos on Velliangiri OS",
+			 total_items);
+		snprintf(scr->summary.text, sizeof(scr->summary.text),
+			 "Select any photo or video card below for 1280×720 fullscreen viewing. Inside the fullscreen viewer, press Left or Right on your remote to browse all %d gallery items, or use Next 4 below.",
+			 total_items);
+		snprintf(scr->summary.source_caption, sizeof(scr->summary.source_caption),
+			 "Showing %d–%d of %d · Page %d/%d",
+			 first_num & 0xff, last_num & 0xff, total_items & 0xff,
+			 (page + 1) & 0xff, total_pages & 0xff);
+
+		for (i = 0; i < SHELL_CARD_COUNT; i++) {
+			int g_idx = (page * 4 + i) % total_items;
+			const struct shell_media_item *it = &g_ui.gallery_items[g_idx];
+			char id_buf[32];
+
+			snprintf(id_buf, sizeof(id_buf), "gal_%d", g_idx);
+			fill_card_uri(&scr->media_cards[i], id_buf,
+				      it->title, it->subtitle,
+				      it->badge, it->meta_pill,
+				      it->is_video ? GIRI_CARD_LOCAL_VIDEO : GIRI_CARD_LOCAL_PHOTO,
+				      it->is_video ? GIRI_ART_MONSOON_VIDEO : GIRI_ART_DAWN_RIDGE,
+				      it->path,
+				      it->is_video ? "play_video" : "open_image",
+				      it->is_video ? "media.play_video" : "media.open_image",
+				      it->title, it->detail[0] ? it->detail : it->subtitle);
+		}
+	} else {
+		snprintf(scr->summary.title, sizeof(scr->summary.title),
+			 "1280×720 Widescreen Streams, Nature Clips & On-Device Media");
+		snprintf(scr->summary.text, sizeof(scr->summary.text),
+			 "Select any card below to open the edge-to-edge 1280×720 fullscreen viewer. Use the Play/Pause button on your remote to control playback and press Menu at any time to return to Giri.");
+		snprintf(scr->summary.source_caption, sizeof(scr->summary.source_caption),
+			 "Velliangiri OS · Media Library");
+
+		fill_card_uri(&scr->media_cards[0], "vid_1", "Dawn Over Seventh Hill",
+			      "Golden Hour Ridge Time-Lapse", "VIDEO", "00:15",
+			      GIRI_CARD_PAGE_VIDEO, GIRI_ART_DAWN_RIDGE, "dawn_ridge.jpg",
+			      "play_video", "media.play_video", "Dawn Over Seventh Hill",
+			      "Widescreen 720p time-lapse capturing first light breaking across the seven hills of Velliangiri.");
+		fill_card_uri(&scr->media_cards[1], "vid_2", "Siruvani Gorge Cascade",
+			      "High-Altitude Forest Waterfall", "VIDEO", "00:18",
+			      GIRI_CARD_PAGE_VIDEO, GIRI_ART_WATERFALL_VIDEO, "waterfall_video.jpg",
+			      "play_video", "media.play_video", "Siruvani Gorge Cascade",
+			      "Crystal-clear mountain streams plunging down twin granite cliffs in the Western Ghats.");
+		fill_card_uri(&scr->media_cards[2], "vid_3", "Monsoon Cloud Sweep",
+			      "Palghat Gap Atmospheric Flow", "STREAM", "00:15",
+			      GIRI_CARD_PAGE_VIDEO, GIRI_ART_MONSOON_VIDEO, "monsoon_video.jpg",
+			      "play_video", "media.play_video", "Monsoon Cloud Sweep",
+			      "Dramatic southwest monsoon clouds rolling across the shola canopy and foothill valleys.");
+		fill_card_uri(&scr->media_cards[3], "vid_4", "Shola Valley Morning",
+			      "Emerald Mist & Birdsong Panorama", "PHOTO", "HD",
+			      GIRI_CARD_LOCAL_PHOTO, GIRI_ART_SHOLA_MIST, "shola_mist.jpg",
+			      "open_image", "media.open_image", "Shola Valley Morning",
+			      "High-dynamic-range still photograph of morning mist suspended above the shola evergreen canopy.");
+	}
+
+	char next_lbl[64];
+	snprintf(next_lbl, sizeof(next_lbl),
+		 "Next 4 photos & videos (Page %d/%d)",
+		 (((page + 1) % total_pages) + 1) & 0xff, total_pages & 0xff);
+
+	set_standard_footer(scr,
+		next_lbl, SHELL_SYM_IMAGE,
+		"gallery_next_page", "media.get_library", "Watch photos and videos on this device",
+		"Explore apps and Play Doom on TV", SHELL_SYM_GAME,
+		"ask_giri", "apps.list_and_install", "Play Doom");
+}
+
+static void build_topic_screen(const char *query, struct giri_screen *scr)
+{
+	memset(scr, 0, sizeof(*scr));
+	snprintf(scr->schema_version, sizeof(scr->schema_version), "1.2");
+
+	if (strcasestr(query, "science") || strcasestr(query, "space")) {
+		snprintf(scr->screen_id, sizeof(scr->screen_id), "screen_bbc_science");
+		snprintf(scr->page_type, sizeof(scr->page_type), "news");
+		snprintf(scr->prompt_title, sizeof(scr->prompt_title), "BBC Science & Space Discoveries");
+		snprintf(scr->summary.title, sizeof(scr->summary.title),
+			 "Deep-Space Telescopes & Renewable Grid Milestones Lead Science");
+		snprintf(scr->summary.text, sizeof(scr->summary.text),
+			 "Astronomers mapped water-vapor plumes across outer exoplanet atmospheres while southern Indian solar-wind hybrid corridors set a new clean-energy dispatch record. Marine biologists also documented resilient coral reefs in the Indian Ocean.");
+		snprintf(scr->summary.source_caption, sizeof(scr->summary.source_caption),
+			 "BBC Science & Environment · Verified");
+
+		fill_card_uri(&scr->media_cards[0], "sci_1", "Exoplanet Water Plumes",
+			      "James Webb Infrared Spectroscopy", "SPACE", "JWST",
+			      GIRI_CARD_PAGE_IMAGE, GIRI_ART_DAWN_RIDGE, "sci_space.jpg",
+			      "open_image", "media.open_image", "Exoplanet Water Plumes",
+			      "High-resolution near-infrared spectroscopy confirmed water vapor and silicate cloud layers in a temperate sub-Neptune atmosphere.");
+		fill_card_uri(&scr->media_cards[1], "sci_2", "Southern Grid Record",
+			      "Wind & Solar Storage Dispatch", "ENERGY", "GRID",
+			      GIRI_CARD_PAGE_IMAGE, GIRI_ART_WEATHER_SKY, "sci_energy.jpg",
+			      "open_image", "media.open_image", "Southern Grid Record",
+			      "Coimbatore and Tirunelveli wind-solar corridors supplied peak afternoon grid demand with zero thermal curtailment.");
+		fill_card_uri(&scr->media_cards[2], "sci_3", "Shola Canopy Ecology",
+			      "High-Altitude Cloud Forest Study", "NATURE", "720P",
+			      GIRI_CARD_PAGE_VIDEO, GIRI_ART_SHOLA_MIST, "sci_forest.jpg",
+			      "play_video", "media.play_video", "Shola Canopy Ecology",
+			      "Field researchers in the Nilgiri Biosphere Reserve tracked montane cloud-water capture across sky-island catchments.");
+		fill_card_uri(&scr->media_cards[3], "sci_4", "Monsoon Ocean Buoys",
+			      "Bay & Arabian Sea Autonomous Fleet", "OCEAN", "LIVE",
+			      GIRI_CARD_PAGE_VIDEO, GIRI_ART_MONSOON_VIDEO, "sci_ocean.jpg",
+			      "play_video", "media.play_video", "Monsoon Ocean Buoys",
+			      "Deep-ocean gliders transmitted real-time salinity and thermocline profiles ahead of the southwest monsoon onset.");
+
+		set_standard_footer(scr,
+			"What is top in the news on BBC?", SHELL_SYM_GLOBE,
+			"ask_giri", "internet.search_and_extract", "What is top in the news on BBC?",
+			"Tell me about the Western Ghats", SHELL_SYM_SPARK,
+			"ask_giri", "internet.search_and_extract", "Tell me about the Western Ghats");
+		return;
+	}
+
+	if (strcasestr(query, "weather") || strcasestr(query, "forecast")) {
+		snprintf(scr->screen_id, sizeof(scr->screen_id), "screen_weather_live");
+		snprintf(scr->page_type, sizeof(scr->page_type), "weather");
+		snprintf(scr->prompt_title, sizeof(scr->prompt_title), "Live Foothills Weather & Radar");
+		snprintf(scr->summary.title, sizeof(scr->summary.title),
+			 "24°C Pleasant Breeze in Poondi Foothills · Clear Evening Ahead");
+		snprintf(scr->summary.text, sizeof(scr->summary.text),
+			 "Light southwest winds at 14 km/h carry cool mountain air across Poondi and Coimbatore. Humidity stands at 62%% with high visibility along the seven hills and a brief passing mist expected over the 1,778m summit before dawn.");
+		snprintf(scr->summary.source_caption, sizeof(scr->summary.source_caption),
+			 "Velliangiri Foothills · Live Telemetry");
+
+		fill_card_uri(&scr->media_cards[0], "wx_1", "Poondi Foothills · 24°C",
+			      "Clear Skies · Wind SW 14 km/h", "NOW", "24°C",
+			      GIRI_CARD_PAGE_IMAGE, GIRI_ART_WEATHER_SKY, "IMG_6397.jpeg",
+			      "open_image", "media.open_image", "Poondi Foothills · 24°C",
+			      "Current foothill station telemetry shows 24°C, 62% relative humidity, barometric pressure 1013 hPa, and clear visibility.");
+		fill_card_uri(&scr->media_cards[1], "wx_2", "Seventh Hill Summit · 15°C",
+			      "Crisp Alpine Breeze · Light Mist", "1,778M", "15°C",
+			      GIRI_CARD_PAGE_IMAGE, GIRI_ART_DAWN_RIDGE, "IMG_6418.jpeg",
+			      "open_image", "media.open_image", "Seventh Hill Summit",
+			      "High-altitude ridge conditions remain cool at 15°C with broken orographic cloud bands drifting across the fifth and seventh hills.");
+		fill_card_uri(&scr->media_cards[2], "wx_3", "Palghat Gap Wind Radar",
+			      "Southwest Monsoon Corridor Flow", "RADAR", "720P",
+			      GIRI_CARD_PAGE_VIDEO, GIRI_ART_MONSOON_VIDEO, "weather_sky.jpg",
+			      "play_video", "media.play_video", "Palghat Gap Wind Radar",
+			      "Doppler wind sweep across the Palghat Gap shows steady moisture transport and evening thermal cooling.");
+		fill_card_uri(&scr->media_cards[3], "wx_4", "Siruvani Catchment",
+			      "Reservoir Inflow & Forest Humidity", "BASIN", "LIVE",
+			      GIRI_CARD_PAGE_IMAGE, GIRI_ART_SHOLA_MIST, "waterfall_video.jpg",
+			      "open_image", "media.open_image", "Siruvani Catchment",
+			      "Siruvani and Noyyal headwater catchments report steady perennial stream flow and crystal-clear water quality.");
+
+		set_standard_footer(scr,
+			"Tell me about the Western Ghats", SHELL_SYM_GLOBE,
+			"ask_giri", "internet.search_and_extract", "Tell me about the Western Ghats",
+			"What is top in the news on BBC?", SHELL_SYM_PAGE,
+			"ask_giri", "internet.search_and_extract", "What is top in the news on BBC?");
+		return;
+	}
+
+	if (strcasestr(query, "ghats") || strcasestr(query, "velliangiri")) {
+		snprintf(scr->screen_id, sizeof(scr->screen_id), "screen_western_ghats");
+		snprintf(scr->page_type, sizeof(scr->page_type), "topic");
+		snprintf(scr->prompt_title, sizeof(scr->prompt_title), "Western Ghats & Velliangiri Hills");
+		snprintf(scr->summary.title, sizeof(scr->summary.title),
+			 "Velliangiri Seven Hills & the UNESCO Western Ghats Biodiversity");
+		snprintf(scr->summary.text, sizeof(scr->summary.text),
+			 "Older than the Himalayas, the Western Ghats form a 1,600 km mountain chain along peninsular India. The Velliangiri hills—known as Thenkailayam—span seven sculpted ridges rising to 1,778m above the Noyyal river valley.");
+		snprintf(scr->summary.source_caption, sizeof(scr->summary.source_caption),
+			 "Velliangiri Encyclopedia · Western Ghats");
+
+		fill_card_uri(&scr->media_cards[0], "vg_1", "Seven Hills Trail",
+			      "Poondi to 1,778m Peak · 14 km", "TREK", "1,778M",
+			      GIRI_CARD_PAGE_IMAGE, GIRI_ART_DAWN_RIDGE, "IMG_6452.jpeg",
+			      "open_image", "media.open_image", "Seven Hills Trail",
+			      "The sacred 14 km trail climbs through bamboo groves, Vellai Vinayagar temple, Paambatti Sunai spring, and breezy alpine meadows.");
+		fill_card_uri(&scr->media_cards[1], "vg_2", "Shola Sky Islands",
+			      "Montane Grasslands & Cloud Forests", "ECOLOGY", "UNESCO",
+			      GIRI_CARD_PAGE_IMAGE, GIRI_ART_SHOLA_MIST, "IMG_6455.jpeg",
+			      "open_image", "media.open_image", "Shola Sky Islands",
+			      "Stunted evergreen shola forests nestled in high valleys act as natural sponges feeding the Noyyal and Bhavani rivers year-round.");
+		fill_card_uri(&scr->media_cards[2], "vg_3", "Siruvani Cascades",
+			      "Twin Granite Cliffs & Pure Waters", "STREAM", "720P",
+			      GIRI_CARD_PAGE_VIDEO, GIRI_ART_WATERFALL_VIDEO, "waterfall_video.jpg",
+			      "play_video", "media.play_video", "Siruvani Cascades",
+			      "Fed by high-altitude forest springs, the Siruvani waterfalls cascade through granite gorges west of Coimbatore.");
+		fill_card_uri(&scr->media_cards[3], "vg_4", "Poondi Temple Trailhead",
+			      "Bamboo Staffs & Foothills Start", "CULTURE", "HD",
+			      GIRI_CARD_PAGE_IMAGE, GIRI_ART_MONSOON_VIDEO, "IMG_6402.jpeg",
+			      "open_image", "media.open_image", "Poondi Temple Trailhead",
+			      "Trekkers gather at the historic Poondi foothills temple with bamboo walking sticks before ascending the seven hills.");
+
+		set_standard_footer(scr,
+			"Watch photos and videos on this device", SHELL_SYM_IMAGE,
+			"show_screen", "media.get_library", "Watch photos and videos on this device",
+			"What is the weather right now?", SHELL_SYM_SPARK,
+			"ask_giri", "internet.search_and_extract", "What is the weather right now?");
+		return;
+	}
+
+	if (strcasestr(query, "video") || strcasestr(query, "photo") ||
+	    strcasestr(query, "device") || strcasestr(query, "gallery")) {
+		populate_gallery_screen(scr, g_ui.gallery_page);
+		return;
+	}
+
+	if (strcasestr(query, "doom") || strcasestr(query, "app") || strcasestr(query, "game")) {
+		int i;
+
+		snprintf(scr->screen_id, sizeof(scr->screen_id), "screen_apps_catalog");
+		snprintf(scr->page_type, sizeof(scr->page_type), "apps");
+		snprintf(scr->prompt_title, sizeof(scr->prompt_title), "Apps & Games on Velliangiri OS");
+		snprintf(scr->summary.title, sizeof(scr->summary.title),
+			 "On-Device TV Apps & Direct Fullscreen Doom (apps.json)");
+		snprintf(scr->summary.text, sizeof(scr->summary.text),
+			 "Launch installed native applications directly in 1280×720 fullscreen with automatic 6-button remote mapping. Hold the Menu button for 2 seconds at any time inside an external game to return to Giri.");
+		snprintf(scr->summary.source_caption, sizeof(scr->summary.source_caption),
+			 "Velliangiri OS · On-Device App Catalog");
+
+		for (i = 0; i < SHELL_CARD_COUNT && i < g_ui.app_count; i++) {
+			const struct giri_app_info *ap = &g_ui.apps[i];
+
+			fill_card_uri(&scr->media_cards[i], ap->id,
+				      ap->name, ap->subtitle,
+				      ap->badge, ap->installed ? "READY" : ap->size_label,
+				      GIRI_CARD_APP_ICON, ap->preset_art, NULL,
+				      ap->installed ? "launch_app" : "install_app",
+				      ap->installed ? "apps.launch" : "apps.list_and_install",
+				      ap->id, ap->description);
+		}
+
+		set_standard_footer(scr,
+			"Watch photos and videos on this device", SHELL_SYM_IMAGE,
+			"show_screen", "media.get_library", "Watch photos and videos on this device",
+			"What is top in the news on BBC?", SHELL_SYM_GLOBE,
+			"ask_giri", "internet.search_and_extract", "What is top in the news on BBC?");
+		return;
+	}
+
+	/* Default: BBC Top News Briefing */
+	snprintf(scr->screen_id, sizeof(scr->screen_id), "screen_bbc_top_news");
+	snprintf(scr->page_type, sizeof(scr->page_type), "news");
+	shell_font_fit_clean_phrase(query[0] ? query : "BBC Global & Regional News",
+				    scr->prompt_title, sizeof(scr->prompt_title),
+				    SHELL_LIMIT_PROMPT_TITLE);
+	snprintf(scr->summary.title, sizeof(scr->summary.title),
+		 "Global Semiconductor Pacts, Clean Transit & Monsoon Preparedness");
+	snprintf(scr->summary.text, sizeof(scr->summary.text),
+		 "International trade ministers finalized resilient chip-supply corridors today while Indian Railways expanded high-speed regional electric service across southern corridors. Forecasters also issued an early favorable outlook for reservoir inflows.");
+	snprintf(scr->summary.source_caption, sizeof(scr->summary.source_caption),
+		 "BBC News · Top Headlines");
+
+	fill_card_uri(&scr->media_cards[0], "news_1", "Chip Supply Corridors",
+		      "Global Fabrication & Packaging Pact", "WORLD", "BBC",
+		      GIRI_CARD_PAGE_IMAGE, GIRI_ART_DAWN_RIDGE, "news_world.jpg",
+		      "open_image", "media.open_image", "Chip Supply Corridors",
+		      "New multilateral agreements expand domestic wafer testing and open-source RISC-V and ARM edge systems across Asia and Europe.");
+	fill_card_uri(&scr->media_cards[1], "news_2", "Southern Rail Corridor",
+		      "Coimbatore–Chennai Express Upgrade", "INDIA", "TRANSIT",
+		      GIRI_CARD_PAGE_IMAGE, GIRI_ART_WEATHER_SKY, "news_transit.jpg",
+		      "open_image", "media.open_image", "Southern Rail Corridor",
+		      "Upgraded signalling and solar-fed traction substations cut intercity travel times across Tamil Nadu and Kerala.");
+	fill_card_uri(&scr->media_cards[2], "news_3", "Western Ghats Canopy",
+		      "UNESCO Corridor Telemetry Report", "CLIMATE", "720P",
+		      GIRI_CARD_PAGE_VIDEO, GIRI_ART_SHOLA_MIST, "news_climate.jpg",
+		      "play_video", "media.play_video", "Western Ghats Canopy",
+		      "Satellite canopy monitoring shows strong regeneration across protected shola-grassland sky islands.");
+	fill_card_uri(&scr->media_cards[3], "news_4", "Reservoir Inflow Briefing",
+		      "Siruvani & Bhavani Basin Outlook", "REGIONAL", "720P",
+		      GIRI_CARD_PAGE_VIDEO, GIRI_ART_WATERFALL_VIDEO, "news_water.jpg",
+		      "play_video", "media.play_video", "Reservoir Inflow Briefing",
+		      "Hydrologists report healthy storage levels across western Tamil Nadu catchments ahead of the seasonal rains.");
+
+	set_standard_footer(scr,
+		"Explore science and space discoveries", SHELL_SYM_SPARK,
+		"ask_giri", "internet.search_and_extract", "What is top in BBC Science news?",
+		"Check live foothills weather right now", SHELL_SYM_GLOBE,
+		"ask_giri", "internet.search_and_extract", "What is the weather right now?");
+}
+
+/* =========================================================================
+ * 3. Live System Metrics Probe (for Settings Modal Read-Only Strip)
+ * ========================================================================= */
+
+static void refresh_system_metrics(void)
+{
+	snprintf(g_ui.sys_temp, sizeof(g_ui.sys_temp), "43°C · Cool");
+	snprintf(g_ui.sys_storage, sizeof(g_ui.sys_storage), "6.4 GB Free (80%%)");
+	snprintf(g_ui.sys_memory, sizeof(g_ui.sys_memory), "88%% Available");
+	snprintf(g_ui.sys_network, sizeof(g_ui.sys_network), "On-Device Ready");
+	snprintf(g_ui.sys_display, sizeof(g_ui.sys_display), "1280×720 · 60Hz");
+
+	/* Probe thermal zone if present */
+	FILE *fp = fopen("/sys/class/thermal/thermal_zone0/temp", "r");
+	if (fp) {
+		long millideg = 0;
+
+		if (fscanf(fp, "%ld", &millideg) == 1 && millideg > 1000) {
+			int c = (int)(millideg / 1000);
+			snprintf(g_ui.sys_temp, sizeof(g_ui.sys_temp),
+				 "%d°C · %s", c, c < 65 ? "Cool" : "Warm");
+		}
+		fclose(fp);
+	}
+
+	/* Probe rootfs free space */
+	struct statvfs vfs;
+	if (statvfs("/", &vfs) == 0 && vfs.f_blocks > 0) {
+		double free_gb = ((double)vfs.f_bavail * vfs.f_frsize) / (1024.0 * 1024.0 * 1024.0);
+		int pct = (int)((vfs.f_bavail * 100ULL) / vfs.f_blocks);
+
+		if (free_gb >= 1.0)
+			snprintf(g_ui.sys_storage, sizeof(g_ui.sys_storage),
+				 "%.1f GB Free (%d%%)", free_gb, pct);
+		else
+			snprintf(g_ui.sys_storage, sizeof(g_ui.sys_storage),
+				 "%.0f MB Free (%d%%)", free_gb * 1024.0, pct);
+	}
+
+	/* Probe /proc/meminfo */
+	fp = fopen("/proc/meminfo", "r");
+	if (fp) {
 		char line[128];
-		while (fgets(line, sizeof(line), f)) {
-			sscanf(line, "MemTotal: %ld kB", &mem_total_kb);
-			sscanf(line, "MemAvailable: %ld kB", &mem_avail_kb);
-		}
-		fclose(f);
-	}
-	snprintf(t->items[0].detail, sizeof(t->items[0].detail),
-		 "%ld MiB free of %ld MiB", mem_avail_kb / 1024, mem_total_kb / 1024);
+		unsigned long total_kb = 0, avail_kb = 0;
 
-	/* Uptime from /proc/uptime */
-	double up_sec = 0.0;
-	f = fopen("/proc/uptime", "r");
-	if (f) {
-		(void)fscanf(f, "%lf", &up_sec);
-		fclose(f);
+		while (fgets(line, sizeof(line), fp)) {
+			if (sscanf(line, "MemTotal: %lu kB", &total_kb) == 1)
+				continue;
+			if (sscanf(line, "MemAvailable: %lu kB", &avail_kb) == 1)
+				break;
+		}
+		fclose(fp);
+		if (total_kb > 0 && avail_kb > 0) {
+			int pct = (int)((avail_kb * 100UL) / total_kb);
+			snprintf(g_ui.sys_memory, sizeof(g_ui.sys_memory),
+				 "%d%% Available", pct);
+		}
 	}
-	int mins = (int)(up_sec / 60.0);
-	int secs = (int)up_sec % 60;
-	snprintf(t->items[2].detail, sizeof(t->items[2].detail),
-		 "Up %dm %02ds \xc2\xb7 1280\xc3\x97""720@30", mins, secs);
 }
 
-static void init_predefined_turns(void)
+/* =========================================================================
+ * 4. Pixel-Exact Compositor for All 4 Windows (Schema v1.2)
+ * ========================================================================= */
+
+static const struct giri_screen *current_screen(void)
 {
-	struct shell_turn *t;
+	return &g_ui.history[g_ui.history_idx];
+}
+
+/* Draw the DOOM / E1M1 vector typography inside preset_art == GIRI_ART_DOOM_GAME */
+static void draw_doom_art_labels(int x, int y, int w, int h)
+{
+#ifdef HAVE_DOOM_POSTER_ASSET
+	(void)x;
+	(void)y;
+	(void)w;
+	(void)h;
+#else
+	int title_px = (w >= 640) ? 72 : 42;
+	int sub_px = (w >= 640) ? 18 : 11;
+	int tw = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, title_px, "DOOM");
+	int sw = shell_font_measure_role(SHELL_FONT_SANS_BOLD, sub_px, "DIRECT LAUNCH · E1M1");
+	int ty = y + (h * 112) / 312;
+	int sy = ty + title_px + 4;
+
+	shell_font_draw_role(SHELL_FONT_MONO_SEMIBOLD, title_px,
+			     x + (w - tw) / 2, ty, 0xfff59e0bU, "DOOM", w - 16);
+	shell_font_draw_role(SHELL_FONT_SANS_BOLD, sub_px,
+			     x + (w - sw) / 2, sy, 0xfffca5a5U, "DIRECT LAUNCH · E1M1", w - 16);
+#endif
+}
+
+/*
+ * Window 0: 4-Slot Main TV Screen (.tv-screen)
+ *   Slot 1 (y=36,  h=44):  Header (49x40 logo + "Giri" + "—" + prompt_title)
+ *   Slot 2 (y=108, h=148): Editorial Summary Box (title + source + <=250c body)
+ *   Slot 3 (y=284, h=312): 4 Selectable Full-Bleed Visual Cards (gap 18px)
+ *   Slot 4 (y=624, h=58):  4 Selectable Bottom Bar Buttons (188px 364px 364px 188px)
+ */
+static void render_window_main(const struct shell_theme *th)
+{
+	const struct giri_screen *scr = current_screen();
 	int i;
 
-	memset(app.turns, 0, sizeof(app.turns));
-	app.num_turns = 6;
-	app.cur_turn = 0;
+	/* Full 1280x720 canvas background */
+	shell_draw_rect(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, th->bg);
 
-	/* Turn 1: Home / Applications */
-	t = &app.turns[0];
-	snprintf(t->question, sizeof(t->question), "What would you like to do today?");
-	snprintf(t->answer, sizeof(t->answer),
-		 "Velliangiri is ready. Pick an application below, check system health, or explore media and notes.");
-	t->num_items = 3;
-	t->items[0].symbol = SHELL_SYM_GAME;
-	snprintf(t->items[0].title, sizeof(t->items[0].title), "Doom");
-	snprintf(t->items[0].detail, sizeof(t->items[0].detail), "Game \xc2\xb7 1280\xc3\x97""720 \xc2\xb7 HDMI audio");
-	snprintf(t->items[0].path, sizeof(t->items[0].path), "/bin/doom \xc2\xb7 saves in /mnt/data/linux/games/doom");
-	t->items[0].num_actions = 3;
-	t->items[0].actions[0] = (struct shell_choice){ SHELL_SYM_GAME, "Play Doom", SHELL_ACT_LAUNCH_DOOM, 0 };
-	t->items[0].actions[1] = (struct shell_choice){ SHELL_SYM_NONE, "Controls guide", SHELL_ACT_GOTO_TURN, 1 };
-	t->items[0].actions[2] = (struct shell_choice){ SHELL_SYM_FOLDER, "Show where it is", SHELL_ACT_SHOW_PATH, 0 };
+	/* -----------------------------------------------------------------
+	 * SLOT 1: Fixed 44px Header (x=64, y=36, w=1152, h=44, border: none)
+	 * ----------------------------------------------------------------- */
+	int hx = SHELL_SAFE_LEFT;
+	int hy = SHELL_SLOT1_Y;
+	int frame = g_ui.is_working ? g_ui.logo_frame_idx : 0;
+	const uint32_t *logo_px = (g_ui.theme_id == SHELL_THEME_SIGNAL)
+				  ? logo_signal_frames[frame]
+				  : logo_paper_frames[frame];
 
-	t->items[1].symbol = SHELL_SYM_PAGE;
-	snprintf(t->items[1].title, sizeof(t->items[1].title), "System status & temperature");
-	snprintf(t->items[1].detail, sizeof(t->items[1].detail), "Sensors, memory & network");
-	snprintf(t->items[1].path, sizeof(t->items[1].path), "/sys/class/hwmon/hwmon0");
-	t->items[1].num_actions = 2;
-	t->items[1].actions[0] = (struct shell_choice){ SHELL_SYM_NONE, "Open status", SHELL_ACT_GOTO_TURN, 2 };
-	t->items[1].actions[1] = (struct shell_choice){ SHELL_SYM_FOLDER, "Show where it is", SHELL_ACT_SHOW_PATH, 1 };
+	shell_draw_bitmap_xrgb(hx, hy + 2, SHELL_LOGO_W, SHELL_LOGO_H, logo_px);
+	hx += SHELL_LOGO_W + 14;
 
-	t->items[2].symbol = SHELL_SYM_FOLDER;
-	snprintf(t->items[2].title, sizeof(t->items[2].title), "Media & photo gallery");
-	snprintf(t->items[2].detail, sizeof(t->items[2].detail), "4 items \xc2\xb7 hardware scaler");
-	snprintf(t->items[2].path, sizeof(t->items[2].path), "/mnt/data/linux/media/photos");
-	t->items[2].num_actions = 2;
-	t->items[2].actions[0] = (struct shell_choice){ SHELL_SYM_NONE, "Browse media", SHELL_ACT_GOTO_TURN, 3 };
-	t->items[2].actions[1] = (struct shell_choice){ SHELL_SYM_FOLDER, "Show where it is", SHELL_ACT_SHOW_PATH, 2 };
+	hx += shell_font_draw_vcentered(SHELL_FONT_SANS_BOLD, 22,
+					hx, hy, SHELL_HEADER_H, th->ink, "Giri", 120) + 14;
+	hx += shell_font_draw_vcentered(SHELL_FONT_SANS_BOLD, 20,
+					hx, hy, SHELL_HEADER_H, th->accent, "—", 40) + 14;
 
-	t->num_choices = 3;
-	t->choices[0] = (struct shell_choice){ SHELL_SYM_GAME, "Play Doom", SHELL_ACT_LAUNCH_DOOM, 0 };
-	t->choices[1] = (struct shell_choice){ SHELL_SYM_NONE, "System status", SHELL_ACT_GOTO_TURN, 2 };
-	t->choices[2] = (struct shell_choice){ SHELL_SYM_NONE, "Switch theme", SHELL_ACT_SWITCH_THEME, 0 };
-	t->focus_zone = SHELL_FOCUS_CHOICES;
-	t->focus_choice_idx = 0;
+	const char *ptitle = g_ui.is_working && g_ui.pending_query[0]
+			     ? g_ui.pending_query : scr->prompt_title;
+	shell_font_draw_vcentered(SHELL_FONT_SANS_SEMIBOLD, 20,
+				  hx, hy, SHELL_HEADER_H, th->muted, ptitle,
+				  SHELL_SAFE_LEFT + SHELL_USABLE_W - hx);
 
-	/* Turn 2: Play Doom on S5L8947X */
-	t = &app.turns[1];
-	snprintf(t->question, sizeof(t->question), "Play Doom on S5L8947X");
-	snprintf(t->answer, sizeof(t->answer),
-		 "Doom runs natively at 1280\xc3\x97""720 with 48 kHz HDMI audio. On the remote: arrows move and turn, OK fires, Play opens doors (double-tap switches weapons), and holding Menu for 2 seconds returns here.");
-	snprintf(t->sources, sizeof(t->sources),
-		 "Saves kept in /mnt/data/linux/games/doom");
-	t->num_choices = 3;
-	t->choices[0] = (struct shell_choice){ SHELL_SYM_GAME, "Launch Doom", SHELL_ACT_LAUNCH_DOOM, 0 };
-	t->choices[1] = (struct shell_choice){ SHELL_SYM_GAME, "Warp to E1M1", SHELL_ACT_LAUNCH_DOOM, 1 };
-	t->choices[2] = (struct shell_choice){ SHELL_SYM_GAME, "Play Widescreen", SHELL_ACT_LAUNCH_DOOM, 2 };
-	t->focus_zone = SHELL_FOCUS_CHOICES;
-	t->focus_choice_idx = 0;
+	/* -----------------------------------------------------------------
+	 * SLOT 2: Fixed 148px Summary Box (x=64, y=108, w=1152, h=148, rx=12)
+	 * ----------------------------------------------------------------- */
+	int sx = SHELL_SAFE_LEFT;
+	int sy = SHELL_SLOT2_Y;
+	int sw = SHELL_USABLE_W;
+	int sh = SHELL_SUMMARY_H;
 
-	/* Turn 3: System Status (64px Value + Item rows) */
-	t = &app.turns[2];
-	snprintf(t->question, sizeof(t->question), "How is the system running?");
-	t->num_items = 3;
-	t->items[0].symbol = SHELL_SYM_PAGE;
-	snprintf(t->items[0].title, sizeof(t->items[0].title), "Memory & zram swap");
-	snprintf(t->items[0].path, sizeof(t->items[0].path), "/proc/meminfo \xc2\xb7 /dev/zram0");
-	t->items[0].num_actions = 2;
-	t->items[0].actions[0] = (struct shell_choice){ SHELL_SYM_NONE, "Refresh status", SHELL_ACT_REFRESH_STATUS, 0 };
-	t->items[0].actions[1] = (struct shell_choice){ SHELL_SYM_FOLDER, "Show where it is", SHELL_ACT_SHOW_PATH, 0 };
+	shell_draw_rounded_rect(sx, sy, sw, sh, 12, th->surface);
 
-	t->items[1].symbol = SHELL_SYM_PAGE;
-	snprintf(t->items[1].title, sizeof(t->items[1].title), "Persistent storage");
-	snprintf(t->items[1].detail, sizeof(t->items[1].detail), "nand0p2 mounted at /mnt/data/linux");
-	snprintf(t->items[1].path, sizeof(t->items[1].path), "/mnt/data/linux");
-	t->items[1].num_actions = 2;
-	t->items[1].actions[0] = (struct shell_choice){ SHELL_SYM_NONE, "Show notes", SHELL_ACT_GOTO_TURN, 5 };
-	t->items[1].actions[1] = (struct shell_choice){ SHELL_SYM_FOLDER, "Show where it is", SHELL_ACT_SHOW_PATH, 1 };
+	int pad_x = sx + 22;
+	int top_y = sy + 14;
+	int src_w = shell_font_measure_role(SHELL_FONT_MONO_MEDIUM, 13,
+					    scr->summary.source_caption);
+	int src_x = sx + sw - 22 - src_w;
 
-	t->items[2].symbol = SHELL_SYM_PAGE;
-	snprintf(t->items[2].title, sizeof(t->items[2].title), "Uptime & display");
-	snprintf(t->items[2].path, sizeof(t->items[2].path), "/dev/dri/card0 \xc2\xb7 1280x720@30 VIC 62");
-	t->items[2].num_actions = 2;
-	t->items[2].actions[0] = (struct shell_choice){ SHELL_SYM_NONE, "Switch theme", SHELL_ACT_SWITCH_THEME, 0 };
-	t->items[2].actions[1] = (struct shell_choice){ SHELL_SYM_FOLDER, "Show where it is", SHELL_ACT_SHOW_PATH, 2 };
+	if (scr->summary.source_caption[0]) {
+		shell_font_draw_role(SHELL_FONT_MONO_MEDIUM, 13,
+				     src_x, top_y + 5, th->muted,
+				     scr->summary.source_caption, src_w + 4);
+	}
 
-	update_system_status_turn(t);
-	t->num_choices = 3;
-	t->choices[0] = (struct shell_choice){ SHELL_SYM_NONE, "Refresh status", SHELL_ACT_REFRESH_STATUS, 0 };
-	t->choices[1] = (struct shell_choice){ SHELL_SYM_GAME, "Play Doom", SHELL_ACT_LAUNCH_DOOM, 0 };
-	t->choices[2] = (struct shell_choice){ SHELL_SYM_NONE, "Switch theme", SHELL_ACT_SWITCH_THEME, 0 };
-	t->focus_zone = SHELL_FOCUS_CHOICES;
-	t->focus_choice_idx = 0;
+	int max_title_w = (src_x - pad_x - 16);
+	if (max_title_w < 200)
+		max_title_w = sw - 44;
+	shell_font_draw_role(SHELL_FONT_SANS_BOLD, 21,
+			     pad_x, top_y, th->ink,
+			     scr->summary.title, max_title_w);
 
-	/* Turn 4: Media Tiles & Full-screen Image Viewer */
-	t = &app.turns[3];
-	snprintf(t->question, sizeof(t->question), "Show recent photos and videos");
-	snprintf(t->answer, sizeof(t->answer),
-		 "Select any tile to open the full-screen viewer. Photos are fitted to 1280\xc3\x97""720 on the theme ground.");
-	t->num_tiles = 4;
+	int body_y = top_y + 34;
+	int body_w = sw - 44;
 
-	snprintf(t->tiles[0].title, sizeof(t->tiles[0].title), "Garden time-lapse");
-	snprintf(t->tiles[0].detail, sizeof(t->tiles[0].detail), "Today");
-	snprintf(t->tiles[0].badge, sizeof(t->tiles[0].badge), "3:12");
-	snprintf(t->tiles[0].media_path, sizeof(t->tiles[0].media_path), "/mnt/data/linux/media/videos/garden.mp4");
-	t->tiles[0].art_id = 0;
+	if (g_ui.is_working) {
+		int phase = (int)(((shell_now_ms() - g_ui.working_start_ms) / 8ULL) % 100ULL);
+		uint32_t base_c = (g_ui.theme_id == SHELL_THEME_PAPER) ? 0xffdfd5c3U : 0xff1e2430U;
 
-	snprintf(t->tiles[1].title, sizeof(t->tiles[1].title), "Kids\xe2\x80\x99 concert");
-	snprintf(t->tiles[1].detail, sizeof(t->tiles[1].detail), "28 Sep");
-	snprintf(t->tiles[1].badge, sizeof(t->tiles[1].badge), "12:47");
-	snprintf(t->tiles[1].media_path, sizeof(t->tiles[1].media_path), "/mnt/data/linux/media/videos/concert.mp4");
-	t->tiles[1].art_id = 1;
+		shell_draw_shimmer_bar(pad_x, body_y + 6, (body_w * 96) / 100, 16, 4,
+				       base_c, th->accent, phase);
+		shell_draw_shimmer_bar(pad_x, body_y + 32, (body_w * 78) / 100, 16, 4,
+				       base_c, th->accent, (phase + 35) % 100);
+	} else {
+		int total_sents = 0;
+		int active_sent = g_ui.tts_speaking ? g_ui.tts_sentence_idx : -1;
 
-	snprintf(t->tiles[2].title, sizeof(t->tiles[2].title), "Beach at sunset");
-	snprintf(t->tiles[2].detail, sizeof(t->tiles[2].detail), "Photo \xc2\xb7 3 May");
-	snprintf(t->tiles[2].media_path, sizeof(t->tiles[2].media_path), "/mnt/data/linux/media/photos/beach.jpg");
-	t->tiles[2].art_id = 2;
+		shell_font_draw_summary_body(pad_x, body_y, 26, body_w,
+					     SHELL_LIMIT_SUMMARY_LINES,
+					     th->ink, 0xfff59e0bU, 66,
+					     scr->summary.text,
+					     active_sent, &total_sents);
+		g_ui.tts_total_sentences = total_sents;
+	}
 
-	snprintf(t->tiles[3].title, sizeof(t->tiles[3].title), "Velliangiri hills");
-	snprintf(t->tiles[3].detail, sizeof(t->tiles[3].detail), "Photo \xc2\xb7 3 Nov");
-	snprintf(t->tiles[3].media_path, sizeof(t->tiles[3].media_path), "/mnt/data/linux/media/photos/hills.jpg");
-	t->tiles[3].art_id = 3;
+	/* -----------------------------------------------------------------
+	 * SLOT 3: Fixed 312px Row of 4 Full-Bleed Media Cards
+	 * 1152px total width, 3 * 18px gaps = 54px -> 1098px across 4 cards:
+	 * Card widths: 274, 275, 275, 274
+	 * ----------------------------------------------------------------- */
+	static const int card_xs[4] = { 64, 356, 649, 942 };
+	static const int card_ws[4] = { 274, 275, 275, 274 };
 
-	for (i = 0; i < 4; i++) {
-		t->tiles[i].thumb_pixels = malloc((size_t)SHELL_THUMB_W * SHELL_THUMB_H * sizeof(uint32_t));
-		if (t->tiles[i].thumb_pixels) {
-			if (shell_media_load_jpeg_thumb(t->tiles[i].media_path,
-							t->tiles[i].thumb_pixels) != 0) {
-				shell_media_render_sample_thumb(t->tiles[i].thumb_pixels,
-								t->tiles[i].art_id);
-			}
+	for (i = 0; i < SHELL_CARD_COUNT; i++) {
+		const struct giri_media_card *mc = &scr->media_cards[i];
+		bool focused = (g_ui.active_win == GIRI_WIN_MAIN &&
+				g_ui.focus_zone == GIRI_ZONE_CARDS &&
+				g_ui.card_focus_idx == i);
+		int cx = card_xs[i];
+		int cw = card_ws[i];
+		int ch = SHELL_CARD_H;
+		int cy = SHELL_SLOT3_Y - (focused ? 4 : 0);
+
+		if (focused) {
+			shell_draw_card_shadow(cx, cy, cw, ch, SHELL_CARD_RADIUS);
+			shell_draw_focus_glow(cx, cy, cw, ch, SHELL_CARD_RADIUS,
+					      3, 0xfff59e0bU, 77);
 		}
-		t->tiles[i].num_actions = 2;
-		t->tiles[i].actions[0] = (struct shell_choice){
-			t->tiles[i].badge[0] ? SHELL_SYM_PLAY : SHELL_SYM_NONE,
-			"Open viewer", SHELL_ACT_OPEN_VIEWER, i
-		};
-		t->tiles[i].actions[1] = (struct shell_choice){
-			SHELL_SYM_FOLDER, "Show where it is", SHELL_ACT_SHOW_PATH, i
-		};
-	}
-	t->num_choices = 3;
-	t->choices[0] = (struct shell_choice){ SHELL_SYM_NONE, "Open photo viewer", SHELL_ACT_OPEN_VIEWER, 2 };
-	t->choices[1] = (struct shell_choice){ SHELL_SYM_NONE, "Show notes", SHELL_ACT_GOTO_TURN, 5 };
-	t->choices[2] = (struct shell_choice){ SHELL_SYM_GAME, "Play Doom", SHELL_ACT_LAUNCH_DOOM, 0 };
-	t->focus_zone = SHELL_FOCUS_CONTENT;
-	t->focus_content_idx = 2; /* Beach at sunset focused */
 
-	/* Turn 5: Sourdough Starter Specimen (from design-system.html) */
-	t = &app.turns[4];
-	snprintf(t->question, sizeof(t->question), "How do I make a sourdough starter?");
-	snprintf(t->answer, sizeof(t->answer),
-		 "Mix equal weights of flour and water in a jar and leave it loosely covered at room temperature. Each day, discard half and feed it.");
-	snprintf(t->sources, sizeof(t->sources),
-		 "Read 2 pages \xc2\xb7 wikipedia.org, seriouseats.com");
-	t->num_steps = 2;
-	t->steps[0].done = true;
-	snprintf(t->steps[0].text, sizeof(t->steps[0].text),
-		 "Searched \xe2\x80\x9csourdough starter video\xe2\x80\x9d");
-	t->steps[1].done = false;
-	snprintf(t->steps[1].text, sizeof(t->steps[1].text),
-		 "Checking the length of each one\xe2\x80\xa6");
-	t->num_choices = 3;
-	t->choices[0] = (struct shell_choice){ SHELL_SYM_NONE, "Feeding schedule", SHELL_ACT_DEMO_WORKING, 4 };
-	t->choices[1] = (struct shell_choice){ SHELL_SYM_PLAY, "Find a video", SHELL_ACT_DEMO_WORKING, 3 };
-	t->choices[2] = (struct shell_choice){ SHELL_SYM_NONE, "A simple first loaf", SHELL_ACT_GOTO_TURN, 5 };
-	t->focus_zone = SHELL_FOCUS_CHOICES;
-	t->focus_choice_idx = 1;
+		const uint32_t *art = shell_media_get_card_art(mc, cw, ch);
+		if (art)
+			shell_draw_rounded_bitmap(cx, cy, cw, ch, SHELL_CARD_RADIUS,
+						  art, focused);
+		else
+			shell_draw_rounded_rect(cx, cy, cw, ch, SHELL_CARD_RADIUS, th->card_bg);
 
-	/* Turn 6: Notes & Folders Specimen (from design-system.html) */
-	t = &app.turns[5];
-	snprintf(t->question, sizeof(t->question), "Show my notes and folders");
-	snprintf(t->answer, sizeof(t->answer),
-		 "Select a note below to read its contents or reveal where it is kept on Data.");
-	t->num_items = 4;
+		if (mc->preset_art == GIRI_ART_DOOM_GAME)
+			draw_doom_art_labels(cx, cy, cw, ch);
 
-	t->items[0].symbol = SHELL_SYM_PAGE;
-	snprintf(t->items[0].title, sizeof(t->items[0].title), "Shopping list");
-	snprintf(t->items[0].detail, sizeof(t->items[0].detail), "Note \xc2\xb7 yesterday");
-	snprintf(t->items[0].path, sizeof(t->items[0].path), SHELL_NOTES_DIR "/shopping-list.txt");
-	snprintf(t->items[0].body, sizeof(t->items[0].body),
-		 "Shopping list: Bread flour, whole rye flour, sea salt, olive oil, and parchment paper for the weekend bake.");
-	t->items[0].num_actions = 2;
-	t->items[0].actions[0] = (struct shell_choice){ SHELL_SYM_NONE, "Read note", SHELL_ACT_READ_NOTE, 0 };
-	t->items[0].actions[1] = (struct shell_choice){ SHELL_SYM_FOLDER, "Show where it is", SHELL_ACT_SHOW_PATH, 0 };
+		/* Video center 46x46 play overlay circle */
+		bool is_video = (mc->kind == GIRI_CARD_PAGE_VIDEO ||
+				 mc->kind == GIRI_CARD_LOCAL_VIDEO ||
+				 strcmp(mc->action.type, "play_video") == 0);
+		if (is_video) {
+			int pcx = cx + cw / 2;
+			int pcy = cy + 128;
 
-	t->items[1].symbol = SHELL_SYM_PAGE;
-	snprintf(t->items[1].title, sizeof(t->items[1].title), "Wi-Fi setup notes");
-	snprintf(t->items[1].detail, sizeof(t->items[1].detail), "Note \xc2\xb7 2 Oct");
-	snprintf(t->items[1].path, sizeof(t->items[1].path), SHELL_NOTES_DIR "/wifi-setup.txt");
-	snprintf(t->items[1].body, sizeof(t->items[1].body),
-		 "Wi-Fi setup: Run 'wifi scan' and 'wifi connect SSID PSK' to join a network. Credentials persist in /mnt/data/linux/etc/wpa_supplicant.");
-	t->items[1].num_actions = 2;
-	t->items[1].actions[0] = (struct shell_choice){ SHELL_SYM_NONE, "Read note", SHELL_ACT_READ_NOTE, 1 };
-	t->items[1].actions[1] = (struct shell_choice){ SHELL_SYM_FOLDER, "Show where it is", SHELL_ACT_SHOW_PATH, 1 };
+			shell_draw_circle_alpha(pcx, pcy, 23, 0xff0c0d10U, 217);
+			shell_draw_symbol(SHELL_SYM_PLAY, pcx - 8, pcy - 9, 18, 0xfff59e0bU);
+		}
 
-	t->items[2].symbol = SHELL_SYM_FOLDER;
-	snprintf(t->items[2].title, sizeof(t->items[2].title), "Music");
-	snprintf(t->items[2].detail, sizeof(t->items[2].detail), "48 items");
-	snprintf(t->items[2].path, sizeof(t->items[2].path), "/mnt/data/linux/media/music");
-	t->items[2].num_actions = 2;
-	t->items[2].actions[0] = (struct shell_choice){ SHELL_SYM_FOLDER, "Show where it is", SHELL_ACT_SHOW_PATH, 2 };
-	t->items[2].actions[1] = (struct shell_choice){ SHELL_SYM_NONE, "Browse media", SHELL_ACT_GOTO_TURN, 3 };
+		/* Top-left badge (border: none, rx=5, rgba(10,12,16,0.82)) */
+		if (mc->badge[0]) {
+			int bw = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 11, mc->badge) + 16;
 
-	t->items[3].symbol = SHELL_SYM_GAME;
-	snprintf(t->items[3].title, sizeof(t->items[3].title), "Doom");
-	snprintf(t->items[3].detail, sizeof(t->items[3].detail), "Ready to play");
-	snprintf(t->items[3].path, sizeof(t->items[3].path), "/bin/doom");
-	t->items[3].num_actions = 2;
-	t->items[3].actions[0] = (struct shell_choice){ SHELL_SYM_GAME, "Play Doom", SHELL_ACT_LAUNCH_DOOM, 0 };
-	t->items[3].actions[1] = (struct shell_choice){ SHELL_SYM_FOLDER, "Show where it is", SHELL_ACT_SHOW_PATH, 3 };
+			shell_draw_rounded_rect_alpha(cx + 12, cy + 12, bw, 22, 5, 0xff0a0c10U, 209);
+			shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 11,
+						     cx + 12, cy + 12, bw, 22,
+						     0xfff2efe9U, mc->badge);
+		}
 
-	t->num_choices = 3;
-	t->choices[0] = (struct shell_choice){ SHELL_SYM_GAME, "Play Doom", SHELL_ACT_LAUNCH_DOOM, 0 };
-	t->choices[1] = (struct shell_choice){ SHELL_SYM_NONE, "Browse media", SHELL_ACT_GOTO_TURN, 3 };
-	t->choices[2] = (struct shell_choice){ SHELL_SYM_NONE, "Back home", SHELL_ACT_GOTO_TURN, 0 };
-	t->focus_zone = SHELL_FOCUS_CONTENT;
-	t->focus_content_idx = 1;
-}
+		/* Top-right meta pill (border: none, rx=5, rgba(10,12,16,0.84), #F59E0B) */
+		if (mc->meta_pill[0]) {
+			int pw = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 11, mc->meta_pill) + 16;
+			int px0 = cx + cw - 12 - pw;
 
-/* --- Rendering --- */
+			shell_draw_rounded_rect_alpha(px0, cy + 12, pw, 22, 5, 0xff0a0c10U, 214);
+			shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 11,
+						     px0, cy + 12, pw, 22,
+						     0xfff59e0bU, mc->meta_pill);
+		}
 
-static const uint32_t *get_logo_bitmap(enum shell_theme_id theme, bool working_outline)
-{
-	if (theme == SHELL_THEME_SIGNAL)
-		return working_outline ? logo_signal_working : logo_signal_ready;
-	return working_outline ? logo_paper_working : logo_paper_ready;
-}
+		/* Bottom gradient scrim (148px tall) + overlaid title, subtitle, action row */
+		shell_draw_card_bottom_scrim(cx, cy, cw, ch, SHELL_CARD_RADIUS, 148);
 
-static void render_header(const struct shell_theme *th, enum shell_theme_id tid,
-			  const char *question, int turn_num, int turn_total,
-			  bool working_outline)
-{
-	int x = SHELL_CONTENT_LEFT;
-	int y = SHELL_CONTENT_TOP;
-	char counter[32];
+		int text_x = cx + 15;
+		int text_w = cw - 30;
+		int act_y = cy + ch - 27;
+		int sub_y = act_y - 22;
+		int title_y = sub_y - 24;
 
-	shell_draw_bitmap_xrgb(x, y, SHELL_LOGO_W, SHELL_LOGO_H,
-			       get_logo_bitmap(tid, working_outline));
+		shell_font_draw_role(SHELL_FONT_SANS_BOLD, 17,
+				     text_x, title_y, 0xfff8fafcU, mc->title, text_w);
+		shell_font_draw_role(SHELL_FONT_SANS_MEDIUM, 13,
+				     text_x, sub_y, 0xffe2e8f0U, mc->subtitle, text_w);
 
-	if (turn_total > 0) {
-		snprintf(counter, sizeof(counter),
-			 tid == SHELL_THEME_SIGNAL ? "%d / %d" : "%d of %d",
-			 turn_num, turn_total);
-	} else {
-		counter[0] = '\0';
+		uint32_t act_col = focused ? 0xfffbbf24U : 0xffcbd5e1U;
+		shell_font_draw_role(SHELL_FONT_MONO_SEMIBOLD, 12,
+				     text_x, act_y, act_col,
+				     mc->action_label[0] ? mc->action_label : "Open",
+				     text_w - 72);
+
+		if (focused) {
+			int sel_w = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 12, "Select ↵");
+			shell_font_draw_role(SHELL_FONT_MONO_SEMIBOLD, 12,
+					     cx + cw - 15 - sel_w, act_y,
+					     0xfffbbf24U, "Select ↵", sel_w + 4);
+		}
+
+		/* Selectable card border: 3px focus_ring when focused, 2px border otherwise */
+		shell_draw_rounded_outline(cx, cy, cw, ch, SHELL_CARD_RADIUS,
+					   focused ? SHELL_CARD_FOCUS_BORDER : SHELL_CARD_BORDER,
+					   focused ? th->focus_ring : th->border);
 	}
 
-	int cw = counter[0] ? shell_font_measure(tid, SHELL_FONT_META, false, counter) : 0;
-	int qx = x + SHELL_LOGO_W + SHELL_SPACE_HEADER_GAP;
-	int q_max_w = SHELL_SCREEN_W - SHELL_CONTENT_RIGHT - qx - (cw ? cw + 24 : 0);
-	int qy = y + (SHELL_LOGO_H - SHELL_FONT_QUESTION) / 2;
+	/* -----------------------------------------------------------------
+	 * SLOT 4: Fixed 58px Row of 4 Bottom Bar Buttons
+	 * Grid: 188px 364px 364px 188px with 16px gaps = 1152px
+	 * ----------------------------------------------------------------- */
+	static const int btn_xs[4] = { 64, 268, 648, 1028 };
+	static const int btn_ws[4] = { 188, 364, 364, 188 };
 
-	shell_font_draw(tid, SHELL_FONT_QUESTION, false, false,
-			qx, qy, th->secondary, question, q_max_w);
+	for (i = 0; i < SHELL_FOOTER_COUNT; i++) {
+		const struct giri_footer_link *fl = &scr->footer_links[i];
+		bool focused = (g_ui.active_win == GIRI_WIN_MAIN &&
+				g_ui.focus_zone == GIRI_ZONE_FOOTER &&
+				g_ui.footer_focus_idx == i);
+		int bx = btn_xs[i];
+		int bw = btn_ws[i];
+		int bh = SHELL_FOOTER_H;
+		int by = SHELL_SLOT4_Y - (focused ? 2 : 0);
 
-	if (cw > 0) {
-		int cx = SHELL_SCREEN_W - SHELL_CONTENT_RIGHT - cw;
-		int cy = y + (SHELL_LOGO_H - SHELL_FONT_META) / 2;
+		if (focused) {
+			shell_draw_focus_glow(bx, by, bw, bh, SHELL_FOOTER_RADIUS,
+					      3, 0xfff59e0bU, 71);
+		}
 
-		shell_font_draw(tid, SHELL_FONT_META, false, false,
-				cx, cy, th->secondary, counter, 0);
-	}
+		shell_draw_rounded_rect(bx, by, bw, bh, SHELL_FOOTER_RADIUS,
+					focused ? th->btn_focus_bg : th->btn_bg);
+		shell_draw_rounded_outline(bx, by, bw, bh, SHELL_FOOTER_RADIUS,
+					   focused ? SHELL_FOOTER_FOCUS_BORDER : SHELL_FOOTER_BORDER,
+					   focused ? th->focus_ring : th->border);
 
-	if (th->has_rule) {
-		int ry = y + SHELL_LOGO_H + SHELL_SPACE_RULE_ABOVE;
+		/* 30x30 internal icon box (border: none, rx=8) */
+		int ibx = bx + 12;
+		int iby = by + (bh - 30) / 2;
+		if (focused) {
+			shell_draw_rounded_rect(ibx, iby, 30, 30, 8, th->accent);
+			shell_draw_symbol(fl->symbol, ibx + 6, iby + 6, 18, 0xffffffffU);
+		} else {
+			shell_draw_rounded_rect_alpha(ibx, iby, 30, 30, 8, th->accent, 36);
+			shell_draw_symbol(fl->symbol, ibx + 6, iby + 6, 18, th->accent);
+		}
 
-		shell_draw_rect(SHELL_CONTENT_LEFT, ry, SHELL_CONTENT_MAX_W, 1, th->rule);
+		/* Right keycap badge "↵" (border: none, rx=6, 24x22) */
+		int kw = 24, kh = 22;
+		int kx = bx + bw - 12 - kw;
+		int ky = by + (bh - kh) / 2;
+		shell_draw_rounded_rect(kx, ky, kw, kh, 6,
+					focused ? th->accent : th->surface);
+		shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 12,
+					     kx, ky, kw, kh,
+					     focused ? 0xffffffffU : th->muted, "↵");
+
+		/* Button label vertically centered on cap-height */
+		int lx = ibx + 30 + 10;
+		int lw = kx - lx - 8;
+		shell_font_draw_vcentered(SHELL_FONT_SANS_SEMIBOLD, 14,
+					  lx, by, bh, th->ink,
+					  fl->label, lw);
 	}
 }
 
-static void render_state_line(const struct shell_theme *th, bool working, int progress_pct)
+/*
+ * Window 1: Fullscreen 1280x720 Edge-to-Edge Media / Detail Viewer (.media-overlay)
+ */
+static void render_window_media_overlay(const struct shell_theme *th)
 {
-	if (!th->has_state_line)
-		return;
-	if (!working) {
-		int h = th->state_line_idle_h;
+	const uint32_t *fs_art = g_ui.overlay_is_video
+				 ? shell_media_get_video_frame(&g_ui.overlay_card,
+							       g_ui.overlay_frame_idx)
+				 : shell_media_get_fullscreen_art(&g_ui.overlay_card);
 
-		shell_draw_rect(0, SHELL_SCREEN_H - h, SHELL_SCREEN_W, h,
-				th->state_line_idle);
-	} else {
-		int h = th->state_line_work_h;
-		int fill_w = (SHELL_SCREEN_W * (progress_pct > 0 ? progress_pct : 62)) / 100;
+	if (fs_art)
+		shell_draw_bitmap_xrgb(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, fs_art);
+	else
+		shell_draw_rect(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, 0xff060709U);
 
-		shell_draw_rect(0, SHELL_SCREEN_H - h, SHELL_SCREEN_W, h,
-				th->state_line_track);
+	if (g_ui.overlay_card.preset_art == GIRI_ART_DOOM_GAME)
+		draw_doom_art_labels(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H);
+
+	/* Top gradient bar */
+	shell_draw_top_scrim(SHELL_SCREEN_W, 96);
+
+	int bx = 56, by = 28;
+	int badge_w = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 12, g_ui.overlay_badge) + 22;
+	shell_draw_rounded_rect(bx, by, badge_w, 28, 6, th->accent);
+	shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 12,
+				     bx, by, badge_w, 28,
+				     0xffffffffU, g_ui.overlay_badge);
+
+	shell_font_draw_vcentered(SHELL_FONT_MONO_MEDIUM, 13,
+				  bx + badge_w + 14, by, 28, 0xffe2e8f0U,
+				  g_ui.overlay_source, 640);
+
+	/* Selectable right Back pill ("Menu / Esc = Back") -> 2px focus_ring border */
+	const char *hint = (g_ui.overlay_gallery_idx >= 0 && !g_ui.overlay_is_video)
+			   ? "Left/Right = Browse · Menu = Back"
+			   : "Menu / Esc = Back";
+	int hw = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 13, hint) + 32;
+	int hx = SHELL_SCREEN_W - 56 - hw;
+	shell_draw_rounded_rect_alpha(hx, by - 2, hw, 32, 8, 0xff0f1218U, 210);
+	shell_draw_rounded_outline(hx, by - 2, hw, 32, 8, 2, th->focus_ring);
+	shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 13,
+				     hx, by - 2, hw, 32,
+				     0xfff8fafcU, hint);
+
+	/* Bottom gradient scrim & summary box */
+	shell_draw_bottom_scrim(SHELL_SCREEN_H - 240, SHELL_SCREEN_W, 240);
+
+	int sy = SHELL_SCREEN_H - 132;
+	if (g_ui.overlay_is_video) {
+		/* Video player bar */
+		int px = 56, py = SHELL_SCREEN_H - 190, pw = SHELL_SCREEN_W - 112, ph = 42;
+		shell_draw_rounded_rect_alpha(px, py, pw, ph, 8, 0xff0c0d10U, 210);
+
+		const char *st_txt = g_ui.overlay_playing ? "PLAYING" : "PAUSED";
+		int st_w = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 13, st_txt) + 20;
+		shell_draw_rounded_rect(px + 16, py + 8, st_w, 26, 5, 0xfff59e0bU);
+		shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 13,
+					     px + 16, py + 8, st_w, 26,
+					     0xff161513U, st_txt);
+
+		char time_buf[32];
+		snprintf(time_buf, sizeof(time_buf), "00:%02d / 00:%02d",
+			 g_ui.overlay_elapsed_sec, g_ui.overlay_duration_sec);
+		int tw = shell_font_measure_role(SHELL_FONT_MONO_MEDIUM, 14, time_buf);
+		shell_font_draw_vcentered(SHELL_FONT_MONO_MEDIUM, 14,
+					  px + pw - 16 - tw, py, ph,
+					  0xffe2dfd7U, time_buf, tw + 4);
+
+		int tx = px + 16 + st_w + 16;
+		int tr_w = (px + pw - 16 - tw - 16) - tx;
+		int ty = py + (ph - 8) / 2;
+		shell_draw_rounded_rect_alpha(tx, ty, tr_w, 8, 4, 0xffffffffU, 56);
+		int fill_w = (tr_w * g_ui.overlay_elapsed_sec) /
+			     (g_ui.overlay_duration_sec > 0 ? g_ui.overlay_duration_sec : 15);
 		if (fill_w > 0)
-			shell_draw_rect(0, SHELL_SCREEN_H - h, fill_w, h, th->accent);
+			shell_draw_rounded_rect(tx, ty, fill_w, 8, 4, 0xfff59e0bU);
 	}
+
+	shell_font_draw_role(SHELL_FONT_SANS_BOLD, 28,
+			     56, sy, 0xffffffffU, g_ui.overlay_title, SHELL_SCREEN_W - 112);
+	shell_font_draw_wrapped_role(SHELL_FONT_SANS_MEDIUM, 18,
+				     56, sy + 38, 26, 1120, 2,
+				     0xfff8fafcU, g_ui.overlay_text);
 }
 
-static int get_active_choices(const struct shell_turn *t,
-			      struct shell_choice out_choices[4],
-			      const char **prefix_title)
+/*
+ * Shared Modal Overlay Frame & Surface Palette for Windows 2 and 3.
+ * Ensures dark ("Signal") theme modals clearly stand out as elevated overlay
+ * dialogs with deep backdrop dimming, ambient halo, elevated slate surfaces,
+ * and crisp double-rimmed borders.
+ */
+struct modal_palette {
+	uint32_t dlg_bg;
+	uint32_t dlg_border;
+	uint32_t dlg_inner_rim;
+	uint32_t strip_bg;
+	uint32_t strip_border;
+	uint32_t surf_bg;
+	uint32_t focus_bg;
+	uint32_t row_border;
+	uint32_t pill_bg;
+};
+
+static void get_modal_palette(const struct shell_theme *th, struct modal_palette *mp)
 {
-	int n = 0, i;
-
-	*prefix_title = NULL;
-	if (t->focus_zone == SHELL_FOCUS_CONTENT) {
-		if (t->num_items > 0 && t->focus_content_idx < t->num_items) {
-			const struct shell_item *it = &t->items[t->focus_content_idx];
-
-			*prefix_title = it->title;
-			for (i = 0; i < it->num_actions && n < 3; i++)
-				out_choices[n++] = it->actions[i];
-		} else if (t->num_tiles > 0 && t->focus_content_idx < t->num_tiles) {
-			const struct shell_tile *tl = &t->tiles[t->focus_content_idx];
-
-			*prefix_title = tl->title;
-			for (i = 0; i < tl->num_actions && n < 3; i++)
-				out_choices[n++] = tl->actions[i];
-		}
-	}
-
-	if (n == 0) {
-		for (i = 0; i < t->num_choices && n < 3; i++)
-			out_choices[n++] = t->choices[i];
-	}
-
-	/* 4th choice: Ask when a keyboard is connected, otherwise More ideas */
-	if (shell_input_has_keyboard()) {
-		out_choices[n++] = (struct shell_choice){
-			SHELL_SYM_KEYBOARD, "Ask", SHELL_ACT_OPEN_ASK, 0
-		};
+	if (g_ui.theme_id == SHELL_THEME_SIGNAL) {
+		mp->dlg_bg        = 0xff131722U;
+		mp->dlg_border    = 0xff4b5975U;
+		mp->dlg_inner_rim = 0xff263044U;
+		mp->strip_bg      = 0xff191f2dU;
+		mp->strip_border  = 0xff2b3548U;
+		mp->surf_bg       = 0xff1c2230U;
+		mp->focus_bg      = 0xff262f42U;
+		mp->row_border    = 0xff364156U;
+		mp->pill_bg       = 0xff10141dU;
 	} else {
-		out_choices[n++] = (struct shell_choice){
-			SHELL_SYM_NONE, "More ideas", SHELL_ACT_NEXT_IDEA, 0
-		};
+		mp->dlg_bg        = th->bg;
+		mp->dlg_border    = 0xffc6bdb0U;
+		mp->dlg_inner_rim = 0xfffaf8f3U;
+		mp->strip_bg      = th->surface;
+		mp->strip_border  = th->border;
+		mp->surf_bg       = th->surface;
+		mp->focus_bg      = th->btn_focus_bg;
+		mp->row_border    = th->border;
+		mp->pill_bg       = th->bg;
 	}
-	return n;
 }
 
-static void render_choices_row(const struct shell_theme *th, enum shell_theme_id tid,
-			       const struct shell_turn *t)
+static void draw_modal_backdrop_and_frame(const struct modal_palette *mp,
+					  int dx, int dy, int dw, int dh)
 {
-	struct shell_choice ch[4];
-	const char *prefix = NULL;
-	int n = get_active_choices(t, ch, &prefix);
-	int bottom_pad = (tid == SHELL_THEME_SIGNAL) ? 56 : SHELL_CONTENT_BOTTOM;
-	int box_h = SHELL_FONT_CHOICE + SHELL_SPACE_CHOICE_PAD_Y * 2;
-	int y = SHELL_SCREEN_H - bottom_pad - box_h;
-	int x = SHELL_CONTENT_LEFT - SHELL_SPACE_CHOICE_PAD_X;
+	/* Dim underlying Window 0 so the modal floats in the foreground */
+	if (g_ui.theme_id == SHELL_THEME_SIGNAL)
+		shell_draw_rect_alpha(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, 0xff020305U, 226);
+	else
+		shell_draw_rect_alpha(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, 0xff08090cU, 214);
+
+	/* Multi-layer elevation shadow + subtle outer halo */
+	shell_draw_card_shadow(dx, dy + 2, dw, dh, 16);
+	if (g_ui.theme_id == SHELL_THEME_SIGNAL)
+		shell_draw_focus_glow(dx, dy, dw, dh, 16, 5, 0xff64748bU, 34);
+
+	/* Elevated dialog surface + inner specular rim + 2px outer border */
+	shell_draw_rounded_rect(dx, dy, dw, dh, 16, mp->dlg_bg);
+	shell_draw_rounded_outline(dx + 2, dy + 2, dw - 4, dh - 4, 14, 1, mp->dlg_inner_rim);
+	shell_draw_rounded_outline(dx, dy, dw, dh, 16, 2, mp->dlg_border);
+}
+
+/*
+ * Window 2: Ask Giri Prompt & Suggested Topics Modal (#inputModal)
+ */
+static void render_window_ask_modal(const struct shell_theme *th)
+{
+	struct modal_palette mp;
+	int dx = 180, dy = 152, dw = 920, dh = 416;
+
+	render_window_main(th);
+	get_modal_palette(th, &mp);
+	draw_modal_backdrop_and_frame(&mp, dx, dy, dw, dh);
+
+	int ix = dx + 34;
+	int iy = dy + 28;
+	int iw = dw - 68;
+
+	shell_font_draw_role(SHELL_FONT_SANS_BOLD, 24, ix, iy, th->ink, "Ask Giri", iw);
+	iy += 46;
+
+	/* Input field + Submit button row (focus index 0) */
+	bool inp_focused = (g_ui.ask_focus_idx == 0);
+	int sub_w = 136;
+	int fld_w = iw - sub_w - 12;
+
+	if (inp_focused) {
+		shell_draw_focus_glow(ix, iy, fld_w, 56, 10, 3, 0xfff59e0bU, 64);
+		shell_draw_focus_glow(ix + fld_w + 12, iy, sub_w, 56, 10, 3, 0xfff59e0bU, 89);
+	}
+
+	shell_draw_rounded_rect(ix, iy, fld_w, 56, 10, mp.surf_bg);
+	shell_draw_rounded_outline(ix, iy, fld_w, 56, 10,
+				   inp_focused ? 3 : 2,
+				   inp_focused ? th->focus_ring : mp.row_border);
+
+	if (g_ui.ask_input_len > 0) {
+		shell_font_draw_vcentered(SHELL_FONT_SANS_SEMIBOLD, 20,
+					  ix + 18, iy, 56, th->ink,
+					  g_ui.ask_input, fld_w - 36);
+	} else {
+		shell_font_draw_vcentered(SHELL_FONT_SANS_SEMIBOLD, 19,
+					  ix + 18, iy, 56, th->muted,
+					  "Ask any question, news, weather, topic, media, or Doom…",
+					  fld_w - 36);
+	}
+
+	int sbx = ix + fld_w + 12;
+	shell_draw_rounded_rect(sbx, iy, sub_w, 56, 10, th->accent);
+	shell_draw_rounded_outline(sbx, iy, sub_w, 56, 10,
+				   inp_focused ? 3 : 2,
+				   inp_focused ? th->focus_ring : th->accent);
+	shell_font_draw_box_centered(SHELL_FONT_SANS_BOLD, 18,
+				     sbx, iy, sub_w, 56, 0xffffffffU,
+				     "Ask Giri");
+
+	iy += 56 + 22;
+	shell_font_draw_role(SHELL_FONT_MONO_SEMIBOLD, 11,
+			     ix + 2, iy, th->muted, "SUGGESTED TOPICS", iw);
+	iy += 22;
+
+	/* 7 Quick-Prompt Chips (focus indices 1..7) */
+	int cx = ix;
+	int cy = iy;
 	int i;
 
-	if (prefix && prefix[0]) {
-		int pw = shell_font_draw(tid, SHELL_FONT_CHOICE, false, false,
-					 SHELL_CONTENT_LEFT,
-					 y + SHELL_SPACE_CHOICE_PAD_Y,
-					 th->secondary, prefix, 260);
-		int dot_w = shell_font_draw(tid, SHELL_FONT_CHOICE, false, false,
-					    SHELL_CONTENT_LEFT + pw + 10,
-					    y + SHELL_SPACE_CHOICE_PAD_Y,
-					    th->secondary, "\xc2\xb7", 0);
-		x = SHELL_CONTENT_LEFT + pw + dot_w + 20 - SHELL_SPACE_CHOICE_PAD_X;
-	}
+	for (i = 0; i < QUICK_PROMPTS_COUNT; i++) {
+		int idx = i + 1;
+		bool c_focused = (g_ui.ask_focus_idx == idx);
+		int cw = shell_font_measure_role(SHELL_FONT_SANS_SEMIBOLD, 14,
+						 quick_prompts[i].label) + 28;
+		int ch = 38;
 
-	for (i = 0; i < n; i++) {
-		bool is_focused = (t->focus_zone == SHELL_FOCUS_CHOICES &&
-				   t->focus_choice_idx == i);
-		bool is_quiet = (i == n - 1);
-		bool bold = is_focused;
-		bool italic = (is_quiet && !is_focused && tid == SHELL_THEME_PAPER);
-		int sym_sz = (ch[i].symbol == SHELL_SYM_KEYBOARD) ? 26 : 22;
-		int sym_w = (ch[i].symbol != SHELL_SYM_NONE) ?
-			    (sym_sz + SHELL_SPACE_SYMBOL_GAP) : 0;
-		int tw = shell_font_measure(tid, SHELL_FONT_CHOICE, bold, ch[i].label);
-		int bw = SHELL_SPACE_CHOICE_PAD_X * 2 + sym_w + tw;
-
-		uint32_t fg = is_focused ? th->on_focus :
-			      (is_quiet ? th->secondary : th->choice);
-
-		if (is_focused)
-			shell_draw_rounded_rect(x, y, bw, box_h, th->radius, th->focus);
-
-		int inner_x = x + SHELL_SPACE_CHOICE_PAD_X;
-		if (ch[i].symbol != SHELL_SYM_NONE) {
-			int sym_y = y + (box_h - sym_sz) / 2;
-
-			shell_draw_symbol(ch[i].symbol, inner_x, sym_y, sym_sz, fg);
-			inner_x += sym_w;
+		if (cx + cw > ix + iw) {
+			cx = ix;
+			cy += ch + 10;
 		}
-		shell_font_draw(tid, SHELL_FONT_CHOICE, bold, italic,
-				inner_x, y + SHELL_SPACE_CHOICE_PAD_Y, fg,
-				ch[i].label, 0);
+		if (c_focused)
+			shell_draw_focus_glow(cx, cy, cw, ch, 8, 3, 0xfff59e0bU, 64);
 
-		x += bw + SHELL_SPACE_CHOICE_GAP;
+		shell_draw_rounded_rect(cx, cy, cw, ch, 8,
+					c_focused ? mp.focus_bg : mp.surf_bg);
+		shell_draw_rounded_outline(cx, cy, cw, ch, 8,
+					   c_focused ? 3 : 2,
+					   c_focused ? th->focus_ring : mp.row_border);
+		shell_font_draw_box_centered(SHELL_FONT_SANS_SEMIBOLD, 14,
+					     cx, cy, cw, ch, th->ink,
+					     quick_prompts[i].label);
+		cx += cw + 10;
 	}
+
+	/* Close row at bottom of dialog (focus index 8) */
+	int close_idx = QUICK_PROMPTS_COUNT + 1;
+	bool close_focused = (g_ui.ask_focus_idx == close_idx);
+	int c_y = dy + dh - 28 - 44;
+
+	if (close_focused)
+		shell_draw_focus_glow(ix, c_y, iw, 44, 10, 3, 0xfff59e0bU, 64);
+	shell_draw_rounded_rect(ix, c_y, iw, 44, 10,
+				close_focused ? mp.focus_bg : mp.surf_bg);
+	shell_draw_rounded_outline(ix, c_y, iw, 44, 10,
+				   close_focused ? 3 : 2,
+				   close_focused ? th->focus_ring : mp.row_border);
+
+	int close_lbl_w = shell_font_measure_role(SHELL_FONT_SANS_BOLD, 15, "Close");
+	int dw_pill = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 12, "Done ↵") + 20;
+	int total_cw = close_lbl_w + 12 + dw_pill;
+	int cl_x = ix + (iw - total_cw) / 2;
+	int dpx = cl_x + close_lbl_w + 12;
+	int dpy = c_y + (44 - 24) / 2;
+
+	shell_font_draw_vcentered(SHELL_FONT_SANS_BOLD, 15,
+				  cl_x, c_y, 44, th->ink, "Close", close_lbl_w + 8);
+	shell_draw_rounded_rect(dpx, dpy, dw_pill, 24, 6,
+				close_focused ? th->accent : mp.pill_bg);
+	shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 12,
+				     dpx, dpy, dw_pill, 24,
+				     close_focused ? 0xffffffffU : th->accent, "Done ↵");
 }
 
-static void render_theme_picker(void)
+/* Helper to draw a selectable .setting-row in Window 3 */
+static void draw_setting_row(const struct shell_theme *th,
+			     const struct modal_palette *mp,
+			     int x, int y, int w, int h,
+			     const char *title, const char *meta_tag,
+			     const char *desc, const char *val_badge,
+			     bool focused, bool is_active_badge,
+			     bool is_downloading, int progress)
 {
-	enum shell_theme_id tid = app.cfg.theme;
-	const struct shell_theme *th = &shell_themes[tid];
+	if (focused)
+		shell_draw_focus_glow(x, y, w, h, 10, 3, 0xfff59e0bU, 64);
 
-	shell_draw_rect(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, th->ground);
-	render_header(th, tid, "Pick a look for your screen", 1, 1, false);
+	shell_draw_rounded_rect(x, y, w, h, 10,
+				focused ? mp->focus_bg : mp->surf_bg);
 
-	int body_y = SHELL_CONTENT_TOP + SHELL_LOGO_H +
-		     SHELL_SPACE_RULE_ABOVE + 1 + SHELL_SPACE_RULE_BELOW;
+	int vw = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 12, val_badge) + 20;
+	int vx = x + w - 14 - vw;
+	int vy = y + (h - 24) / 2;
+	bool pill_accent = focused || is_active_badge;
 
-	shell_font_draw(tid, SHELL_FONT_DISPLAY, true, false,
-			SHELL_CONTENT_LEFT, body_y, th->text,
-			tid == SHELL_THEME_SIGNAL ? "Signal" : "Paper", 0);
+	shell_draw_rounded_rect(vx, vy, vw, 24, 6, pill_accent ? th->accent : mp->pill_bg);
+	shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 12,
+				     vx, vy, vw, 24,
+				     pill_accent ? 0xffffffffU : th->accent, val_badge);
 
-	body_y += SHELL_FONT_DISPLAY + 20;
-	shell_font_draw_wrapped(tid, SHELL_FONT_ANSWER, false,
-				SHELL_CONTENT_LEFT, body_y,
-				(SHELL_FONT_ANSWER * th->answer_lh_pct) / 100,
-				SHELL_TEXT_MAX_W, 4, th->text,
-				"Paper is warm and bookish in Literata. Signal is dark and high-contrast in Atkinson Hyperlegible. Use Left and Right to preview, and press OK to start.");
+	int tx = x + 14;
+	int max_tw = vx - tx - 8;
+	int tw = shell_font_draw_role(SHELL_FONT_SANS_BOLD, 15,
+				      tx, y + 13, th->ink, title, max_tw);
+	if (meta_tag && meta_tag[0] && tw + 14 < max_tw) {
+		shell_font_draw_role(SHELL_FONT_MONO_MEDIUM, 11,
+				     tx + tw + 7, y + 16, th->muted,
+				     meta_tag, max_tw - tw - 7);
+	}
+	if (desc && desc[0]) {
+		shell_font_draw_role(SHELL_FONT_SANS_MEDIUM, 11,
+				     tx, y + 34, th->muted, desc, max_tw);
+	}
 
-	/* Draw the two theme choices at the bottom */
-	int bottom_pad = (tid == SHELL_THEME_SIGNAL) ? 56 : SHELL_CONTENT_BOTTOM;
-	int box_h = SHELL_FONT_CHOICE + SHELL_SPACE_CHOICE_PAD_Y * 2;
-	int y = SHELL_SCREEN_H - bottom_pad - box_h;
-	int x = SHELL_CONTENT_LEFT - SHELL_SPACE_CHOICE_PAD_X;
-	const char *labels[2] = { "Paper", "Signal" };
+	if (is_downloading) {
+		shell_draw_rect_alpha(x + 2, y + h - 6, w - 4, 4, 0xfff59e0bU, 46);
+		int fw = ((w - 4) * progress) / 100;
+		if (fw > 0)
+			shell_draw_rect(x + 2, y + h - 6, fw, 4, 0xfff59e0bU);
+	}
+
+	shell_draw_rounded_outline(x, y, w, h, 10,
+				   focused ? 3 : 2,
+				   focused ? th->focus_ring : mp->row_border);
+}
+
+/*
+ * Window 3: Velliangiri OS Settings Modal (#settingsModal)
+ *   - Read-only 5-column System Status Strip
+ *   - 3-column OS Preferences grid (indices 0..2)
+ *   - 2x3 Supported AI Models grid from supported_models.json (indices 3..8)
+ *   - Close Settings row (index 9)
+ */
+static void render_window_settings_modal(const struct shell_theme *th)
+{
+	struct modal_palette mp;
+	int dx = 160, dy = 42, dw = 960, dh = 636;
+
+	render_window_main(th);
+	get_modal_palette(th, &mp);
+	draw_modal_backdrop_and_frame(&mp, dx, dy, dw, dh);
+
+	int ix = dx + 28;
+	int iy = dy + 22;
+	int iw = dw - 56;	/* 904px */
+
+	shell_font_draw_role(SHELL_FONT_SANS_BOLD, 24,
+			     ix, iy, th->ink, "Velliangiri OS Settings", iw);
+	iy += 38;
+
+	/* Non-selectable 5-column System Status Strip (rx=10) */
+	shell_draw_rounded_rect(ix, iy, iw, 54, 10, mp.strip_bg);
+	if (g_ui.theme_id == SHELL_THEME_SIGNAL)
+		shell_draw_rounded_outline(ix, iy, iw, 54, 10, 1, mp.strip_border);
+	const char *labels[5] = { "TEMPERATURE", "STORAGE", "MEMORY", "NETWORK", "DISPLAY" };
+	const char *vals[5] = {
+		g_ui.sys_temp, g_ui.sys_storage, g_ui.sys_memory,
+		g_ui.sys_network, g_ui.sys_display
+	};
+	int col_w = (iw - 32) / 5;
 	int i;
 
-	for (i = 0; i < 2; i++) {
-		bool is_focused = ((int)tid == i);
-		int tw = shell_font_measure(tid, SHELL_FONT_CHOICE, is_focused, labels[i]);
-		int bw = SHELL_SPACE_CHOICE_PAD_X * 2 + tw;
-		uint32_t fg = is_focused ? th->on_focus : th->choice;
+	for (i = 0; i < 5; i++) {
+		int mx = ix + 16 + i * col_w;
+		shell_font_draw_role(SHELL_FONT_MONO_SEMIBOLD, 11,
+				     mx, iy + 11, th->muted, labels[i], col_w - 8);
+		shell_font_draw_role(SHELL_FONT_SANS_BOLD, 15,
+				     mx, iy + 28, th->ink, vals[i], col_w - 8);
+	}
+	iy += 54 + 14;
 
-		if (is_focused)
-			shell_draw_rounded_rect(x, y, bw, box_h, th->radius, th->focus);
-		shell_font_draw(tid, SHELL_FONT_CHOICE, is_focused, false,
-				x + SHELL_SPACE_CHOICE_PAD_X,
-				y + SHELL_SPACE_CHOICE_PAD_Y,
-				fg, labels[i], 0);
-		x += bw + SHELL_SPACE_CHOICE_GAP;
+	/* Section 1: OS PREFERENCES (3 columns, indices 0..2) */
+	shell_font_draw_role(SHELL_FONT_MONO_SEMIBOLD, 11,
+			     ix + 2, iy, th->muted, "OS PREFERENCES", iw);
+	iy += 18;
+
+	int pref_w = (iw - 20) / 3;	/* 294px each */
+	draw_setting_row(th, &mp, ix, iy, pref_w, 58,
+			 "Display Theme", NULL, "Paper (Daylight) or Signal (Night)",
+			 g_ui.theme_id == SHELL_THEME_PAPER ? "Paper" : "Signal",
+			 g_ui.settings_focus_idx == 0, false, false, 0);
+	draw_setting_row(th, &mp, ix + pref_w + 10, iy, pref_w, 58,
+			 "Auto Read Aloud", NULL, "Speak summary automatically on load",
+			 g_ui.auto_read_aloud ? "On" : "Off",
+			 g_ui.settings_focus_idx == 1, false, false, 0);
+	draw_setting_row(th, &mp, ix + (pref_w + 10) * 2, iy, iw - (pref_w + 10) * 2, 58,
+			 "Navigation Sound", NULL, "Remote D-pad acoustic micro-feedback",
+			 g_ui.nav_sound_enabled ? "On" : "Muted",
+			 g_ui.settings_focus_idx == 2, false, false, 0);
+	iy += 58 + 14;
+
+	/* Section 2: SUPPORTED AI MODELS (2x3 grid, indices 3..8) */
+	shell_font_draw_role(SHELL_FONT_MONO_SEMIBOLD, 11,
+			     ix + 2, iy, th->muted,
+			     "SUPPORTED AI MODELS (SUPPORTED_MODELS.JSON)", iw);
+	iy += 18;
+
+	int mod_w = (iw - 10) / 2;	/* 447px each */
+	for (i = 0; i < g_ui.model_count && i < 6; i++) {
+		const struct giri_model_info *m = &g_ui.models[i];
+		int col = i & 1;
+		int row = i >> 1;
+		int mx = ix + col * (mod_w + 10);
+		int my = iy + row * (58 + 8);
+		int focus_idx = 3 + i;
+		bool is_active = m->installed && (i == g_ui.active_model_idx);
+		char meta[48];
+		char val_badge[32];
+		char dl_desc[96];
+
+		snprintf(meta, sizeof(meta), "%s · %s", m->id, m->size_label);
+		if (is_active)
+			snprintf(val_badge, sizeof(val_badge), "✓ Active");
+		else if (m->installed)
+			snprintf(val_badge, sizeof(val_badge), "Select ↵");
+		else if (m->downloading)
+			snprintf(val_badge, sizeof(val_badge), "%d%%", m->progress);
+		else
+			snprintf(val_badge, sizeof(val_badge), "⬇ %s", m->size_label);
+
+		if (m->downloading)
+			snprintf(dl_desc, sizeof(dl_desc), "Downloading %d%%…", m->progress);
+
+		draw_setting_row(th, &mp, mx, my, mod_w, 58,
+				 m->name, meta,
+				 m->downloading ? dl_desc : m->description,
+				 val_badge,
+				 g_ui.settings_focus_idx == focus_idx,
+				 is_active, m->downloading, m->progress);
 	}
 
-	render_state_line(th, false, 0);
-	shell_display_present();
+	iy += 3 * (58 + 8) + 6;
+
+	/* Close Settings row (index 3 + model_count) */
+	int close_idx = 3 + g_ui.model_count;
+	bool close_focused = (g_ui.settings_focus_idx == close_idx);
+
+	if (close_focused)
+		shell_draw_focus_glow(ix, iy, iw, 44, 10, 3, 0xfff59e0bU, 64);
+	shell_draw_rounded_rect(ix, iy, iw, 44, 10,
+				close_focused ? mp.focus_bg : mp.surf_bg);
+	shell_draw_rounded_outline(ix, iy, iw, 44, 10,
+				   close_focused ? 3 : 2,
+				   close_focused ? th->focus_ring : mp.row_border);
+
+	int close_lbl_w = shell_font_measure_role(SHELL_FONT_SANS_BOLD, 15, "Close Settings");
+	int dw_pill = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 12, "Done ↵") + 20;
+	int total_cw = close_lbl_w + 12 + dw_pill;
+	int cl_x = ix + (iw - total_cw) / 2;
+	int dpx = cl_x + close_lbl_w + 12;
+	int dpy = iy + (44 - 24) / 2;
+
+	shell_font_draw_vcentered(SHELL_FONT_SANS_BOLD, 15,
+				  cl_x, iy, 44, th->ink, "Close Settings", close_lbl_w + 8);
+	shell_draw_rounded_rect(dpx, dpy, dw_pill, 24, 6,
+				close_focused ? th->accent : mp.pill_bg);
+	shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 12,
+				     dpx, dpy, dw_pill, 24,
+				     close_focused ? 0xffffffffU : th->accent, "Done ↵");
 }
 
-static void render_turn_screen(void)
+static void render_frame(void)
 {
-	enum shell_theme_id tid = app.cfg.theme;
-	const struct shell_theme *th = &shell_themes[tid];
-	const struct shell_turn *t = &app.turns[app.cur_turn];
-	bool working = (t->state == SHELL_TURN_WORKING);
+	const struct shell_theme *th = &shell_themes[g_ui.theme_id];
 
-	shell_draw_rect(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, th->ground);
-	render_header(th, tid, t->question, app.cur_turn + 1, app.num_turns,
-		      working && app.logo_blink_alt);
-
-	int y = SHELL_CONTENT_TOP + SHELL_LOGO_H +
-		SHELL_SPACE_RULE_ABOVE + 1 + SHELL_SPACE_RULE_BELOW;
-
-	if (working) {
-		int i;
-
-		for (i = 0; i < t->num_steps; i++) {
-			bool done = t->steps[i].done;
-			enum shell_symbol_id sym = done ? SHELL_SYM_CHECK : SHELL_SYM_STEP_DOT;
-			uint32_t sym_c = done ? th->secondary : th->accent;
-			uint32_t txt_c = done ? th->secondary : th->text;
-			bool italic = (!done && tid == SHELL_THEME_PAPER);
-
-			shell_draw_symbol(sym, SHELL_CONTENT_LEFT, y + 2, 24, sym_c);
-			shell_font_draw(tid, SHELL_FONT_STEP, false, italic,
-					SHELL_CONTENT_LEFT + 24 + 18, y,
-					txt_c, t->steps[i].text,
-					SHELL_TEXT_MAX_W);
-			y += SHELL_FONT_STEP + SHELL_SPACE_STEP_GAP;
-		}
-
-		int bottom_pad = (tid == SHELL_THEME_SIGNAL) ? 56 : SHELL_CONTENT_BOTTOM;
-		shell_font_draw(tid, SHELL_FONT_META, false, false,
-				SHELL_CONTENT_LEFT,
-				SHELL_SCREEN_H - bottom_pad - SHELL_FONT_META,
-				th->secondary, "Menu to stop", 0);
-		render_state_line(th, true, t->progress_pct);
-		shell_display_present();
-		return;
-	}
-
-	/* Notice banner if active */
-	if (app.notice_text[0] && monotonic_ms() < app.notice_until_ms) {
-		shell_draw_symbol(app.notice_sym, SHELL_CONTENT_LEFT, y + 2, 28, th->text);
-		shell_font_draw(tid, SHELL_FONT_ITEM, false, false,
-				SHELL_CONTENT_LEFT + 28 + 24, y,
-				th->text, app.notice_text, SHELL_TEXT_MAX_W);
-		y += SHELL_FONT_ITEM + 28;
-	}
-
-	/* Optional 64px Value block */
-	if (t->value_big[0]) {
-		shell_font_draw(tid, SHELL_FONT_DISPLAY, true, false,
-				SHELL_CONTENT_LEFT, y, th->text, t->value_big, 0);
-		y += (SHELL_FONT_DISPLAY * 110) / 100 + 4;
-		if (t->value_label[0]) {
-			shell_font_draw(tid, SHELL_FONT_ITEM_DETAIL, false, false,
-					SHELL_CONTENT_LEFT, y, th->secondary,
-					t->value_label, SHELL_TEXT_MAX_W);
-			y += SHELL_FONT_ITEM_DETAIL + SHELL_SPACE_ANSWER_TO_ITEMS;
-		}
-	}
-
-	/* Answer text */
-	if (t->answer[0]) {
-		int lh = (SHELL_FONT_ANSWER * th->answer_lh_pct) / 100;
-		int ah = shell_font_draw_wrapped(tid, SHELL_FONT_ANSWER, false,
-						 SHELL_CONTENT_LEFT, y, lh,
-						 SHELL_TEXT_MAX_W,
-						 SHELL_LIMIT_ANSWER_LINES,
-						 th->text, t->answer);
-		y += ah;
-	}
-
-	/* Optional sources line */
-	if (t->sources[0]) {
-		y += SHELL_SPACE_ANSWER_TO_SOURCES;
-		shell_draw_symbol(SHELL_SYM_PAGE, SHELL_CONTENT_LEFT, y, 20, th->secondary);
-		shell_font_draw(tid, SHELL_FONT_META, false, false,
-				SHELL_CONTENT_LEFT + 20 + 10, y,
-				th->secondary, t->sources, SHELL_TEXT_MAX_W);
-		y += SHELL_FONT_META;
-	}
-
-	/* Optional Item rows (<= 5) */
-	if (t->num_items > 0) {
-		int i;
-		int row_h = SHELL_FONT_ITEM + SHELL_SPACE_ITEM_PAD_Y * 2;
-		int row_x = SHELL_CONTENT_LEFT - SHELL_SPACE_ITEM_PAD_X;
-		int row_w = 1060;
-
-		if (t->answer[0] || t->sources[0])
-			y += SHELL_SPACE_ANSWER_TO_ITEMS;
-
-		for (i = 0; i < t->num_items && i < SHELL_LIMIT_ITEMS; i++) {
-			const struct shell_item *it = &t->items[i];
-			bool is_on = (t->focus_zone == SHELL_FOCUS_CONTENT &&
-				      t->focus_content_idx == i);
-			uint32_t fg = is_on ? th->on_focus : th->item;
-			uint32_t dfg = is_on ? th->on_focus_secondary : th->secondary;
-
-			if (is_on)
-				shell_draw_rounded_rect(row_x, y, row_w, row_h,
-							th->radius, th->focus);
-
-			int tx = SHELL_CONTENT_LEFT;
-			if (it->symbol != SHELL_SYM_NONE) {
-				shell_draw_symbol(it->symbol, tx,
-						  y + (row_h - 24) / 2, 24, fg);
-				tx += 24 + 16;
-			}
-			shell_font_draw(tid, SHELL_FONT_ITEM, is_on, false,
-					tx, y + SHELL_SPACE_ITEM_PAD_Y,
-					fg, it->title, 620);
-
-			if (it->detail[0]) {
-				int dw = shell_font_measure(tid, SHELL_FONT_ITEM_DETAIL,
-							    false, it->detail);
-				int dx = row_x + row_w - SHELL_SPACE_ITEM_PAD_X - dw;
-				int dy = y + (row_h - SHELL_FONT_ITEM_DETAIL) / 2;
-
-				shell_font_draw(tid, SHELL_FONT_ITEM_DETAIL, false, false,
-						dx, dy, dfg, it->detail, 0);
-			}
-			y += row_h;
-		}
-	}
-
-	/* Optional Media tiles (4 x 248x140) */
-	if (t->num_tiles > 0) {
-		int i;
-
-		y += SHELL_SPACE_ANSWER_TO_TILES;
-		for (i = 0; i < t->num_tiles && i < SHELL_LIMIT_TILES; i++) {
-			const struct shell_tile *tl = &t->tiles[i];
-			bool is_on = (t->focus_zone == SHELL_FOCUS_CONTENT &&
-				      t->focus_content_idx == i);
-			int tx = SHELL_CONTENT_LEFT +
-				 i * (SHELL_THUMB_W + SHELL_SPACE_TILE_GAP);
-
-			if (tl->thumb_pixels) {
-				shell_draw_rounded_bitmap(tx, y,
-							  SHELL_THUMB_W, SHELL_THUMB_H,
-							  th->radius, tl->thumb_pixels);
-			}
-			if (is_on) {
-				int off = SHELL_THUMB_FOCUS_OFFSET;
-				int fw = SHELL_THUMB_FOCUS_FRAME;
-
-				shell_draw_rounded_outline(tx - off - fw, y - off - fw,
-							   SHELL_THUMB_W + (off + fw) * 2,
-							   SHELL_THUMB_H + (off + fw) * 2,
-							   th->radius + off, fw, th->focus);
-			}
-
-			/* Video duration badge at bottom-right (8px inset) */
-			if (tl->badge[0]) {
-				uint32_t b_bg = is_on ? th->focus : th->badge;
-				uint32_t b_fg = is_on ? th->on_focus : th->on_badge;
-				int tw = shell_font_measure(tid, SHELL_FONT_BADGE, false, tl->badge);
-				int bw = 8 + 12 + 6 + tw + 8;
-				int bh = SHELL_FONT_BADGE + 6;
-				int bx = tx + SHELL_THUMB_W - 8 - bw;
-				int by = y + SHELL_THUMB_H - 8 - bh;
-
-				shell_draw_rounded_rect(bx, by, bw, bh, 4, b_bg);
-				shell_draw_symbol(SHELL_SYM_PLAY, bx + 8,
-						  by + (bh - 12) / 2, 12, b_fg);
-				shell_font_draw(tid, SHELL_FONT_BADGE, false, false,
-						bx + 8 + 12 + 6, by + 3,
-						b_fg, tl->badge, 0);
-			}
-
-			int ty = y + SHELL_THUMB_H + 12;
-			shell_font_draw(tid, SHELL_FONT_TILE_TITLE, is_on, false,
-					tx, ty,
-					is_on ? th->text : th->item,
-					tl->title, SHELL_THUMB_W);
-			ty += SHELL_FONT_TILE_TITLE + 6;
-			shell_font_draw(tid, SHELL_FONT_TILE_DETAIL, false, false,
-					tx, ty, th->secondary,
-					tl->detail, SHELL_THUMB_W);
-		}
-	}
-
-	render_choices_row(th, tid, t);
-	render_state_line(th, false, 0);
-	shell_display_present();
-}
-
-static void render_ask_screen(void)
-{
-	enum shell_theme_id tid = app.cfg.theme;
-	const struct shell_theme *th = &shell_themes[tid];
-	const struct shell_turn *t = &app.turns[app.cur_turn];
-
-	shell_draw_rect(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, th->ground);
-	render_header(th, tid, t->question, app.cur_turn + 1, app.num_turns, false);
-
-	int y = 240;
-
-	shell_draw_symbol(SHELL_SYM_KEYBOARD, SHELL_CONTENT_LEFT, y, 26, th->secondary);
-	shell_font_draw(tid, SHELL_FONT_ITEM_DETAIL, false, false,
-			SHELL_CONTENT_LEFT + 26 + 12, y + 2,
-			th->secondary, "Ask anything", 0);
-
-	y += 26 + 18;
-	int tw = shell_font_draw(tid, SHELL_FONT_ASK_INPUT, false, false,
-				 SHELL_CONTENT_LEFT, y, th->text,
-				 app.ask_buf, SHELL_CONTENT_MAX_W - 12);
-
-	/* Caret (3px in Paper text, 4px in Signal accent, 50px high) */
-	int caret_w = (tid == SHELL_THEME_SIGNAL) ? 4 : 3;
-	uint32_t caret_c = (tid == SHELL_THEME_SIGNAL) ? th->accent : th->text;
-
-	shell_draw_rect(SHELL_CONTENT_LEFT + tw + 2, y - 2, caret_w, 50, caret_c);
-
-	if (tid == SHELL_THEME_PAPER) {
-		shell_draw_rect(SHELL_CONTENT_LEFT, y + 50 + 14,
-				SHELL_CONTENT_MAX_W, 2, th->text);
-	}
-
-	int bottom_pad = (tid == SHELL_THEME_SIGNAL) ? 56 : SHELL_CONTENT_BOTTOM;
-	shell_font_draw(tid, SHELL_FONT_META, false, false,
-			SHELL_CONTENT_LEFT,
-			SHELL_SCREEN_H - bottom_pad - SHELL_FONT_META,
-			th->secondary, "Enter to ask \xc2\xb7 Esc to cancel", 0);
-
-	render_state_line(th, false, 0);
-	shell_display_present();
-}
-
-static void open_image_viewer(int tile_idx)
-{
-	enum shell_theme_id tid = app.cfg.theme;
-	const struct shell_theme *th = &shell_themes[tid];
-	const struct shell_turn *t = &app.turns[3];
-
-	if (tile_idx < 0 || tile_idx >= t->num_tiles)
-		tile_idx = 0;
-	app.viewer_tile_idx = tile_idx;
-	app.mode = MODE_IMAGE_VIEWER;
-	app.viewer_chip_visible = true;
-	app.viewer_chip_until_ms = monotonic_ms() + SHELL_TIMING_VIEWER_HIDE_MS;
-
-	if (!app.viewer_pixels) {
-		app.viewer_pixels = malloc((size_t)SHELL_SCREEN_W *
-					   SHELL_SCREEN_H * sizeof(uint32_t));
-	}
-	if (app.viewer_pixels) {
-		const struct shell_tile *tl = &t->tiles[tile_idx];
-
-		if (shell_media_load_jpeg_viewer(tl->media_path,
-						 app.viewer_pixels,
-						 th->ground) != 0) {
-			shell_media_render_sample_viewer(app.viewer_pixels,
-							 tl->art_id,
-							 th->ground);
-		}
-	}
-}
-
-static void render_image_viewer(void)
-{
-	enum shell_theme_id tid = app.cfg.theme;
-	const struct shell_theme *th = &shell_themes[tid];
-	const struct shell_turn *t = &app.turns[3];
-	const struct shell_tile *tl = &t->tiles[app.viewer_tile_idx];
-
-	if (app.viewer_pixels) {
-		shell_draw_bitmap_xrgb(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H,
-				       app.viewer_pixels);
-	} else {
-		shell_draw_rect(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, th->ground);
-	}
-
-	if (app.viewer_chip_visible) {
-		char sub[64];
-
-		snprintf(sub, sizeof(sub),
-			 tid == SHELL_THEME_SIGNAL ?
-			 "%d / %d \xc2\xb7 \xe2\x86\x90 \xe2\x86\x92 \xc2\xb7 Menu back" :
-			 "%d of %d \xc2\xb7 \xe2\x86\x90 \xe2\x86\x92 \xc2\xb7 Menu back",
-			 app.viewer_tile_idx + 1, t->num_tiles);
-
-		int tw1 = shell_font_measure(tid, SHELL_FONT_ITEM_DETAIL, false, tl->title);
-		int tw2 = shell_font_measure(tid, SHELL_FONT_BADGE, false, sub);
-		int max_tw = tw1 > tw2 ? tw1 : tw2;
-		int chip_w = 18 + SHELL_LOGO_W + 16 + max_tw + 18;
-		int chip_h = 68;
-
-		shell_draw_rounded_rect(32, 20, chip_w, chip_h, th->radius, th->ground);
-		shell_draw_bitmap_xrgb(32 + 18, 20 + (chip_h - SHELL_LOGO_H) / 2,
-				       SHELL_LOGO_W, SHELL_LOGO_H,
-				       get_logo_bitmap(tid, false));
-		shell_font_draw(tid, SHELL_FONT_ITEM_DETAIL, false, false,
-				32 + 18 + SHELL_LOGO_W + 16, 20 + 12,
-				th->text, tl->title, 0);
-		shell_font_draw(tid, SHELL_FONT_BADGE, false, false,
-				32 + 18 + SHELL_LOGO_W + 16, 20 + 38,
-				th->secondary, sub, 0);
-	}
-	shell_display_present();
-}
-
-static void redraw_current_screen(void)
-{
-	switch (app.mode) {
-	case MODE_THEME_PICKER:
-		render_theme_picker();
-		break;
-	case MODE_ASK_LINE:
-		render_ask_screen();
-		break;
-	case MODE_IMAGE_VIEWER:
-		render_image_viewer();
-		break;
-	case MODE_TURN_VIEW:
+	switch (g_ui.active_win) {
+	case GIRI_WIN_MAIN:
 	default:
-		render_turn_screen();
+		render_window_main(th);
 		break;
+	case GIRI_WIN_MEDIA_OVERLAY:
+		render_window_media_overlay(th);
+		break;
+	case GIRI_WIN_ASK_MODAL:
+		render_window_ask_modal(th);
+		break;
+	case GIRI_WIN_SETTINGS_MODAL:
+		render_window_settings_modal(th);
+		break;
+	}
+	shell_display_damage_all();
+	shell_display_present();
+}
+
+/* =========================================================================
+ * 5. Action Execution & 6-Button Remote Navigation State Machine
+ * ========================================================================= */
+
+static void start_topic_transition(const char *query)
+{
+	g_ui.active_win = GIRI_WIN_MAIN;
+	g_ui.tts_speaking = false;
+	g_ui.is_working = true;
+	g_ui.working_start_ms = shell_now_ms();
+	g_ui.last_logo_step_ms = g_ui.working_start_ms;
+	g_ui.logo_step_cursor = 0;
+	g_ui.logo_frame_idx = 0;
+	shell_font_fit_clean_phrase(query, g_ui.pending_query,
+				    sizeof(g_ui.pending_query), SHELL_LIMIT_PROMPT_TITLE);
+}
+
+static void complete_topic_transition(void)
+{
+	struct giri_screen next_scr;
+
+	build_topic_screen(g_ui.pending_query, &next_scr);
+	if (g_ui.history_idx + 1 < HISTORY_MAX) {
+		g_ui.history_idx++;
+		g_ui.history_len = g_ui.history_idx + 1;
+	}
+	g_ui.history[g_ui.history_idx] = next_scr;
+	g_ui.is_working = false;
+	g_ui.logo_frame_idx = 0;
+	g_ui.focus_zone = GIRI_ZONE_CARDS;
+	g_ui.card_focus_idx = 0;
+
+	if (g_ui.auto_read_aloud) {
+		g_ui.tts_speaking = true;
+		g_ui.tts_sentence_idx = 0;
+		g_ui.tts_last_step_ms = shell_now_ms();
 	}
 }
 
-/* --- Actions & Navigation --- */
-
-static void launch_doom_app(int mode)
+static void open_gallery_item_overlay(int g_idx)
 {
-	const char *bin = "/bin/doom";
-	const char *argv[8];
-	struct stat st;
-	int n = 0;
+	if (g_ui.gallery_count <= 0)
+		return;
+	g_idx = ((g_idx % g_ui.gallery_count) + g_ui.gallery_count) % g_ui.gallery_count;
+	g_ui.overlay_gallery_idx = g_idx;
 
-	if (stat("/bin/doom", &st) != 0 && stat("/usr/local/bin/doom", &st) == 0)
-		bin = "/usr/local/bin/doom";
+	const struct shell_media_item *it = &g_ui.gallery_items[g_idx];
+	struct giri_media_card mc;
+	char id_buf[32];
 
-	argv[n++] = bin;
-	if (mode == 1) {
-		argv[n++] = "-skill";
-		argv[n++] = "3";
-		argv[n++] = "-warp";
-		argv[n++] = "1";
-		argv[n++] = "1";
-	} else if (mode == 2) {
-		argv[n++] = "-widescreen";
-	}
-	argv[n] = NULL;
+	snprintf(id_buf, sizeof(id_buf), "gal_%d", g_idx);
+	fill_card_uri(&mc, id_buf, it->title, it->subtitle,
+		      it->badge, it->meta_pill,
+		      it->is_video ? GIRI_CARD_LOCAL_VIDEO : GIRI_CARD_LOCAL_PHOTO,
+		      it->is_video ? GIRI_ART_MONSOON_VIDEO : GIRI_ART_DAWN_RIDGE,
+		      it->path,
+		      it->is_video ? "play_video" : "open_image",
+		      it->is_video ? "media.play_video" : "media.open_image",
+		      it->title, it->detail[0] ? it->detail : it->subtitle);
 
-	shell_app_run(argv, true);
-	redraw_current_screen();
+	g_ui.tts_speaking = false;
+	g_ui.active_win = GIRI_WIN_MEDIA_OVERLAY;
+	snprintf(g_ui.overlay_badge, sizeof(g_ui.overlay_badge),
+		 "%s", it->is_video ? "VIDEO STREAM" : "PHOTO VIEW");
+	snprintf(g_ui.overlay_source, sizeof(g_ui.overlay_source),
+		 "%s · Item %d of %d on Device",
+		 it->subtitle, g_idx + 1, g_ui.gallery_count);
+	snprintf(g_ui.overlay_title, sizeof(g_ui.overlay_title), "%s", mc.title);
+	snprintf(g_ui.overlay_text, sizeof(g_ui.overlay_text),
+		 "%s", mc.detail_text[0] ? mc.detail_text : mc.subtitle);
+	g_ui.overlay_card = mc;
+	g_ui.overlay_is_video = it->is_video;
+	g_ui.overlay_playing = it->is_video;
+	g_ui.overlay_elapsed_sec = 0;
+	g_ui.overlay_duration_sec = 15;
+	g_ui.overlay_frame_idx = 0;
+	g_ui.overlay_last_tick_ms = shell_now_ms();
+	g_ui.overlay_frame_tick_ms = g_ui.overlay_last_tick_ms;
 }
 
-static void execute_action(enum shell_action_id act, int arg)
+static void open_media_overlay(const char *badge, const struct giri_media_card *mc, bool is_video)
 {
-	struct shell_turn *t = &app.turns[app.cur_turn];
+	int g_idx = -1;
 
-	switch (act) {
-	case SHELL_ACT_GOTO_TURN:
-		if (arg >= 0 && arg < app.num_turns) {
-			app.cur_turn = arg;
-			if (app.cur_turn == 2)
-				update_system_status_turn(&app.turns[2]);
-		}
-		break;
-
-	case SHELL_ACT_NEXT_IDEA:
-		app.cur_turn = (app.cur_turn + 1) % app.num_turns;
-		if (app.cur_turn == 2)
-			update_system_status_turn(&app.turns[2]);
-		break;
-
-	case SHELL_ACT_OPEN_ASK:
-		app.mode = MODE_ASK_LINE;
-		app.ask_len = 0;
-		app.ask_buf[0] = '\0';
-		break;
-
-	case SHELL_ACT_LAUNCH_DOOM:
-		launch_doom_app(arg);
+	if (mc && strncmp(mc->id, "gal_", 4) == 0 && g_ui.gallery_count > 0) {
+		g_idx = atoi(mc->id + 4);
+		open_gallery_item_overlay(g_idx);
 		return;
-
-	case SHELL_ACT_SWITCH_THEME:
-		app.cfg.theme = (app.cfg.theme == SHELL_THEME_PAPER) ?
-				SHELL_THEME_SIGNAL : SHELL_THEME_PAPER;
-		app.cfg.theme_set = true;
-		config_save(&app.cfg);
-		break;
-
-	case SHELL_ACT_REFRESH_STATUS:
-		update_system_status_turn(&app.turns[2]);
-		break;
-
-	case SHELL_ACT_OPEN_VIEWER:
-		app.cur_turn = 3;
-		open_image_viewer(arg);
-		break;
-
-	case SHELL_ACT_SHOW_PATH:
-		if (t->num_items > 0 && arg >= 0 && arg < t->num_items) {
-			size_t n = strlen(t->items[arg].path);
-			if (n >= sizeof(t->sources))
-				n = sizeof(t->sources) - 1;
-			memmove(t->sources, t->items[arg].path, n);
-			t->sources[n] = '\0';
-		} else if (t->num_tiles > 0 && arg >= 0 && arg < t->num_tiles) {
-			size_t n = strlen(t->tiles[arg].media_path);
-			if (n >= sizeof(t->sources))
-				n = sizeof(t->sources) - 1;
-			memmove(t->sources, t->tiles[arg].media_path, n);
-			t->sources[n] = '\0';
-		}
-		break;
-
-	case SHELL_ACT_READ_NOTE:
-		if (arg >= 0 && arg < t->num_items && t->items[arg].body[0]) {
-			size_t n = strlen(t->items[arg].body);
-			if (n >= sizeof(t->answer))
-				n = sizeof(t->answer) - 1;
-			memmove(t->answer, t->items[arg].body, n);
-			t->answer[n] = '\0';
-		}
-		break;
-
-	case SHELL_ACT_DEMO_WORKING:
-		t->state = SHELL_TURN_WORKING;
-		t->progress_pct = 35;
-		t->demo_target_turn = arg;
-		app.working_start_ms = monotonic_ms();
-		app.last_blink_ms = app.working_start_ms;
-		app.logo_blink_alt = true;
-		break;
-
-	case SHELL_ACT_NONE:
-	default:
-		break;
 	}
-	redraw_current_screen();
+
+	g_ui.overlay_gallery_idx = -1;
+	g_ui.tts_speaking = false;
+	g_ui.active_win = GIRI_WIN_MEDIA_OVERLAY;
+	snprintf(g_ui.overlay_badge, sizeof(g_ui.overlay_badge), "%s", badge);
+	snprintf(g_ui.overlay_source, sizeof(g_ui.overlay_source),
+		 "%s", current_screen()->summary.source_caption[0]
+		       ? current_screen()->summary.source_caption
+		       : "Velliangiri OS · Standardized Detail View");
+	snprintf(g_ui.overlay_title, sizeof(g_ui.overlay_title), "%s", mc->title);
+	snprintf(g_ui.overlay_text, sizeof(g_ui.overlay_text),
+		 "%s", mc->detail_text[0] ? mc->detail_text : mc->subtitle);
+	g_ui.overlay_card = *mc;
+	g_ui.overlay_is_video = is_video;
+	g_ui.overlay_playing = is_video;
+	g_ui.overlay_elapsed_sec = 4;
+	g_ui.overlay_duration_sec = 15;
+	g_ui.overlay_frame_idx = 0;
+	g_ui.overlay_last_tick_ms = shell_now_ms();
+	g_ui.overlay_frame_tick_ms = g_ui.overlay_last_tick_ms;
 }
 
-static void handle_ask_submit(const char *query)
+static void execute_action(const struct giri_action *act, const struct giri_media_card *card)
 {
-	app.mode = MODE_TURN_VIEW;
-	if (!query || !query[0]) {
-		redraw_current_screen();
+	if (!act)
+		return;
+	if (g_ui.is_working)
+		complete_topic_transition();
+
+	if (strcmp(act->type, "gallery_next_page") == 0) {
+		populate_gallery_screen(&g_ui.history[g_ui.history_idx],
+					g_ui.gallery_page + 1);
 		return;
 	}
 
-	if (strcasestr(query, "doom") || strcasestr(query, "game") ||
-	    strcasestr(query, "play")) {
-		app.cur_turn = 1;
-	} else if (strcasestr(query, "temp") || strcasestr(query, "status") ||
-		   strcasestr(query, "system") || strcasestr(query, "mem")) {
-		update_system_status_turn(&app.turns[2]);
-		app.cur_turn = 2;
-	} else if (strcasestr(query, "photo") || strcasestr(query, "video") ||
-		   strcasestr(query, "media") || strcasestr(query, "beach")) {
-		app.cur_turn = 3;
-	} else if (strcasestr(query, "sourdough") || strcasestr(query, "bread") ||
-		   strcasestr(query, "loaf")) {
-		app.cur_turn = 4;
-	} else if (strcasestr(query, "note") || strcasestr(query, "shop") ||
-		   strcasestr(query, "wifi") || strcasestr(query, "music")) {
-		app.cur_turn = 5;
-	} else if (strcasestr(query, "signal")) {
-		app.cfg.theme = SHELL_THEME_SIGNAL;
-		config_save(&app.cfg);
-	} else if (strcasestr(query, "paper")) {
-		app.cfg.theme = SHELL_THEME_PAPER;
-		config_save(&app.cfg);
-	} else {
-		app.cur_turn = 0;
-		snprintf(app.turns[0].question, sizeof(app.turns[0].question),
-			 "%s", query);
+	if (strcmp(act->type, "open_prompt_box") == 0 ||
+	    strcmp(act->capability, "ui.open_prompt") == 0) {
+		g_ui.tts_speaking = false;
+		g_ui.active_win = GIRI_WIN_ASK_MODAL;
+		g_ui.ask_focus_idx = 0;
+		g_ui.ask_input[0] = '\0';
+		g_ui.ask_input_len = 0;
+		return;
 	}
-	redraw_current_screen();
+
+	if (strcmp(act->type, "open_settings") == 0 ||
+	    strcmp(act->capability, "system.open_settings") == 0) {
+		g_ui.tts_speaking = false;
+		refresh_system_metrics();
+		g_ui.active_win = GIRI_WIN_SETTINGS_MODAL;
+		g_ui.settings_focus_idx = 0;
+		return;
+	}
+
+	if (strcmp(act->type, "launch_app") == 0 ||
+	    strcmp(act->capability, "apps.launch") == 0) {
+		/* If /bin/doom exists on target TV, launch it directly with game_map=1 */
+		if (strcmp(act->app_id, "doom") == 0 && access("/bin/doom", X_OK) == 0) {
+			const char *const argv[] = { "/bin/doom", NULL };
+			shell_app_run(argv, true);
+			return;
+		}
+		if (card) {
+			struct giri_media_card app_card = *card;
+			snprintf(app_card.detail_text, sizeof(app_card.detail_text),
+				 "%.40s is running directly in 1280×720 fullscreen mode on Velliangiri OS with 6-button remote mapping active. Press Menu or Escape at any time to return to Giri.",
+				 card->title);
+			open_media_overlay("APP RUNNING", &app_card, false);
+			snprintf(g_ui.overlay_title, sizeof(g_ui.overlay_title),
+				 "%.40s — Fullscreen Game Session", card->title);
+		}
+		return;
+	}
+
+	if (strcmp(act->type, "open_image") == 0 ||
+	    strcmp(act->capability, "media.open_image") == 0) {
+		if (card)
+			open_media_overlay("PHOTO VIEW", card, false);
+		return;
+	}
+
+	if (strcmp(act->type, "play_video") == 0 ||
+	    strcmp(act->capability, "media.play_video") == 0) {
+		if (card)
+			open_media_overlay("VIDEO STREAM", card, true);
+		return;
+	}
+
+	const char *q = act->query[0] ? act->query
+			: (card && card->title[0] ? card->title : "What is top in the news on BBC?");
+	start_topic_transition(q);
 }
 
-static void handle_turn_event(const struct shell_event *ev)
+static void handle_key_event(const struct shell_input_event *ev)
 {
-	struct shell_turn *t = &app.turns[app.cur_turn];
-	struct shell_choice active_ch[4];
-	const char *prefix = NULL;
-	int n_choices = get_active_choices(t, active_ch, &prefix);
-	int n_content = t->num_items > 0 ? t->num_items : t->num_tiles;
+	/* Complete any in-flight topic shimmer transition immediately on user input */
+	if (g_ui.is_working)
+		complete_topic_transition();
 
-	if (t->state == SHELL_TURN_WORKING) {
-		if (ev->type == SHELL_EVT_KEY_MENU || ev->type == SHELL_EVT_TEXT_ESC) {
-			t->state = SHELL_TURN_READY;
-			redraw_current_screen();
-		}
+	/* Global 2-second Menu hold returns to Home Screen from any state */
+	if (ev->key == SHELL_KEY_MENU_HOLD) {
+		g_ui.active_win = GIRI_WIN_MAIN;
+		g_ui.history_idx = 0;
+		g_ui.focus_zone = GIRI_ZONE_CARDS;
+		g_ui.card_focus_idx = 0;
+		g_ui.tts_speaking = false;
 		return;
 	}
 
-	/* Typing any printable character on a Bluetooth keyboard opens the Ask line */
-	if (ev->type == SHELL_EVT_TEXT_CHAR) {
-		app.mode = MODE_ASK_LINE;
-		app.ask_buf[0] = (char)ev->codepoint;
-		app.ask_buf[1] = '\0';
-		app.ask_len = 1;
-		redraw_current_screen();
-		return;
-	}
+	/* Window 2: Ask Giri Modal navigation */
+	if (g_ui.active_win == GIRI_WIN_ASK_MODAL) {
+		int total = QUICK_PROMPTS_COUNT + 2; /* 0 = input, 1..7 = chips, 8 = Close */
 
-	switch (ev->type) {
-	case SHELL_EVT_KEY_LEFT:
-		if (t->focus_zone == SHELL_FOCUS_CONTENT && t->num_tiles > 0) {
-			if (t->focus_content_idx > 0)
-				t->focus_content_idx--;
-		} else {
-			t->focus_zone = SHELL_FOCUS_CHOICES;
-			if (t->focus_choice_idx > 0)
-				t->focus_choice_idx--;
+		if (ev->key == SHELL_KEY_CHAR && g_ui.ask_focus_idx == 0) {
+			if (g_ui.ask_input_len + 1 < (int)sizeof(g_ui.ask_input)) {
+				g_ui.ask_input[g_ui.ask_input_len++] = ev->ch;
+				g_ui.ask_input[g_ui.ask_input_len] = '\0';
+			}
+			return;
 		}
-		redraw_current_screen();
-		break;
-
-	case SHELL_EVT_KEY_RIGHT:
-		if (t->focus_zone == SHELL_FOCUS_CONTENT && t->num_tiles > 0) {
-			if (t->focus_content_idx + 1 < t->num_tiles)
-				t->focus_content_idx++;
-		} else {
-			t->focus_zone = SHELL_FOCUS_CHOICES;
-			if (t->focus_choice_idx + 1 < n_choices)
-				t->focus_choice_idx++;
+		if (ev->key == SHELL_KEY_BACKSPACE && g_ui.ask_focus_idx == 0 && g_ui.ask_input_len > 0) {
+			g_ui.ask_input[--g_ui.ask_input_len] = '\0';
+			return;
 		}
-		redraw_current_screen();
-		break;
 
-	case SHELL_EVT_KEY_UP:
-		if (t->focus_zone == SHELL_FOCUS_CHOICES && n_content > 0) {
-			t->focus_zone = SHELL_FOCUS_CONTENT;
-			if (t->focus_content_idx >= n_content)
-				t->focus_content_idx = n_content - 1;
-		} else if (t->focus_zone == SHELL_FOCUS_CONTENT && t->num_items > 0 &&
-			   t->focus_content_idx > 0) {
-			t->focus_content_idx--;
-		} else if (app.cur_turn > 0) {
-			app.cur_turn--;
-			if (app.cur_turn == 2)
-				update_system_status_turn(&app.turns[2]);
-		}
-		redraw_current_screen();
-		break;
-
-	case SHELL_EVT_KEY_DOWN:
-		if (t->focus_zone == SHELL_FOCUS_CONTENT) {
-			if (t->num_items > 0 && t->focus_content_idx + 1 < t->num_items) {
-				t->focus_content_idx++;
+		switch (ev->key) {
+		case SHELL_KEY_MENU:
+			g_ui.active_win = GIRI_WIN_MAIN;
+			break;
+		case SHELL_KEY_DOWN:
+		case SHELL_KEY_RIGHT:
+			g_ui.ask_focus_idx = (g_ui.ask_focus_idx + 1) % total;
+			break;
+		case SHELL_KEY_UP:
+		case SHELL_KEY_LEFT:
+			g_ui.ask_focus_idx = (g_ui.ask_focus_idx - 1 + total) % total;
+			break;
+		case SHELL_KEY_SELECT:
+			if (g_ui.ask_focus_idx == 0) {
+				const char *q = g_ui.ask_input_len > 0
+						? g_ui.ask_input
+						: quick_prompts[0].query;
+				start_topic_transition(q);
+			} else if (g_ui.ask_focus_idx >= 1 &&
+				   g_ui.ask_focus_idx <= QUICK_PROMPTS_COUNT) {
+				start_topic_transition(quick_prompts[g_ui.ask_focus_idx - 1].query);
 			} else {
-				t->focus_zone = SHELL_FOCUS_CHOICES;
-				t->focus_choice_idx = 0;
+				g_ui.active_win = GIRI_WIN_MAIN;
 			}
-		} else if (app.cur_turn + 1 < app.num_turns) {
-			app.cur_turn++;
-			if (app.cur_turn == 2)
-				update_system_status_turn(&app.turns[2]);
-		}
-		redraw_current_screen();
-		break;
-
-	case SHELL_EVT_KEY_PLAY:
-		if (shell_input_has_keyboard()) {
-			execute_action(SHELL_ACT_OPEN_ASK, 0);
+			break;
+		default:
 			break;
 		}
-		/* Fall through on remote so Play activates the focused choice/item */
-		/* fallthrough */
-	case SHELL_EVT_KEY_OK:
-	case SHELL_EVT_TEXT_ENTER:
-		if (t->focus_zone == SHELL_FOCUS_CONTENT) {
-			if (t->num_items > 0 && t->focus_content_idx < t->num_items) {
-				const struct shell_item *it = &t->items[t->focus_content_idx];
-				if (it->num_actions > 0)
-					execute_action(it->actions[0].action,
-						       it->actions[0].arg);
-			} else if (t->num_tiles > 0 && t->focus_content_idx < t->num_tiles) {
-				const struct shell_tile *tl = &t->tiles[t->focus_content_idx];
-				if (tl->num_actions > 0)
-					execute_action(tl->actions[0].action,
-						       tl->actions[0].arg);
+		return;
+	}
+
+	/* Window 3: Settings Modal navigation (matches prototype.html 2D grid rules) */
+	if (g_ui.active_win == GIRI_WIN_SETTINGS_MODAL) {
+		int total = 3 + g_ui.model_count + 1;
+		int last_idx = total - 1;
+
+		switch (ev->key) {
+		case SHELL_KEY_MENU:
+			g_ui.active_win = GIRI_WIN_MAIN;
+			break;
+		case SHELL_KEY_LEFT:
+			g_ui.settings_focus_idx = (g_ui.settings_focus_idx - 1 + total) % total;
+			break;
+		case SHELL_KEY_RIGHT:
+			g_ui.settings_focus_idx = (g_ui.settings_focus_idx + 1) % total;
+			break;
+		case SHELL_KEY_DOWN:
+			if (g_ui.settings_focus_idx <= 2) {
+				g_ui.settings_focus_idx = (g_ui.settings_focus_idx == 0)
+							  ? 3 : (4 < last_idx ? 4 : last_idx);
+			} else if (g_ui.settings_focus_idx < last_idx) {
+				int next = g_ui.settings_focus_idx + 2;
+				g_ui.settings_focus_idx = (next < last_idx) ? next : last_idx;
+			} else {
+				g_ui.settings_focus_idx = 0;
 			}
+			break;
+		case SHELL_KEY_UP:
+			if (g_ui.settings_focus_idx == last_idx) {
+				g_ui.settings_focus_idx = (last_idx - 2 >= 3) ? (last_idx - 2) : 3;
+			} else if (g_ui.settings_focus_idx >= 3) {
+				int off = g_ui.settings_focus_idx - 3;
+				if (off < 2)
+					g_ui.settings_focus_idx = (off == 0) ? 0 : 2;
+				else
+					g_ui.settings_focus_idx -= 2;
+			} else {
+				g_ui.settings_focus_idx = last_idx;
+			}
+			break;
+		case SHELL_KEY_SELECT:
+			if (g_ui.settings_focus_idx == 0) {
+				g_ui.theme_id = (g_ui.theme_id == SHELL_THEME_PAPER)
+						? SHELL_THEME_SIGNAL : SHELL_THEME_PAPER;
+			} else if (g_ui.settings_focus_idx == 1) {
+				g_ui.auto_read_aloud = !g_ui.auto_read_aloud;
+			} else if (g_ui.settings_focus_idx == 2) {
+				g_ui.nav_sound_enabled = !g_ui.nav_sound_enabled;
+			} else if (g_ui.settings_focus_idx >= 3 &&
+				   g_ui.settings_focus_idx < last_idx) {
+				int m_idx = g_ui.settings_focus_idx - 3;
+				struct giri_model_info *m = &g_ui.models[m_idx];
+
+				if (m->installed) {
+					g_ui.active_model_idx = m_idx;
+				} else if (!m->downloading) {
+					m->downloading = true;
+					m->progress = 16;
+					g_ui.model_dl_tick_ms = shell_now_ms();
+				}
+			} else if (g_ui.settings_focus_idx == last_idx) {
+				g_ui.active_win = GIRI_WIN_MAIN;
+			}
+			break;
+		default:
+			break;
+		}
+		return;
+	}
+
+	/* Window 1: Fullscreen Media Overlay navigation */
+	if (g_ui.active_win == GIRI_WIN_MEDIA_OVERLAY) {
+		switch (ev->key) {
+		case SHELL_KEY_MENU:
+		case SHELL_KEY_SELECT:
+			g_ui.active_win = GIRI_WIN_MAIN;
+			break;
+		case SHELL_KEY_PLAY_PAUSE:
+			if (g_ui.overlay_is_video)
+				g_ui.overlay_playing = !g_ui.overlay_playing;
+			break;
+		case SHELL_KEY_UP:
+			if (g_ui.overlay_gallery_idx >= 0 && g_ui.gallery_count > 0)
+				open_gallery_item_overlay(g_ui.overlay_gallery_idx - 1);
+			break;
+		case SHELL_KEY_DOWN:
+			if (g_ui.overlay_gallery_idx >= 0 && g_ui.gallery_count > 0)
+				open_gallery_item_overlay(g_ui.overlay_gallery_idx + 1);
+			break;
+		case SHELL_KEY_LEFT:
+			if (g_ui.overlay_is_video) {
+				g_ui.overlay_elapsed_sec -= 3;
+				if (g_ui.overlay_elapsed_sec < 0)
+					g_ui.overlay_elapsed_sec = 0;
+				g_ui.overlay_frame_idx = g_ui.overlay_elapsed_sec;
+			} else if (g_ui.overlay_gallery_idx >= 0 && g_ui.gallery_count > 0) {
+				open_gallery_item_overlay(g_ui.overlay_gallery_idx - 1);
+			}
+			break;
+		case SHELL_KEY_RIGHT:
+			if (g_ui.overlay_is_video) {
+				g_ui.overlay_elapsed_sec += 3;
+				if (g_ui.overlay_elapsed_sec > g_ui.overlay_duration_sec)
+					g_ui.overlay_elapsed_sec = g_ui.overlay_duration_sec;
+				g_ui.overlay_frame_idx = g_ui.overlay_elapsed_sec;
+			} else if (g_ui.overlay_gallery_idx >= 0 && g_ui.gallery_count > 0) {
+				open_gallery_item_overlay(g_ui.overlay_gallery_idx + 1);
+			}
+			break;
+		default:
+			break;
+		}
+		return;
+	}
+
+	/* Window 0: Main 4-Slot Screen navigation */
+	const struct giri_screen *scr = current_screen();
+
+	switch (ev->key) {
+	case SHELL_KEY_LEFT:
+		if (g_ui.focus_zone == GIRI_ZONE_CARDS)
+			g_ui.card_focus_idx = (g_ui.card_focus_idx + SHELL_CARD_COUNT - 1) % SHELL_CARD_COUNT;
+		else
+			g_ui.footer_focus_idx = (g_ui.footer_focus_idx + SHELL_FOOTER_COUNT - 1) % SHELL_FOOTER_COUNT;
+		break;
+	case SHELL_KEY_RIGHT:
+		if (g_ui.focus_zone == GIRI_ZONE_CARDS)
+			g_ui.card_focus_idx = (g_ui.card_focus_idx + 1) % SHELL_CARD_COUNT;
+		else
+			g_ui.footer_focus_idx = (g_ui.footer_focus_idx + 1) % SHELL_FOOTER_COUNT;
+		break;
+	case SHELL_KEY_DOWN:
+		if (g_ui.focus_zone == GIRI_ZONE_CARDS)
+			g_ui.focus_zone = GIRI_ZONE_FOOTER;
+		break;
+	case SHELL_KEY_UP:
+		if (g_ui.focus_zone == GIRI_ZONE_FOOTER)
+			g_ui.focus_zone = GIRI_ZONE_CARDS;
+		break;
+	case SHELL_KEY_PLAY_PAUSE:
+		if (g_ui.tts_speaking) {
+			g_ui.tts_speaking = false;
 		} else {
-			if (t->focus_choice_idx >= 0 && t->focus_choice_idx < n_choices) {
-				execute_action(active_ch[t->focus_choice_idx].action,
-					       active_ch[t->focus_choice_idx].arg);
-			}
+			g_ui.tts_speaking = true;
+			g_ui.tts_sentence_idx = 0;
+			g_ui.tts_last_step_ms = shell_now_ms();
 		}
 		break;
-
-	case SHELL_EVT_KEY_MENU:
-	case SHELL_EVT_TEXT_ESC:
-		if (t->focus_zone == SHELL_FOCUS_CONTENT) {
-			t->focus_zone = SHELL_FOCUS_CHOICES;
-			t->focus_choice_idx = 0;
-		} else if (app.cur_turn > 0) {
-			app.cur_turn = 0;
+	case SHELL_KEY_SELECT:
+		if (g_ui.focus_zone == GIRI_ZONE_CARDS) {
+			const struct giri_media_card *mc = &scr->media_cards[g_ui.card_focus_idx];
+			execute_action(&mc->action, mc);
+		} else {
+			const struct giri_footer_link *fl = &scr->footer_links[g_ui.footer_focus_idx];
+			execute_action(&fl->action, NULL);
 		}
-		redraw_current_screen();
 		break;
-
+	case SHELL_KEY_MENU:
+		if (g_ui.tts_speaking) {
+			g_ui.tts_speaking = false;
+		} else if (g_ui.history_idx > 0) {
+			g_ui.history_idx--;
+			g_ui.focus_zone = GIRI_ZONE_CARDS;
+			g_ui.card_focus_idx = 0;
+		}
+		break;
 	default:
 		break;
 	}
+}
+
+/* Advance animations (65ms ping-pong logo, Stage-1 shimmer, TTS sentence highlight, model download) */
+static bool tick_animations(uint64_t now)
+{
+	bool dirty = false;
+	int i;
+
+	if (g_ui.is_working) {
+		if (now - g_ui.last_logo_step_ms >= SHELL_LOGO_FRAME_MS) {
+			g_ui.last_logo_step_ms = now;
+			g_ui.logo_step_cursor = (g_ui.logo_step_cursor + 1) & 7;
+			g_ui.logo_frame_idx = logo_pingpong_steps[g_ui.logo_step_cursor];
+			dirty = true;
+		}
+		if (now - g_ui.working_start_ms >= 360) {
+			complete_topic_transition();
+			dirty = true;
+		}
+	}
+
+	if (g_ui.tts_speaking && now - g_ui.tts_last_step_ms >= 2200) {
+		g_ui.tts_last_step_ms = now;
+		g_ui.tts_sentence_idx++;
+		if (g_ui.tts_sentence_idx >= g_ui.tts_total_sentences)
+			g_ui.tts_speaking = false;
+		dirty = true;
+	}
+
+	if (g_ui.active_win == GIRI_WIN_MEDIA_OVERLAY &&
+	    g_ui.overlay_is_video && g_ui.overlay_playing) {
+		if (now - g_ui.overlay_frame_tick_ms >= 500) {
+			g_ui.overlay_frame_tick_ms = now;
+			g_ui.overlay_frame_idx = (g_ui.overlay_frame_idx + 1) % 15;
+			dirty = true;
+		}
+		if (now - g_ui.overlay_last_tick_ms >= 1000) {
+			g_ui.overlay_last_tick_ms = now;
+			g_ui.overlay_elapsed_sec = (g_ui.overlay_elapsed_sec + 1) %
+						   (g_ui.overlay_duration_sec + 1);
+			dirty = true;
+		}
+	}
+
+	for (i = 0; i < g_ui.model_count; i++) {
+		if (g_ui.models[i].downloading && now - g_ui.model_dl_tick_ms >= 320) {
+			g_ui.model_dl_tick_ms = now;
+			g_ui.models[i].progress += 28;
+			if (g_ui.models[i].progress >= 100) {
+				g_ui.models[i].progress = 100;
+				g_ui.models[i].downloading = false;
+				g_ui.models[i].installed = true;
+				g_ui.active_model_idx = i;
+			}
+			dirty = true;
+		}
+	}
+
+	return dirty;
+}
+
+/* Ensure only a single /bin/tvshell instance owns /dev/input and /dev/fb0 */
+static int acquire_single_instance_lock(void)
+{
+	int fd = open("/tmp/tvshell.lock", O_CREAT | O_RDWR, 0644);
+	char buf[32];
+
+	if (fd < 0)
+		return -1;
+
+	if (flock(fd, LOCK_EX | LOCK_NB) < 0) {
+		ssize_t n = read(fd, buf, sizeof(buf) - 1);
+		if (n > 0) {
+			buf[n] = '\0';
+			long old_pid = strtol(buf, NULL, 10);
+			if (old_pid > 1 && old_pid != (long)getpid()) {
+				kill((pid_t)old_pid, SIGTERM);
+				usleep(80000);
+				kill((pid_t)old_pid, SIGKILL);
+				usleep(40000);
+			}
+		}
+		(void)flock(fd, LOCK_EX);
+	}
+
+	(void)ftruncate(fd, 0);
+	(void)lseek(fd, 0, SEEK_SET);
+	int len = snprintf(buf, sizeof(buf), "%ld\n", (long)getpid());
+	if (len > 0)
+		(void)write(fd, buf, (size_t)len);
+	return fd;
 }
 
 int main(int argc, char **argv)
 {
-	const char *dump_ppm = NULL;
-	const char *force_theme = NULL;
-	int force_turn = -1;
-	bool force_viewer = false;
-	bool force_working = false;
-	bool force_ask = false;
-	int opt;
+	bool headless = false;
+	const char *dump_ppm_path = NULL;
+	const char *initial_topic = NULL;
+	int lock_fd = -1;
+	int i;
 
-	while ((opt = getopt(argc, argv, "d:t:n:vwah")) != -1) {
-		switch (opt) {
-		case 'd':
-			dump_ppm = optarg;
-			break;
-		case 't':
-			force_theme = optarg;
-			break;
-		case 'n':
-			force_turn = atoi(optarg);
-			break;
-		case 'v':
-			force_viewer = true;
-			break;
-		case 'w':
-			force_working = true;
-			break;
-		case 'a':
-			force_ask = true;
-			break;
-		default:
-			fprintf(stderr,
-				"usage: %s [-d out.ppm] [-t paper|signal] [-n turn] [-v] [-w] [-a]\n",
-				argv[0]);
-			return opt == 'h' ? 0 : 2;
+	memset(&g_ui, 0, sizeof(g_ui));
+	g_ui.theme_id = SHELL_THEME_PAPER;
+	g_ui.active_win = GIRI_WIN_MAIN;
+	g_ui.focus_zone = GIRI_ZONE_CARDS;
+	g_ui.nav_sound_enabled = true;
+	g_ui.overlay_gallery_idx = -1;
+
+	for (i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "--headless") == 0) {
+			headless = true;
+		} else if (strcmp(argv[i], "--theme") == 0 && i + 1 < argc) {
+			i++;
+			if (strcasecmp(argv[i], "signal") == 0)
+				g_ui.theme_id = SHELL_THEME_SIGNAL;
+			else
+				g_ui.theme_id = SHELL_THEME_PAPER;
+		} else if (strcmp(argv[i], "--window") == 0 && i + 1 < argc) {
+			i++;
+			if (strcasecmp(argv[i], "overlay") == 0)
+				g_ui.active_win = GIRI_WIN_MEDIA_OVERLAY;
+			else if (strcasecmp(argv[i], "ask") == 0)
+				g_ui.active_win = GIRI_WIN_ASK_MODAL;
+			else if (strcasecmp(argv[i], "settings") == 0)
+				g_ui.active_win = GIRI_WIN_SETTINGS_MODAL;
+			else
+				g_ui.active_win = GIRI_WIN_MAIN;
+		} else if (strcmp(argv[i], "--topic") == 0 && i + 1 < argc) {
+			initial_topic = argv[++i];
+		} else if (strcmp(argv[i], "--focus-footer") == 0 && i + 1 < argc) {
+			g_ui.focus_zone = GIRI_ZONE_FOOTER;
+			g_ui.footer_focus_idx = atoi(argv[++i]) & 3;
+		} else if (strcmp(argv[i], "--focus-card") == 0 && i + 1 < argc) {
+			g_ui.focus_zone = GIRI_ZONE_CARDS;
+			g_ui.card_focus_idx = atoi(argv[++i]) & 3;
+		} else if (strcmp(argv[i], "--tts-demo") == 0) {
+			g_ui.tts_speaking = true;
+			g_ui.tts_sentence_idx = 0;
+		} else if (strcmp(argv[i], "--dump-ppm") == 0 && i + 1 < argc) {
+			dump_ppm_path = argv[++i];
+			headless = true;
 		}
 	}
 
-	seed_sample_notes();
-	config_load(&app.cfg);
+	signal(SIGINT, handle_sig);
+	signal(SIGTERM, handle_sig);
 
-	if (force_theme) {
-		app.cfg.theme = (!strcasecmp(force_theme, "signal")) ?
-				SHELL_THEME_SIGNAL : SHELL_THEME_PAPER;
-		app.cfg.theme_set = true;
+	if (!headless)
+		lock_fd = acquire_single_instance_lock();
+
+	if (shell_display_init(headless) < 0)
+		return 1;
+	if (shell_font_init() < 0) {
+		shell_display_close();
+		return 1;
 	}
+	shell_media_init();
+	shell_input_init(headless);
 
-	if (shell_display_init(dump_ppm != NULL) < 0)
-		return 1;
-	if (shell_font_init() < 0)
-		return 1;
-	if (!dump_ppm)
-		shell_input_init();
+	load_supported_models();
+	load_apps_catalog();
+	refresh_system_metrics();
 
-	init_predefined_turns();
-
-	if (!app.cfg.theme_set && !dump_ppm)
-		app.mode = MODE_THEME_PICKER;
+	if (initial_topic)
+		build_topic_screen(initial_topic, &g_ui.history[0]);
 	else
-		app.mode = MODE_TURN_VIEW;
+		build_home_screen(&g_ui.history[0]);
+	g_ui.history_len = 1;
+	g_ui.history_idx = 0;
 
-	if (force_turn >= 0 && force_turn < app.num_turns)
-		app.cur_turn = force_turn;
-	if (force_working) {
-		app.turns[app.cur_turn].state = SHELL_TURN_WORKING;
-		app.turns[app.cur_turn].progress_pct = 62;
-	}
-	if (force_ask) {
-		app.mode = MODE_ASK_LINE;
-		snprintf(app.ask_buf, sizeof(app.ask_buf),
-			 "Find a sourdough video under ten min");
-		app.ask_len = (int)strlen(app.ask_buf);
-	}
-	if (force_viewer) {
-		app.cur_turn = 3;
-		open_image_viewer(2);
+	if (g_ui.active_win == GIRI_WIN_MEDIA_OVERLAY) {
+		open_media_overlay("VIDEO STREAM", &g_ui.history[0].media_cards[0],
+				   g_ui.history[0].media_cards[0].kind == GIRI_CARD_PAGE_VIDEO ||
+				   g_ui.history[0].media_cards[0].kind == GIRI_CARD_LOCAL_VIDEO);
 	}
 
-	redraw_current_screen();
+	render_frame();
 
-	if (dump_ppm) {
-		int r = shell_display_dump_ppm(dump_ppm);
-
+	if (dump_ppm_path) {
+		int rc = shell_display_dump_ppm(dump_ppm_path);
+		shell_input_close();
+		shell_media_free();
 		shell_font_free();
 		shell_display_close();
-		return r < 0 ? 1 : 0;
+		return rc == 0 ? 0 : 1;
 	}
 
-	for (;;) {
-		struct shell_event ev;
-		int timeout_ms = 250;
-		uint64_t now = monotonic_ms();
+	while (g_running) {
+		struct shell_input_event ev;
+		int timeout_ms = (g_ui.is_working || g_ui.tts_speaking ||
+				  g_ui.active_win == GIRI_WIN_MEDIA_OVERLAY ||
+				  g_ui.active_win == GIRI_WIN_SETTINGS_MODAL) ? 30 : 250;
+		bool dirty = false;
 
-		/* Handle 500ms logo blink and simulated progress during working state */
-		struct shell_turn *ct = &app.turns[app.cur_turn];
-		if (app.mode == MODE_TURN_VIEW && ct->state == SHELL_TURN_WORKING) {
-			timeout_ms = 100;
-			if (now - app.last_blink_ms >= SHELL_TIMING_LOGO_BLINK_MS) {
-				app.logo_blink_alt = !app.logo_blink_alt;
-				app.last_blink_ms = now;
-				ct->progress_pct += 22;
-				if (ct->progress_pct >= 100) {
-					ct->state = SHELL_TURN_READY;
-					if (ct->demo_target_turn >= 0 &&
-					    ct->demo_target_turn < app.num_turns)
-						app.cur_turn = ct->demo_target_turn;
-				}
-				redraw_current_screen();
-			}
+		if (shell_input_poll(&ev, timeout_ms)) {
+			handle_key_event(&ev);
+			while (shell_input_poll(&ev, 0))
+				handle_key_event(&ev);
+			dirty = true;
 		}
-
-		/* Auto-hide image viewer overlay chip after 2 seconds */
-		if (app.mode == MODE_IMAGE_VIEWER && app.viewer_chip_visible &&
-		    now >= app.viewer_chip_until_ms) {
-			app.viewer_chip_visible = false;
-			redraw_current_screen();
-		}
-
-		/* Clear notice banner when expired */
-		if (app.notice_text[0] && now >= app.notice_until_ms) {
-			app.notice_text[0] = '\0';
-			redraw_current_screen();
-		}
-
-		if (shell_input_poll(&ev, timeout_ms) <= 0)
-			continue;
-
-		if (ev.type == SHELL_EVT_KB_ATTACHED) {
-			snprintf(app.notice_text, sizeof(app.notice_text),
-				 "Keyboard connected");
-			app.notice_sym = SHELL_SYM_KEYBOARD;
-			app.notice_until_ms = monotonic_ms() + 2500;
-			redraw_current_screen();
-			continue;
-		} else if (ev.type == SHELL_EVT_KB_DETACHED) {
-			app.notice_text[0] = '\0';
-			redraw_current_screen();
-			continue;
-		}
-
-		if (app.mode == MODE_THEME_PICKER) {
-			if (ev.type == SHELL_EVT_KEY_LEFT ||
-			    ev.type == SHELL_EVT_KEY_RIGHT) {
-				app.cfg.theme = (app.cfg.theme == SHELL_THEME_PAPER) ?
-						SHELL_THEME_SIGNAL : SHELL_THEME_PAPER;
-				redraw_current_screen();
-			} else if (ev.type == SHELL_EVT_KEY_OK ||
-				   ev.type == SHELL_EVT_KEY_PLAY ||
-				   ev.type == SHELL_EVT_TEXT_ENTER) {
-				app.cfg.theme_set = true;
-				config_save(&app.cfg);
-				app.mode = MODE_TURN_VIEW;
-				redraw_current_screen();
-			}
-			continue;
-		}
-
-		if (app.mode == MODE_IMAGE_VIEWER) {
-			if (ev.type == SHELL_EVT_KEY_MENU ||
-			    ev.type == SHELL_EVT_TEXT_ESC ||
-			    ev.type == SHELL_EVT_MENU_HOLD) {
-				app.mode = MODE_TURN_VIEW;
-				app.turns[3].focus_zone = SHELL_FOCUS_CONTENT;
-				app.turns[3].focus_content_idx = app.viewer_tile_idx;
-				redraw_current_screen();
-			} else if (ev.type == SHELL_EVT_KEY_LEFT) {
-				int prev = (app.viewer_tile_idx + 3) % 4;
-				open_image_viewer(prev);
-				redraw_current_screen();
-			} else if (ev.type == SHELL_EVT_KEY_RIGHT) {
-				int next = (app.viewer_tile_idx + 1) % 4;
-				open_image_viewer(next);
-				redraw_current_screen();
-			} else if (ev.type == SHELL_EVT_KEY_OK ||
-				   ev.type == SHELL_EVT_KEY_PLAY ||
-				   ev.type == SHELL_EVT_TEXT_ENTER) {
-				app.viewer_chip_visible = !app.viewer_chip_visible;
-				if (app.viewer_chip_visible)
-					app.viewer_chip_until_ms = monotonic_ms() +
-								   SHELL_TIMING_VIEWER_HIDE_MS;
-				redraw_current_screen();
-			}
-			continue;
-		}
-
-		if (app.mode == MODE_ASK_LINE) {
-			if (ev.type == SHELL_EVT_TEXT_ESC ||
-			    ev.type == SHELL_EVT_KEY_MENU) {
-				app.mode = MODE_TURN_VIEW;
-				redraw_current_screen();
-			} else if (ev.type == SHELL_EVT_TEXT_ENTER ||
-				   ev.type == SHELL_EVT_KEY_OK) {
-				handle_ask_submit(app.ask_buf);
-			} else if (ev.type == SHELL_EVT_TEXT_BACKSPACE) {
-				if (app.ask_len > 0) {
-					app.ask_buf[--app.ask_len] = '\0';
-					redraw_current_screen();
-				}
-			} else if (ev.type == SHELL_EVT_TEXT_CHAR) {
-				if (app.ask_len + 1 < SHELL_ASK_MAX_LEN) {
-					app.ask_buf[app.ask_len++] = (char)ev.codepoint;
-					app.ask_buf[app.ask_len] = '\0';
-					redraw_current_screen();
-				}
-			}
-			continue;
-		}
-
-		handle_turn_event(&ev);
+		if (shell_media_poll_async())
+			dirty = true;
+		if (tick_animations(shell_now_ms()))
+			dirty = true;
+		if (dirty)
+			render_frame();
 	}
+
+	shell_input_close();
+	shell_media_free();
+	shell_font_free();
+	shell_display_close();
+	if (lock_fd >= 0)
+		close(lock_fd);
+	return 0;
 }

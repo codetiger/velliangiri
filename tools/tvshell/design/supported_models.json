@@ -1,0 +1,54 @@
+{
+  "schema_version": "1.0",
+  "default_model": "gemma4:e4b",
+  "models": [
+    {
+      "id": "gemma4:e4b",
+      "name": "Gemma 4 E4B",
+      "params": "4B",
+      "size": "3.1 GB",
+      "description": "Default Velliangiri OS edge model for fast TV summaries",
+      "recommended": true
+    },
+    {
+      "id": "gemma3:12b",
+      "name": "Gemma 3 12B",
+      "params": "12B",
+      "size": "8.1 GB",
+      "description": "High-capacity model for deep editorial summarization",
+      "recommended": false
+    },
+    {
+      "id": "gemma3:4b",
+      "name": "Gemma 3 4B",
+      "params": "4B",
+      "size": "3.3 GB",
+      "description": "Compact multimodal-ready model with low latency",
+      "recommended": false
+    },
+    {
+      "id": "qwen2.5:3b",
+      "name": "Qwen 2.5 3B",
+      "params": "3B",
+      "size": "1.9 GB",
+      "description": "Fast instruction model tuned for strict JSON output",
+      "recommended": false
+    },
+    {
+      "id": "llama3.2:3b",
+      "name": "Llama 3.2 3B",
+      "params": "3B",
+      "size": "2.0 GB",
+      "description": "Balanced compact model for news and topic overviews",
+      "recommended": false
+    },
+    {
+      "id": "gemma3:1b",
+      "name": "Gemma 3 1B",
+      "params": "1B",
+      "size": "815 MB",
+      "description": "Ultra-lightweight 1B model for instant responses",
+      "recommended": false
+    }
+  ]
+}

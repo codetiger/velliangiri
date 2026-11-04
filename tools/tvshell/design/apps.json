@@ -1,0 +1,57 @@
+{
+  "schema_version": "1.2",
+  "apps": [
+    {
+      "id": "doom",
+      "name": "Doom (1993)",
+      "subtitle": "id Software · Shareware Episode 1",
+      "badge": "GAME",
+      "meta_pill": "PLAY",
+      "version": "1.9",
+      "size_label": "4.2 MB",
+      "binary_path": "/bin/doom",
+      "preset_art": "doom_game",
+      "installed": true,
+      "description": "Classic 1993 Doom running natively on the Velliangiri framebuffer at 1280x720. Use directional keys to move, Select to fire, and hold Menu for 2 seconds to return to Giri."
+    },
+    {
+      "id": "chess",
+      "name": "Temple Chess",
+      "subtitle": "Grandmaster Engine · 6-Button Remote",
+      "badge": "APP",
+      "meta_pill": "READY",
+      "version": "1.1",
+      "size_label": "1.4 MB",
+      "binary_path": "/usr/bin/temple-chess",
+      "preset_art": "app_chess",
+      "installed": true,
+      "description": "Temple Chess is a clean 10-foot chess board designed for the 6-button remote. Navigate squares with directional keys and press Select to pick up or place pieces."
+    },
+    {
+      "id": "radio",
+      "name": "Western Ghats FM",
+      "subtitle": "Ambient & Classical Streams",
+      "badge": "APP",
+      "meta_pill": "AUDIO",
+      "version": "2.0",
+      "size_label": "920 KB",
+      "binary_path": "/usr/bin/ghats-fm",
+      "preset_art": "app_radio",
+      "installed": true,
+      "description": "Western Ghats FM streams Carnatic instrumental sessions, monsoon rain recordings, and All India Radio bulletins with low-power background audio playback."
+    },
+    {
+      "id": "weather_radar",
+      "name": "Monsoon Radar",
+      "subtitle": "Coimbatore & Nilgiri Telemetry",
+      "badge": "APP",
+      "meta_pill": "1.8 MB",
+      "version": "1.4",
+      "size_label": "1.8 MB",
+      "binary_path": "/usr/bin/monsoon-radar",
+      "preset_art": "weather_sky",
+      "installed": false,
+      "description": "Live barometric, wind shear, and rainfall contour viewer for the Palghat Gap, Nilgiri biosphere, and Velliangiri foothills."
+    }
+  ]
+}

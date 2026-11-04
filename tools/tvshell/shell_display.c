@@ -1,11 +1,11 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Velliangiri 1280x720 TV Shell - Display Surface & Damaged-Rectangle Renderer
+ * Giri on Velliangiri OS — 1280x720 Display Surface & v1.2 Compositor Primitives
  *
- * Uses a cached 1280x720 XRGB8888 backbuffer and copies only damaged
- * rectangles to the scanout mapping (/dev/dri/card0 dumb buffer or /dev/fb0).
- * Supports clean display release and 1280x720@30 mode restoration when
- * launching external applications such as Doom.
+ * Uses a 1280x720 XRGB8888 backbuffer and copies damaged rectangles to the
+ * scanout mapping (/dev/fb0 or /dev/dri/card0 dumb buffer). Bypasses the
+ * hardware gamma LUT (gamma_brightness = 100 -> OUT_GAMMA_EN = 0) so dark
+ * mountain facets and bright highlights retain full 24-bit RGB fidelity on TV.
  */
 
 #include <errno.h>
@@ -14,6 +14,7 @@
 #include <linux/fb.h>
 #include <linux/kd.h>
 #endif
+#include <math.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -120,6 +121,13 @@ struct drm_mode_destroy_dumb {
 	uint32_t handle;
 };
 
+static const uint8_t bayer4x4[16] = {
+	 0,  8,  2, 10,
+	12,  4, 14,  6,
+	 3, 11,  1,  9,
+	15,  7, 13,  5,
+};
+
 static struct {
 	bool headless;
 	bool use_drm;
@@ -157,24 +165,32 @@ static void write_sysfs_str(const char *path, const char *val)
 	}
 }
 
-static inline uint32_t blend_pixel_linear(uint32_t dst, uint32_t src, uint32_t a255)
+static inline uint32_t blend_pixel(uint32_t dst, uint32_t src, uint32_t a255)
 {
-	uint32_t out = 0xff000000U;
-	int sh;
+	uint32_t inv_a, rl, gl, bl;
 
 	if (a255 == 0)
 		return dst;
 	if (a255 >= 255)
 		return src | 0xff000000U;
 
-	for (sh = 0; sh < 24; sh += 8) {
-		uint32_t d = (dst >> sh) & 0xffU;
-		uint32_t s = (src >> sh) & 0xffU;
-		uint32_t v = (d * (255U - a255) + s * a255 + 127U) / 255U;
-
-		out |= v << sh;
-	}
-	return out;
+	inv_a = 255U - a255;
+	rl = (shell_srgb_to_linear[(dst >> 16) & 0xffU] * inv_a +
+	      shell_srgb_to_linear[(src >> 16) & 0xffU] * a255 + 127U) / 255U;
+	gl = (shell_srgb_to_linear[(dst >> 8) & 0xffU] * inv_a +
+	      shell_srgb_to_linear[(src >> 8) & 0xffU] * a255 + 127U) / 255U;
+	bl = (shell_srgb_to_linear[dst & 0xffU] * inv_a +
+	      shell_srgb_to_linear[src & 0xffU] * a255 + 127U) / 255U;
+	if (rl > 4095U)
+		rl = 4095U;
+	if (gl > 4095U)
+		gl = 4095U;
+	if (bl > 4095U)
+		bl = 4095U;
+	return 0xff000000U |
+	       ((uint32_t)shell_lin_to_srgb[rl] << 16) |
+	       ((uint32_t)shell_lin_to_srgb[gl] << 8) |
+	       (uint32_t)shell_lin_to_srgb[bl];
 }
 
 static bool drm_find_720p30(int fd)
@@ -219,7 +235,6 @@ static bool drm_find_720p30(int fd)
 	if (ioctl(fd, DRM_IOCTL_MODE_GETCONNECTOR, &conn) < 0)
 		return false;
 
-	/* Prefer 1280x720@30, then any 1280x720, then preferred mode */
 	for (i = 0; i < conn.count_modes; i++) {
 		if (modes[i].hdisplay == 1280 && modes[i].vdisplay == 720 &&
 		    modes[i].vrefresh == 30) {
@@ -313,6 +328,7 @@ err_fb:
 err_dumb:
 	{
 		struct drm_mode_destroy_dumb dreq = { .handle = disp.dumb_handle };
+
 		(void)ioctl(disp.drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
 	}
 err:
@@ -364,6 +380,7 @@ static void ensure_720p30_and_gamma(void)
 	fd = open("/sys/module/s5l8947x_drm/parameters/preferred_mode", O_RDONLY);
 	if (fd >= 0) {
 		ssize_t n = read(fd, cur, sizeof(cur) - 1);
+
 		close(fd);
 		if (n > 0 && strncmp(cur, "1280x720@30", 11) == 0)
 			return;
@@ -386,10 +403,8 @@ int shell_display_init(bool headless)
 	if (headless)
 		return 0;
 
-	/* Bypass the hardware gamma LUT (100 = OUT_GAMMA_EN 0) */
 	ensure_720p30_and_gamma();
 
-	/* Silence the fbcon cursor on tty0 */
 	disp.tty_fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
 	if (disp.tty_fd >= 0) {
 		(void)write(disp.tty_fd, "\033[?25l", 6);
@@ -567,6 +582,7 @@ int shell_display_dump_ppm(const char *path)
 			(uint8_t)((c >> 8) & 0xffU),
 			(uint8_t)(c & 0xffU),
 		};
+
 		if (fwrite(rgb, 1, 3, f) != 3) {
 			fclose(f);
 			return -EIO;
@@ -576,7 +592,7 @@ int shell_display_dump_ppm(const char *path)
 	return 0;
 }
 
-/* --- Drawing primitives --- */
+/* --- Drawing Primitives --- */
 
 void shell_draw_rect(int x, int y, int w, int h, uint32_t color)
 {
@@ -601,49 +617,103 @@ void shell_draw_rect(int x, int y, int w, int h, uint32_t color)
 	shell_display_damage(x0, y0, x1 - x0, y1 - y0);
 }
 
+void shell_draw_rect_alpha(int x, int y, int w, int h, uint32_t color, uint8_t alpha)
+{
+	int x0, y0, x1, y1, py, px;
+
+	if (w <= 0 || h <= 0 || alpha == 0)
+		return;
+	if (alpha == 255) {
+		shell_draw_rect(x, y, w, h, color);
+		return;
+	}
+	x0 = x < 0 ? 0 : x;
+	y0 = y < 0 ? 0 : y;
+	x1 = (x + w > SHELL_SCREEN_W) ? SHELL_SCREEN_W : (x + w);
+	y1 = (y + h > SHELL_SCREEN_H) ? SHELL_SCREEN_H : (y + h);
+	if (x0 >= x1 || y0 >= y1)
+		return;
+
+	for (py = y0; py < y1; py++) {
+		uint32_t *row = disp.backbuf + py * SHELL_SCREEN_W;
+
+		for (px = x0; px < x1; px++)
+			row[px] = blend_pixel(row[px], color, alpha);
+	}
+	shell_display_damage(x0, y0, x1 - x0, y1 - y0);
+}
+
 /*
- * 8x8 subpixel coverage for a rounded rectangle of size (w, h) and corner
- * radius r at local coordinates (lx, ly).
+ * Exact Euclidean Signed Distance Field (SDF) for a rounded rectangle of size
+ * (w, h) and corner radius r at continuous pixel coordinates (px, py).
+ * Returns < 0 inside, 0 on boundary, > 0 outside.
  */
+static inline float sdf_rounded_rect_dist(float px, float py, float w, float h, float r)
+{
+	float hw = w * 0.5f;
+	float hh = h * 0.5f;
+	float qx = fabsf(px - hw) - (hw - r);
+	float qy = fabsf(py - hh) - (hh - r);
+	float ox = qx > 0.0f ? qx : 0.0f;
+	float oy = qy > 0.0f ? qy : 0.0f;
+	float outside = sqrtf(ox * ox + oy * oy);
+	float inside = (qx > qy ? qx : qy);
+
+	if (inside > 0.0f)
+		inside = 0.0f;
+	return outside + inside - r;
+}
+
 static inline uint32_t rounded_rect_cov255(int lx, int ly, int w, int h, int r)
 {
-	int cx, cy, sx, sy, inside = 0;
-	int r8;
+	int sx, sy;
+	float acc = 0.0f;
+	float wf = (float)w, hf = (float)h, rf = (float)r;
 
 	if (r <= 0)
 		return 255;
+	if (lx < 0 || ly < 0 || lx >= w || ly >= h)
+		return 0;
 	if (lx >= r && lx < w - r)
 		return 255;
 	if (ly >= r && ly < h - r)
 		return 255;
 
-	cx = (lx < r) ? (r * 8) : ((w - r) * 8);
-	cy = (ly < r) ? (r * 8) : ((h - r) * 8);
-	r8 = r * 8;
+	/* 2x2 subpixel rotated-grid SDF evaluation for ultra-smooth corners */
+	for (sy = 0; sy < 2; sy++) {
+		float py = (float)ly + 0.25f + 0.5f * (float)sy;
 
-	for (sy = 0; sy < 8; sy++) {
-		int dy = (ly * 8 + sy) * 2 + 1 - cy * 2;
+		for (sx = 0; sx < 2; sx++) {
+			float px = (float)lx + 0.25f + 0.5f * (float)sx;
+			float d = sdf_rounded_rect_dist(px, py, wf, hf, rf);
+			float c = 0.5f - d;
 
-		for (sx = 0; sx < 8; sx++) {
-			int dx = (lx * 8 + sx) * 2 + 1 - cx * 2;
-
-			if (dx * dx + dy * dy <= (r8 * 2) * (r8 * 2))
-				inside++;
+			if (c > 1.0f)
+				c = 1.0f;
+			else if (c < 0.0f)
+				c = 0.0f;
+			acc += c;
 		}
 	}
-	return (uint32_t)((inside * 255 + 32) >> 6);
+	return (uint32_t)(acc * 63.75f + 0.5f);
 }
 
 void shell_draw_rounded_rect(int x, int y, int w, int h, int radius, uint32_t color)
 {
+	shell_draw_rounded_rect_alpha(x, y, w, h, radius, color, 255);
+}
+
+void shell_draw_rounded_rect_alpha(int x, int y, int w, int h, int radius,
+				   uint32_t color, uint8_t alpha)
+{
 	int py, px;
 
+	if (w <= 0 || h <= 0 || alpha == 0)
+		return;
 	if (radius <= 0) {
-		shell_draw_rect(x, y, w, h, color);
+		shell_draw_rect_alpha(x, y, w, h, color, alpha);
 		return;
 	}
-	if (w <= 0 || h <= 0)
-		return;
 	if (radius * 2 > w)
 		radius = w / 2;
 	if (radius * 2 > h)
@@ -662,12 +732,13 @@ void shell_draw_rounded_rect(int x, int y, int w, int h, int radius, uint32_t co
 
 			if (sx < 0 || sx >= SHELL_SCREEN_W)
 				continue;
-			uint32_t a = rounded_rect_cov255(px, py, w, h, radius);
+			uint32_t cov = rounded_rect_cov255(px, py, w, h, radius);
+			uint32_t a = (cov * alpha + 127U) / 255U;
 
 			if (a == 255)
 				row[sx] = color;
 			else if (a > 0)
-				row[sx] = blend_pixel_linear(row[sx], color, a);
+				row[sx] = blend_pixel(row[sx], color, a);
 		}
 	}
 	shell_display_damage(x, y, w, h);
@@ -677,13 +748,291 @@ void shell_draw_rounded_outline(int x, int y, int w, int h, int radius,
 				int thickness, uint32_t color)
 {
 	int py, px;
-	int inner_r = radius > thickness ? radius - thickness : 0;
-	int inner_w = w - 2 * thickness;
-	int inner_h = h - 2 * thickness;
+	float wf, hf, rf, tf;
 
 	if (w <= 0 || h <= 0 || thickness <= 0)
 		return;
+	if (radius * 2 > w)
+		radius = w / 2;
+	if (radius * 2 > h)
+		radius = h / 2;
+	wf = (float)w;
+	hf = (float)h;
+	rf = (float)radius;
+	tf = (float)thickness;
 	color |= 0xff000000U;
+
+	for (py = 0; py < h; py++) {
+		int sy = y + py;
+
+		if (sy < 0 || sy >= SHELL_SCREEN_H)
+			continue;
+		uint32_t *row = disp.backbuf + sy * SHELL_SCREEN_W;
+		bool in_y_mid = (py >= radius && py < h - radius);
+
+		for (px = 0; px < w; px++) {
+			int sx = x + px;
+
+			if (sx < 0 || sx >= SHELL_SCREEN_W)
+				continue;
+
+			/* Fast-path interior hollow region */
+			if (in_y_mid && px >= thickness && px < w - thickness)
+				continue;
+			if (px >= radius && px < w - radius &&
+			    py >= thickness && py < h - thickness)
+				continue;
+
+			/* Fast-path straight horizontal/vertical border segments */
+			if ((in_y_mid && (px < thickness || px >= w - thickness)) ||
+			    (px >= radius && px < w - radius &&
+			     (py < thickness || py >= h - thickness))) {
+				row[sx] = color;
+				continue;
+			}
+
+			/* Exact perpendicular Euclidean SDF stroke at rounded corners */
+			int sub_x, sub_y;
+			float acc = 0.0f;
+
+			for (sub_y = 0; sub_y < 2; sub_y++) {
+				float fy = (float)py + 0.25f + 0.5f * (float)sub_y;
+
+				for (sub_x = 0; sub_x < 2; sub_x++) {
+					float fx = (float)px + 0.25f + 0.5f * (float)sub_x;
+					float d = sdf_rounded_rect_dist(fx, fy, wf, hf, rf);
+					float outer_c = 0.5f - d;
+					float inner_c = 0.5f + d + tf;
+
+					if (outer_c > 1.0f)
+						outer_c = 1.0f;
+					else if (outer_c < 0.0f)
+						outer_c = 0.0f;
+					if (inner_c > 1.0f)
+						inner_c = 1.0f;
+					else if (inner_c < 0.0f)
+						inner_c = 0.0f;
+					acc += outer_c * inner_c;
+				}
+			}
+			uint32_t a = (uint32_t)(acc * 63.75f + 0.5f);
+
+			if (a >= 255)
+				row[sx] = color;
+			else if (a > 0)
+				row[sx] = blend_pixel(row[sx], color, a);
+		}
+	}
+	shell_display_damage(x, y, w, h);
+}
+
+/*
+ * Outer focus glow ring: box-shadow: 0 0 0 <spread>px rgba(245, 158, 11, 0.28)
+ */
+void shell_draw_focus_glow(int x, int y, int w, int h, int radius,
+			   int spread, uint32_t glow_color, uint8_t max_alpha)
+{
+	int gx = x - spread;
+	int gy = y - spread;
+	int gw = w + 2 * spread;
+	int gh = h + 2 * spread;
+	int gr = radius + spread;
+	int py, px;
+
+	if (spread <= 0 || max_alpha == 0)
+		return;
+
+	for (py = 0; py < gh; py++) {
+		int sy = gy + py;
+
+		if (sy < 0 || sy >= SHELL_SCREEN_H)
+			continue;
+		uint32_t *row = disp.backbuf + sy * SHELL_SCREEN_W;
+
+		for (px = 0; px < gw; px++) {
+			int sx = gx + px;
+
+			if (sx < 0 || sx >= SHELL_SCREEN_W)
+				continue;
+			/* Skip interior of the element itself */
+			if (px >= spread + radius && px < gw - spread - radius &&
+			    py >= spread && py < gh - spread)
+				continue;
+			if (py >= spread + radius && py < gh - spread - radius &&
+			    px >= spread && px < gw - spread)
+				continue;
+
+			uint32_t outer_a = rounded_rect_cov255(px, py, gw, gh, gr);
+			uint32_t inner_a = 0;
+
+			if (px >= spread && px < gw - spread &&
+			    py >= spread && py < gh - spread) {
+				inner_a = rounded_rect_cov255(px - spread,
+							      py - spread,
+							      w, h, radius);
+			}
+			if (outer_a > inner_a) {
+				uint32_t cov = outer_a - inner_a;
+				uint32_t a = (cov * max_alpha + 127U) / 255U;
+
+				row[sx] = blend_pixel(row[sx], glow_color, a);
+			}
+		}
+	}
+	shell_display_damage(gx, gy, gw, gh);
+}
+
+/*
+ * Subtle drop shadow beneath elevated focused cards: 0 10px 22px rgba(0,0,0,0.22)
+ */
+void shell_draw_card_shadow(int x, int y, int w, int h, int radius)
+{
+	int s;
+
+	for (s = 8; s >= 2; s -= 2) {
+		shell_draw_rounded_rect_alpha(x - s / 2, y + 4 + s,
+					      w + s, h, radius + s / 2,
+					      0xff06080cU, 14);
+	}
+}
+
+/*
+ * Bottom gradient scrim on Slot 3 media cards (.media-body):
+ *   linear-gradient(to top, rgba(6,8,12,0.96) 0%, rgba(6,8,12,0.84) 58%,
+ *                   rgba(6,8,12,0.32) 84%, transparent 100%)
+ * Clipped to the bottom rounded corners of the card.
+ */
+void shell_draw_card_bottom_scrim(int card_x, int card_y, int card_w, int card_h,
+				  int radius, int scrim_h)
+{
+	int y_start, py, px;
+
+	if (scrim_h <= 0 || scrim_h > card_h)
+		scrim_h = card_h;
+	y_start = card_h - scrim_h;
+
+	for (py = y_start; py < card_h; py++) {
+		int sy = card_y + py;
+
+		if (sy < 0 || sy >= SHELL_SCREEN_H)
+			continue;
+		uint32_t *row = disp.backbuf + sy * SHELL_SCREEN_W;
+
+		/* Distance from bottom: 0.0 at bottom -> 1.0 at top of scrim */
+		float dist_from_bottom = (float)(card_h - 1 - py) / (float)(scrim_h > 1 ? scrim_h - 1 : 1);
+		float alpha_f;
+
+		if (dist_from_bottom <= 0.58f) {
+			float t = dist_from_bottom / 0.58f;
+			alpha_f = 0.96f + (0.84f - 0.96f) * t;
+		} else if (dist_from_bottom <= 0.84f) {
+			float t = (dist_from_bottom - 0.58f) / (0.84f - 0.58f);
+			alpha_f = 0.84f + (0.32f - 0.84f) * t;
+		} else {
+			float t = (dist_from_bottom - 0.84f) / (1.0f - 0.84f);
+			alpha_f = 0.32f * (1.0f - t);
+		}
+
+		for (px = 0; px < card_w; px++) {
+			int sx = card_x + px;
+
+			if (sx < 0 || sx >= SHELL_SCREEN_W)
+				continue;
+			uint32_t cov = rounded_rect_cov255(px, py, card_w, card_h, radius);
+			if (cov == 0)
+				continue;
+
+			int dither = (int)bayer4x4[(sy & 3) * 4 + (sx & 3)] - 7;
+			int a255 = (int)(alpha_f * 255.0f) + (dither >> 2);
+			if (a255 < 0)
+				a255 = 0;
+			if (a255 > 255)
+				a255 = 255;
+			a255 = (int)((cov * (uint32_t)a255 + 127U) / 255U);
+			if (a255 > 0)
+				row[sx] = blend_pixel(row[sx], 0xff06080cU, (uint32_t)a255);
+		}
+	}
+	shell_display_damage(card_x, card_y + y_start, card_w, scrim_h);
+}
+
+/*
+ * Fullscreen overlay top scrim (.overlay-top-bar):
+ *   linear-gradient(to bottom, rgba(6,8,12,0.88) 0%, rgba(6,8,12,0.45) 65%, transparent 100%)
+ */
+void shell_draw_top_scrim(int w, int h)
+{
+	int py, px;
+
+	for (py = 0; py < h && py < SHELL_SCREEN_H; py++) {
+		uint32_t *row = disp.backbuf + py * SHELL_SCREEN_W;
+		float t = (float)py / (float)(h > 1 ? h - 1 : 1);
+		float alpha_f = (t <= 0.65f) ?
+			(0.88f + (0.45f - 0.88f) * (t / 0.65f)) :
+			(0.45f * (1.0f - (t - 0.65f) / 0.35f));
+
+		for (px = 0; px < w && px < SHELL_SCREEN_W; px++) {
+			int dither = (int)bayer4x4[(py & 3) * 4 + (px & 3)] - 7;
+			int a = (int)(alpha_f * 255.0f) + (dither >> 2);
+
+			if (a > 0) {
+				if (a > 255)
+					a = 255;
+				row[px] = blend_pixel(row[px], 0xff06080cU, (uint32_t)a);
+			}
+		}
+	}
+	shell_display_damage(0, 0, w, h);
+}
+
+/*
+ * Fullscreen overlay bottom scrim (.overlay-bottom-scrim):
+ *   linear-gradient(to top, rgba(6,8,12,0.96) 0%, rgba(6,8,12,0.82) 55%,
+ *                   rgba(6,8,12,0.35) 82%, transparent 100%)
+ */
+void shell_draw_bottom_scrim(int y0, int w, int h)
+{
+	int py, px;
+
+	for (py = 0; py < h; py++) {
+		int sy = y0 + py;
+
+		if (sy < 0 || sy >= SHELL_SCREEN_H)
+			continue;
+		uint32_t *row = disp.backbuf + sy * SHELL_SCREEN_W;
+		float dist = (float)(h - 1 - py) / (float)(h > 1 ? h - 1 : 1);
+		float alpha_f;
+
+		if (dist <= 0.55f)
+			alpha_f = 0.96f + (0.82f - 0.96f) * (dist / 0.55f);
+		else if (dist <= 0.82f)
+			alpha_f = 0.82f + (0.35f - 0.82f) * ((dist - 0.55f) / 0.27f);
+		else
+			alpha_f = 0.35f * (1.0f - (dist - 0.82f) / 0.18f);
+
+		for (px = 0; px < w && px < SHELL_SCREEN_W; px++) {
+			int dither = (int)bayer4x4[(sy & 3) * 4 + (px & 3)] - 7;
+			int a = (int)(alpha_f * 255.0f) + (dither >> 2);
+
+			if (a > 0) {
+				if (a > 255)
+					a = 255;
+				row[px] = blend_pixel(row[px], 0xff06080cU, (uint32_t)a);
+			}
+		}
+	}
+	shell_display_damage(0, y0, w, h);
+}
+
+/*
+ * Stage-1 progressive skeleton shimmer bar (.skeleton-line)
+ */
+void shell_draw_shimmer_bar(int x, int y, int w, int h, int radius,
+			    uint32_t base_color, uint32_t highlight_color, int phase_pct)
+{
+	int py, px;
+	int center_x = (w * phase_pct) / 100;
+	int band_w = w / 3 > 1 ? w / 3 : 1;
 
 	for (py = 0; py < h; py++) {
 		int sy = y + py;
@@ -697,21 +1046,18 @@ void shell_draw_rounded_outline(int x, int y, int w, int h, int radius,
 
 			if (sx < 0 || sx >= SHELL_SCREEN_W)
 				continue;
-			uint32_t outer_a = rounded_rect_cov255(px, py, w, h, radius);
-			uint32_t inner_a = 0;
+			uint32_t cov = rounded_rect_cov255(px, py, w, h, radius);
+			if (cov == 0)
+				continue;
 
-			if (px >= thickness && px < w - thickness &&
-			    py >= thickness && py < h - thickness) {
-				inner_a = rounded_rect_cov255(px - thickness,
-							      py - thickness,
-							      inner_w, inner_h,
-							      inner_r);
-			}
-			if (outer_a > inner_a) {
-				uint32_t a = outer_a - inner_a;
+			int dist = abs(px - center_x);
+			uint32_t bar_c = base_color;
 
-				row[sx] = blend_pixel_linear(row[sx], color, a);
+			if (dist < band_w) {
+				uint32_t t = (uint32_t)((band_w - dist) * 180 / band_w);
+				bar_c = blend_pixel(base_color, highlight_color, t);
 			}
+			row[sx] = blend_pixel(row[sx], bar_c, cov);
 		}
 	}
 	shell_display_damage(x, y, w, h);
@@ -742,7 +1088,7 @@ void shell_draw_bitmap_xrgb(int x, int y, int w, int h, const uint32_t *pixels)
 }
 
 void shell_draw_rounded_bitmap(int x, int y, int w, int h, int radius,
-			       const uint32_t *pixels)
+			       const uint32_t *pixels, bool zoom_slightly)
 {
 	int py, px;
 
@@ -754,22 +1100,76 @@ void shell_draw_rounded_bitmap(int x, int y, int w, int h, int radius,
 		if (sy < 0 || sy >= SHELL_SCREEN_H)
 			continue;
 		uint32_t *row = disp.backbuf + sy * SHELL_SCREEN_W;
-		const uint32_t *src = pixels + py * w;
+		int y_q8 = py << 8;
+
+		if (zoom_slightly) {
+			/* Smooth bilinear 1.03x center zoom on focused card artwork */
+			y_q8 = (h << 7) + (((py * 2 - h) * 124) );
+			if (y_q8 < 0)
+				y_q8 = 0;
+			if (y_q8 > ((h - 1) << 8))
+				y_q8 = (h - 1) << 8;
+		}
+		int y0 = y_q8 >> 8;
+		int y1 = (y0 + 1 < h) ? (y0 + 1) : y0;
+		uint32_t fy = (uint32_t)(y_q8 & 0xff);
+		const uint32_t *row0 = pixels + y0 * w;
+		const uint32_t *row1 = pixels + y1 * w;
 
 		for (px = 0; px < w; px++) {
 			int sx = x + px;
 
 			if (sx < 0 || sx >= SHELL_SCREEN_W)
 				continue;
+			uint32_t sample;
+
+			if (!zoom_slightly) {
+				sample = row0[px] | 0xff000000U;
+			} else {
+				int x_q8 = (w << 7) + (((px * 2 - w) * 124));
+				if (x_q8 < 0)
+					x_q8 = 0;
+				if (x_q8 > ((w - 1) << 8))
+					x_q8 = (w - 1) << 8;
+				int x0 = x_q8 >> 8;
+				int x1 = (x0 + 1 < w) ? (x0 + 1) : x0;
+				uint32_t fx = (uint32_t)(x_q8 & 0xff);
+				uint32_t c00 = row0[x0], c10 = row0[x1];
+				uint32_t c01 = row1[x0], c11 = row1[x1];
+				uint32_t w00 = (256U - fx) * (256U - fy);
+				uint32_t w10 = fx * (256U - fy);
+				uint32_t w01 = (256U - fx) * fy;
+				uint32_t w11 = fx * fy;
+				uint32_t r = (((c00 >> 16) & 0xffU) * w00 +
+					      ((c10 >> 16) & 0xffU) * w10 +
+					      ((c01 >> 16) & 0xffU) * w01 +
+					      ((c11 >> 16) & 0xffU) * w11 + 32768U) >> 16;
+				uint32_t g = (((c00 >> 8) & 0xffU) * w00 +
+					      ((c10 >> 8) & 0xffU) * w10 +
+					      ((c01 >> 8) & 0xffU) * w01 +
+					      ((c11 >> 8) & 0xffU) * w11 + 32768U) >> 16;
+				uint32_t b = ((c00 & 0xffU) * w00 +
+					      (c10 & 0xffU) * w10 +
+					      (c01 & 0xffU) * w01 +
+					      (c11 & 0xffU) * w11 + 32768U) >> 16;
+				sample = 0xff000000U | (r << 16) | (g << 8) | b;
+			}
 			uint32_t a = rounded_rect_cov255(px, py, w, h, radius);
 
 			if (a == 255)
-				row[sx] = src[px] | 0xff000000U;
+				row[sx] = sample;
 			else if (a > 0)
-				row[sx] = blend_pixel_linear(row[sx], src[px], a);
+				row[sx] = blend_pixel(row[sx], sample, a);
 		}
 	}
 	shell_display_damage(x, y, w, h);
+}
+
+void shell_draw_circle_alpha(int cx, int cy, int r, uint32_t color, uint8_t alpha)
+{
+	int d = r * 2;
+
+	shell_draw_rounded_rect_alpha(cx - r, cy - r, d, d, r, color, alpha);
 }
 
 void shell_draw_symbol(enum shell_symbol_id sym, int x, int y, int size, uint32_t fg)
@@ -791,7 +1191,7 @@ void shell_draw_symbol(enum shell_symbol_id sym, int x, int y, int size, uint32_
 			uint8_t a = mask[py * size + px];
 
 			if (a && sx >= 0 && sx < SHELL_SCREEN_W)
-				row[sx] = blend_pixel_linear(row[sx], fg, a);
+				row[sx] = blend_pixel(row[sx], fg, a);
 		}
 	}
 	shell_display_damage(x, y, size, size);

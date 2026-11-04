@@ -1,0 +1,220 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://velliangiri.local/schemas/screen.schema.json",
+  "title": "Giri Standardized 4-Slot Fixed-Length Screen Layout Schema (screen.json v1.2)",
+  "description": "Clean 4-slot fixed-length screen layout schema for Velliangiri OS (1280x720): header (44px), summary (148px: title <= 64 chars, text <= 250 chars), media_cards (312px: 4 full-bleed overlaid cards), and footer_links (58px: fixed bottom-left Ask Giri, 2 contextual buttons <= 42 chars, and fixed bottom-right Settings). Borders appear strictly on selectable elements only.",
+  "type": "object",
+  "required": [
+    "schema_version",
+    "screen_id",
+    "page_type",
+    "header",
+    "summary",
+    "media_cards",
+    "footer_links"
+  ],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.2"
+    },
+    "screen_id": {
+      "type": "string",
+      "maxLength": 40,
+      "description": "Unique identifier for the current screen response."
+    },
+    "page_type": {
+      "type": "string",
+      "enum": ["home", "news", "topic", "weather", "media", "apps", "system"],
+      "description": "Standardized information page archetype."
+    },
+    "header": {
+      "type": "object",
+      "description": "Slot 1 (Fixed 44px Top Bar, border: none): 49x40 3D mountain emblem + 'Giri —' + prompt_title on the left.",
+      "required": ["assistant_name", "prompt_title", "os_label"],
+      "properties": {
+        "assistant_name": {
+          "type": "string",
+          "const": "Giri"
+        },
+        "prompt_title": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 56,
+          "description": "Strict fixed-length user prompt or page context title (max 56 chars, no ellipsis)."
+        },
+        "os_label": {
+          "type": "string",
+          "const": "Velliangiri OS"
+        }
+      }
+    },
+    "summary": {
+      "type": "object",
+      "description": "Slot 2 (Fixed 148px Clean Editorial Summary Zone, border: none): Title (<= 64 chars) + Concise Summary Text (<= 250 chars, zero ellipsis) + Source Caption (<= 48 chars).",
+      "required": ["title", "text", "source_caption"],
+      "properties": {
+        "title": {
+          "type": "string",
+          "minLength": 6,
+          "maxLength": 64,
+          "description": "Standardized single-line page headline (max 64 chars, no ellipsis)."
+        },
+        "text": {
+          "type": "string",
+          "minLength": 20,
+          "maxLength": 250,
+          "description": "Concise 1-2 sentence summary of the page content, strictly <= 250 characters (no ellipsis)."
+        },
+        "source_caption": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 48,
+          "description": "Fixed-length source attribution (max 48 chars)."
+        },
+        "char_count": {
+          "type": "integer",
+          "minimum": 1,
+          "maximum": 250,
+          "description": "Character count of summary.text (strictly <= 250)."
+        }
+      }
+    },
+    "media_cards": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 4,
+      "description": "Slot 3 (Fixed 312px Row of 4 Full-Bleed Visual Cards with Overlaid Text): Primary interactive row (Left/Right arrows). Strict title <= 26 chars and subtitle <= 38 chars.",
+      "items": {
+        "$ref": "#/$defs/mediaCard"
+      }
+    },
+    "footer_links": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 4,
+      "description": "Slot 4 (Fixed 58px Row of 4 Selectable Bottom Buttons): [0] Fixed bottom-left 'Ask Giri', [1..2] 2 contextual links (<= 42 chars, zero '...'), [3] Fixed bottom-right 'Settings'.",
+      "items": {
+        "$ref": "#/$defs/footerLink"
+      }
+    }
+  },
+  "$defs": {
+    "mediaCard": {
+      "type": "object",
+      "required": ["id", "title", "subtitle", "badge", "meta_pill", "thumbnail", "action"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "title": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 26,
+          "description": "Strict short card title (max 26 chars, zero '...')."
+        },
+        "subtitle": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 38,
+          "description": "Strict short card subtitle (max 38 chars, zero '...')."
+        },
+        "badge": {
+          "type": "string",
+          "minLength": 3,
+          "maxLength": 10,
+          "description": "Top-left thumbnail badge (max 10 chars: LIVE NEWS, WEATHER, VIDEOS, GAME, PAGE IMAGE, PAGE VIDEO, PHOTO, VIDEO, APP)."
+        },
+        "meta_pill": {
+          "type": "string",
+          "minLength": 2,
+          "maxLength": 8,
+          "description": "Top-right thumbnail pill (max 8 chars: BBC, LIVE, 720P, HD, 00:15, PLAY, 43°C)."
+        },
+        "thumbnail": {
+          "type": "object",
+          "required": ["kind", "uri", "preset_art"],
+          "properties": {
+            "kind": {
+              "type": "string",
+              "enum": ["page_image", "page_video", "local_image", "local_video", "app_icon"]
+            },
+            "uri": {
+              "type": "string"
+            },
+            "preset_art": {
+              "type": "string"
+            }
+          }
+        },
+        "action": {
+          "$ref": "#/$defs/standardAction"
+        }
+      }
+    },
+    "footerLink": {
+      "type": "object",
+      "required": ["id", "label", "symbol", "action"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 32
+        },
+        "label": {
+          "type": "string",
+          "minLength": 4,
+          "maxLength": 42,
+          "description": "Strict max 42-character selectable button title summarized by the LLM (no '...' truncation)."
+        },
+        "symbol": {
+          "type": "string",
+          "enum": ["keyboard", "globe", "image", "play", "stream", "folder", "page", "game", "check", "spark", "settings"]
+        },
+        "action": {
+          "$ref": "#/$defs/standardAction"
+        }
+      }
+    },
+    "standardAction": {
+      "type": "object",
+      "required": ["type", "capability", "parameters"],
+      "description": "Maps selection of a media card or bottom button to an OS capability or standardized detail view.",
+      "properties": {
+        "type": {
+          "type": "string",
+          "enum": [
+            "open_image",
+            "play_video",
+            "launch_app",
+            "install_app",
+            "ask_giri",
+            "show_screen",
+            "set_theme",
+            "open_prompt_box",
+            "open_settings"
+          ]
+        },
+        "capability": {
+          "type": "string",
+          "enum": [
+            "media.open_image",
+            "media.play_video",
+            "media.get_library",
+            "apps.launch",
+            "apps.list_and_install",
+            "system.get_info",
+            "system.set_theme",
+            "system.open_settings",
+            "internet.search_and_extract",
+            "ui.open_prompt"
+          ]
+        },
+        "parameters": {
+          "type": "object",
+          "description": "Standardized parameters. For open_image/play_video, includes fixed-length title (<= 64 chars), summary (<= 250 chars), and source_caption (<= 48 chars)."
+        }
+      }
+    }
+  }
+}

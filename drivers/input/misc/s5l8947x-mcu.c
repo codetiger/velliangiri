@@ -247,12 +247,6 @@ static void s5l8947x_mcu_handle_ir_key(struct s5l8947x_mcu *mcu,
 		return;
 	}
 
-	/* A repeat of the key already down is not a new press */
-	if (mcu->key != KEY_RESERVED && code == mcu->key_code) {
-		s5l8947x_mcu_key_repeat(mcu);
-		return;
-	}
-
 	s5l8947x_mcu_key_up(mcu);
 	keycode = s5l8947x_mcu_map_ir_key(mcu, code);
 	if (keycode != KEY_UNKNOWN) {

@@ -1,12 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Velliangiri 1280x720 TV Shell - Input Multiplexer, Keyboard Hotplug & App Supervisor
+ * Giri on Velliangiri OS — TV Input Multiplexer & App Supervisor
  *
  * Monitors /dev/input/event* and /dev/input (via inotify):
- *   - Distinguishes the 7-button IR remote from Bluetooth keyboards via EVIOCGBIT
+ *   - 7-button IR remote (Up, Down, Left, Right, Select/OK, Menu/Back, Play/Pause)
+ *   - Optional USB / Bluetooth keyboard for Ask Giri text input
  *   - Toggles /sys/bus/serdev/devices/serial0-0/game_map between 0 (shell) and 1 (games)
- *   - Tracks 2-second Menu hold (SHELL_TIMING_MENU_HOLD_MS = 2000) to exit external apps
- *   - Translates keyboard events into printable ASCII for the Ask line
+ *   - Tracks 2-second Menu hold (2000 ms) to exit external apps or return home
  */
 
 #include <dirent.h>
@@ -30,7 +30,10 @@
 
 #include "tvshell.h"
 
-#define MAX_EVDEVS	16
+#define MAX_EVDEVS		16
+#define SHELL_MENU_HOLD_MS	2000ULL
+#define SHELL_DPAD_REPEAT_DELAY	350ULL
+#define SHELL_DPAD_REPEAT_RATE	160ULL
 
 struct evdev_slot {
 	int fd;
@@ -42,27 +45,30 @@ static struct {
 	struct evdev_slot devs[MAX_EVDEVS];
 	int num_devs;
 	int inotify_fd;
+	bool headless;
 	bool has_keyboard;
 	bool shift_down;
 	bool menu_down;
 	bool menu_hold_fired;
 	uint64_t menu_down_ms;
 	uint16_t down_code;
+	uint64_t down_ms;
+	uint64_t last_repeat_ms;
+	bool pending_ir_press;
+	uint8_t last_ir_scan;
 } inp = {
 	.inotify_fd = -1,
 };
 
-#ifdef __linux__
-static uint64_t now_ms(void)
+uint64_t shell_now_ms(void)
 {
 	struct timespec ts;
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return (uint64_t)ts.tv_sec * 1000ULL + (uint64_t)(ts.tv_nsec / 1000000ULL);
 }
-#endif
 
-void shell_input_set_game_map(bool enable)
+static void shell_input_set_game_map(bool enable)
 {
 	static const char *const paths[] = {
 		"/sys/bus/serial-base/devices/serial0-0/game_map",
@@ -102,7 +108,7 @@ static bool check_is_keyboard(int fd)
 	       test_bit(KEY_E, keybits) && test_bit(KEY_A, keybits);
 }
 
-static bool rescan_evdevs(void)
+static void rescan_evdevs(void)
 {
 	DIR *d;
 	struct dirent *de;
@@ -117,7 +123,7 @@ static bool rescan_evdevs(void)
 
 	d = opendir("/dev/input");
 	if (!d)
-		return false;
+		return;
 
 	while ((de = readdir(d)) != NULL && inp.num_devs < MAX_EVDEVS) {
 		char path[300];
@@ -139,22 +145,23 @@ static bool rescan_evdevs(void)
 			kb_found = true;
 	}
 	closedir(d);
-
-	bool changed = (kb_found != inp.has_keyboard);
 	inp.has_keyboard = kb_found;
-	return changed;
 }
 #endif
 
-int shell_input_init(void)
+int shell_input_init(bool headless)
 {
+	inp.headless = headless;
+	if (headless)
+		return 0;
+
 	shell_input_set_game_map(false);
 #ifdef __linux__
 	inp.inotify_fd = inotify_init1(IN_NONBLOCK | IN_CLOEXEC);
 	if (inp.inotify_fd >= 0)
 		(void)inotify_add_watch(inp.inotify_fd, "/dev/input",
 					IN_CREATE | IN_DELETE);
-	(void)rescan_evdevs();
+	rescan_evdevs();
 #endif
 	return 0;
 }
@@ -172,11 +179,6 @@ void shell_input_close(void)
 		close(inp.inotify_fd);
 		inp.inotify_fd = -1;
 	}
-}
-
-bool shell_input_has_keyboard(void)
-{
-	return inp.has_keyboard;
 }
 
 #ifdef __linux__
@@ -233,28 +235,56 @@ static char keycode_to_ascii(uint16_t code, bool shift)
 
 static bool translate_ev_key(const struct evdev_slot *slot,
 			     const struct input_event *ie,
-			     struct shell_event *out)
+			     struct shell_input_event *out)
 {
+	/*
+	 * Track MCU_EVT_IR_KEY (0x10) scan frames via EV_MSC MSC_SCAN.
+	 * Unlike 0x11 NEC repeat pulses, 0x10 frames always emit MSC_SCAN,
+	 * allowing us to distinguish a rapid re-press of the same button
+	 * (< 200ms after the previous tap) from a held-button repeat pulse.
+	 */
+	if (ie->type == EV_MSC && ie->code == MSC_SCAN) {
+		uint8_t ir_code = (uint8_t)(ie->value & 0xfeU);
+
+		if (ir_code == 0x04 &&
+		    (inp.last_ir_scan == 0x5c || inp.last_ir_scan == 0x5e)) {
+			return false;
+		}
+		inp.pending_ir_press = true;
+		inp.last_ir_scan = ir_code;
+		return false;
+	}
+
 	if (ie->type != EV_KEY)
 		return false;
+
+	bool is_new_ir_press = inp.pending_ir_press;
+	inp.pending_ir_press = false;
 
 	if (ie->code == KEY_LEFTSHIFT || ie->code == KEY_RIGHTSHIFT) {
 		inp.shift_down = (ie->value != 0);
 		return false;
 	}
 
+	uint64_t now = shell_now_ms();
+
 	/* Track 2-second Menu hold across press (1), repeat (2), and release (0) */
 	if (ie->code == KEY_MENU || (!slot->is_keyboard && ie->code == KEY_ESC)) {
-		if (ie->value == 1) {
+		if (ie->value == 1 || (ie->value == 2 && is_new_ir_press)) {
+			bool rapid_retap = inp.menu_down && !inp.menu_hold_fired;
 			inp.menu_down = true;
 			inp.menu_hold_fired = false;
-			inp.menu_down_ms = now_ms();
+			inp.menu_down_ms = now;
+			if (rapid_retap) {
+				out->key = SHELL_KEY_MENU;
+				return true;
+			}
 			return false;
 		} else if (ie->value == 2 && inp.menu_down) {
 			if (!inp.menu_hold_fired &&
-			    now_ms() - inp.menu_down_ms >= SHELL_TIMING_MENU_HOLD_MS) {
+			    now - inp.menu_down_ms >= SHELL_MENU_HOLD_MS) {
 				inp.menu_hold_fired = true;
-				out->type = SHELL_EVT_MENU_HOLD;
+				out->key = SHELL_KEY_MENU_HOLD;
 				return true;
 			}
 			return false;
@@ -263,54 +293,70 @@ static bool translate_ev_key(const struct evdev_slot *slot,
 			inp.menu_down = false;
 			inp.menu_hold_fired = false;
 			if (emit_click) {
-				out->type = SHELL_EVT_KEY_MENU;
+				out->key = SHELL_KEY_MENU;
 				return true;
 			}
 			return false;
 		}
+		return false;
 	}
 
 	/*
-	 * Register button actions strictly on key release (press_up, value == 0)
-	 * after a matching press_down (value == 1), ignoring NEC repeat frames
-	 * (value == 2) so a single button press never double-triggers.
+	 * Register navigation and action buttons immediately on key-down
+	 * (value == 1) and on rapid physical IR re-taps (value == 2 with
+	 * MSC_SCAN), while providing smooth controlled auto-repeat when a
+	 * directional key is held down.
 	 */
-	if (ie->value == 1) {
-		inp.down_code = ie->code;
+	if (ie->value == 0) {
+		if (inp.down_code == ie->code)
+			inp.down_code = 0;
 		return false;
 	}
-	if (ie->value != 0)
+
+	if (ie->value == 1 || (ie->value == 2 && is_new_ir_press)) {
+		inp.down_code = ie->code;
+		inp.down_ms = now;
+		inp.last_repeat_ms = now;
+	} else if (ie->value == 2) {
+		bool can_repeat = (ie->code == KEY_LEFT || ie->code == KEY_RIGHT ||
+				   ie->code == KEY_UP || ie->code == KEY_DOWN ||
+				   ie->code == KEY_BACKSPACE);
+		if (!can_repeat || inp.down_code != ie->code)
+			return false;
+		if (now - inp.down_ms < SHELL_DPAD_REPEAT_DELAY ||
+		    now - inp.last_repeat_ms < SHELL_DPAD_REPEAT_RATE)
+			return false;
+		inp.last_repeat_ms = now;
+	} else {
 		return false;
-	if (inp.down_code != ie->code)
-		return false;
-	inp.down_code = 0;
+	}
 
 	switch (ie->code) {
 	case KEY_LEFT:
-		out->type = SHELL_EVT_KEY_LEFT;
+		out->key = SHELL_KEY_LEFT;
 		return true;
 	case KEY_RIGHT:
-		out->type = SHELL_EVT_KEY_RIGHT;
+		out->key = SHELL_KEY_RIGHT;
 		return true;
 	case KEY_UP:
-		out->type = SHELL_EVT_KEY_UP;
+		out->key = SHELL_KEY_UP;
 		return true;
 	case KEY_DOWN:
-		out->type = SHELL_EVT_KEY_DOWN;
+		out->key = SHELL_KEY_DOWN;
 		return true;
 	case KEY_ENTER:
 	case KEY_KPENTER:
-		out->type = slot->is_keyboard ? SHELL_EVT_TEXT_ENTER : SHELL_EVT_KEY_OK;
+		out->key = SHELL_KEY_SELECT;
 		return true;
 	case KEY_PLAYPAUSE:
 	case KEY_PLAY:
-		out->type = SHELL_EVT_KEY_PLAY;
+		out->key = SHELL_KEY_PLAY_PAUSE;
 		return true;
 	case KEY_ESC:
-		out->type = slot->is_keyboard ? SHELL_EVT_TEXT_ESC : SHELL_EVT_KEY_MENU;
+		out->key = SHELL_KEY_MENU;
 		return true;
 	case KEY_BACKSPACE:
-		out->type = SHELL_EVT_TEXT_BACKSPACE;
+		out->key = SHELL_KEY_BACKSPACE;
 		return true;
 	default:
 		break;
@@ -318,11 +364,11 @@ static bool translate_ev_key(const struct evdev_slot *slot,
 
 	if (!slot->is_keyboard) {
 		if (ie->code == KEY_LEFTCTRL) {
-			out->type = SHELL_EVT_KEY_OK;
+			out->key = SHELL_KEY_SELECT;
 			return true;
 		}
 		if (ie->code == KEY_SPACE) {
-			out->type = SHELL_EVT_KEY_PLAY;
+			out->key = SHELL_KEY_PLAY_PAUSE;
 			return true;
 		}
 		return false;
@@ -330,17 +376,22 @@ static bool translate_ev_key(const struct evdev_slot *slot,
 
 	char ch = keycode_to_ascii(ie->code, inp.shift_down);
 	if (ch != 0) {
-		out->type = SHELL_EVT_TEXT_CHAR;
-		out->codepoint = (uint8_t)ch;
+		out->key = SHELL_KEY_CHAR;
+		out->ch = ch;
 		return true;
 	}
 	return false;
 }
 #endif
 
-int shell_input_poll(struct shell_event *ev, int timeout_ms)
+bool shell_input_poll(struct shell_input_event *ev, int timeout_ms)
 {
 	memset(ev, 0, sizeof(*ev));
+	if (inp.headless) {
+		if (timeout_ms > 0)
+			usleep((useconds_t)timeout_ms * 1000U);
+		return false;
+	}
 
 #ifdef __linux__
 	struct pollfd pfds[MAX_EVDEVS + 1];
@@ -348,26 +399,26 @@ int shell_input_poll(struct shell_event *ev, int timeout_ms)
 
 	/* Check if an active Menu press has crossed the 2-second hold threshold */
 	if (inp.menu_down && !inp.menu_hold_fired) {
-		uint64_t elapsed = now_ms() - inp.menu_down_ms;
+		uint64_t elapsed = shell_now_ms() - inp.menu_down_ms;
 
-		if (elapsed >= SHELL_TIMING_MENU_HOLD_MS) {
+		if (elapsed >= SHELL_MENU_HOLD_MS) {
 			inp.menu_hold_fired = true;
-			ev->type = SHELL_EVT_MENU_HOLD;
-			return 1;
+			ev->key = SHELL_KEY_MENU_HOLD;
+			return true;
 		}
-		int rem = (int)(SHELL_TIMING_MENU_HOLD_MS - elapsed);
+		int rem = (int)(SHELL_MENU_HOLD_MS - elapsed);
 		if (timeout_ms < 0 || rem < timeout_ms)
 			timeout_ms = rem;
 	}
 
-	/* First drain any buffered events before blocking in poll() */
+	/* Drain buffered events before blocking in poll() */
 	for (i = 0; i < inp.num_devs; i++) {
 		struct input_event ie;
 
 		while (inp.devs[i].fd >= 0 &&
 		       read(inp.devs[i].fd, &ie, sizeof(ie)) == (ssize_t)sizeof(ie)) {
 			if (translate_ev_key(&inp.devs[i], &ie, ev))
-				return 1;
+				return true;
 		}
 	}
 
@@ -387,12 +438,12 @@ int shell_input_poll(struct shell_event *ev, int timeout_ms)
 	ret = poll(pfds, (nfds_t)nfds, timeout_ms);
 	if (ret <= 0) {
 		if (inp.menu_down && !inp.menu_hold_fired &&
-		    now_ms() - inp.menu_down_ms >= SHELL_TIMING_MENU_HOLD_MS) {
+		    shell_now_ms() - inp.menu_down_ms >= SHELL_MENU_HOLD_MS) {
 			inp.menu_hold_fired = true;
-			ev->type = SHELL_EVT_MENU_HOLD;
-			return 1;
+			ev->key = SHELL_KEY_MENU_HOLD;
+			return true;
 		}
-		return 0;
+		return false;
 	}
 
 	if (inp.inotify_fd >= 0 && (pfds[nfds - 1].revents & POLLIN)) {
@@ -400,11 +451,7 @@ int shell_input_poll(struct shell_event *ev, int timeout_ms)
 
 		while (read(inp.inotify_fd, ibuf, sizeof(ibuf)) > 0)
 			;
-		if (rescan_evdevs()) {
-			ev->type = inp.has_keyboard ? SHELL_EVT_KB_ATTACHED
-						    : SHELL_EVT_KB_DETACHED;
-			return 1;
-		}
+		rescan_evdevs();
 	}
 
 	for (i = 0; i < inp.num_devs; i++) {
@@ -414,20 +461,20 @@ int shell_input_poll(struct shell_event *ev, int timeout_ms)
 			continue;
 		while (read(inp.devs[i].fd, &ie, sizeof(ie)) == (ssize_t)sizeof(ie)) {
 			if (translate_ev_key(&inp.devs[i], &ie, ev))
-				return 1;
+				return true;
 		}
 	}
 #else
 	if (timeout_ms > 0)
 		usleep((useconds_t)timeout_ms * 1000U);
 #endif
-	return 0;
+	return false;
 }
 
 /*
  * Run an external application (such as /bin/doom), releasing DRM master so
  * the app owns the display and monitoring the IR remote for a 2-second Menu
- * hold (menuHoldMs: 2000) to return to the shell at any time.
+ * hold (2000 ms) to return to the shell at any time.
  */
 int shell_app_run(const char *const argv[], bool game_keys)
 {
@@ -463,9 +510,9 @@ int shell_app_run(const char *const argv[], bool game_keys)
 		if (w == pid || (w < 0 && errno != EINTR))
 			break;
 
-		struct shell_event ev;
-		if (shell_input_poll(&ev, 50) > 0 &&
-		    ev.type == SHELL_EVT_MENU_HOLD) {
+		struct shell_input_event ev;
+		if (shell_input_poll(&ev, 50) &&
+		    ev.key == SHELL_KEY_MENU_HOLD) {
 			/* 2-second Menu hold: terminate external app and return */
 			kill(-pid, SIGTERM);
 			usleep(150000);
@@ -483,7 +530,6 @@ int shell_app_run(const char *const argv[], bool game_keys)
 	inp.down_code = 0;
 
 #ifdef __linux__
-	/* Drain any residual button release events before returning to the shell */
 	usleep(100000);
 	int i;
 	for (i = 0; i < inp.num_devs; i++) {

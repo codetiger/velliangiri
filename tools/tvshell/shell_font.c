@@ -1,13 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Velliangiri 1280x720 TV Shell - TrueType (.ttf) & Vector Fallback Font Engine
+ * Giri on Velliangiri OS — TrueType (.ttf) & Vector Fallback Typography Engine
  *
  * Parses TrueType outlines (head, hhea, maxp, cmap, hmtx, loca, glyf) from
- * /usr/share/fonts/tvshell/{Literata,AtkinsonHyperlegible}-*.ttf and caches
- * anti-aliased glyph bitmaps for the shell's fixed type scale:
- *   16, 18, 20, 22, 24, 26, 28, 34, 44, 64 px
- * Includes a built-in geometric vector fallback so text remains legible even
- * if the external font files are absent.
+ * /usr/share/fonts/tvshell/{PlusJakartaSans,JetBrainsMono}-*.ttf and caches
+ * anti-aliased glyph bitmaps for the v1.2 design system type scale.
+ * Includes built-in geometric vector glyphs for UI symbols (↵, —, ✓, ⬇, ·)
+ * and ASCII fallback so text remains crisp even without external font files.
  */
 
 #include <ctype.h>
@@ -21,7 +20,7 @@
 #include "tvshell.h"
 #include "shell_assets.h"
 
-#define SUB		16
+#define SUB		64
 #define SAMPLES		16
 
 struct ttf_font {
@@ -42,10 +41,10 @@ struct ttf_font {
 struct glyph_entry {
 	uint32_t codepoint;
 	uint16_t size_px;
-	uint8_t theme;
-	uint8_t bold;
-	uint8_t italic;
+	uint8_t role;
+	uint8_t phase;
 	int16_t advance;
+	int16_t advance_q6;
 	int16_t xoff;
 	int16_t yoff;
 	uint16_t w;
@@ -54,10 +53,18 @@ struct glyph_entry {
 	struct glyph_entry *next;
 };
 
-#define GLYPH_HASH_BUCKETS	512
+#define GLYPH_HASH_BUCKETS	1024
 
-static struct ttf_font fonts[2][2]; /* [theme][bold] */
+static struct ttf_font fonts[SHELL_FONT_ROLE_COUNT];
 static struct glyph_entry *glyph_cache[GLYPH_HASH_BUCKETS];
+
+static const char * const font_filenames[SHELL_FONT_ROLE_COUNT] = {
+	[SHELL_FONT_SANS_MEDIUM]   = "PlusJakartaSans-Medium.ttf",
+	[SHELL_FONT_SANS_SEMIBOLD] = "PlusJakartaSans-SemiBold.ttf",
+	[SHELL_FONT_SANS_BOLD]     = "PlusJakartaSans-Bold.ttf",
+	[SHELL_FONT_MONO_MEDIUM]   = "JetBrainsMono-Medium.ttf",
+	[SHELL_FONT_MONO_SEMIBOLD] = "JetBrainsMono-SemiBold.ttf",
+};
 
 static inline uint16_t be16(const uint8_t *p)
 {
@@ -320,7 +327,7 @@ static void flatten_quad_to_buf(float x0, float y0, float x1, float y1,
 				float x2, float y2, float *xs, float *ys,
 				int *count, int max_pts)
 {
-	int steps = 16, i;
+	int steps = 32, i;
 
 	for (i = 1; i <= steps && *count < max_pts; i++) {
 		float t = (float)i / (float)steps;
@@ -602,60 +609,92 @@ static void poly_add_segment(struct poly_list *pl, float x0, float y0,
  * omits an arrow/symbol glyph.
  */
 static bool build_special_or_fallback_glyph(uint32_t cp, int size_px, bool bold,
-					    struct poly_list *pl, int *adv_out)
+					    float tx_px, struct poly_list *pl, int *adv_q6_out)
 {
 	float h = (float)size_px;
 	float cap = h * 0.70f;
 	float xh = h * 0.48f;
-	float sw = h * (bold ? 0.095f : 0.072f);
-	if (sw < 0.9f)
-		sw = 0.9f;
+	float sw = h * (bold ? 0.088f : 0.068f);
+	if (sw < 0.85f)
+		sw = 0.85f;
 	float w = h * 0.52f;
-	float pad = h * 0.06f;
+	float pad = h * 0.06f + tx_px;
 
+	if (cp == 0x21B5) { /* ↵ (return keycap symbol, centered on cap midline) */
+		float rx = pad + w * 0.84f;
+		float lx = pad + w * 0.12f;
+		float top_y = -cap * 0.82f;
+		float mid_y = -cap * 0.36f;
+
+		poly_add_segment(pl, rx, top_y, rx, mid_y, sw * 0.88f);
+		poly_add_segment(pl, rx, mid_y, lx, mid_y, sw * 0.88f);
+		poly_add_segment(pl, lx + w * 0.28f, mid_y - cap * 0.22f, lx, mid_y, sw * 0.88f);
+		poly_add_segment(pl, lx + w * 0.28f, mid_y + cap * 0.22f, lx, mid_y, sw * 0.88f);
+		*adv_q6_out = (int)lrintf((w + h * 0.12f) * 64.0f);
+		return true;
+	}
+	if (cp == 0x2014 || cp == 0x2013) { /* — / – (em / en dash) */
+		float cy = -cap * 0.48f;
+		float dw = (cp == 0x2014) ? (h * 0.72f) : (h * 0.46f);
+
+		poly_add_segment(pl, pad, cy, pad + dw, cy, sw * 0.90f);
+		*adv_q6_out = (int)lrintf((dw + h * 0.12f) * 64.0f);
+		return true;
+	}
+	if (cp == 0x2713) { /* ✓ (checkmark, centered on cap midline) */
+		float x0 = pad + w * 0.06f, y0 = -cap * 0.44f;
+		float x1 = pad + w * 0.36f, y1 = -cap * 0.16f;
+		float x2 = pad + w * 0.90f, y2 = -cap * 0.84f;
+
+		poly_add_segment(pl, x0, y0, x1, y1, sw * 0.92f);
+		poly_add_segment(pl, x1, y1, x2, y2, sw * 0.92f);
+		*adv_q6_out = (int)lrintf((w + h * 0.12f) * 64.0f);
+		return true;
+	}
+	if (cp == 0x2B07 || cp == 0x2193) { /* ⬇ / ↓ (download / down arrow) */
+		float cx = pad + w * 0.42f;
+
+		poly_add_segment(pl, cx, -cap * 0.86f, cx, -cap * 0.14f, sw * 0.92f);
+		poly_add_segment(pl, cx - w * 0.30f, -cap * 0.42f, cx, -cap * 0.14f, sw * 0.92f);
+		poly_add_segment(pl, cx + w * 0.30f, -cap * 0.42f, cx, -cap * 0.14f, sw * 0.92f);
+		*adv_q6_out = (int)lrintf((w * 0.84f + h * 0.12f) * 64.0f);
+		return true;
+	}
 	if (cp == 0x2190) { /* ← */
-		float cy = -cap * 0.5f;
+		float cy = -cap * 0.50f;
 		poly_add_segment(pl, pad, cy, pad + w, cy, sw);
-		poly_add_segment(pl, pad + w * 0.42f, cy - cap * 0.30f, pad, cy, sw);
-		poly_add_segment(pl, pad + w * 0.42f, cy + cap * 0.30f, pad, cy, sw);
-		*adv_out = (int)lrintf(w + pad * 2.5f);
+		poly_add_segment(pl, pad + w * 0.42f, cy - cap * 0.28f, pad, cy, sw);
+		poly_add_segment(pl, pad + w * 0.42f, cy + cap * 0.28f, pad, cy, sw);
+		*adv_q6_out = (int)lrintf((w + h * 0.15f) * 64.0f);
 		return true;
 	}
 	if (cp == 0x2192) { /* → */
-		float cy = -cap * 0.5f;
+		float cy = -cap * 0.50f;
 		poly_add_segment(pl, pad, cy, pad + w, cy, sw);
-		poly_add_segment(pl, pad + w * 0.58f, cy - cap * 0.30f, pad + w, cy, sw);
-		poly_add_segment(pl, pad + w * 0.58f, cy + cap * 0.30f, pad + w, cy, sw);
-		*adv_out = (int)lrintf(w + pad * 2.5f);
+		poly_add_segment(pl, pad + w * 0.58f, cy - cap * 0.28f, pad + w, cy, sw);
+		poly_add_segment(pl, pad + w * 0.58f, cy + cap * 0.28f, pad + w, cy, sw);
+		*adv_q6_out = (int)lrintf((w + h * 0.15f) * 64.0f);
 		return true;
 	}
 	if (cp == 0x2191) { /* ↑ */
 		float cx = pad + w * 0.4f;
-		poly_add_segment(pl, cx, -cap, cx, 0.0f, sw);
-		poly_add_segment(pl, cx - w * 0.3f, -cap * 0.62f, cx, -cap, sw);
-		poly_add_segment(pl, cx + w * 0.3f, -cap * 0.62f, cx, -cap, sw);
-		*adv_out = (int)lrintf(w * 0.8f + pad * 2.0f);
-		return true;
-	}
-	if (cp == 0x2193) { /* ↓ */
-		float cx = pad + w * 0.4f;
-		poly_add_segment(pl, cx, -cap, cx, 0.0f, sw);
-		poly_add_segment(pl, cx - w * 0.3f, -cap * 0.38f, cx, 0.0f, sw);
-		poly_add_segment(pl, cx + w * 0.3f, -cap * 0.38f, cx, 0.0f, sw);
-		*adv_out = (int)lrintf(w * 0.8f + pad * 2.0f);
+		poly_add_segment(pl, cx, -cap * 0.88f, cx, -cap * 0.12f, sw);
+		poly_add_segment(pl, cx - w * 0.3f, -cap * 0.58f, cx, -cap * 0.88f, sw);
+		poly_add_segment(pl, cx + w * 0.3f, -cap * 0.58f, cx, -cap * 0.88f, sw);
+		*adv_q6_out = (int)lrintf((w * 0.8f + h * 0.12f) * 64.0f);
 		return true;
 	}
 	if (cp == 0x25B6) { /* ▶ */
 		float xs[3] = { pad, pad + w * 0.85f, pad };
-		float ys[3] = { -cap * 0.88f, -cap * 0.48f, -cap * 0.08f };
+		float ys[3] = { -cap * 0.86f, -cap * 0.50f, -cap * 0.14f };
 		poly_add_contour(pl, xs, ys, 3);
-		*adv_out = (int)lrintf(w + pad * 2.0f);
+		*adv_q6_out = (int)lrintf((w + h * 0.12f) * 64.0f);
 		return true;
 	}
 	if (cp == 0x00B7) { /* · */
-		poly_add_segment(pl, pad + sw * 1.5f, -xh * 0.65f,
-				 pad + sw * 1.5f, -xh * 0.65f, sw * 1.4f);
-		*adv_out = (int)lrintf(pad * 2.0f + sw * 3.0f);
+		poly_add_segment(pl, pad + sw * 1.5f, -cap * 0.48f,
+				 pad + sw * 1.5f, -cap * 0.48f, sw * 1.35f);
+		*adv_q6_out = (int)lrintf((h * 0.12f + sw * 3.0f) * 64.0f);
 		return true;
 	}
 	if (cp == 0x2026) { /* … */
@@ -663,43 +702,45 @@ static bool build_special_or_fallback_glyph(uint32_t cp, int size_px, bool bold,
 		poly_add_segment(pl, pad + sw, -sw, pad + sw, -sw, sw * 1.15f);
 		poly_add_segment(pl, pad + sw + sp, -sw, pad + sw + sp, -sw, sw * 1.15f);
 		poly_add_segment(pl, pad + sw + sp * 2.0f, -sw, pad + sw + sp * 2.0f, -sw, sw * 1.15f);
-		*adv_out = (int)lrintf(pad * 2.0f + sp * 2.5f);
+		*adv_q6_out = (int)lrintf((h * 0.12f + sp * 2.5f) * 64.0f);
 		return true;
 	}
 	if (cp == 0x00B0) { /* ° */
 		float cx = pad + h * 0.16f, cy = -cap * 0.80f, r = h * 0.12f;
 		int i;
-		for (i = 0; i < 12; i++) {
-			float a0 = 2.0f * (float)M_PI * i / 12.0f;
-			float a1 = 2.0f * (float)M_PI * (i + 1) / 12.0f;
+		for (i = 0; i < 16; i++) {
+			float a0 = 2.0f * (float)M_PI * i / 16.0f;
+			float a1 = 2.0f * (float)M_PI * (i + 1) / 16.0f;
 			poly_add_segment(pl, cx + r * cosf(a0), cy + r * sinf(a0),
-					 cx + r * cosf(a1), cy + r * sinf(a1), sw * 0.75f);
+					 cx + r * cosf(a1), cy + r * sinf(a1), sw * 0.72f);
 		}
-		*adv_out = (int)lrintf(pad * 2.0f + h * 0.34f);
+		*adv_q6_out = (int)lrintf((h * 0.44f) * 64.0f);
 		return true;
 	}
 	if (cp == 0x00D7) { /* × */
-		float cy = -xh * 0.6f, s = xh * 0.38f;
-		poly_add_segment(pl, pad, cy - s, pad + s * 2.0f, cy + s, sw);
-		poly_add_segment(pl, pad, cy + s, pad + s * 2.0f, cy - s, sw);
-		*adv_out = (int)lrintf(pad * 2.0f + s * 2.2f);
+		float cy = -cap * 0.48f, s = xh * 0.34f;
+		poly_add_segment(pl, pad, cy - s, pad + s * 2.0f, cy + s, sw * 0.90f);
+		poly_add_segment(pl, pad, cy + s, pad + s * 2.0f, cy - s, sw * 0.90f);
+		*adv_q6_out = (int)lrintf((h * 0.12f + s * 2.2f) * 64.0f);
 		return true;
 	}
 	return false;
 }
 
-static struct glyph_entry *rasterize_glyph(enum shell_theme_id theme, int size_px,
-					   bool bold, bool italic, uint32_t cp)
+static struct glyph_entry *rasterize_glyph(enum shell_font_role role, int size_px,
+					   uint32_t cp, uint8_t phase)
 {
-	const struct ttf_font *f = &fonts[theme][bold ? 1 : 0];
+	const struct ttf_font *f = &fonts[role];
 	struct poly_list pl = { 0 };
 	struct glyph_entry *ge;
-	int adv_px = 0;
+	int adv_q6 = 0;
+	bool bold = (role == SHELL_FONT_SANS_BOLD || role == SHELL_FONT_SANS_SEMIBOLD ||
+		     role == SHELL_FONT_MONO_SEMIBOLD);
 	bool used_special = false;
-	float shear_x = italic ? 0.18f : 0.0f;
+	float sub_x_px = (float)(phase & 3) * 0.25f;
 
-	if (!f->data && fonts[theme][0].data)
-		f = &fonts[theme][0];
+	if (!f->data && fonts[SHELL_FONT_SANS_MEDIUM].data)
+		f = &fonts[SHELL_FONT_SANS_MEDIUM];
 
 	if (cp == ' ') {
 		ge = calloc(1, sizeof(*ge));
@@ -707,22 +748,29 @@ static struct glyph_entry *rasterize_glyph(enum shell_theme_id theme, int size_p
 			return NULL;
 		ge->codepoint = cp;
 		ge->size_px = (uint16_t)size_px;
-		ge->theme = (uint8_t)theme;
-		ge->bold = bold ? 1 : 0;
-		ge->italic = italic ? 1 : 0;
-		ge->advance = (int16_t)(size_px * 28 / 100);
+		ge->role = (uint8_t)role;
+		ge->phase = phase & 3;
+		ge->advance_q6 = (int16_t)(size_px * 64 * 28 / 100);
 		if (f->data) {
 			uint16_t glyph_id = ttf_find_glyph(f, ' ');
 			uint16_t adv = 0;
 			int16_t lsb = 0;
+
 			ttf_get_hmetrics(f, glyph_id, &adv, &lsb);
 			if (adv)
-				ge->advance = (int16_t)lrintf((float)adv * size_px / f->units_per_em);
+				ge->advance_q6 = (int16_t)lrintf((float)adv * size_px * 64.0f / f->units_per_em);
 		}
+		ge->advance = (int16_t)((ge->advance_q6 + 32) >> 6);
 		return ge;
 	}
 
-	uint16_t glyph_id = f->data ? ttf_find_glyph(f, cp) : 0;
+	/* Always use built-in crisp geometric glyphs for UI symbols ↵, ✓, ⬇ */
+	if (cp == 0x21B5 || cp == 0x2713 || cp == 0x2B07) {
+		used_special = build_special_or_fallback_glyph(cp, size_px, bold,
+							       sub_x_px, &pl, &adv_q6);
+	}
+
+	uint16_t glyph_id = (!used_special && f->data) ? ttf_find_glyph(f, cp) : 0;
 
 	if (glyph_id != 0 && f->data) {
 		float scale = (float)size_px / (float)f->units_per_em;
@@ -730,25 +778,27 @@ static struct glyph_entry *rasterize_glyph(enum shell_theme_id theme, int size_p
 		int16_t lsb = 0;
 
 		ttf_get_hmetrics(f, glyph_id, &adv, &lsb);
-		adv_px = (int)lrintf((float)adv * scale);
-		ttf_extract_glyph_polys(f, glyph_id, scale, 1.0f, 0.0f, shear_x, 1.0f,
-					0.0f, 0.0f, &pl, 0);
-	} else {
-		used_special = build_special_or_fallback_glyph(cp, size_px, bold, &pl, &adv_px);
+		adv_q6 = (int)lrintf((float)adv * scale * 64.0f);
+		ttf_extract_glyph_polys(f, glyph_id, scale, 1.0f, 0.0f, 0.0f, 1.0f,
+					sub_x_px / scale, 0.0f, &pl, 0);
+	} else if (!used_special) {
+		used_special = build_special_or_fallback_glyph(cp, size_px, bold,
+							       sub_x_px, &pl, &adv_q6);
 		if (!used_special && f->data && cp > 127) {
-			/* Map curly quotes/dashes to ASCII if missing in font */
 			uint32_t ascii_cp = (cp == 0x2018 || cp == 0x2019) ? '\'' :
 					    (cp == 0x201C || cp == 0x201D) ? '"' :
 					    (cp == 0x2013 || cp == 0x2014) ? '-' : '?';
+
 			glyph_id = ttf_find_glyph(f, ascii_cp);
 			if (glyph_id) {
 				float scale = (float)size_px / (float)f->units_per_em;
 				uint16_t adv = 0;
 				int16_t lsb = 0;
+
 				ttf_get_hmetrics(f, glyph_id, &adv, &lsb);
-				adv_px = (int)lrintf((float)adv * scale);
-				ttf_extract_glyph_polys(f, glyph_id, scale, 1.0f, 0.0f, shear_x, 1.0f,
-							0.0f, 0.0f, &pl, 0);
+				adv_q6 = (int)lrintf((float)adv * scale * 64.0f);
+				ttf_extract_glyph_polys(f, glyph_id, scale, 1.0f, 0.0f, 0.0f, 1.0f,
+							sub_x_px / scale, 0.0f, &pl, 0);
 			}
 		}
 	}
@@ -761,10 +811,10 @@ static struct glyph_entry *rasterize_glyph(enum shell_theme_id theme, int size_p
 	}
 	ge->codepoint = cp;
 	ge->size_px = (uint16_t)size_px;
-	ge->theme = (uint8_t)theme;
-	ge->bold = bold ? 1 : 0;
-	ge->italic = italic ? 1 : 0;
-	ge->advance = (int16_t)(adv_px > 0 ? adv_px : (size_px / 2));
+	ge->role = (uint8_t)role;
+	ge->phase = phase & 3;
+	ge->advance_q6 = (int16_t)(adv_q6 > 0 ? adv_q6 : (size_px * 32));
+	ge->advance = (int16_t)((ge->advance_q6 + 32) >> 6);
 
 	if (pl.ncontours == 0 || pl.npts == 0) {
 		free(pl.pts);
@@ -811,7 +861,6 @@ static struct glyph_entry *rasterize_glyph(enum shell_theme_id theme, int size_p
 		return ge;
 	}
 
-	/* Shift polygon points relative to (px0, py0) */
 	for (i = 0; i < pl.npts; i++) {
 		pl.pts[i].x -= px0 * SUB;
 		pl.pts[i].y -= py0 * SUB;
@@ -842,7 +891,7 @@ static struct glyph_entry *rasterize_glyph(enum shell_theme_id theme, int size_p
 
 					if (sy < ylo || sy >= yhi || ncr >= 128)
 						continue;
-					int32_t cx = a.x + (sy - a.y) * (b.x - a.x) / (b.y - a.y);
+					int32_t cx = a.x + (int32_t)(((int64_t)(sy - a.y) * (b.x - a.x)) / (b.y - a.y));
 					int dir = (b.y > a.y) ? 1 : -1;
 					int m = ncr++;
 
@@ -887,15 +936,6 @@ static struct glyph_entry *rasterize_glyph(enum shell_theme_id theme, int size_p
 
 			if (v > 255)
 				v = 255;
-			if (v > 0 && v < 255) {
-				/*
-				 * Stem-weight contrast curve (gamma ~1.3): preserves smooth
-				 * subpixel anti-aliasing on thin strokes straddling pixel columns.
-				 */
-				v = (uint32_t)lrintf(powf((float)v / 255.0f, 0.78f) * 255.0f);
-				if (v > 255)
-					v = 255;
-			}
 			ge->bitmap[y * gw + i] = (uint8_t)v;
 		}
 	}
@@ -906,27 +946,31 @@ static struct glyph_entry *rasterize_glyph(enum shell_theme_id theme, int size_p
 	return ge;
 }
 
-static struct glyph_entry *get_glyph(enum shell_theme_id theme, int size_px,
-				     bool bold, bool italic, uint32_t cp)
+static struct glyph_entry *get_glyph_phased(enum shell_font_role role, int size_px,
+					    uint32_t cp, uint8_t phase)
 {
+	phase &= 3;
 	uint32_t h = ((cp * 2654435761U) ^ ((uint32_t)size_px << 8) ^
-		      ((uint32_t)theme << 2) ^ (bold ? 1U : 0U) ^ (italic ? 8U : 0U)) &
-		     (GLYPH_HASH_BUCKETS - 1);
+		      ((uint32_t)role << 3) ^ phase) & (GLYPH_HASH_BUCKETS - 1);
 	struct glyph_entry *e = glyph_cache[h];
 
 	while (e) {
 		if (e->codepoint == cp && e->size_px == size_px &&
-		    e->theme == theme && e->bold == (bold ? 1 : 0) &&
-		    e->italic == (italic ? 1 : 0))
+		    e->role == (uint8_t)role && e->phase == phase)
 			return e;
 		e = e->next;
 	}
-	e = rasterize_glyph(theme, size_px, bold, italic, cp);
+	e = rasterize_glyph(role, size_px, cp, phase);
 	if (e) {
 		e->next = glyph_cache[h];
 		glyph_cache[h] = e;
 	}
 	return e;
+}
+
+static inline struct glyph_entry *get_glyph(enum shell_font_role role, int size_px, uint32_t cp)
+{
+	return get_glyph_phased(role, size_px, cp, 0);
 }
 
 static uint32_t utf8_next(const char **p)
@@ -966,56 +1010,55 @@ static uint32_t utf8_next(const char **p)
 int shell_font_init(void)
 {
 	const char *env_dir = getenv("TVSHELL_FONT_DIR");
-	int t;
+	int r;
 
-	for (t = 0; t < 2; t++) {
-		char path_reg[256], path_bold[256];
+	for (r = 0; r < SHELL_FONT_ROLE_COUNT; r++) {
+		char path[256];
+		const char *fname = font_filenames[r];
 
 		if (env_dir && env_dir[0]) {
-			const char *b_reg = strrchr(shell_themes[t].font_regular, '/');
-			const char *b_bold = strrchr(shell_themes[t].font_bold, '/');
-
-			snprintf(path_reg, sizeof(path_reg), "%s/%s", env_dir,
-				 b_reg ? b_reg + 1 : shell_themes[t].font_regular);
-			snprintf(path_bold, sizeof(path_bold), "%s/%s", env_dir,
-				 b_bold ? b_bold + 1 : shell_themes[t].font_bold);
-		} else {
-			snprintf(path_reg, sizeof(path_reg), "%s", shell_themes[t].font_regular);
-			snprintf(path_bold, sizeof(path_bold), "%s", shell_themes[t].font_bold);
+			snprintf(path, sizeof(path), "%s/%s", env_dir, fname);
+			if (ttf_load_file(&fonts[r], path) == 0)
+				continue;
 		}
-		if (ttf_load_file(&fonts[t][0], path_reg) < 0 && (!env_dir || !env_dir[0])) {
-			const char *b_reg = strrchr(shell_themes[t].font_regular, '/');
-
-			snprintf(path_reg, sizeof(path_reg), "build/dl/fonts/%s",
-				 b_reg ? b_reg + 1 : shell_themes[t].font_regular);
-			(void)ttf_load_file(&fonts[t][0], path_reg);
-		}
-		if (ttf_load_file(&fonts[t][1], path_bold) < 0 && (!env_dir || !env_dir[0])) {
-			const char *b_bold = strrchr(shell_themes[t].font_bold, '/');
-
-			snprintf(path_bold, sizeof(path_bold), "build/dl/fonts/%s",
-				 b_bold ? b_bold + 1 : shell_themes[t].font_bold);
-			(void)ttf_load_file(&fonts[t][1], path_bold);
-		}
+		snprintf(path, sizeof(path), "/usr/share/fonts/tvshell/%s", fname);
+		if (ttf_load_file(&fonts[r], path) == 0)
+			continue;
+		snprintf(path, sizeof(path), "build/dl/fonts/%s", fname);
+		(void)ttf_load_file(&fonts[r], path);
 	}
 
-	/* Pre-warm ASCII glyphs for the 10 unique sizes in tokens.json */
-	static const int sizes[] = { 16, 18, 20, 22, 24, 26, 28, 34, 44, 64 };
-	size_t si;
+	/* Pre-warm common v1.2 sizes */
+	static const struct {
+		enum shell_font_role role;
+		int size_px;
+	} warmup[] = {
+		{ SHELL_FONT_SANS_BOLD,     22 },
+		{ SHELL_FONT_SANS_SEMIBOLD, 20 },
+		{ SHELL_FONT_SANS_BOLD,     21 },
+		{ SHELL_FONT_SANS_MEDIUM,   18 },
+		{ SHELL_FONT_MONO_MEDIUM,   13 },
+		{ SHELL_FONT_SANS_BOLD,     17 },
+		{ SHELL_FONT_SANS_MEDIUM,   13 },
+		{ SHELL_FONT_MONO_SEMIBOLD, 11 },
+		{ SHELL_FONT_MONO_SEMIBOLD, 12 },
+		{ SHELL_FONT_SANS_SEMIBOLD, 14 },
+		{ SHELL_FONT_SANS_BOLD,     24 },
+		{ SHELL_FONT_SANS_BOLD,     28 },
+	};
+	size_t wi;
 	uint32_t cp;
 
-	for (t = 0; t < 2; t++) {
-		for (si = 0; si < sizeof(sizes) / sizeof(sizes[0]); si++) {
-			for (cp = 32; cp <= 126; cp++)
-				(void)get_glyph((enum shell_theme_id)t, sizes[si], false, false, cp);
-		}
+	for (wi = 0; wi < sizeof(warmup) / sizeof(warmup[0]); wi++) {
+		for (cp = 32; cp <= 126; cp++)
+			(void)get_glyph(warmup[wi].role, warmup[wi].size_px, cp);
 	}
 	return 0;
 }
 
 void shell_font_free(void)
 {
-	int i, t, b;
+	int i, r;
 
 	for (i = 0; i < GLYPH_HASH_BUCKETS; i++) {
 		struct glyph_entry *e = glyph_cache[i];
@@ -1029,27 +1072,35 @@ void shell_font_free(void)
 		}
 		glyph_cache[i] = NULL;
 	}
-	for (t = 0; t < 2; t++)
-		for (b = 0; b < 2; b++)
-			free(fonts[t][b].data);
+	for (r = 0; r < SHELL_FONT_ROLE_COUNT; r++)
+		free(fonts[r].data);
 	memset(fonts, 0, sizeof(fonts));
 }
 
-int shell_font_measure(enum shell_theme_id theme, int size_px, bool bold, const char *utf8)
+int shell_font_cap_height(enum shell_font_role role, int size_px)
+{
+	struct glyph_entry *ge = get_glyph_phased(role, size_px, 'H', 0);
+
+	if (ge && ge->yoff < 0)
+		return -ge->yoff;
+	return (size_px * 70 + 50) / 100;
+}
+
+int shell_font_measure_role(enum shell_font_role role, int size_px, const char *utf8)
 {
 	const char *p = utf8;
-	int w = 0;
+	int w_q6 = 0;
 	uint32_t cp;
 
 	if (!p)
 		return 0;
 	while ((cp = utf8_next(&p)) != 0) {
-		struct glyph_entry *ge = get_glyph(theme, size_px, bold, false, cp);
+		struct glyph_entry *ge = get_glyph_phased(role, size_px, cp, 0);
 
 		if (ge)
-			w += ge->advance;
+			w_q6 += ge->advance_q6;
 	}
-	return w;
+	return (w_q6 + 32) >> 6;
 }
 
 static void blit_glyph(const struct glyph_entry *ge, int pen_x, int baseline_y,
@@ -1057,9 +1108,14 @@ static void blit_glyph(const struct glyph_entry *ge, int pen_x, int baseline_y,
 {
 	uint32_t *fb = shell_display_backbuffer();
 	int py, px;
+	uint32_t fg_rl, fg_gl, fg_bl;
 
 	if (!ge || !ge->bitmap || !fb)
 		return;
+
+	fg_rl = shell_srgb_to_linear[(fg >> 16) & 0xffU];
+	fg_gl = shell_srgb_to_linear[(fg >> 8) & 0xffU];
+	fg_bl = shell_srgb_to_linear[fg & 0xffU];
 
 	for (py = 0; py < (int)ge->h; py++) {
 		int rel_y = ge->yoff + py;
@@ -1084,64 +1140,112 @@ static void blit_glyph(const struct glyph_entry *ge, int pen_x, int baseline_y,
 				uint32_t a = a255;
 				uint32_t inv_a = 255U - a;
 				uint32_t dst = row[sx];
-				uint32_t r = (((dst >> 16) & 0xffU) * inv_a + ((fg >> 16) & 0xffU) * a + 127U) / 255U;
-				uint32_t g = (((dst >> 8) & 0xffU) * inv_a + ((fg >> 8) & 0xffU) * a + 127U) / 255U;
-				uint32_t b = ((dst & 0xffU) * inv_a + (fg & 0xffU) * a + 127U) / 255U;
+				uint32_t rl = (shell_srgb_to_linear[(dst >> 16) & 0xffU] * inv_a +
+					       fg_rl * a + 127U) / 255U;
+				uint32_t gl = (shell_srgb_to_linear[(dst >> 8) & 0xffU] * inv_a +
+					       fg_gl * a + 127U) / 255U;
+				uint32_t bl = (shell_srgb_to_linear[dst & 0xffU] * inv_a +
+					       fg_bl * a + 127U) / 255U;
+				if (rl > 4095U)
+					rl = 4095U;
+				if (gl > 4095U)
+					gl = 4095U;
+				if (bl > 4095U)
+					bl = 4095U;
 
-				row[sx] = 0xff000000U | (r << 16) | (g << 8) | b;
+				row[sx] = 0xff000000U |
+					  ((uint32_t)shell_lin_to_srgb[rl] << 16) |
+					  ((uint32_t)shell_lin_to_srgb[gl] << 8) |
+					  (uint32_t)shell_lin_to_srgb[bl];
 			}
 		}
 	}
 }
 
-int shell_font_draw(enum shell_theme_id theme, int size_px, bool bold, bool italic,
-		    int x, int y, uint32_t fg, const char *utf8, int max_width)
+static int draw_role_at_baseline(enum shell_font_role role, int size_px,
+				 int x, int baseline_y, uint32_t fg,
+				 const char *utf8, int max_width)
 {
 	const char *p = utf8;
-	int baseline_y = y + (size_px * 78) / 100;
-	int pen_x = x;
-	int ell_w = 0;
-	bool need_ellipsis = false;
+	int pen_x_q6 = x << 6;
+	int start_x_q6 = pen_x_q6;
+	int max_w_q6 = max_width > 0 ? (max_width << 6) : 0;
+	uint32_t cp;
 
 	if (!utf8 || !utf8[0])
 		return 0;
 
-	if (max_width > 0 && shell_font_measure(theme, size_px, bold, utf8) > max_width) {
-		struct glyph_entry *ell = get_glyph(theme, size_px, bold, italic, 0x2026);
-
-		ell_w = ell ? ell->advance : size_px / 2;
-		need_ellipsis = true;
-	}
-
-	uint32_t cp;
-
 	while ((cp = utf8_next(&p)) != 0) {
-		struct glyph_entry *ge = get_glyph(theme, size_px, bold, italic, cp);
+		uint8_t phase = (uint8_t)((pen_x_q6 >> 4) & 3);
+		struct glyph_entry *ge = get_glyph_phased(role, size_px, cp, phase);
 
 		if (!ge)
 			continue;
-		if (need_ellipsis && (pen_x - x) + ge->advance + ell_w > max_width) {
-			struct glyph_entry *ell = get_glyph(theme, size_px, bold, italic, 0x2026);
-
-			if (ell) {
-				blit_glyph(ell, pen_x, baseline_y, fg);
-				pen_x += ell->advance;
-			}
+		if (max_w_q6 > 0 && (pen_x_q6 - start_x_q6) + ge->advance_q6 > max_w_q6)
 			break;
-		}
-		blit_glyph(ge, pen_x, baseline_y, fg);
-		pen_x += ge->advance;
+		blit_glyph(ge, pen_x_q6 >> 6, baseline_y, fg);
+		pen_x_q6 += ge->advance_q6;
 	}
 
-	shell_display_damage(x - 4, y - 4, (pen_x - x) + 16, size_px + 12);
-	return pen_x - x;
+	int drawn_w = (pen_x_q6 - start_x_q6 + 32) >> 6;
+	shell_display_damage(x - 4, baseline_y - size_px - 4, drawn_w + 16, size_px + 16);
+	return drawn_w;
 }
 
-int shell_font_draw_wrapped(enum shell_theme_id theme, int size_px, bool bold,
-			    int x, int y, int line_height, int max_width, int max_lines,
-			    uint32_t fg, const char *utf8)
+/*
+ * Draw single-line text with zero ellipsis truncation (stops cleanly at word
+ * or character boundary if max_width > 0). Centers cap-height vertically inside
+ * the [y, y + size_px] line box so top and bottom margins are equal.
+ */
+int shell_font_draw_role(enum shell_font_role role, int size_px,
+			 int x, int y, uint32_t fg, const char *utf8, int max_width)
 {
-	char line[256];
+	int cap_h = shell_font_cap_height(role, size_px);
+	int baseline_y = y + (size_px + cap_h) / 2;
+
+	return draw_role_at_baseline(role, size_px, x, baseline_y, fg, utf8, max_width);
+}
+
+/*
+ * Draw single-line text vertically centered inside [box_y, box_y + box_h]
+ * using the exact measured cap-height of the font so top and bottom margins
+ * above capitals and below the baseline are identical to the pixel.
+ */
+int shell_font_draw_vcentered(enum shell_font_role role, int size_px,
+			      int x, int box_y, int box_h,
+			      uint32_t fg, const char *utf8, int max_width)
+{
+	int cap_h = shell_font_cap_height(role, size_px);
+	int baseline_y = box_y + (box_h + cap_h) / 2;
+
+	return draw_role_at_baseline(role, size_px, x, baseline_y, fg, utf8, max_width);
+}
+
+/*
+ * Draw single-line text both horizontally and vertically centered inside
+ * [box_x, box_y, box_w, box_h].
+ */
+int shell_font_draw_box_centered(enum shell_font_role role, int size_px,
+				 int box_x, int box_y, int box_w, int box_h,
+				 uint32_t fg, const char *utf8)
+{
+	int tw = shell_font_measure_role(role, size_px, utf8);
+	int tx = box_x + (box_w - tw) / 2;
+
+	if (tx < box_x)
+		tx = box_x;
+	return shell_font_draw_vcentered(role, size_px, tx, box_y, box_h,
+					 fg, utf8, box_w);
+}
+
+/*
+ * Draw multi-line wrapped text with zero ellipsis truncation.
+ */
+int shell_font_draw_wrapped_role(enum shell_font_role role, int size_px,
+				 int x, int y, int line_height, int max_width,
+				 int max_lines, uint32_t fg, const char *utf8)
+{
+	char line[384];
 	const char *p = utf8;
 	int lines_drawn = 0;
 
@@ -1154,11 +1258,10 @@ int shell_font_draw_wrapped(enum shell_theme_id theme, int size_px, bool bold,
 		if (!*p)
 			break;
 
-		/* Find how many words fit on this line */
 		const char *scan = p;
 		const char *last_fit = p;
-		line[0] = '\0';
 
+		line[0] = '\0';
 		while (*scan && *scan != '\n') {
 			const char *word_end = scan;
 
@@ -1166,16 +1269,16 @@ int shell_font_draw_wrapped(enum shell_theme_id theme, int size_px, bool bold,
 				word_end++;
 
 			size_t candidate_len = (size_t)(word_end - p);
+
 			if (candidate_len >= sizeof(line))
 				break;
-
 			memcpy(line, p, candidate_len);
 			line[candidate_len] = '\0';
 
-			if (shell_font_measure(theme, size_px, bold, line) <= max_width ||
+			if (shell_font_measure_role(role, size_px, line) <= max_width ||
 			    last_fit == p) {
 				last_fit = word_end;
-				if (shell_font_measure(theme, size_px, bold, line) > max_width)
+				if (shell_font_measure_role(role, size_px, line) > max_width)
 					break;
 			} else {
 				break;
@@ -1187,24 +1290,14 @@ int shell_font_draw_wrapped(enum shell_theme_id theme, int size_px, bool bold,
 		}
 
 		size_t final_len = (size_t)(last_fit - p);
+
 		if (final_len >= sizeof(line))
 			final_len = sizeof(line) - 1;
 		memcpy(line, p, final_len);
 		line[final_len] = '\0';
 
-		/* If this is the last allowed line and more text remains, truncate with ellipsis */
-		const char *rem = last_fit;
-		while (*rem == ' ' || *rem == '\n')
-			rem++;
-		if (lines_drawn + 1 == max_lines && *rem != '\0') {
-			size_t l = strlen(line);
-			if (l + 4 < sizeof(line)) {
-				memcpy(line + l, "\xe2\x80\xa6", 4);
-			}
-		}
-
-		shell_font_draw(theme, size_px, bold, false,
-				x, y + lines_drawn * line_height, fg, line, max_width);
+		shell_font_draw_role(role, size_px, x, y + lines_drawn * line_height,
+				     fg, line, max_width);
 		lines_drawn++;
 
 		p = last_fit;
@@ -1213,4 +1306,206 @@ int shell_font_draw_wrapped(enum shell_theme_id theme, int size_px, bool bold,
 	}
 
 	return lines_drawn * line_height;
+}
+
+/*
+ * Render Slot 2 Editorial Summary Body (18px Plus Jakarta Sans Medium, max 3 lines)
+ * with sentence-level highlight pill (.summary-sentence.speaking) when Play/Pause
+ * read-aloud is active.
+ */
+int shell_font_draw_summary_body(int x, int y, int line_height, int max_width,
+				 int max_lines, uint32_t fg, uint32_t highlight_color,
+				 uint8_t highlight_alpha, const char *utf8,
+				 int active_sentence_idx, int *total_sentences_out)
+{
+	enum shell_font_role role = SHELL_FONT_SANS_MEDIUM;
+	int size_px = 18;
+	const char *p = utf8;
+	int cur_line = 0;
+	int pen_x = x;
+	int cur_sentence = 0;
+	int space_w;
+	struct {
+		char text[96];
+		int wx;
+		int wy;
+		int ww;
+		int line;
+		int sentence;
+	} words[80];
+	int word_count = 0;
+	int line_hl_x0[8];
+	int line_hl_x1[8];
+	int i;
+
+	if (!utf8 || !utf8[0]) {
+		if (total_sentences_out)
+			*total_sentences_out = 0;
+		return 0;
+	}
+
+	for (i = 0; i < 8; i++) {
+		line_hl_x0[i] = 100000;
+		line_hl_x1[i] = -1;
+	}
+
+	space_w = shell_font_measure_role(role, size_px, " ");
+	if (space_w <= 0)
+		space_w = 5;
+
+	while (*p) {
+		while (*p == ' ' || *p == '\n')
+			p++;
+		if (!*p)
+			break;
+
+		const char *w_end = p;
+
+		while (*w_end && *w_end != ' ' && *w_end != '\n')
+			w_end++;
+
+		char word[96];
+		size_t wlen = (size_t)(w_end - p);
+
+		if (wlen >= sizeof(word))
+			wlen = sizeof(word) - 1;
+		memcpy(word, p, wlen);
+		word[wlen] = '\0';
+
+		int ww = shell_font_measure_role(role, size_px, word);
+
+		if (pen_x > x && (pen_x - x) + ww > max_width) {
+			cur_line++;
+			pen_x = x;
+		}
+		if (cur_line < max_lines && cur_line < 8 && word_count < 80) {
+			int wy = y + cur_line * line_height;
+
+			if (cur_sentence == active_sentence_idx && highlight_alpha > 0) {
+				if (pen_x < line_hl_x0[cur_line])
+					line_hl_x0[cur_line] = pen_x;
+				if (pen_x + ww > line_hl_x1[cur_line])
+					line_hl_x1[cur_line] = pen_x + ww;
+			}
+			snprintf(words[word_count].text, sizeof(words[word_count].text), "%s", word);
+			words[word_count].wx = pen_x;
+			words[word_count].wy = wy;
+			words[word_count].ww = ww;
+			words[word_count].line = cur_line;
+			words[word_count].sentence = cur_sentence;
+			word_count++;
+			pen_x += ww + space_w;
+		}
+
+		/* Check if this word ends a sentence */
+		if (wlen > 0 && (word[wlen - 1] == '.' ||
+				 word[wlen - 1] == '!' ||
+				 word[wlen - 1] == '?')) {
+			const char *next = w_end;
+
+			while (*next == ' ')
+				next++;
+			if (*next)
+				cur_sentence++;
+		}
+
+		p = w_end;
+	}
+
+	/* First draw continuous highlight pill per line for the active sentence */
+	if (active_sentence_idx >= 0 && highlight_alpha > 0) {
+		for (i = 0; i < max_lines && i < 8; i++) {
+			if (line_hl_x1[i] > line_hl_x0[i]) {
+				int wy = y + i * line_height;
+
+				shell_draw_rounded_rect_alpha(line_hl_x0[i] - 4, wy - 1,
+							      (line_hl_x1[i] - line_hl_x0[i]) + 8,
+							      size_px + 5, 4,
+							      highlight_color, highlight_alpha);
+			}
+		}
+	}
+
+	/* Then draw all words cleanly on top */
+	for (i = 0; i < word_count; i++) {
+		shell_font_draw_role(role, size_px, words[i].wx, words[i].wy,
+				     fg, words[i].text, 0);
+	}
+
+	if (total_sentences_out)
+		*total_sentences_out = cur_sentence + 1;
+	return (cur_line + 1) * line_height;
+}
+
+/*
+ * Fit a phrase cleanly within max_chars with zero '...' ellipsis truncation,
+ * matching fit_clean_phrase() in giri_server.py.
+ */
+void shell_font_fit_clean_phrase(const char *src, char *dst, size_t dst_sz, int max_chars)
+{
+	char buf[512];
+	size_t i = 0, len;
+
+	if (!dst || dst_sz == 0)
+		return;
+	dst[0] = '\0';
+	if (!src)
+		return;
+
+	while (*src == ' ')
+		src++;
+	while (*src && i + 1 < sizeof(buf)) {
+		if (*src == '.' && src[1] == '.' && src[2] == '.') {
+			src += 3;
+			continue;
+		}
+		if ((uint8_t)src[0] == 0xe2 && (uint8_t)src[1] == 0x80 &&
+		    (uint8_t)src[2] == 0xa6) {
+			src += 3;
+			continue;
+		}
+		buf[i++] = *src++;
+	}
+	buf[i] = '\0';
+	len = strlen(buf);
+	while (len > 0 && (buf[len - 1] == ' ' || buf[len - 1] == '-' ||
+			   buf[len - 1] == ',' || buf[len - 1] == ';' ||
+			   buf[len - 1] == ':'))
+		buf[--len] = '\0';
+
+	if ((int)len > max_chars && max_chars > 0) {
+		int cut = max_chars;
+
+		while (cut > max_chars / 2 && buf[cut] != ' ')
+			cut--;
+		if (cut <= max_chars / 2)
+			cut = max_chars;
+		buf[cut] = '\0';
+		len = (size_t)cut;
+		while (len > 0 && (buf[len - 1] == ' ' || buf[len - 1] == '-' ||
+				   buf[len - 1] == ',' || buf[len - 1] == ';' ||
+				   buf[len - 1] == ':'))
+			buf[--len] = '\0';
+	}
+
+	if (len >= dst_sz)
+		len = dst_sz - 1;
+	memcpy(dst, buf, len);
+	dst[len] = '\0';
+}
+
+/*
+ * Fit a summary paragraph within max_chars (<= 250) on sentence/word boundaries
+ * with zero '...' ellipsis truncation, matching fit_short_summary() in giri_server.py.
+ */
+void shell_font_fit_short_summary(const char *src, char *dst, size_t dst_sz, int max_chars)
+{
+	shell_font_fit_clean_phrase(src, dst, dst_sz, max_chars);
+	size_t len = strlen(dst);
+
+	if (len > 0 && dst[len - 1] != '.' && dst[len - 1] != '!' &&
+	    dst[len - 1] != '?' && len + 1 < dst_sz && (int)len < max_chars) {
+		dst[len] = '.';
+		dst[len + 1] = '\0';
+	}
 }

@@ -71,17 +71,32 @@ if [ -f "${ROOT}/tools/sgx/sgxframe.c" ]; then
 	chmod 755 "${STAGE_DIR}/bin/sgxframe"
 fi
 
-# Build and install the 1280x720@30 TV Shell (/bin/tvshell) and its fonts
+# Build and install the 1280x720@30 TV Shell (/bin/tvshell), its fonts, and on-device JSON catalogs
 echo "[rootfs] Building 1280x720@30 TV Shell (/bin/tvshell) ..."
 CROSS_CC="${CROSS_CC}" "${ROOT}/tools/tvshell/build.sh"
 cp "${ROOT}/build/tvshell/tvshell" "${STAGE_DIR}/bin/tvshell"
 chmod 755 "${STAGE_DIR}/bin/tvshell"
 
-if [ ! -f "${DL_DIR}/fonts/Literata-Regular.ttf" ]; then
+if [ ! -f "${DL_DIR}/fonts/PlusJakartaSans-Medium.ttf" ]; then
 	"${ROOT}/tools/tvshell/fetch-fonts.sh"
 fi
+if [ ! -f "${DL_DIR}/placeholders/dawn_ridge.jpg" ] || [ ! -f "${DL_DIR}/gallery/IMG_6452.jpeg" ]; then
+	"${ROOT}/tools/tvshell/prepare-media.sh"
+fi
 mkdir -p "${STAGE_DIR}/usr/share/fonts/tvshell"
-cp "${DL_DIR}/fonts/"*.ttf "${STAGE_DIR}/usr/share/fonts/tvshell/"
+for fn in \
+	PlusJakartaSans-Medium.ttf \
+	PlusJakartaSans-SemiBold.ttf \
+	PlusJakartaSans-Bold.ttf \
+	JetBrainsMono-Medium.ttf \
+	JetBrainsMono-SemiBold.ttf; do
+	cp "${DL_DIR}/fonts/${fn}" "${STAGE_DIR}/usr/share/fonts/tvshell/${fn}"
+done
+
+mkdir -p "${STAGE_DIR}/usr/share/tvshell" "${STAGE_DIR}/etc/tvshell"
+for jn in screen.json supported_models.json apps.json tokens.json; do
+	cp "${ROOT}/tools/tvshell/design/${jn}" "${STAGE_DIR}/usr/share/tvshell/${jn}"
+done
 
 # Build and install the native S5L8947X Doom port (/bin/doom) if fetched
 if [ -d "${ROOT}/build/doom-src/doomgeneric/doomgeneric" ]; then
@@ -201,10 +216,19 @@ if command -v mksquashfs >/dev/null 2>&1; then
 		mkdir -p "${STAGE_DIR}/usr/share/games/doom"
 		cp "${DL_DIR}/doom/freedoom1.wad" "${STAGE_DIR}/usr/share/games/doom/freedoom1.wad"
 	fi
+	if [ -d "${DL_DIR}/placeholders" ]; then
+		mkdir -p "${STAGE_DIR}/usr/share/tvshell/placeholders"
+		cp "${DL_DIR}/placeholders/"*.jpg "${STAGE_DIR}/usr/share/tvshell/placeholders/" 2>/dev/null || true
+	fi
+	if [ -d "${DL_DIR}/gallery" ]; then
+		mkdir -p "${STAGE_DIR}/usr/share/tvshell/media/.frames"
+		cp "${DL_DIR}/gallery/"*.jpeg "${DL_DIR}/gallery/"*.mov "${STAGE_DIR}/usr/share/tvshell/media/" 2>/dev/null || true
+		cp "${DL_DIR}/gallery/.frames/"*.jpg "${STAGE_DIR}/usr/share/tvshell/media/.frames/" 2>/dev/null || true
+	fi
 	echo "[rootfs] Packing uncompressed SquashFS image -> ${ROOT}/out/rootfs.sqsh ..."
 	mksquashfs "${STAGE_DIR}" "${ROOT}/out/rootfs.sqsh" \
 		-noappend -all-root -noI -noD -noF -noX -b 131072 >/dev/null
-	if [ -s "${ROOT}/build/mesa-sgx-install.tar" ] || [ -s "${ROOT}/build/weston-armv7.tar" ] || [ -s "${DL_DIR}/doom/freedoom1.wad" ]; then
+	if [ -s "${ROOT}/build/mesa-sgx-install.tar" ] || [ -s "${ROOT}/build/weston-armv7.tar" ] || [ -s "${DL_DIR}/doom/freedoom1.wad" ] || [ -d "${DL_DIR}/placeholders" ]; then
 		echo "[rootfs] Packing usr-local SquashFS image -> ${ROOT}/build/usr-local.sqsh ..."
 		ULOCAL_STAGE="/tmp/velliangiri-usr-local-stage"
 		rm -rf "${ULOCAL_STAGE}"
@@ -220,6 +244,15 @@ if command -v mksquashfs >/dev/null 2>&1; then
 		if [ -s "${DL_DIR}/doom/freedoom1.wad" ]; then
 			mkdir -p "${ULOCAL_STAGE}/share/games/doom"
 			cp "${DL_DIR}/doom/freedoom1.wad" "${ULOCAL_STAGE}/share/games/doom/freedoom1.wad"
+		fi
+		if [ -d "${DL_DIR}/placeholders" ]; then
+			mkdir -p "${ULOCAL_STAGE}/share/tvshell/placeholders"
+			cp "${DL_DIR}/placeholders/"*.jpg "${ULOCAL_STAGE}/share/tvshell/placeholders/" 2>/dev/null || true
+		fi
+		if [ -d "${DL_DIR}/gallery" ]; then
+			mkdir -p "${ULOCAL_STAGE}/share/tvshell/media/.frames"
+			cp "${DL_DIR}/gallery/"*.jpeg "${DL_DIR}/gallery/"*.mov "${ULOCAL_STAGE}/share/tvshell/media/" 2>/dev/null || true
+			cp "${DL_DIR}/gallery/.frames/"*.jpg "${ULOCAL_STAGE}/share/tvshell/media/.frames/" 2>/dev/null || true
 		fi
 		mksquashfs "${ULOCAL_STAGE}" "${ROOT}/build/usr-local.sqsh" \
 			-noappend -all-root -noI -noD -noF -noX -b 131072 >/dev/null

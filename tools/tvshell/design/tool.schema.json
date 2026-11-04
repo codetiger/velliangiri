@@ -1,0 +1,85 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://velliangiri.local/schemas/tool.schema.json",
+  "title": "Velliangiri OS High-Level Tool Registry Schema (tool.json)",
+  "description": "Defines the four high-level capability domains exposed by Velliangiri OS to the Giri assistant: 1. Media (Images & Video), 2. Apps (Launch & Velliangiri App Server), 3. System Info, and 4. Internet Summarize.",
+  "type": "object",
+  "required": ["schema_version", "os", "assistant", "capabilities", "tools"],
+  "properties": {
+    "schema_version": {
+      "type": "string",
+      "const": "1.0"
+    },
+    "os": {
+      "type": "object",
+      "required": ["name", "app_server"],
+      "properties": {
+        "name": { "type": "string", "const": "Velliangiri" },
+        "app_server": { "type": "string" }
+      }
+    },
+    "assistant": {
+      "type": "object",
+      "required": ["name", "output_contract"],
+      "properties": {
+        "name": { "type": "string", "const": "Giri" },
+        "output_contract": { "type": "string", "const": "screen.json" }
+      }
+    },
+    "capabilities": {
+      "type": "array",
+      "items": {
+        "type": "string",
+        "enum": ["media", "apps", "system", "internet"]
+      }
+    },
+    "tools": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "$ref": "#/$defs/toolDefinition"
+      }
+    }
+  },
+  "$defs": {
+    "toolDefinition": {
+      "type": "object",
+      "required": [
+        "name",
+        "domain",
+        "description",
+        "execution_mode",
+        "parameters",
+        "returns"
+      ],
+      "properties": {
+        "name": {
+          "type": "string",
+          "pattern": "^(media|apps|system|internet)\\.[a-z0-9_]+$"
+        },
+        "domain": {
+          "type": "string",
+          "enum": ["media", "apps", "system", "internet"]
+        },
+        "description": {
+          "type": "string"
+        },
+        "execution_mode": {
+          "type": "string",
+          "enum": [
+            "context_screen",
+            "fullscreen_media",
+            "native_app",
+            "shell_setting"
+          ]
+        },
+        "parameters": {
+          "type": "object"
+        },
+        "returns": {
+          "type": "object"
+        }
+      }
+    }
+  }
+}
