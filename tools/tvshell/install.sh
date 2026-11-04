@@ -56,14 +56,14 @@ PLACEHOLDER_DIR="$ROOT/build/dl/placeholders"
 GALLERY_DIR="$ROOT/build/dl/gallery"
 
 if [ -d "$PLACEHOLDER_DIR" ]; then
-	echo "==> installing high-res internet placeholders in /usr/share/tvshell/placeholders on $DEST"
-	$SSH "mkdir -p /usr/share/tvshell/placeholders"
-	tar -C "$PLACEHOLDER_DIR" -cf - . | $SSH "tar -C /usr/share/tvshell/placeholders -xf -"
+	echo "==> installing high-res internet placeholders in /usr/share/tvshell/placeholders and /mnt/data/linux/placeholders on $DEST"
+	$SSH "mkdir -p /usr/share/tvshell/placeholders /mnt/data/linux/placeholders"
+	tar -C "$PLACEHOLDER_DIR" -cf - . | $SSH "tar -C /usr/share/tvshell/placeholders -xf - && cp -a /usr/share/tvshell/placeholders/. /mnt/data/linux/placeholders/"
 fi
 
 if [ -d "$GALLERY_DIR" ]; then
 	echo "==> installing gallery photos & videos in /mnt/data/linux/media on $DEST"
-	$SSH "mkdir -p /mnt/data/linux/media/.frames"
+	$SSH "mkdir -p /mnt/data/linux/media && rm -rf /mnt/data/linux/media/.frames"
 	tar -C "$GALLERY_DIR" -cf - . | $SSH "tar -C /mnt/data/linux/media -xf -"
 fi
 

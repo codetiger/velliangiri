@@ -99,6 +99,7 @@ static void __init s5l8940x_pmgr_gates_init(struct device_node *node)
 	struct s5l8940x_pmgr_gate *gates;
 	struct clk_init_data init = {};
 	const char *parent_name;
+	bool is_s5l8947x;
 	struct resource res;
 	void __iomem *base;
 	unsigned int i, num;
@@ -109,6 +110,7 @@ static void __init s5l8940x_pmgr_gates_init(struct device_node *node)
 		pr_err("%pOFn: missing parent clock or reg\n", node);
 		return;
 	}
+	is_s5l8947x = of_device_is_compatible(node, "apple,s5l8947x-pmgr-gates");
 
 	num = resource_size(&res) / 4;
 	base = of_iomap(node, 0);
@@ -119,12 +121,22 @@ static void __init s5l8940x_pmgr_gates_init(struct device_node *node)
 	clk_data->num = num;
 
 	init.ops = &s5l8940x_pmgr_gate_ops;
-	init.flags = CLK_IGNORE_UNUSED;
-	init.parent_names = &parent_name;
 	init.num_parents = 1;
 
+	/*
+	 * On S5L8947X, gate 9 (0x3f10102c, HPERF-NRT) is the parent interconnect
+	 * domain for the media engines on gates 10..13 (VDEC, SCALER0, SCALER1,
+	 * JPEG). Keep gate 9 enabled and parent gates 10..13 to it so media
+	 * register windows are always clocked when accessed.
+	 */
 	for (i = 0; i < num; i++) {
+		const char *gate_parent = (is_s5l8947x && i >= 10 && i <= 13) ?
+					  "pmgr-gate9" : parent_name;
+
 		init.name = kasprintf(GFP_KERNEL, "pmgr-gate%u", i);
+		init.parent_names = &gate_parent;
+		init.flags = CLK_IGNORE_UNUSED |
+			     ((is_s5l8947x && i == 9) ? CLK_IS_CRITICAL : 0);
 		gates[i].reg = base + i * 4;
 		gates[i].hw.init = &init;
 		err = init.name ? clk_hw_register(NULL, &gates[i].hw) : -ENOMEM;

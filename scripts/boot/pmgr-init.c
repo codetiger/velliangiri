@@ -6,7 +6,7 @@
  * 1. Scales the CPU clock from the initial 212.5 MHz boot performance state
  *    (state 6, PLL4 / 4) to the full 850 MHz high-performance state
  *    (state 2, PLL4 / 1) so zImage XZ decompression and Linux run at 850 MHz.
- * 2. Switches on the 7 core peripheral clock gates at 0x3f101080..0x3f101144
+ * 2. Switches on the 8 core peripheral clock gates at 0x3f10102c..0x3f101144
  *    using the request (bits 3:0) / status (bits 7:4) handshake protocol.
  */
 
@@ -28,6 +28,7 @@
 #define PMGR_PERF_STATE_BUSY	0x00ff0000U
 
 static const uint32_t s5l8947x_pmgr_gates[] = {
+	0x3f10102cU, /* HPERF-NRT */
 	0x3f1010f8U, /* UART0 */
 	0x3f101118U, /* I2C0 */
 	0x3f101120U, /* I2C2 */

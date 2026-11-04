@@ -23,8 +23,10 @@
 #endif
 #ifdef __linux__
 #include <linux/videodev2.h>
+#include <sound/asound.h>
 #endif
 #include <math.h>
+#include <pthread.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -188,10 +190,406 @@ static uint32_t *scale_cover_bilinear(const uint32_t *src, int src_w, int src_h,
 }
 
 /* =========================================================================
- * 2. S5L8947X Hardware V4L2 M2M JPEG (/dev/video2) + M2SC (/dev/video0)
+ * 2. S5L8947X Hardware V4L2 M2M JPEG (/dev/video2) + Dual M2SC (/dev/video0,1)
+ *
+ * Persistent zero-copy V4L2 M2M hardware pipeline:
+ *   - Keeps s5l8947x-jpeg open with STREAMON and an exported NV12 DMABUF
+ *     (VIDIOC_EXPBUF), avoiding per-image open/REQBUFS/mmap/close overhead.
+ *   - Keeps two persistent s5l8947x-m2sc contexts open (275x312 card scaler on
+ *     scaler0 and 1280x720 fullscreen/video scaler on scaler1) that import the
+ *     JPEG decoder's NV12 DMABUF directly (V4L2_MEMORY_DMABUF) with zero CPU
+ *     copy of the intermediate NV12 frame.
+ *   - Offloads centered object-fit:cover cropping (VIDIOC_S_SELECTION /
+ *     V4L2_SEL_TGT_CROP), 8-tap/4-tap polyphase scaling, and full-range BT.601
+ *     YCbCr->XRGB8888 colour conversion entirely to the M2SC hardware engines.
  * ========================================================================= */
 
+/* =========================================================================
+ * 1c. QuickTime (.mov / ISO-BMFF Motion-JPEG) Container Reader
+ *
+ * Parses the standard QuickTime `moov` -> `trak` -> `mdia` -> `minf` -> `stbl`
+ * sample tables (`mdhd`, `hdlr`, `stts`, `stsc`, `stsz`, `stco`) directly from
+ * `.mov` files so that:
+ *   - Frame 0 is extracted on the fly for card/poster thumbnails
+ *   - All video frames are streamed directly from the `.mov` into the
+ *     s5l8947x-jpeg + s5l8947x-m2sc hardware pipeline at 24 FPS with zero
+ *     sidecar frame JPEG files.
+ * ========================================================================= */
+
+#define QT_MOV_MAX_FRAMES	1024
+
+struct qt_mov_sample {
+	uint32_t offset;
+	uint32_t size;
+};
+
+struct qt_mov_audio_chunk {
+	uint32_t offset;
+	uint32_t pcm_frames;
+	uint32_t start_frame;
+};
+
+static struct {
+	int fd;
+	char path[512];
+	uint32_t fps;
+	uint32_t frame_count;
+	uint32_t duration_sec;
+	struct qt_mov_sample samples[QT_MOV_MAX_FRAMES];
+	uint32_t audio_rate;
+	uint32_t audio_chunk_count;
+	uint32_t audio_total_frames;
+	struct qt_mov_audio_chunk audio_chunks[QT_MOV_MAX_FRAMES];
+} g_qt_mov = {
+	.fd = -1,
+};
+
+static uint32_t rd_be32(const uint8_t *p)
+{
+	return ((uint32_t)p[0] << 24) | ((uint32_t)p[1] << 16) |
+	       ((uint32_t)p[2] << 8)  | (uint32_t)p[3];
+}
+
+static void qt_mov_close(void)
+{
+	if (g_qt_mov.fd >= 0) {
+		close(g_qt_mov.fd);
+		g_qt_mov.fd = -1;
+	}
+	g_qt_mov.path[0] = '\0';
+	g_qt_mov.fps = 0;
+	g_qt_mov.frame_count = 0;
+	g_qt_mov.duration_sec = 0;
+	g_qt_mov.audio_rate = 0;
+	g_qt_mov.audio_chunk_count = 0;
+	g_qt_mov.audio_total_frames = 0;
+}
+
+struct qt_stbl_parse {
+	bool is_video;
+	bool is_audio;
+	uint32_t timescale;
+	uint32_t duration_ts;
+	uint32_t sample_delta;
+	const uint8_t *stsc;
+	size_t stsc_len;
+	const uint8_t *stsz;
+	size_t stsz_len;
+	const uint8_t *stco;
+	size_t stco_len;
+};
+
+static void qt_walk_atoms(const uint8_t *buf, size_t len,
+			  struct qt_stbl_parse *cur,
+			  struct qt_stbl_parse *vid_out,
+			  struct qt_stbl_parse *aud_out)
+{
+	size_t off = 0;
+
+	while (off + 8 <= len) {
+		uint32_t sz = rd_be32(buf + off);
+		const uint8_t *typ = buf + off + 4;
+		size_t hdr = 8;
+		size_t body_len;
+
+		if (sz == 1) {
+			if (off + 16 > len)
+				break;
+			sz = rd_be32(buf + off + 12);
+			hdr = 16;
+		} else if (sz == 0) {
+			sz = (uint32_t)(len - off);
+		}
+		if (sz < hdr || off + sz > len)
+			break;
+		body_len = sz - hdr;
+		const uint8_t *body = buf + off + hdr;
+
+		if (!memcmp(typ, "moov", 4)) {
+			qt_walk_atoms(body, body_len, cur, vid_out, aud_out);
+		} else if (!memcmp(typ, "trak", 4)) {
+			struct qt_stbl_parse sub;
+			memset(&sub, 0, sizeof(sub));
+			qt_walk_atoms(body, body_len, &sub, vid_out, aud_out);
+			if (sub.is_video && sub.stsz && sub.stco)
+				*vid_out = sub;
+			else if (sub.is_audio && sub.stsz && sub.stco)
+				*aud_out = sub;
+		} else if (!memcmp(typ, "mdia", 4) || !memcmp(typ, "minf", 4) ||
+			   !memcmp(typ, "stbl", 4)) {
+			qt_walk_atoms(body, body_len, cur, vid_out, aud_out);
+		} else if (!memcmp(typ, "hdlr", 4) && body_len >= 12) {
+			if (!memcmp(body + 8, "vide", 4))
+				cur->is_video = true;
+			else if (!memcmp(body + 8, "soun", 4))
+				cur->is_audio = true;
+		} else if (!memcmp(typ, "mdhd", 4) && body_len >= 20) {
+			uint8_t ver = body[0];
+			if (ver == 0 && body_len >= 20) {
+				cur->timescale = rd_be32(body + 12);
+				cur->duration_ts = rd_be32(body + 16);
+			} else if (ver == 1 && body_len >= 28) {
+				cur->timescale = rd_be32(body + 20);
+				cur->duration_ts = rd_be32(body + 28);
+			}
+		} else if (!memcmp(typ, "stts", 4) && body_len >= 16) {
+			uint32_t cnt = rd_be32(body + 4);
+			if (cnt >= 1)
+				cur->sample_delta = rd_be32(body + 12);
+		} else if (!memcmp(typ, "stsc", 4) && body_len >= 8) {
+			cur->stsc = body;
+			cur->stsc_len = body_len;
+		} else if (!memcmp(typ, "stsz", 4) && body_len >= 12) {
+			cur->stsz = body;
+			cur->stsz_len = body_len;
+		} else if (!memcmp(typ, "stco", 4) && body_len >= 8) {
+			cur->stco = body;
+			cur->stco_len = body_len;
+		}
+		off += sz;
+	}
+}
+
+static bool qt_mov_open_path(const char *path)
+{
+	struct stat st;
+	int fd;
+	uint8_t hdr[16];
+	off_t fpos = 0;
+	uint8_t *moov_buf = NULL;
+	size_t moov_len = 0;
+	struct qt_stbl_parse cur_sp, sp, aud_sp;
+	uint32_t fixed_sz, sample_cnt, chunk_cnt, stsc_cnt;
+	uint32_t s_idx = 0, c_idx;
+
+	if (!path || !path[0])
+		return false;
+	if (g_qt_mov.fd >= 0 && strcmp(g_qt_mov.path, path) == 0 &&
+	    g_qt_mov.frame_count > 0)
+		return true;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return false;
+	if (fstat(fd, &st) < 0 || st.st_size < 32) {
+		close(fd);
+		return false;
+	}
+
+	while (fpos + 8 <= st.st_size) {
+		uint64_t asz;
+		size_t ahdr = 8;
+
+		if (pread(fd, hdr, 16, fpos) < 8)
+			break;
+		asz = rd_be32(hdr);
+		if (asz == 1) {
+			asz = ((uint64_t)rd_be32(hdr + 8) << 32) | rd_be32(hdr + 12);
+			ahdr = 16;
+		} else if (asz == 0) {
+			asz = (uint64_t)(st.st_size - fpos);
+		}
+		if (asz < ahdr || fpos + (off_t)asz > st.st_size)
+			break;
+		if (!memcmp(hdr + 4, "moov", 4)) {
+			moov_len = (size_t)(asz - ahdr);
+			if (moov_len > 4 * 1024 * 1024)
+				break;
+			moov_buf = malloc(moov_len);
+			if (!moov_buf)
+				break;
+			if (pread(fd, moov_buf, moov_len, fpos + (off_t)ahdr) !=
+			    (ssize_t)moov_len) {
+				free(moov_buf);
+				moov_buf = NULL;
+			}
+			break;
+		}
+		fpos += (off_t)asz;
+	}
+
+	if (!moov_buf) {
+		close(fd);
+		return false;
+	}
+
+	memset(&cur_sp, 0, sizeof(cur_sp));
+	memset(&sp, 0, sizeof(sp));
+	memset(&aud_sp, 0, sizeof(aud_sp));
+	qt_walk_atoms(moov_buf, moov_len, &cur_sp, &sp, &aud_sp);
+	if (!sp.is_video || !sp.stsz || !sp.stco || sp.stsz_len < 12 || sp.stco_len < 8) {
+		free(moov_buf);
+		close(fd);
+		return false;
+	}
+
+	fixed_sz = rd_be32(sp.stsz + 4);
+	sample_cnt = rd_be32(sp.stsz + 8);
+	if (sample_cnt == 0) {
+		free(moov_buf);
+		close(fd);
+		return false;
+	}
+	if (sample_cnt > QT_MOV_MAX_FRAMES)
+		sample_cnt = QT_MOV_MAX_FRAMES;
+	if (fixed_sz == 0 && sp.stsz_len < 12 + (size_t)sample_cnt * 4) {
+		free(moov_buf);
+		close(fd);
+		return false;
+	}
+
+	chunk_cnt = rd_be32(sp.stco + 4);
+	if (chunk_cnt == 0 || sp.stco_len < 8 + (size_t)chunk_cnt * 4) {
+		free(moov_buf);
+		close(fd);
+		return false;
+	}
+	stsc_cnt = (sp.stsc && sp.stsc_len >= 8) ? rd_be32(sp.stsc + 4) : 0;
+
+	qt_mov_close();
+	for (c_idx = 0; c_idx < chunk_cnt && s_idx < sample_cnt; c_idx++) {
+		uint32_t chunk_no = c_idx + 1;
+		uint32_t spc = 1;
+		uint32_t cur_off = rd_be32(sp.stco + 8 + c_idx * 4);
+		uint32_t j;
+
+		for (j = 0; j < stsc_cnt; j++) {
+			if (8 + (j + 1) * 12 > sp.stsc_len)
+				break;
+			uint32_t first_chunk = rd_be32(sp.stsc + 8 + j * 12);
+			uint32_t n_spc = rd_be32(sp.stsc + 8 + j * 12 + 4);
+			if (chunk_no >= first_chunk)
+				spc = n_spc;
+			else
+				break;
+		}
+		for (j = 0; j < spc && s_idx < sample_cnt; j++) {
+			uint32_t ssz = fixed_sz ? fixed_sz :
+				       rd_be32(sp.stsz + 12 + s_idx * 4);
+			g_qt_mov.samples[s_idx].offset = cur_off;
+			g_qt_mov.samples[s_idx].size = ssz;
+			cur_off += ssz;
+			s_idx++;
+		}
+	}
+
+	/* Parse S16_LE stereo PCM audio track ("soun") if present */
+	if (aud_sp.is_audio && aud_sp.stco && aud_sp.stco_len >= 8) {
+		uint32_t a_chunks = rd_be32(aud_sp.stco + 4);
+		uint32_t a_stsc_cnt = (aud_sp.stsc && aud_sp.stsc_len >= 8) ?
+				      rd_be32(aud_sp.stsc + 4) : 0;
+		uint32_t total_pcm = 0;
+		uint32_t ac;
+
+		if (a_chunks > QT_MOV_MAX_FRAMES)
+			a_chunks = QT_MOV_MAX_FRAMES;
+		for (ac = 0; ac < a_chunks; ac++) {
+			uint32_t chunk_no = ac + 1;
+			uint32_t spc = 1024;
+			uint32_t j;
+
+			if (8 + (size_t)(ac + 1) * 4 > aud_sp.stco_len)
+				break;
+			for (j = 0; j < a_stsc_cnt; j++) {
+				if (8 + (j + 1) * 12 > aud_sp.stsc_len)
+					break;
+				uint32_t first_chunk = rd_be32(aud_sp.stsc + 8 + j * 12);
+				uint32_t n_spc = rd_be32(aud_sp.stsc + 8 + j * 12 + 4);
+				if (chunk_no >= first_chunk)
+					spc = n_spc;
+				else
+					break;
+			}
+			g_qt_mov.audio_chunks[ac].offset = rd_be32(aud_sp.stco + 8 + ac * 4);
+			g_qt_mov.audio_chunks[ac].pcm_frames = spc;
+			g_qt_mov.audio_chunks[ac].start_frame = total_pcm;
+			total_pcm += spc;
+		}
+		g_qt_mov.audio_chunk_count = ac;
+		g_qt_mov.audio_total_frames = total_pcm;
+		g_qt_mov.audio_rate = (aud_sp.timescale >= 8000 && aud_sp.timescale <= 96000) ?
+				      aud_sp.timescale : 48000;
+	}
+
+	free(moov_buf);
+	if (s_idx == 0) {
+		close(fd);
+		return false;
+	}
+
+	g_qt_mov.fd = fd;
+	snprintf(g_qt_mov.path, sizeof(g_qt_mov.path), "%s", path);
+	g_qt_mov.frame_count = s_idx;
+	if (sp.timescale > 0 && sp.sample_delta > 0) {
+		uint32_t fps = (sp.timescale + sp.sample_delta / 2) / sp.sample_delta;
+		g_qt_mov.fps = (fps >= 1 && fps <= 120) ? fps : 24;
+	} else {
+		g_qt_mov.fps = 24;
+	}
+	if (sp.timescale > 0 && sp.duration_ts > 0) {
+		g_qt_mov.duration_sec = (sp.duration_ts + sp.timescale / 2) / sp.timescale;
+	} else {
+		g_qt_mov.duration_sec = g_qt_mov.frame_count / g_qt_mov.fps;
+	}
+	if (g_qt_mov.duration_sec == 0)
+		g_qt_mov.duration_sec = 1;
+	return true;
+}
+
+/*
+ * Reads either a standalone JPEG file or Frame 0 of a QuickTime .mov container
+ * into @dst_buf (up to @max_len bytes). Returns the JPEG byte length on success,
+ * or 0 on failure.
+ */
+static size_t read_jpeg_or_mov_frame0(const char *path, uint8_t *dst_buf, size_t max_len)
+{
+	struct stat st;
+	int fd;
+	uint8_t magic[4];
+
+	if (!path || !path[0] || !dst_buf || max_len < 64)
+		return 0;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
+		return 0;
+	if (fstat(fd, &st) < 0 || st.st_size < 16 ||
+	    read(fd, magic, 4) != 4) {
+		close(fd);
+		return 0;
+	}
+
+	/* Standalone JPEG (starts with FF D8) */
+	if (magic[0] == 0xff && magic[1] == 0xd8) {
+		ssize_t n;
+		if ((size_t)st.st_size > max_len) {
+			close(fd);
+			return 0;
+		}
+		n = pread(fd, dst_buf, (size_t)st.st_size, 0);
+		close(fd);
+		return (n == st.st_size) ? (size_t)n : 0;
+	}
+	close(fd);
+
+	/* QuickTime .mov container: read sample 0 */
+	if (qt_mov_open_path(path) && g_qt_mov.frame_count > 0) {
+		uint32_t sz = g_qt_mov.samples[0].size;
+		uint32_t off = g_qt_mov.samples[0].offset;
+		if (sz > 16 && sz <= max_len) {
+			ssize_t n = pread(g_qt_mov.fd, dst_buf, sz, (off_t)off);
+			if (n == (ssize_t)sz && dst_buf[0] == 0xff && dst_buf[1] == 0xd8)
+				return (size_t)n;
+		}
+	}
+	return 0;
+}
+
 #ifdef __linux__
+#define HW_JPG_MAX_BS		(512 * 1024)
+#define HW_NV12_BUF_W		1280
+#define HW_NV12_BUF_H		960
+
 static bool parse_jpeg_sof0_dims(const uint8_t *buf, size_t len, int *w, int *h)
 {
 	size_t i = 2;
@@ -216,7 +614,9 @@ static bool parse_jpeg_sof0_dims(const uint8_t *buf, size_t len, int *w, int *h)
 		size_t seglen = ((size_t)buf[i] << 8) | buf[i + 1];
 		if (seglen < 2 || i + seglen > len)
 			break;
-		if (m == 0xc0 && seglen >= 7) {
+		if (m >= 0xc0 && m <= 0xcf && m != 0xc4 && m != 0xc8 && m != 0xcc) {
+			if (m != 0xc0 || seglen < 7)
+				return false;
 			*h = ((int)buf[i + 3] << 8) | buf[i + 4];
 			*w = ((int)buf[i + 5] << 8) | buf[i + 6];
 			return (*w >= 16 && *h >= 16);
@@ -236,152 +636,55 @@ static int xioctl_v4l2(int fd, unsigned long req, void *arg)
 	return r;
 }
 
-struct v4l2_slot {
-	void *ptr;
-	size_t len;
+struct hw_m2sc_ctx {
+	int fd;
+	uint32_t dst_w;
+	uint32_t dst_h;
+	uint32_t out_sizeimage;
+	uint32_t cap_sizeimage;
+	void *cap_ptr;
+	size_t cap_len;
+	struct v4l2_rect last_crop;
+	bool cap_dmabuf;
+	bool streaming;
 };
 
-static int m2m_run_one(const char *dev, uint32_t out_pixfmt,
-		       uint32_t out_w, uint32_t out_h,
-		       const void *in_data, size_t in_len, size_t in_alloc,
-		       uint32_t cap_pixfmt, uint32_t cap_w, uint32_t cap_h,
-		       void *out_data, size_t out_max)
-{
-	struct v4l2_slot out_s = { 0 }, cap_s = { 0 };
-	struct v4l2_format fmt;
-	struct v4l2_requestbuffers req;
-	struct v4l2_buffer b;
-	enum v4l2_buf_type type;
-	int fd, rc = -1;
+static struct {
+	bool probed;
+	bool ready;
+	char jpg_dev[32];
+	char m2sc_dev[2][32];
+	int m2sc_count;
 
-	fd = open(dev, O_RDWR | O_CLOEXEC);
-	if (fd < 0)
-		return -1;
+	int jpg_fd;
+	void *jpg_out_ptr;
+	size_t jpg_out_len;
+	int nv12_dmabuf_fd;
+	struct v4l2_pix_format nv12_pix;
+	bool jpg_streaming;
 
-	memset(&fmt, 0, sizeof(fmt));
-	fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-	fmt.fmt.pix.width = out_w;
-	fmt.fmt.pix.height = out_h;
-	fmt.fmt.pix.pixelformat = out_pixfmt;
-	fmt.fmt.pix.sizeimage = (uint32_t)in_alloc;
-	if (xioctl_v4l2(fd, VIDIOC_S_FMT, &fmt) < 0)
-		goto out;
+	char last_jpg_path[512];
+	int last_src_w;
+	int last_src_h;
 
-	memset(&fmt, 0, sizeof(fmt));
-	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	fmt.fmt.pix.width = cap_w;
-	fmt.fmt.pix.height = cap_h;
-	fmt.fmt.pix.pixelformat = cap_pixfmt;
-	if (xioctl_v4l2(fd, VIDIOC_S_FMT, &fmt) < 0)
-		goto out;
-
-	memset(&req, 0, sizeof(req));
-	req.count = 1;
-	req.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-	req.memory = V4L2_MEMORY_MMAP;
-	if (xioctl_v4l2(fd, VIDIOC_REQBUFS, &req) < 0)
-		goto out;
-
-	memset(&b, 0, sizeof(b));
-	b.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-	b.memory = V4L2_MEMORY_MMAP;
-	b.index = 0;
-	if (xioctl_v4l2(fd, VIDIOC_QUERYBUF, &b) < 0)
-		goto out;
-	out_s.len = b.length;
-	out_s.ptr = mmap(NULL, b.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, b.m.offset);
-	if (out_s.ptr == MAP_FAILED) {
-		out_s.ptr = NULL;
-		goto out;
-	}
-
-	memset(&req, 0, sizeof(req));
-	req.count = 1;
-	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	req.memory = V4L2_MEMORY_MMAP;
-	if (xioctl_v4l2(fd, VIDIOC_REQBUFS, &req) < 0)
-		goto out;
-
-	memset(&b, 0, sizeof(b));
-	b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	b.memory = V4L2_MEMORY_MMAP;
-	b.index = 0;
-	if (xioctl_v4l2(fd, VIDIOC_QUERYBUF, &b) < 0)
-		goto out;
-	cap_s.len = b.length;
-	cap_s.ptr = mmap(NULL, b.length, PROT_READ | PROT_WRITE, MAP_SHARED, fd, b.m.offset);
-	if (cap_s.ptr == MAP_FAILED) {
-		cap_s.ptr = NULL;
-		goto out;
-	}
-
-	if (in_len > out_s.len)
-		goto out;
-	memcpy(out_s.ptr, in_data, in_len);
-
-	memset(&b, 0, sizeof(b));
-	b.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-	b.memory = V4L2_MEMORY_MMAP;
-	b.index = 0;
-	b.bytesused = (uint32_t)in_len;
-	if (xioctl_v4l2(fd, VIDIOC_QBUF, &b) < 0)
-		goto out;
-
-	memset(&b, 0, sizeof(b));
-	b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	b.memory = V4L2_MEMORY_MMAP;
-	b.index = 0;
-	if (xioctl_v4l2(fd, VIDIOC_QBUF, &b) < 0)
-		goto out;
-
-	type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-	if (xioctl_v4l2(fd, VIDIOC_STREAMON, &type) < 0)
-		goto out;
-	type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	if (xioctl_v4l2(fd, VIDIOC_STREAMON, &type) < 0)
-		goto out;
-
-	memset(&b, 0, sizeof(b));
-	b.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-	b.memory = V4L2_MEMORY_MMAP;
-	if (xioctl_v4l2(fd, VIDIOC_DQBUF, &b) < 0)
-		goto stop;
-
-	memset(&b, 0, sizeof(b));
-	b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	b.memory = V4L2_MEMORY_MMAP;
-	if (xioctl_v4l2(fd, VIDIOC_DQBUF, &b) < 0 || (b.flags & V4L2_BUF_FLAG_ERROR))
-		goto stop;
-
-	size_t n = b.bytesused < out_max ? b.bytesused : out_max;
-	memcpy(out_data, cap_s.ptr, n);
-	rc = (int)n;
-
-stop:
-	type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
-	xioctl_v4l2(fd, VIDIOC_STREAMOFF, &type);
-	type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-	xioctl_v4l2(fd, VIDIOC_STREAMOFF, &type);
-out:
-	if (out_s.ptr)
-		munmap(out_s.ptr, out_s.len);
-	if (cap_s.ptr)
-		munmap(cap_s.ptr, cap_s.len);
-	close(fd);
-	return rc;
-}
-
-static bool g_v4l2_probed;
-static char g_v4l2_jpeg_dev[32];
-static char g_v4l2_m2sc_dev[32];
+	struct hw_m2sc_ctx sc_card;	/* 275 x 312 XRGB32 on scaler0 */
+	struct hw_m2sc_ctx sc_fs;	/* 1280 x 720 XRGB32 on scaler1 (MMAP) */
+	struct hw_m2sc_ctx sc_vid;	/* 1280 x 720 XRGB32 on scaler1 (DRM DMABUF) */
+} g_hw_pipe = {
+	.jpg_fd = -1,
+	.nv12_dmabuf_fd = -1,
+	.sc_card = { .fd = -1 },
+	.sc_fs = { .fd = -1 },
+	.sc_vid = { .fd = -1 },
+};
 
 static void discover_v4l2_devices(void)
 {
 	int i;
 
-	if (g_v4l2_probed)
+	if (g_hw_pipe.probed)
 		return;
-	g_v4l2_probed = true;
+	g_hw_pipe.probed = true;
 
 	for (i = 0; i < 8; i++) {
 		char path[32];
@@ -394,15 +697,581 @@ static void discover_v4l2_devices(void)
 			continue;
 		memset(&cap, 0, sizeof(cap));
 		if (ioctl(fd, VIDIOC_QUERYCAP, &cap) == 0) {
-			if (!g_v4l2_jpeg_dev[0] &&
-			    strcmp((const char *)cap.driver, "s5l8947x-jpeg") == 0)
-				snprintf(g_v4l2_jpeg_dev, sizeof(g_v4l2_jpeg_dev), "%s", path);
-			else if (!g_v4l2_m2sc_dev[0] &&
-				 strcmp((const char *)cap.driver, "s5l8947x-m2sc") == 0)
-				snprintf(g_v4l2_m2sc_dev, sizeof(g_v4l2_m2sc_dev), "%s", path);
+			if (!g_hw_pipe.jpg_dev[0] &&
+			    strcmp((const char *)cap.driver, "s5l8947x-jpeg") == 0) {
+				snprintf(g_hw_pipe.jpg_dev, sizeof(g_hw_pipe.jpg_dev),
+					 "%s", path);
+			} else if (g_hw_pipe.m2sc_count < 2 &&
+				   strcmp((const char *)cap.driver, "s5l8947x-m2sc") == 0) {
+				snprintf(g_hw_pipe.m2sc_dev[g_hw_pipe.m2sc_count],
+					 sizeof(g_hw_pipe.m2sc_dev[0]), "%s", path);
+				g_hw_pipe.m2sc_count++;
+			}
 		}
 		close(fd);
 	}
+}
+
+static void hw_m2sc_ctx_close(struct hw_m2sc_ctx *sc)
+{
+	if (!sc)
+		return;
+	if (sc->fd >= 0 && sc->streaming) {
+		enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+		(void)xioctl_v4l2(sc->fd, VIDIOC_STREAMOFF, &type);
+		type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		(void)xioctl_v4l2(sc->fd, VIDIOC_STREAMOFF, &type);
+		sc->streaming = false;
+	}
+	if (sc->cap_ptr) {
+		munmap(sc->cap_ptr, sc->cap_len);
+		sc->cap_ptr = NULL;
+		sc->cap_len = 0;
+	}
+	if (sc->fd >= 0) {
+		close(sc->fd);
+		sc->fd = -1;
+	}
+	memset(&sc->last_crop, 0, sizeof(sc->last_crop));
+}
+
+static void hw_pipe_close(void)
+{
+	hw_m2sc_ctx_close(&g_hw_pipe.sc_card);
+	hw_m2sc_ctx_close(&g_hw_pipe.sc_fs);
+	hw_m2sc_ctx_close(&g_hw_pipe.sc_vid);
+
+	if (g_hw_pipe.jpg_fd >= 0 && g_hw_pipe.jpg_streaming) {
+		enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+		(void)xioctl_v4l2(g_hw_pipe.jpg_fd, VIDIOC_STREAMOFF, &type);
+		type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		(void)xioctl_v4l2(g_hw_pipe.jpg_fd, VIDIOC_STREAMOFF, &type);
+		g_hw_pipe.jpg_streaming = false;
+	}
+	if (g_hw_pipe.nv12_dmabuf_fd >= 0) {
+		close(g_hw_pipe.nv12_dmabuf_fd);
+		g_hw_pipe.nv12_dmabuf_fd = -1;
+	}
+	if (g_hw_pipe.jpg_out_ptr) {
+		munmap(g_hw_pipe.jpg_out_ptr, g_hw_pipe.jpg_out_len);
+		g_hw_pipe.jpg_out_ptr = NULL;
+		g_hw_pipe.jpg_out_len = 0;
+	}
+	if (g_hw_pipe.jpg_fd >= 0) {
+		close(g_hw_pipe.jpg_fd);
+		g_hw_pipe.jpg_fd = -1;
+	}
+	g_hw_pipe.last_jpg_path[0] = '\0';
+	g_hw_pipe.last_src_w = 0;
+	g_hw_pipe.last_src_h = 0;
+	g_hw_pipe.ready = false;
+}
+
+static bool hw_m2sc_ctx_init(struct hw_m2sc_ctx *sc, const char *dev,
+			     uint32_t dst_w, uint32_t dst_h, bool cap_dmabuf)
+{
+	struct v4l2_format fmt;
+	struct v4l2_requestbuffers req;
+	struct v4l2_buffer b;
+	enum v4l2_buf_type type;
+
+	memset(sc, 0, sizeof(*sc));
+	sc->fd = open(dev, O_RDWR | O_CLOEXEC);
+	if (sc->fd < 0)
+		return false;
+	sc->cap_dmabuf = cap_dmabuf;
+
+	/* OUTPUT: zero-copy NV12 DMABUF exported by s5l8947x-jpeg */
+	memset(&fmt, 0, sizeof(fmt));
+	fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	fmt.fmt.pix = g_hw_pipe.nv12_pix;
+	fmt.fmt.pix.colorspace = V4L2_COLORSPACE_JPEG;
+	fmt.fmt.pix.ycbcr_enc = V4L2_YCBCR_ENC_601;
+	fmt.fmt.pix.quantization = V4L2_QUANTIZATION_FULL_RANGE;
+	fmt.fmt.pix.xfer_func = V4L2_XFER_FUNC_SRGB;
+	if (xioctl_v4l2(sc->fd, VIDIOC_S_FMT, &fmt) < 0 ||
+	    fmt.fmt.pix.bytesperline != g_hw_pipe.nv12_pix.bytesperline)
+		goto err;
+	sc->out_sizeimage = fmt.fmt.pix.sizeimage;
+
+	/* CAPTURE: scaled & colour-converted XRGB8888 surface */
+	memset(&fmt, 0, sizeof(fmt));
+	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	fmt.fmt.pix.width = dst_w;
+	fmt.fmt.pix.height = dst_h;
+	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_XRGB32;
+	fmt.fmt.pix.colorspace = V4L2_COLORSPACE_SRGB;
+	if (xioctl_v4l2(sc->fd, VIDIOC_S_FMT, &fmt) < 0)
+		goto err;
+	sc->dst_w = fmt.fmt.pix.width;
+	sc->dst_h = fmt.fmt.pix.height;
+	sc->cap_sizeimage = fmt.fmt.pix.sizeimage;
+
+	memset(&req, 0, sizeof(req));
+	req.count = 1;
+	req.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	req.memory = V4L2_MEMORY_DMABUF;
+	if (xioctl_v4l2(sc->fd, VIDIOC_REQBUFS, &req) < 0 || req.count < 1)
+		goto err;
+
+	memset(&req, 0, sizeof(req));
+	req.count = cap_dmabuf ? 2 : 1;
+	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	req.memory = cap_dmabuf ? V4L2_MEMORY_DMABUF : V4L2_MEMORY_MMAP;
+	if (xioctl_v4l2(sc->fd, VIDIOC_REQBUFS, &req) < 0 || req.count < 1)
+		goto err;
+
+	if (!cap_dmabuf) {
+		memset(&b, 0, sizeof(b));
+		b.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+		b.memory = V4L2_MEMORY_MMAP;
+		b.index = 0;
+		if (xioctl_v4l2(sc->fd, VIDIOC_QUERYBUF, &b) < 0)
+			goto err;
+		sc->cap_len = b.length;
+		sc->cap_ptr = mmap(NULL, b.length, PROT_READ | PROT_WRITE, MAP_SHARED,
+				   sc->fd, b.m.offset);
+		if (sc->cap_ptr == MAP_FAILED) {
+			sc->cap_ptr = NULL;
+			goto err;
+		}
+	}
+
+	type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	if (xioctl_v4l2(sc->fd, VIDIOC_STREAMON, &type) < 0)
+		goto err;
+	type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	if (xioctl_v4l2(sc->fd, VIDIOC_STREAMON, &type) < 0)
+		goto err;
+	sc->streaming = true;
+	return true;
+
+err:
+	hw_m2sc_ctx_close(sc);
+	return false;
+}
+
+static bool hw_pipe_init(void)
+{
+	struct v4l2_format fmt;
+	struct v4l2_requestbuffers req;
+	struct v4l2_buffer b;
+	struct v4l2_exportbuffer eb;
+	enum v4l2_buf_type type;
+	const char *fs_dev;
+
+	if (g_hw_pipe.ready)
+		return true;
+
+	discover_v4l2_devices();
+	if (!g_hw_pipe.jpg_dev[0] || g_hw_pipe.m2sc_count <= 0)
+		return false;
+
+	g_hw_pipe.jpg_fd = open(g_hw_pipe.jpg_dev, O_RDWR | O_CLOEXEC);
+	if (g_hw_pipe.jpg_fd < 0)
+		return false;
+
+	/* JPEG OUTPUT (compressed bitstream) */
+	memset(&fmt, 0, sizeof(fmt));
+	fmt.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	fmt.fmt.pix.width = HW_NV12_BUF_W;
+	fmt.fmt.pix.height = HW_NV12_BUF_H;
+	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_JPEG;
+	fmt.fmt.pix.sizeimage = HW_JPG_MAX_BS;
+	if (xioctl_v4l2(g_hw_pipe.jpg_fd, VIDIOC_S_FMT, &fmt) < 0)
+		goto err;
+
+	/* JPEG CAPTURE (NV12 DMA buffer exported as DMABUF) */
+	memset(&fmt, 0, sizeof(fmt));
+	fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	fmt.fmt.pix.width = HW_NV12_BUF_W;
+	fmt.fmt.pix.height = HW_NV12_BUF_H;
+	fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_NV12;
+	if (xioctl_v4l2(g_hw_pipe.jpg_fd, VIDIOC_S_FMT, &fmt) < 0)
+		goto err;
+	g_hw_pipe.nv12_pix = fmt.fmt.pix;
+
+	memset(&req, 0, sizeof(req));
+	req.count = 1;
+	req.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	req.memory = V4L2_MEMORY_MMAP;
+	if (xioctl_v4l2(g_hw_pipe.jpg_fd, VIDIOC_REQBUFS, &req) < 0 || req.count < 1)
+		goto err;
+
+	memset(&b, 0, sizeof(b));
+	b.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	b.memory = V4L2_MEMORY_MMAP;
+	b.index = 0;
+	if (xioctl_v4l2(g_hw_pipe.jpg_fd, VIDIOC_QUERYBUF, &b) < 0)
+		goto err;
+	g_hw_pipe.jpg_out_len = b.length;
+	g_hw_pipe.jpg_out_ptr = mmap(NULL, b.length, PROT_READ | PROT_WRITE,
+				     MAP_SHARED, g_hw_pipe.jpg_fd, b.m.offset);
+	if (g_hw_pipe.jpg_out_ptr == MAP_FAILED) {
+		g_hw_pipe.jpg_out_ptr = NULL;
+		goto err;
+	}
+
+	memset(&req, 0, sizeof(req));
+	req.count = 1;
+	req.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	req.memory = V4L2_MEMORY_MMAP;
+	if (xioctl_v4l2(g_hw_pipe.jpg_fd, VIDIOC_REQBUFS, &req) < 0 || req.count < 1)
+		goto err;
+
+	memset(&eb, 0, sizeof(eb));
+	eb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	eb.index = 0;
+	eb.flags = O_RDWR | O_CLOEXEC;
+	if (xioctl_v4l2(g_hw_pipe.jpg_fd, VIDIOC_EXPBUF, &eb) < 0)
+		goto err;
+	g_hw_pipe.nv12_dmabuf_fd = eb.fd;
+
+	type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	if (xioctl_v4l2(g_hw_pipe.jpg_fd, VIDIOC_STREAMON, &type) < 0)
+		goto err;
+	type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	if (xioctl_v4l2(g_hw_pipe.jpg_fd, VIDIOC_STREAMON, &type) < 0)
+		goto err;
+	g_hw_pipe.jpg_streaming = true;
+
+	fs_dev = g_hw_pipe.m2sc_dev[g_hw_pipe.m2sc_count > 1 ? 1 : 0];
+	if (!hw_m2sc_ctx_init(&g_hw_pipe.sc_card, g_hw_pipe.m2sc_dev[0], 275, 312, false))
+		goto err;
+	if (!hw_m2sc_ctx_init(&g_hw_pipe.sc_fs, fs_dev, SHELL_SCREEN_W, SHELL_SCREEN_H, false))
+		goto err;
+	(void)hw_m2sc_ctx_init(&g_hw_pipe.sc_vid, fs_dev, SHELL_SCREEN_W, SHELL_SCREEN_H, true);
+
+	g_hw_pipe.ready = true;
+	return true;
+
+err:
+	hw_pipe_close();
+	return false;
+}
+
+/* Compute centered object-fit:cover source crop rectangle (even-aligned for NV12) */
+static void compute_cover_crop_rect(int src_w, int src_h, int dst_w, int dst_h,
+				    struct v4l2_rect *r)
+{
+	int sw = src_w & ~1;
+	int sh = src_h & ~1;
+	int cw, ch;
+
+	if (sw < 16)
+		sw = 16;
+	if (sh < 16)
+		sh = 16;
+
+	if ((int64_t)sw * dst_h >= (int64_t)sh * dst_w) {
+		ch = sh;
+		cw = (int)(((int64_t)sh * dst_w) / dst_h) & ~1;
+	} else {
+		cw = sw;
+		ch = (int)(((int64_t)sw * dst_h) / dst_w) & ~1;
+	}
+	if (cw < 16)
+		cw = 16;
+	if (ch < 16)
+		ch = 16;
+	if (cw > sw)
+		cw = sw;
+	if (ch > sh)
+		ch = sh;
+
+	/* Respect M2SC hardware polyphase step limits (< 8x H, <= 7x V) */
+	if (cw >= 8 * dst_w)
+		cw = (8 * dst_w - 2) & ~1;
+	if (ch > 7 * dst_h)
+		ch = (7 * dst_h) & ~1;
+
+	r->left = ((sw - cw) / 2) & ~1;
+	r->top = ((sh - ch) / 2) & ~1;
+	r->width = cw;
+	r->height = ch;
+}
+
+static bool hw_m2sc_queue_job(struct hw_m2sc_ctx *sc, const struct v4l2_rect *crop)
+{
+	struct v4l2_buffer ob, cb;
+
+	if (!sc || sc->fd < 0 || !sc->streaming)
+		return false;
+
+	if (crop->left != sc->last_crop.left ||
+	    crop->top != sc->last_crop.top ||
+	    crop->width != sc->last_crop.width ||
+	    crop->height != sc->last_crop.height) {
+		struct v4l2_selection sel = {
+			.type = V4L2_BUF_TYPE_VIDEO_OUTPUT,
+			.target = V4L2_SEL_TGT_CROP,
+			.r = *crop,
+		};
+		if (xioctl_v4l2(sc->fd, VIDIOC_S_SELECTION, &sel) < 0)
+			return false;
+		sc->last_crop = *crop;
+	}
+
+	memset(&ob, 0, sizeof(ob));
+	ob.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	ob.memory = V4L2_MEMORY_DMABUF;
+	ob.index = 0;
+	ob.m.fd = g_hw_pipe.nv12_dmabuf_fd;
+	ob.bytesused = sc->out_sizeimage;
+	ob.length = sc->out_sizeimage;
+	if (xioctl_v4l2(sc->fd, VIDIOC_QBUF, &ob) < 0)
+		return false;
+
+	memset(&cb, 0, sizeof(cb));
+	cb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	cb.memory = V4L2_MEMORY_MMAP;
+	cb.index = 0;
+	if (xioctl_v4l2(sc->fd, VIDIOC_QBUF, &cb) < 0) {
+		(void)xioctl_v4l2(sc->fd, VIDIOC_DQBUF, &ob);
+		return false;
+	}
+	return true;
+}
+
+static bool hw_m2sc_wait_job(struct hw_m2sc_ctx *sc, uint32_t *dst_pixels)
+{
+	struct v4l2_buffer ob, cb;
+	bool ok = true;
+
+	memset(&cb, 0, sizeof(cb));
+	cb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	cb.memory = V4L2_MEMORY_MMAP;
+	if (xioctl_v4l2(sc->fd, VIDIOC_DQBUF, &cb) < 0 ||
+	    (cb.flags & V4L2_BUF_FLAG_ERROR))
+		ok = false;
+
+	memset(&ob, 0, sizeof(ob));
+	ob.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	ob.memory = V4L2_MEMORY_DMABUF;
+	if (xioctl_v4l2(sc->fd, VIDIOC_DQBUF, &ob) < 0)
+		ok = false;
+
+	if (ok && dst_pixels) {
+		size_t bytes = (size_t)sc->dst_w * sc->dst_h * sizeof(uint32_t);
+		if (bytes <= sc->cap_len)
+			memcpy(dst_pixels, sc->cap_ptr, bytes);
+		else
+			ok = false;
+	}
+	return ok;
+}
+
+/*
+ * Run a zero-copy M2SC job that DMAs the scaled 1280x720 XRGB32 output
+ * directly into the caller's DRM scanout DMABUF fd (zero CPU copies!).
+ */
+static bool hw_m2sc_dmabuf_run(struct hw_m2sc_ctx *sc,
+			       const struct v4l2_rect *crop,
+			       int buf_idx, int dst_dmabuf_fd)
+{
+	struct v4l2_buffer ob, cb;
+	bool ok = true;
+
+	if (!sc || sc->fd < 0 || !sc->streaming || !sc->cap_dmabuf ||
+	    buf_idx < 0 || buf_idx > 1 || dst_dmabuf_fd < 0)
+		return false;
+
+	if (crop->left != sc->last_crop.left ||
+	    crop->top != sc->last_crop.top ||
+	    crop->width != sc->last_crop.width ||
+	    crop->height != sc->last_crop.height) {
+		struct v4l2_selection sel = {
+			.type = V4L2_BUF_TYPE_VIDEO_OUTPUT,
+			.target = V4L2_SEL_TGT_CROP,
+			.r = *crop,
+		};
+		if (xioctl_v4l2(sc->fd, VIDIOC_S_SELECTION, &sel) < 0)
+			return false;
+		sc->last_crop = *crop;
+	}
+
+	memset(&ob, 0, sizeof(ob));
+	ob.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	ob.memory = V4L2_MEMORY_DMABUF;
+	ob.index = 0;
+	ob.m.fd = g_hw_pipe.nv12_dmabuf_fd;
+	ob.bytesused = sc->out_sizeimage;
+	ob.length = sc->out_sizeimage;
+	if (xioctl_v4l2(sc->fd, VIDIOC_QBUF, &ob) < 0)
+		return false;
+
+	memset(&cb, 0, sizeof(cb));
+	cb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	cb.memory = V4L2_MEMORY_DMABUF;
+	cb.index = (uint32_t)buf_idx;
+	cb.m.fd = dst_dmabuf_fd;
+	cb.bytesused = sc->cap_sizeimage;
+	cb.length = sc->cap_sizeimage;
+	if (xioctl_v4l2(sc->fd, VIDIOC_QBUF, &cb) < 0) {
+		(void)xioctl_v4l2(sc->fd, VIDIOC_DQBUF, &ob);
+		return false;
+	}
+
+	memset(&cb, 0, sizeof(cb));
+	cb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	cb.memory = V4L2_MEMORY_DMABUF;
+	if (xioctl_v4l2(sc->fd, VIDIOC_DQBUF, &cb) < 0 ||
+	    (cb.flags & V4L2_BUF_FLAG_ERROR))
+		ok = false;
+
+	memset(&ob, 0, sizeof(ob));
+	ob.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	ob.memory = V4L2_MEMORY_DMABUF;
+	if (xioctl_v4l2(sc->fd, VIDIOC_DQBUF, &ob) < 0)
+		ok = false;
+
+	return ok;
+}
+
+/* Run s5l8947x-jpeg on the bitstream already placed in g_hw_pipe.jpg_out_ptr */
+static bool hw_jpeg_run_bitstream(size_t jpg_len, int *out_w, int *out_h)
+{
+	struct v4l2_buffer ob, cb;
+	int src_w = 0, src_h = 0;
+	bool ok = true;
+
+	if (!parse_jpeg_sof0_dims(g_hw_pipe.jpg_out_ptr, jpg_len, &src_w, &src_h))
+		return false;
+	if (src_w > (int)g_hw_pipe.nv12_pix.width ||
+	    src_h > (int)g_hw_pipe.nv12_pix.height)
+		return false;
+
+	memset(&ob, 0, sizeof(ob));
+	ob.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	ob.memory = V4L2_MEMORY_MMAP;
+	ob.index = 0;
+	ob.bytesused = (uint32_t)jpg_len;
+	if (xioctl_v4l2(g_hw_pipe.jpg_fd, VIDIOC_QBUF, &ob) < 0)
+		return false;
+
+	memset(&cb, 0, sizeof(cb));
+	cb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	cb.memory = V4L2_MEMORY_MMAP;
+	cb.index = 0;
+	if (xioctl_v4l2(g_hw_pipe.jpg_fd, VIDIOC_QBUF, &cb) < 0) {
+		(void)xioctl_v4l2(g_hw_pipe.jpg_fd, VIDIOC_DQBUF, &ob);
+		return false;
+	}
+
+	memset(&cb, 0, sizeof(cb));
+	cb.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	cb.memory = V4L2_MEMORY_MMAP;
+	if (xioctl_v4l2(g_hw_pipe.jpg_fd, VIDIOC_DQBUF, &cb) < 0 ||
+	    (cb.flags & V4L2_BUF_FLAG_ERROR))
+		ok = false;
+
+	memset(&ob, 0, sizeof(ob));
+	ob.type = V4L2_BUF_TYPE_VIDEO_OUTPUT;
+	ob.memory = V4L2_MEMORY_MMAP;
+	if (xioctl_v4l2(g_hw_pipe.jpg_fd, VIDIOC_DQBUF, &ob) < 0 ||
+	    (ob.flags & V4L2_BUF_FLAG_ERROR))
+		ok = false;
+
+	if (!ok)
+		return false;
+
+	*out_w = src_w;
+	*out_h = src_h;
+	return true;
+}
+
+/*
+ * Decode a baseline JPEG file on s5l8947x-jpeg directly into the persistent
+ * NV12 DMABUF, then crop & polyphase-scale on s5l8947x-m2sc (scaler0 for
+ * 275x312 cards, scaler1 for 1280x720 fullscreen/video).
+ */
+static bool hw_decode_and_scale_jpeg_file(const char *path,
+					  uint32_t **out_card_275,
+					  uint32_t **out_fs_720p,
+					  uint32_t *fs_inplace_buf)
+{
+	int src_w = 0, src_h = 0;
+	bool need_card = (out_card_275 != NULL);
+	bool need_fs = (out_fs_720p != NULL || fs_inplace_buf != NULL);
+
+	if (!path || !path[0] || (!need_card && !need_fs))
+		return false;
+	if (!hw_pipe_init())
+		return false;
+
+	/* Reuse the already-decoded NV12 DMABUF if the same file was just decoded */
+	if (g_hw_pipe.last_jpg_path[0] &&
+	    strcmp(g_hw_pipe.last_jpg_path, path) == 0 &&
+	    g_hw_pipe.last_src_w >= 16 && g_hw_pipe.last_src_h >= 16) {
+		src_w = g_hw_pipe.last_src_w;
+		src_h = g_hw_pipe.last_src_h;
+	} else {
+		ssize_t n = read_jpeg_or_mov_frame0(path, g_hw_pipe.jpg_out_ptr,
+						    g_hw_pipe.jpg_out_len);
+		if (n <= 16) {
+			g_hw_pipe.last_jpg_path[0] = '\0';
+			return false;
+		}
+		if (!hw_jpeg_run_bitstream((size_t)n, &src_w, &src_h)) {
+			g_hw_pipe.last_jpg_path[0] = '\0';
+			return false;
+		}
+		snprintf(g_hw_pipe.last_jpg_path, sizeof(g_hw_pipe.last_jpg_path),
+			 "%s", path);
+		g_hw_pipe.last_src_w = src_w;
+		g_hw_pipe.last_src_h = src_h;
+	}
+
+	uint32_t *card_buf = NULL;
+	uint32_t *fs_buf = fs_inplace_buf;
+
+	if (need_card) {
+		card_buf = malloc(275 * 312 * sizeof(uint32_t));
+		if (!card_buf)
+			return false;
+	}
+	if (out_fs_720p) {
+		fs_buf = malloc((size_t)SHELL_SCREEN_W * SHELL_SCREEN_H * sizeof(uint32_t));
+		if (!fs_buf) {
+			free(card_buf);
+			return false;
+		}
+	}
+
+	struct v4l2_rect card_crop, fs_crop;
+	bool card_queued = false, fs_queued = false;
+	bool ok = true;
+
+	if (need_card) {
+		compute_cover_crop_rect(src_w, src_h, 275, 312, &card_crop);
+		card_queued = hw_m2sc_queue_job(&g_hw_pipe.sc_card, &card_crop);
+		if (!card_queued)
+			ok = false;
+	}
+	if (ok && need_fs) {
+		compute_cover_crop_rect(src_w, src_h, SHELL_SCREEN_W, SHELL_SCREEN_H, &fs_crop);
+		fs_queued = hw_m2sc_queue_job(&g_hw_pipe.sc_fs, &fs_crop);
+		if (!fs_queued)
+			ok = false;
+	}
+
+	if (card_queued && !hw_m2sc_wait_job(&g_hw_pipe.sc_card, card_buf))
+		ok = false;
+	if (fs_queued && !hw_m2sc_wait_job(&g_hw_pipe.sc_fs, fs_buf))
+		ok = false;
+
+	if (!ok) {
+		free(card_buf);
+		if (out_fs_720p)
+			free(fs_buf);
+		return false;
+	}
+
+	if (out_card_275)
+		*out_card_275 = card_buf;
+	if (out_fs_720p)
+		*out_fs_720p = fs_buf;
+	return true;
 }
 
 static uint32_t *hw_jpeg_decode_raw(const uint8_t *jpg, size_t jpg_len,
@@ -410,58 +1279,29 @@ static uint32_t *hw_jpeg_decode_raw(const uint8_t *jpg, size_t jpg_len,
 {
 	int src_w = 0, src_h = 0;
 
-	discover_v4l2_devices();
-	if (!g_v4l2_jpeg_dev[0] || !g_v4l2_m2sc_dev[0])
-		return NULL;
-	if (!parse_jpeg_sof0_dims(jpg, jpg_len, &src_w, &src_h))
-		return NULL;
-	if (src_w > 4096 || src_h > 4096)
+	if (!hw_pipe_init() || jpg_len > g_hw_pipe.jpg_out_len)
 		return NULL;
 
-	uint32_t aw = ((uint32_t)src_w + 15U) & ~15U;
-	uint32_t ah = ((uint32_t)src_h + 15U) & ~15U;
-	size_t nv12_sz = (size_t)aw * ah * 3 / 2;
-	uint8_t *nv12 = malloc(nv12_sz);
-	if (!nv12)
+	memcpy(g_hw_pipe.jpg_out_ptr, jpg, jpg_len);
+	g_hw_pipe.last_jpg_path[0] = '\0';
+	if (!hw_jpeg_run_bitstream(jpg_len, &src_w, &src_h))
 		return NULL;
 
-	if (m2m_run_one(g_v4l2_jpeg_dev, V4L2_PIX_FMT_JPEG, aw, ah,
-			jpg, jpg_len, jpg_len + 4096,
-			V4L2_PIX_FMT_NV12, aw, ah, nv12, nv12_sz) < 0) {
-		free(nv12);
+	uint32_t *fs_buf = malloc((size_t)SHELL_SCREEN_W * SHELL_SCREEN_H * sizeof(uint32_t));
+	if (!fs_buf)
+		return NULL;
+
+	struct v4l2_rect fs_crop;
+	compute_cover_crop_rect(src_w, src_h, SHELL_SCREEN_W, SHELL_SCREEN_H, &fs_crop);
+	if (!hw_m2sc_queue_job(&g_hw_pipe.sc_fs, &fs_crop) ||
+	    !hw_m2sc_wait_job(&g_hw_pipe.sc_fs, fs_buf)) {
+		free(fs_buf);
 		return NULL;
 	}
 
-	int dst_w = (src_w == 1280 && src_h == 720) ? 1280 : (src_w & ~1);
-	int dst_h = (src_w == 1280 && src_h == 720) ? 720 : (src_h & ~1);
-	if (dst_w > 1280 || dst_h > 720) {
-		dst_w = 1280;
-		dst_h = 720;
-	}
-	size_t xrgb_sz = (size_t)dst_w * dst_h * sizeof(uint32_t);
-	uint32_t *xrgb = malloc(xrgb_sz);
-	if (!xrgb) {
-		free(nv12);
-		return NULL;
-	}
-
-	if (m2m_run_one(g_v4l2_m2sc_dev, V4L2_PIX_FMT_NV12, (uint32_t)(src_w & ~1), (uint32_t)(src_h & ~1),
-			nv12, nv12_sz, nv12_sz,
-			V4L2_PIX_FMT_XRGB32, (uint32_t)dst_w, (uint32_t)dst_h,
-			xrgb, xrgb_sz) < 0) {
-		free(nv12);
-		free(xrgb);
-		return NULL;
-	}
-	free(nv12);
-
-	size_t total = (size_t)dst_w * dst_h;
-	for (size_t i = 0; i < total; i++)
-		xrgb[i] |= 0xff000000U;
-
-	*out_w = dst_w;
-	*out_h = dst_h;
-	return xrgb;
+	*out_w = SHELL_SCREEN_W;
+	*out_h = SHELL_SCREEN_H;
+	return fs_buf;
 }
 #endif
 
@@ -1151,7 +1991,7 @@ static uint32_t *load_ppm_raw(const uint8_t *buf, size_t len, int *out_w, int *o
 	return pixels;
 }
 
-/* Decode a JPEG or PPM file into a raw XRGB8888 surface (hardware V4L2 first, C fallback) */
+/* Decode a JPEG, QuickTime .mov (frame 0), or PPM file into a raw XRGB8888 surface */
 static uint32_t *decode_image_file_raw(const char *path, int *out_w, int *out_h)
 {
 	FILE *fp;
@@ -1161,6 +2001,30 @@ static uint32_t *decode_image_file_raw(const char *path, int *out_w, int *out_h)
 
 	if (!path || !path[0])
 		return NULL;
+
+	if (qt_mov_open_path(path)) {
+		struct qt_mov_sample s0 = g_qt_mov.samples[0];
+		if (s0.size <= 16 || s0.size > 4 * 1024 * 1024)
+			return NULL;
+		fbuf = malloc(s0.size);
+		if (!fbuf)
+			return NULL;
+		if (pread(g_qt_mov.fd, fbuf, s0.size, (off_t)s0.offset) != (ssize_t)s0.size) {
+			free(fbuf);
+			return NULL;
+		}
+#ifdef __linux__
+		raw = hw_jpeg_decode_raw(fbuf, s0.size, out_w, out_h);
+		if (raw) {
+			free(fbuf);
+			return raw;
+		}
+#endif
+		raw = sw_jpeg_decode_raw(fbuf, s0.size, out_w, out_h);
+		free(fbuf);
+		return raw;
+	}
+
 	fp = fopen(path, "rb");
 	if (!fp)
 		return NULL;
@@ -1744,6 +2608,11 @@ static struct uri_cache_entry *get_uri_cache_entry(const char *resolved_path, bo
 
 	if (hit) {
 		if (need_fs && !hit->fs_720p) {
+#ifdef __linux__
+			if (hw_decode_and_scale_jpeg_file(resolved_path, NULL,
+							  &hit->fs_720p, NULL))
+				return hit;
+#endif
 			int rw = 0, rh = 0;
 			uint32_t *raw = decode_image_file_raw(resolved_path, &rw, &rh);
 			if (raw) {
@@ -1766,6 +2635,27 @@ static struct uri_cache_entry *get_uri_cache_entry(const char *resolved_path, bo
 			victim = i;
 		}
 	}
+
+#ifdef __linux__
+	{
+		uint32_t *hw_card = NULL;
+		uint32_t *hw_fs = NULL;
+
+		if (hw_decode_and_scale_jpeg_file(resolved_path, &hw_card,
+						  need_fs ? &hw_fs : NULL, NULL)) {
+			struct uri_cache_entry *e = &g_uri_cache[victim];
+
+			free(e->card_275);
+			free(e->fs_720p);
+			memset(e, 0, sizeof(*e));
+			snprintf(e->path, sizeof(e->path), "%s", resolved_path);
+			e->last_used = ++g_cache_clock;
+			e->card_275 = hw_card;
+			e->fs_720p = hw_fs;
+			return e;
+		}
+	}
+#endif
 
 	int rw = 0, rh = 0;
 	uint32_t *raw = decode_image_file_raw(resolved_path, &rw, &rh);
@@ -1802,6 +2692,12 @@ static const uint32_t *ensure_preset_art_loaded(enum giri_preset_art preset)
 
 	ph_name = preset_placeholder_names[preset];
 	if (ph_name && resolve_placeholder_path(ph_name, ph_path, sizeof(ph_path))) {
+#ifdef __linux__
+		if (hw_decode_and_scale_jpeg_file(ph_path,
+						  &g_art_cache[preset].card_275,
+						  NULL, NULL))
+			return g_art_cache[preset].card_275;
+#endif
 		int rw = 0, rh = 0;
 		uint32_t *raw = decode_image_file_raw(ph_path, &rw, &rh);
 		if (raw) {
@@ -1822,6 +2718,376 @@ static const uint32_t *ensure_preset_art_loaded(enum giri_preset_art preset)
 	return g_art_cache[preset].card_275;
 }
 
+static bool qt_mov_open_for_card(const struct giri_media_card *card)
+{
+	char resolved[512];
+
+	if (!card)
+		return false;
+	if (card->uri[0] && resolve_media_path(card->uri, resolved, sizeof(resolved))) {
+		if (qt_mov_open_path(resolved))
+			return true;
+	}
+	if (card->detail_text[0] &&
+	    resolve_media_path(card->detail_text, resolved, sizeof(resolved))) {
+		if (qt_mov_open_path(resolved))
+			return true;
+	}
+	return false;
+}
+
+/* =========================================================================
+ * 5b. S5L8947X Direct Kernel ALSA Audio Engine (/dev/snd/pcmC0D0p HDMI I2S
+ *     & /dev/snd/pcmC0D1p Optical S/PDIF) for Synchronized .mov Playback
+ * ========================================================================= */
+
+#define VID_PCM_PERIOD_FRAMES	1024
+#define VID_PCM_BUFFER_FRAMES	4096
+#define VID_OPT_PERIOD_FRAMES	1000
+#define VID_OPT_BUFFER_FRAMES	4000
+
+static struct {
+	pthread_mutex_t lock;
+	pthread_t thread;
+	volatile bool running;
+	volatile bool paused;
+	volatile bool hw_active;
+	int aud_fd;
+	uint32_t rate;
+	uint32_t chunk_count;
+	uint32_t total_frames;
+	uint32_t pcm_pos;
+	uint32_t cur_chunk;
+	uint32_t primed_frames;
+	uint32_t synth_phase;
+	struct qt_mov_audio_chunk chunks[QT_MOV_MAX_FRAMES];
+} g_vid_audio = {
+	.lock = PTHREAD_MUTEX_INITIALIZER,
+	.aud_fd = -1,
+	.rate = 48000,
+};
+
+#ifdef __linux__
+static void alsa_hw_mask_set(struct snd_pcm_hw_params *p, int param, unsigned int bit)
+{
+	struct snd_mask *mask = &p->masks[param - SNDRV_PCM_HW_PARAM_FIRST_MASK];
+
+	memset(mask, 0, sizeof(*mask));
+	mask->bits[bit / 32] |= 1U << (bit % 32);
+}
+
+static void alsa_hw_interval_set(struct snd_pcm_hw_params *p, int param, unsigned int val)
+{
+	struct snd_interval *iv =
+		&p->intervals[param - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL];
+
+	memset(iv, 0, sizeof(*iv));
+	iv->min = val;
+	iv->max = val;
+	iv->integer = 1;
+}
+
+static int alsa_pcm_configure(int fd, unsigned int rate,
+			      unsigned int period_frames,
+			      unsigned int buffer_frames)
+{
+	struct snd_pcm_hw_params hw;
+	int i;
+
+	memset(&hw, 0, sizeof(hw));
+	for (i = 0; i <= SNDRV_PCM_HW_PARAM_LAST_MASK - SNDRV_PCM_HW_PARAM_FIRST_MASK; i++)
+		memset(&hw.masks[i], 0xff, sizeof(hw.masks[i]));
+	for (i = 0; i <= SNDRV_PCM_HW_PARAM_LAST_INTERVAL - SNDRV_PCM_HW_PARAM_FIRST_INTERVAL; i++)
+		hw.intervals[i].max = ~0U;
+
+	alsa_hw_mask_set(&hw, SNDRV_PCM_HW_PARAM_ACCESS, SNDRV_PCM_ACCESS_RW_INTERLEAVED);
+	alsa_hw_mask_set(&hw, SNDRV_PCM_HW_PARAM_FORMAT, SNDRV_PCM_FORMAT_S16_LE);
+	alsa_hw_mask_set(&hw, SNDRV_PCM_HW_PARAM_SUBFORMAT, SNDRV_PCM_SUBFORMAT_STD);
+	alsa_hw_interval_set(&hw, SNDRV_PCM_HW_PARAM_CHANNELS, 2);
+	alsa_hw_interval_set(&hw, SNDRV_PCM_HW_PARAM_RATE, rate);
+	alsa_hw_interval_set(&hw, SNDRV_PCM_HW_PARAM_PERIOD_SIZE, period_frames);
+	alsa_hw_interval_set(&hw, SNDRV_PCM_HW_PARAM_BUFFER_SIZE, buffer_frames);
+	hw.rmask = ~0U;
+
+	if (ioctl(fd, SNDRV_PCM_IOCTL_HW_PARAMS, &hw) < 0)
+		return -1;
+	if (ioctl(fd, SNDRV_PCM_IOCTL_PREPARE) < 0)
+		return -1;
+	return 0;
+}
+
+static void vid_audio_fill_period_locked(int16_t *dst_stereo, uint32_t frames)
+{
+	if (g_vid_audio.aud_fd >= 0 && g_vid_audio.chunk_count > 0 &&
+	    g_vid_audio.total_frames > 0) {
+		while (frames > 0) {
+			uint32_t pos = g_vid_audio.pcm_pos % g_vid_audio.total_frames;
+			uint32_t cnt = g_vid_audio.chunk_count;
+			uint32_t idx = g_vid_audio.cur_chunk % cnt;
+			uint32_t step;
+			const struct qt_mov_audio_chunk *ch = &g_vid_audio.chunks[idx];
+
+			for (step = 0; step < cnt; step++) {
+				ch = &g_vid_audio.chunks[idx];
+				if (pos >= ch->start_frame &&
+				    pos < ch->start_frame + ch->pcm_frames) {
+					g_vid_audio.cur_chunk = idx;
+					break;
+				}
+				idx = (idx + 1) % cnt;
+			}
+
+			uint32_t in_off = (pos >= ch->start_frame &&
+					   pos < ch->start_frame + ch->pcm_frames) ?
+					  (pos - ch->start_frame) : 0;
+			uint32_t avail = (ch->pcm_frames > in_off) ?
+					 (ch->pcm_frames - in_off) : 1;
+			uint32_t take = frames < avail ? frames : avail;
+			off_t byte_off = (off_t)ch->offset + (off_t)in_off * 4;
+
+			if (pread(g_vid_audio.aud_fd, dst_stereo, take * 4, byte_off) !=
+			    (ssize_t)(take * 4)) {
+				memset(dst_stereo, 0, take * 4);
+			}
+			dst_stereo += take * 2;
+			frames -= take;
+			g_vid_audio.pcm_pos = (pos + take) % g_vid_audio.total_frames;
+			if (in_off + take >= ch->pcm_frames)
+				g_vid_audio.cur_chunk = (g_vid_audio.cur_chunk + 1) % cnt;
+		}
+		return;
+	}
+
+	/* Gentle stereo ambient harmonic chord for non-.mov video stream cards */
+	{
+		uint32_t i;
+		float rate_f = (float)(g_vid_audio.rate > 0 ? g_vid_audio.rate : 48000);
+
+		for (i = 0; i < frames; i++) {
+			uint32_t p = g_vid_audio.synth_phase++;
+			float t = (float)p / rate_f;
+			float env = 0.55f + 0.35f * sinf(t * 0.8f);
+			float l = sinf(t * 2.0f * 3.14159265f * 220.0f) * 0.45f +
+				  sinf(t * 2.0f * 3.14159265f * 329.63f) * 0.30f +
+				  sinf(t * 2.0f * 3.14159265f * 440.0f) * 0.20f;
+			float r = sinf(t * 2.0f * 3.14159265f * 220.5f) * 0.45f +
+				  sinf(t * 2.0f * 3.14159265f * 330.0f) * 0.30f +
+				  sinf(t * 2.0f * 3.14159265f * 554.37f) * 0.20f;
+			dst_stereo[i * 2]     = (int16_t)(l * env * 2800.0f);
+			dst_stereo[i * 2 + 1] = (int16_t)(r * env * 2800.0f);
+		}
+		if (g_vid_audio.total_frames > 0)
+			g_vid_audio.pcm_pos = (g_vid_audio.pcm_pos + frames) %
+					      g_vid_audio.total_frames;
+	}
+}
+
+static void *alsa_video_audio_worker(void *arg)
+{
+	int16_t period_buf[VID_PCM_PERIOD_FRAMES * 2];
+	int16_t opt_buf[VID_OPT_PERIOD_FRAMES * 2];
+	int hdmi_fd = -1;
+	int opt_fd = -1;
+	unsigned int rate = g_vid_audio.rate ? g_vid_audio.rate : 48000;
+
+	(void)arg;
+	hdmi_fd = open("/dev/snd/pcmC0D0p", O_WRONLY | O_CLOEXEC);
+	if (hdmi_fd >= 0) {
+		if (alsa_pcm_configure(hdmi_fd, rate,
+				       VID_PCM_PERIOD_FRAMES,
+				       VID_PCM_BUFFER_FRAMES) < 0) {
+			if (alsa_pcm_configure(hdmi_fd, 48000,
+					       VID_PCM_PERIOD_FRAMES,
+					       VID_PCM_BUFFER_FRAMES) == 0) {
+				g_vid_audio.rate = 48000;
+			} else {
+				close(hdmi_fd);
+				hdmi_fd = -1;
+			}
+		}
+	}
+
+	opt_fd = open("/dev/snd/pcmC0D1p", O_WRONLY | O_NONBLOCK | O_CLOEXEC);
+	if (opt_fd >= 0) {
+		if (alsa_pcm_configure(opt_fd, 46875,
+				       VID_OPT_PERIOD_FRAMES,
+				       VID_OPT_BUFFER_FRAMES) < 0) {
+			close(opt_fd);
+			opt_fd = -1;
+		}
+	}
+
+	if (hdmi_fd < 0 && opt_fd < 0) {
+		g_vid_audio.hw_active = false;
+		return NULL;
+	}
+	g_vid_audio.hw_active = true;
+
+	while (g_vid_audio.running) {
+		if (g_vid_audio.paused) {
+			usleep(10000);
+			continue;
+		}
+
+		pthread_mutex_lock(&g_vid_audio.lock);
+		vid_audio_fill_period_locked(period_buf, VID_PCM_PERIOD_FRAMES);
+		g_vid_audio.primed_frames += VID_PCM_PERIOD_FRAMES;
+		pthread_mutex_unlock(&g_vid_audio.lock);
+
+		if (hdmi_fd >= 0) {
+			struct snd_xferi xfer = {
+				.buf = period_buf,
+				.frames = VID_PCM_PERIOD_FRAMES,
+			};
+			while (g_vid_audio.running && !g_vid_audio.paused &&
+			       ioctl(hdmi_fd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &xfer) < 0) {
+				if (errno == EINTR)
+					continue;
+				if (errno == EPIPE) {
+					(void)ioctl(hdmi_fd, SNDRV_PCM_IOCTL_PREPARE);
+					continue;
+				}
+				usleep(5000);
+				break;
+			}
+		}
+
+		if (opt_fd >= 0) {
+			int i;
+			struct snd_xferi xfer_opt = {
+				.buf = opt_buf,
+				.frames = VID_OPT_PERIOD_FRAMES,
+			};
+			for (i = 0; i < VID_OPT_PERIOD_FRAMES; i++) {
+				int s = (i * VID_PCM_PERIOD_FRAMES) / VID_OPT_PERIOD_FRAMES;
+				opt_buf[i * 2]     = period_buf[s * 2];
+				opt_buf[i * 2 + 1] = period_buf[s * 2 + 1];
+			}
+			if (ioctl(opt_fd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &xfer_opt) < 0 &&
+			    errno == EPIPE) {
+				(void)ioctl(opt_fd, SNDRV_PCM_IOCTL_PREPARE);
+				(void)ioctl(opt_fd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &xfer_opt);
+			}
+			if (hdmi_fd < 0)
+				usleep(21333);
+		}
+	}
+
+	g_vid_audio.hw_active = false;
+	if (hdmi_fd >= 0)
+		close(hdmi_fd);
+	if (opt_fd >= 0)
+		close(opt_fd);
+	return NULL;
+}
+#endif
+
+void shell_media_audio_stop(void)
+{
+#ifdef __linux__
+	if (g_vid_audio.running) {
+		g_vid_audio.running = false;
+		pthread_join(g_vid_audio.thread, NULL);
+	}
+#endif
+	pthread_mutex_lock(&g_vid_audio.lock);
+	if (g_vid_audio.aud_fd >= 0) {
+		close(g_vid_audio.aud_fd);
+		g_vid_audio.aud_fd = -1;
+	}
+	g_vid_audio.hw_active = false;
+	g_vid_audio.chunk_count = 0;
+	g_vid_audio.total_frames = 0;
+	g_vid_audio.pcm_pos = 0;
+	g_vid_audio.cur_chunk = 0;
+	g_vid_audio.primed_frames = 0;
+	pthread_mutex_unlock(&g_vid_audio.lock);
+}
+
+void shell_media_audio_start(const struct giri_media_card *card)
+{
+	shell_media_audio_stop();
+	if (!card)
+		return;
+
+	(void)qt_mov_open_for_card(card);
+
+	pthread_mutex_lock(&g_vid_audio.lock);
+	if (g_qt_mov.fd >= 0 && g_qt_mov.audio_chunk_count > 0 &&
+	    g_qt_mov.audio_total_frames > 0) {
+		g_vid_audio.aud_fd = open(g_qt_mov.path, O_RDONLY | O_CLOEXEC);
+		g_vid_audio.rate = g_qt_mov.audio_rate ? g_qt_mov.audio_rate : 48000;
+		g_vid_audio.chunk_count = g_qt_mov.audio_chunk_count;
+		g_vid_audio.total_frames = g_qt_mov.audio_total_frames;
+		memcpy(g_vid_audio.chunks, g_qt_mov.audio_chunks,
+		       (size_t)g_vid_audio.chunk_count * sizeof(struct qt_mov_audio_chunk));
+	} else {
+		g_vid_audio.aud_fd = -1;
+		g_vid_audio.rate = 48000;
+		g_vid_audio.chunk_count = 0;
+		g_vid_audio.total_frames = 48000 * 15;
+	}
+	g_vid_audio.pcm_pos = 0;
+	g_vid_audio.cur_chunk = 0;
+	g_vid_audio.primed_frames = 0;
+	g_vid_audio.synth_phase = 0;
+	g_vid_audio.paused = false;
+	g_vid_audio.running = true;
+	pthread_mutex_unlock(&g_vid_audio.lock);
+
+#ifdef __linux__
+	if (pthread_create(&g_vid_audio.thread, NULL, alsa_video_audio_worker, NULL) != 0) {
+		g_vid_audio.running = false;
+		if (g_vid_audio.aud_fd >= 0) {
+			close(g_vid_audio.aud_fd);
+			g_vid_audio.aud_fd = -1;
+		}
+	}
+#endif
+}
+
+void shell_media_audio_set_paused(bool paused)
+{
+	pthread_mutex_lock(&g_vid_audio.lock);
+	g_vid_audio.paused = paused;
+	pthread_mutex_unlock(&g_vid_audio.lock);
+}
+
+void shell_media_audio_seek_sec(int elapsed_sec)
+{
+	if (elapsed_sec < 0)
+		elapsed_sec = 0;
+	pthread_mutex_lock(&g_vid_audio.lock);
+	if (g_vid_audio.total_frames > 0 && g_vid_audio.rate > 0) {
+		g_vid_audio.pcm_pos = (uint32_t)(((uint64_t)elapsed_sec * g_vid_audio.rate) %
+						 g_vid_audio.total_frames);
+		g_vid_audio.cur_chunk = 0;
+		g_vid_audio.primed_frames = 0;
+	}
+	pthread_mutex_unlock(&g_vid_audio.lock);
+}
+
+int shell_media_audio_get_frame_idx(int fps, int total_frames)
+{
+	int fidx = -1;
+
+	if (!g_vid_audio.running || !g_vid_audio.hw_active ||
+	    fps <= 0 || total_frames <= 0)
+		return -1;
+
+	pthread_mutex_lock(&g_vid_audio.lock);
+	if (g_vid_audio.total_frames > 0 && g_vid_audio.rate > 0) {
+		uint32_t tot = g_vid_audio.total_frames;
+		uint32_t lat = g_vid_audio.primed_frames < 3072 ?
+			       g_vid_audio.primed_frames : 3072;
+		uint32_t audible = (g_vid_audio.pcm_pos + tot - (lat % tot)) % tot;
+		fidx = (int)((((uint64_t)audible * (uint64_t)fps) /
+			      (uint64_t)g_vid_audio.rate) % (uint64_t)total_frames);
+	}
+	pthread_mutex_unlock(&g_vid_audio.lock);
+	return fidx;
+}
+
 void shell_media_init(void)
 {
 	memset(g_art_cache, 0, sizeof(g_art_cache));
@@ -1839,6 +3105,11 @@ void shell_media_free(void)
 {
 	int i;
 
+	shell_media_audio_stop();
+	qt_mov_close();
+#ifdef __linux__
+	hw_pipe_close();
+#endif
 	for (i = 0; i < GIRI_ART_COUNT; i++) {
 		free(g_art_cache[i].card_275);
 		free(g_art_cache[i].fs_720p);
@@ -1980,11 +3251,190 @@ const uint32_t *shell_media_get_fullscreen_art(const struct giri_media_card *car
 
 	(void)ensure_preset_art_loaded(preset);
 	if (!g_art_cache[preset].fs_720p) {
-		g_art_cache[preset].fs_720p = rasterize_preset_surface(preset,
-								       SHELL_SCREEN_W,
-								       SHELL_SCREEN_H);
+		char ph_path[256];
+		const char *ph_name = preset_placeholder_names[preset];
+
+#ifdef __linux__
+		if (ph_name && resolve_placeholder_path(ph_name, ph_path, sizeof(ph_path)))
+			(void)hw_decode_and_scale_jpeg_file(ph_path, NULL,
+							    &g_art_cache[preset].fs_720p, NULL);
+#else
+		(void)ph_path;
+		(void)ph_name;
+#endif
+		if (!g_art_cache[preset].fs_720p) {
+			g_art_cache[preset].fs_720p = rasterize_preset_surface(preset,
+									       SHELL_SCREEN_W,
+									       SHELL_SCREEN_H);
+		}
 	}
 	return g_art_cache[preset].fs_720p;
+}
+
+void shell_media_get_video_info(const struct giri_media_card *card,
+				int *out_fps, int *out_frame_count,
+				int *out_duration_sec)
+{
+	int fps = 24, nframes = 360, dur = 15;
+
+	if (qt_mov_open_for_card(card)) {
+		fps = (int)g_qt_mov.fps;
+		nframes = (int)g_qt_mov.frame_count;
+		dur = (int)g_qt_mov.duration_sec;
+	}
+	if (out_fps)
+		*out_fps = fps;
+	if (out_frame_count)
+		*out_frame_count = nframes;
+	if (out_duration_sec)
+		*out_duration_sec = dur;
+}
+
+#ifdef __linux__
+static void compute_pan_zoom_crop(int src_w, int src_h, int frame_idx,
+				  struct v4l2_rect *anim_r)
+{
+	struct v4l2_rect base_r;
+	int step, phase, dw, dh;
+
+	compute_cover_crop_rect(src_w, src_h, SHELL_SCREEN_W, SHELL_SCREEN_H, &base_r);
+
+	/* Smooth 24 FPS triangle wave 0..180..0 across the 360-frame (15s) cycle */
+	step = frame_idx % 360;
+	if (step < 0)
+		step += 360;
+	phase = (step <= 180) ? step : (360 - step);
+
+	dw = ((base_r.width * 12) / 100) & ~1;
+	dh = ((base_r.height * 12) / 100) & ~1;
+	anim_r->width = (base_r.width - (dw * phase) / 180) & ~1;
+	anim_r->height = (base_r.height - (dh * phase) / 180) & ~1;
+	if (anim_r->width < 64 || anim_r->height < 64) {
+		*anim_r = base_r;
+		return;
+	}
+	anim_r->left = (base_r.left + ((base_r.width - anim_r->width) * phase) / 360) & ~1;
+	anim_r->top = (base_r.top + ((base_r.height - anim_r->height) / 2)) & ~1;
+}
+
+static bool hw_decode_jpeg_file_to_nv12(const char *path, int *out_w, int *out_h)
+{
+	size_t bslen;
+	int src_w = 0, src_h = 0;
+
+	if (!path || !path[0] || !hw_pipe_init())
+		return false;
+
+	if (g_hw_pipe.last_jpg_path[0] &&
+	    strcmp(g_hw_pipe.last_jpg_path, path) == 0 &&
+	    g_hw_pipe.last_src_w >= 16 && g_hw_pipe.last_src_h >= 16) {
+		*out_w = g_hw_pipe.last_src_w;
+		*out_h = g_hw_pipe.last_src_h;
+		return true;
+	}
+
+	bslen = read_jpeg_or_mov_frame0(path, g_hw_pipe.jpg_out_ptr, g_hw_pipe.jpg_out_len);
+	if (bslen <= 16 || !hw_jpeg_run_bitstream(bslen, &src_w, &src_h)) {
+		g_hw_pipe.last_jpg_path[0] = '\0';
+		return false;
+	}
+	snprintf(g_hw_pipe.last_jpg_path, sizeof(g_hw_pipe.last_jpg_path), "%s", path);
+	g_hw_pipe.last_src_w = src_w;
+	g_hw_pipe.last_src_h = src_h;
+	*out_w = src_w;
+	*out_h = src_h;
+	return true;
+}
+
+static bool hw_decode_mov_frame_to_nv12(int frame_idx, int *out_w, int *out_h)
+{
+	uint32_t fidx;
+	struct qt_mov_sample ent;
+	char tag[544];
+	ssize_t n;
+	int src_w = 0, src_h = 0;
+
+	if (g_qt_mov.fd < 0 || g_qt_mov.frame_count == 0 || !hw_pipe_init())
+		return false;
+
+	fidx = (uint32_t)(((frame_idx % (int)g_qt_mov.frame_count) + (int)g_qt_mov.frame_count) %
+			  (int)g_qt_mov.frame_count);
+	ent = g_qt_mov.samples[fidx];
+	if (ent.size <= 16 || ent.size > g_hw_pipe.jpg_out_len)
+		return false;
+
+	snprintf(tag, sizeof(tag), "%.490s#%u", g_qt_mov.path, fidx);
+	if (strcmp(g_hw_pipe.last_jpg_path, tag) == 0 &&
+	    g_hw_pipe.last_src_w >= 16 && g_hw_pipe.last_src_h >= 16) {
+		*out_w = g_hw_pipe.last_src_w;
+		*out_h = g_hw_pipe.last_src_h;
+		return true;
+	}
+
+	n = pread(g_qt_mov.fd, g_hw_pipe.jpg_out_ptr, ent.size, (off_t)ent.offset);
+	if (n != (ssize_t)ent.size || !hw_jpeg_run_bitstream(ent.size, &src_w, &src_h)) {
+		g_hw_pipe.last_jpg_path[0] = '\0';
+		return false;
+	}
+	snprintf(g_hw_pipe.last_jpg_path, sizeof(g_hw_pipe.last_jpg_path), "%.510s", tag);
+	g_hw_pipe.last_src_w = src_w;
+	g_hw_pipe.last_src_h = src_h;
+	*out_w = src_w;
+	*out_h = src_h;
+	return true;
+}
+#endif
+
+/*
+ * Zero-copy hardware video frame renderer:
+ *   1. Decodes the target frame on s5l8947x-jpeg (/dev/video2) into NV12 DMABUF
+ *   2. Crops, scales, and colour-converts on s5l8947x-m2sc (/dev/video1)
+ *      directly into the back DRM scanout DMABUF (@dst_dmabuf_fd)
+ *   3. Zero CPU reads from uncached memory and zero full-screen CPU copies!
+ */
+bool shell_media_render_video_frame_dmabuf(const struct giri_media_card *card,
+					   int frame_idx, int buf_idx,
+					   int dst_dmabuf_fd)
+{
+#ifdef __linux__
+	struct v4l2_rect crop;
+	int src_w = 0, src_h = 0;
+
+	if (!card || buf_idx < 0 || buf_idx > 1 || dst_dmabuf_fd < 0 ||
+	    !hw_pipe_init() || g_hw_pipe.sc_vid.fd < 0)
+		return false;
+
+	/* 1. Continuous 24 FPS QuickTime .mov container */
+	if (qt_mov_open_for_card(card) &&
+	    hw_decode_mov_frame_to_nv12(frame_idx, &src_w, &src_h)) {
+		compute_cover_crop_rect(src_w, src_h, SHELL_SCREEN_W, SHELL_SCREEN_H, &crop);
+		return hw_m2sc_dmabuf_run(&g_hw_pipe.sc_vid, &crop, buf_idx, dst_dmabuf_fd);
+	}
+
+	/* 2. Hardware M2SC pan/zoom video synthesizer for still-backed video cards */
+	{
+		char resolved[256] = "";
+		enum giri_preset_art preset = GIRI_ART_DAWN_RIDGE;
+
+		if (card->preset_art >= 0 && card->preset_art < GIRI_ART_COUNT)
+			preset = card->preset_art;
+		if (!resolve_card_image_path(card, resolved, sizeof(resolved)) &&
+		    preset_placeholder_names[preset]) {
+			(void)resolve_placeholder_path(preset_placeholder_names[preset],
+						       resolved, sizeof(resolved));
+		}
+		if (resolved[0] && hw_decode_jpeg_file_to_nv12(resolved, &src_w, &src_h)) {
+			compute_pan_zoom_crop(src_w, src_h, frame_idx, &crop);
+			return hw_m2sc_dmabuf_run(&g_hw_pipe.sc_vid, &crop, buf_idx, dst_dmabuf_fd);
+		}
+	}
+#else
+	(void)card;
+	(void)frame_idx;
+	(void)buf_idx;
+	(void)dst_dmabuf_fd;
+#endif
+	return false;
 }
 
 const uint32_t *shell_media_get_video_frame(const struct giri_media_card *card,
@@ -1993,34 +3443,39 @@ const uint32_t *shell_media_get_video_frame(const struct giri_media_card *card,
 	if (!card)
 		return NULL;
 
-	const char *src_uri = card->uri[0] ? card->uri : card->detail_text;
-	const char *bn = strrchr(src_uri, '/');
-	bn = bn ? (bn + 1) : src_uri;
+#ifdef __linux__
+	/* Fast hardware V4L2 path (used by --bench and non-DRM fallback) */
+	if (hw_pipe_init()) {
+		struct v4l2_rect crop;
+		int src_w = 0, src_h = 0;
 
-	if (bn && bn[0]) {
-		static const char *const fdirs[] = {
-			"/mnt/data/linux/media/.frames",
-			"/usr/local/share/tvshell/media/.frames",
-			"/usr/share/tvshell/media/.frames",
-			"build/dl/gallery/.frames",
-			NULL
-		};
-		int fidx = frame_idx % 15;
-		if (fidx < 0)
-			fidx = 0;
-		int i;
+		if (qt_mov_open_for_card(card) &&
+		    hw_decode_mov_frame_to_nv12(frame_idx, &src_w, &src_h)) {
+			compute_cover_crop_rect(src_w, src_h, SHELL_SCREEN_W, SHELL_SCREEN_H, &crop);
+			if (hw_m2sc_queue_job(&g_hw_pipe.sc_fs, &crop) &&
+			    hw_m2sc_wait_job(&g_hw_pipe.sc_fs, NULL))
+				return (const uint32_t *)g_hw_pipe.sc_fs.cap_ptr;
+		}
+	}
+#endif
 
-		for (i = 0; fdirs[i]; i++) {
-			char cand[512];
-			struct stat st;
+	if (!g_vid_frame_buf) {
+		g_vid_frame_buf = malloc((size_t)SHELL_SCREEN_W * SHELL_SCREEN_H *
+					 sizeof(uint32_t));
+	}
 
-			snprintf(cand, sizeof(cand), "%s/%.128s.f%02d.jpg", fdirs[i], bn, fidx);
-			if (stat(cand, &st) == 0 && st.st_size > 128) {
-				if (strcmp(g_vid_frame_path, cand) == 0 && g_vid_frame_buf)
-					return g_vid_frame_buf;
+	/* Software fallback for QuickTime .mov on host */
+	if (qt_mov_open_for_card(card)) {
+		uint32_t fidx = (uint32_t)(((frame_idx % (int)g_qt_mov.frame_count) +
+					    (int)g_qt_mov.frame_count) % (int)g_qt_mov.frame_count);
+		struct qt_mov_sample ent = g_qt_mov.samples[fidx];
+		uint8_t *jbuf = malloc(ent.size);
 
+		if (jbuf) {
+			if (pread(g_qt_mov.fd, jbuf, ent.size, (off_t)ent.offset) == (ssize_t)ent.size) {
 				int rw = 0, rh = 0;
-				uint32_t *raw = decode_image_file_raw(cand, &rw, &rh);
+				uint32_t *raw = sw_jpeg_decode_raw(jbuf, ent.size, &rw, &rh);
+				free(jbuf);
 				if (raw) {
 					free(g_vid_frame_buf);
 					if (rw == SHELL_SCREEN_W && rh == SHELL_SCREEN_H) {
@@ -2031,12 +3486,36 @@ const uint32_t *shell_media_get_video_frame(const struct giri_media_card *card,
 										       SHELL_SCREEN_H);
 						free(raw);
 					}
-					snprintf(g_vid_frame_path, sizeof(g_vid_frame_path), "%s", cand);
 					return g_vid_frame_buf;
 				}
+			} else {
+				free(jbuf);
 			}
 		}
 	}
+
+#ifdef __linux__
+	{
+		char resolved[256] = "";
+		enum giri_preset_art preset = GIRI_ART_DAWN_RIDGE;
+		int src_w = 0, src_h = 0;
+		struct v4l2_rect anim_r;
+
+		if (card->preset_art >= 0 && card->preset_art < GIRI_ART_COUNT)
+			preset = card->preset_art;
+		if (!resolve_card_image_path(card, resolved, sizeof(resolved)) &&
+		    preset_placeholder_names[preset]) {
+			(void)resolve_placeholder_path(preset_placeholder_names[preset],
+						       resolved, sizeof(resolved));
+		}
+		if (resolved[0] && hw_decode_jpeg_file_to_nv12(resolved, &src_w, &src_h)) {
+			compute_pan_zoom_crop(src_w, src_h, frame_idx, &anim_r);
+			if (hw_m2sc_queue_job(&g_hw_pipe.sc_fs, &anim_r) &&
+			    hw_m2sc_wait_job(&g_hw_pipe.sc_fs, NULL))
+				return (const uint32_t *)g_hw_pipe.sc_fs.cap_ptr;
+		}
+	}
+#endif
 
 	return shell_media_get_fullscreen_art(card);
 }
@@ -2054,30 +3533,30 @@ struct gallery_meta {
 };
 
 static const struct gallery_meta gallery_catalog[] = {
-	{ "IMG_6452.jpeg",  1, "Seventh Hill Ascent",     "Velliangiri Summit Trail · 1,778m",
-	  "Pilgrims and trekkers ascending the granite boulder trail of the seventh hill in the Velliangiri Mountains." },
-	{ "IMG_6455.jpeg",  2, "Shola Cloud Canopy",      "Velliangiri High Ridge · Mist",
-	  "Sweeping view of montane shola forests and valley clouds drifting across the Velliangiri mountain range." },
-	{ "IMG_6397.jpeg",  3, "Adiyogi Foothills",       "Poondi Valley · Western Ghats",
-	  "Portrait at the base of the Velliangiri foothills with the 112-foot Adiyogi statue and mist-clad ridges behind." },
-	{ "GX016305.mov",   4, "Lagoon Speedboat Clip",   "Turquoise Reef · 720p Video",
+	{ "GX016305.mov",   1, "Lagoon Speedboat Clip",   "Turquoise Reef · 720p Video",
 	  "Widescreen 720p video cruising across crystal-clear turquoise lagoon waters aboard a coastal boat." },
-	{ "IMG_6402.jpeg",  5, "Poondi Trek Start",       "Bamboo Walking Sticks · Trailhead",
-	  "Trekking group gathered at the Poondi temple trailhead with traditional bamboo staffs before climbing the seven hills." },
-	{ "IMG_6418.jpeg",  6, "Above the Cloud Bank",    "High Meadow · Velliangiri Hills",
-	  "Golden alpine grasslands and white orographic clouds below the upper ridges of Velliangiri." },
-	{ "IMG_8624.mov",   7, "Castle Courtyard Band",   "Brass Ensemble · 720p Video",
+	{ "IMG_8624.mov",   2, "Castle Courtyard Band",   "Brass Ensemble · 720p Video",
 	  "Live brass band concert performing in a historic stone castle courtyard, captured in 1280x720 HD video." },
-	{ "IMG_9481.jpeg",  8, "Natural Coral Arch",      "Andaman Coastline · Limestone Bridge",
-	  "Sunlight framing a natural coastal rock arch and tide pools against a deep blue sky." },
-	{ "_MG_9451.jpeg",  9, "Flyboard Water Jet",      "Coastal Lagoon · Action Photo",
-	  "High-speed telephoto shot of hydroflight flyboarding above tropical green coastline waters." },
-	{ "DSC04988.jpeg", 10, "Radhanagar Beach",        "Family Portrait · White Sand Shore",
-	  "Family photograph along the pristine white sand shoreline and emerald hills." },
-	{ "GOPR6262.jpeg", 11, "Reef Snorkeling Dive",    "Clear Lagoon Waters · Action Cam",
-	  "Wetsuit snorkeling session in calm shallow turquoise reef waters." },
-	{ "IMG_8734.mov",  12, "Tower Bridge by Night",   "Thames Bascule Lift · 720p Video",
+	{ "IMG_8734.mov",   3, "Tower Bridge by Night",   "Thames Bascule Lift · 720p Video",
 	  "Nighttime 720p video of London's illuminated Tower Bridge with its twin bascules raised over the River Thames." },
+	{ "IMG_6452.jpeg",  4, "Seventh Hill Ascent",     "Velliangiri Summit Trail · 1,778m",
+	  "Pilgrims and trekkers ascending the granite boulder trail of the seventh hill in the Velliangiri Mountains." },
+	{ "IMG_6455.jpeg",  5, "Shola Cloud Canopy",      "Velliangiri High Ridge · Mist",
+	  "Sweeping view of montane shola forests and valley clouds drifting across the Velliangiri mountain range." },
+	{ "IMG_6397.jpeg",  6, "Adiyogi Foothills",       "Poondi Valley · Western Ghats",
+	  "Portrait at the base of the Velliangiri foothills with the 112-foot Adiyogi statue and mist-clad ridges behind." },
+	{ "IMG_6402.jpeg",  7, "Poondi Trek Start",       "Bamboo Walking Sticks · Trailhead",
+	  "Trekking group gathered at the Poondi temple trailhead with traditional bamboo staffs before climbing the seven hills." },
+	{ "IMG_6418.jpeg",  8, "Above the Cloud Bank",    "High Meadow · Velliangiri Hills",
+	  "Golden alpine grasslands and white orographic clouds below the upper ridges of Velliangiri." },
+	{ "IMG_9481.jpeg",  9, "Natural Coral Arch",      "Andaman Coastline · Limestone Bridge",
+	  "Sunlight framing a natural coastal rock arch and tide pools against a deep blue sky." },
+	{ "_MG_9451.jpeg", 10, "Flyboard Water Jet",      "Coastal Lagoon · Action Photo",
+	  "High-speed telephoto shot of hydroflight flyboarding above tropical green coastline waters." },
+	{ "DSC04988.jpeg", 11, "Radhanagar Beach",        "Family Portrait · White Sand Shore",
+	  "Family photograph along the pristine white sand shoreline and emerald hills." },
+	{ "GOPR6262.jpeg", 12, "Reef Snorkeling Dive",    "Clear Lagoon Waters · Action Cam",
+	  "Wetsuit snorkeling session in calm shallow turquoise reef waters." },
 	{ "IMG_6395.jpeg", 13, "Foothills Walkway",       "Velliangiri Horizon · Group Photo",
 	  "Friends walking along the grand promenade beneath the Velliangiri mountain range." },
 	{ "IMG_6414.jpeg", 14, "Dawn on the Ridge",       "Morning Trek · Mountain Trail",

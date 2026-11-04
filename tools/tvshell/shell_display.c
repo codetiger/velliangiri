@@ -37,6 +37,7 @@
 
 #define DRM_IOCTL_SET_MASTER		DRM_IO(0x1e)
 #define DRM_IOCTL_DROP_MASTER		DRM_IO(0x1f)
+#define DRM_IOCTL_PRIME_HANDLE_TO_FD	DRM_IOWR(0x2d, struct drm_prime_handle)
 #define DRM_IOCTL_MODE_GETRESOURCES	DRM_IOWR(0xa0, struct drm_mode_card_res)
 #define DRM_IOCTL_MODE_GETCRTC		DRM_IOWR(0xa1, struct drm_mode_crtc)
 #define DRM_IOCTL_MODE_SETCRTC		DRM_IOWR(0xa2, struct drm_mode_crtc)
@@ -124,11 +125,24 @@ struct drm_mode_destroy_dumb {
 	uint32_t handle;
 };
 
+struct drm_prime_handle {
+	uint32_t handle;
+	uint32_t flags;
+	int32_t fd;
+};
+
 static const uint8_t bayer4x4[16] = {
 	 0,  8,  2, 10,
 	12,  4, 14,  6,
 	 3, 11,  1,  9,
 	15,  7, 13,  5,
+};
+
+struct drm_scanout_buf {
+	uint32_t handle;
+	uint32_t fb_id;
+	uint32_t *map;
+	int dmabuf_fd;
 };
 
 static struct {
@@ -140,7 +154,8 @@ static struct {
 	uint32_t conn_id;
 	uint32_t crtc_id;
 	uint32_t fb_id;
-	uint32_t dumb_handle;
+	struct drm_scanout_buf bufs[2];
+	int active_buf;
 	struct drm_mode_modeinfo mode_720p30;
 	bool have_mode;
 
@@ -156,6 +171,10 @@ static struct {
 	.drm_fd = -1,
 	.fb_fd = -1,
 	.tty_fd = -1,
+	.bufs = {
+		{ .dmabuf_fd = -1 },
+		{ .dmabuf_fd = -1 },
+	},
 };
 
 static void write_sysfs_str(const char *path, const char *val)
@@ -424,11 +443,32 @@ static bool drm_find_720p30(int fd)
 	return true;
 }
 
+static void destroy_drm_buf(int idx)
+{
+	struct drm_scanout_buf *b = &disp.bufs[idx];
+
+	if (b->dmabuf_fd >= 0) {
+		close(b->dmabuf_fd);
+		b->dmabuf_fd = -1;
+	}
+	if (b->map) {
+		munmap(b->map, disp.scanout_bytes);
+		b->map = NULL;
+	}
+	if (disp.drm_fd >= 0 && b->fb_id) {
+		(void)ioctl(disp.drm_fd, DRM_IOCTL_MODE_RMFB, &b->fb_id);
+		b->fb_id = 0;
+	}
+	if (disp.drm_fd >= 0 && b->handle) {
+		struct drm_mode_destroy_dumb dreq = { .handle = b->handle };
+
+		(void)ioctl(disp.drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+		b->handle = 0;
+	}
+}
+
 static int setup_drm_scanout(void)
 {
-	struct drm_mode_create_dumb creq = { 0 };
-	struct drm_mode_fb_cmd fbcmd = { 0 };
-	struct drm_mode_map_dumb mreq = { 0 };
 	struct drm_mode_crtc crtc = { 0 };
 	const char *cards[] = { "/dev/dri/card0", "/dev/dri/card1" };
 	int i;
@@ -448,38 +488,56 @@ static int setup_drm_scanout(void)
 	if (disp.drm_fd < 0)
 		return -1;
 
-	creq.width = SHELL_SCREEN_W;
-	creq.height = SHELL_SCREEN_H;
-	creq.bpp = 32;
-	if (ioctl(disp.drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0)
-		goto err;
+	for (i = 0; i < 2; i++) {
+		struct drm_mode_create_dumb creq = { 0 };
+		struct drm_mode_fb_cmd fbcmd = { 0 };
+		struct drm_mode_map_dumb mreq = { 0 };
+		struct drm_prime_handle preq = { 0 };
 
-	disp.dumb_handle = creq.handle;
-	disp.scanout_bytes = (size_t)creq.size;
-	disp.scanout_pitch_px = creq.pitch / 4;
-	disp.scanout_w = SHELL_SCREEN_W;
-	disp.scanout_h = SHELL_SCREEN_H;
+		disp.bufs[i].dmabuf_fd = -1;
+		creq.width = SHELL_SCREEN_W;
+		creq.height = SHELL_SCREEN_H;
+		creq.bpp = 32;
+		if (ioctl(disp.drm_fd, DRM_IOCTL_MODE_CREATE_DUMB, &creq) < 0)
+			goto err;
 
-	fbcmd.width = SHELL_SCREEN_W;
-	fbcmd.height = SHELL_SCREEN_H;
-	fbcmd.pitch = creq.pitch;
-	fbcmd.bpp = 32;
-	fbcmd.depth = 24;
-	fbcmd.handle = creq.handle;
-	if (ioctl(disp.drm_fd, DRM_IOCTL_MODE_ADDFB, &fbcmd) < 0)
-		goto err_dumb;
-	disp.fb_id = fbcmd.fb_id;
+		disp.bufs[i].handle = creq.handle;
+		disp.scanout_bytes = (size_t)creq.size;
+		disp.scanout_pitch_px = creq.pitch / 4;
+		disp.scanout_w = SHELL_SCREEN_W;
+		disp.scanout_h = SHELL_SCREEN_H;
 
-	mreq.handle = creq.handle;
-	if (ioctl(disp.drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) < 0)
-		goto err_fb;
+		fbcmd.width = SHELL_SCREEN_W;
+		fbcmd.height = SHELL_SCREEN_H;
+		fbcmd.pitch = creq.pitch;
+		fbcmd.bpp = 32;
+		fbcmd.depth = 24;
+		fbcmd.handle = creq.handle;
+		if (ioctl(disp.drm_fd, DRM_IOCTL_MODE_ADDFB, &fbcmd) < 0)
+			goto err;
+		disp.bufs[i].fb_id = fbcmd.fb_id;
 
-	disp.scanout = mmap(NULL, disp.scanout_bytes, PROT_READ | PROT_WRITE,
-			    MAP_SHARED, disp.drm_fd, (off_t)mreq.offset);
-	if (disp.scanout == MAP_FAILED) {
-		disp.scanout = NULL;
-		goto err_fb;
+		mreq.handle = creq.handle;
+		if (ioctl(disp.drm_fd, DRM_IOCTL_MODE_MAP_DUMB, &mreq) < 0)
+			goto err;
+
+		disp.bufs[i].map = mmap(NULL, disp.scanout_bytes,
+					PROT_READ | PROT_WRITE, MAP_SHARED,
+					disp.drm_fd, (off_t)mreq.offset);
+		if (disp.bufs[i].map == MAP_FAILED) {
+			disp.bufs[i].map = NULL;
+			goto err;
+		}
+
+		preq.handle = creq.handle;
+		preq.flags = O_CLOEXEC | O_RDWR;
+		if (ioctl(disp.drm_fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &preq) == 0)
+			disp.bufs[i].dmabuf_fd = preq.fd;
 	}
+
+	disp.active_buf = 0;
+	disp.fb_id = disp.bufs[0].fb_id;
+	disp.scanout = disp.bufs[0].map;
 
 	crtc.crtc_id = disp.crtc_id;
 	crtc.fb_id = disp.fb_id;
@@ -492,15 +550,9 @@ static int setup_drm_scanout(void)
 	disp.use_drm = true;
 	return 0;
 
-err_fb:
-	(void)ioctl(disp.drm_fd, DRM_IOCTL_MODE_RMFB, &disp.fb_id);
-err_dumb:
-	{
-		struct drm_mode_destroy_dumb dreq = { .handle = disp.dumb_handle };
-
-		(void)ioctl(disp.drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
-	}
 err:
+	destroy_drm_buf(0);
+	destroy_drm_buf(1);
 	close(disp.drm_fd);
 	disp.drm_fd = -1;
 	return -1;
@@ -583,9 +635,9 @@ int shell_display_init(bool headless)
 #endif
 	}
 
-	if (setup_fbdev_scanout() == 0)
-		return 0;
 	if (setup_drm_scanout() == 0)
+		return 0;
+	if (setup_fbdev_scanout() == 0)
 		return 0;
 
 	fprintf(stderr, "tvshell: no /dev/fb0 or /dev/dri/card*, running headless\n");
@@ -603,18 +655,16 @@ void shell_display_close(void)
 		close(disp.tty_fd);
 		disp.tty_fd = -1;
 	}
-	if (disp.scanout) {
-		munmap(disp.scanout, disp.scanout_bytes);
-		disp.scanout = NULL;
-	}
 	if (disp.use_drm && disp.drm_fd >= 0) {
-		struct drm_mode_destroy_dumb dreq = { .handle = disp.dumb_handle };
-
-		(void)ioctl(disp.drm_fd, DRM_IOCTL_MODE_RMFB, &disp.fb_id);
-		(void)ioctl(disp.drm_fd, DRM_IOCTL_MODE_DESTROY_DUMB, &dreq);
+		destroy_drm_buf(0);
+		destroy_drm_buf(1);
+		disp.scanout = NULL;
 		(void)ioctl(disp.drm_fd, DRM_IOCTL_DROP_MASTER, 0);
 		close(disp.drm_fd);
 		disp.drm_fd = -1;
+	} else if (disp.scanout) {
+		munmap(disp.scanout, disp.scanout_bytes);
+		disp.scanout = NULL;
 	}
 	if (disp.fb_fd >= 0) {
 		close(disp.fb_fd);
@@ -705,6 +755,84 @@ void shell_display_present(void)
 		uint32_t *dst = disp.scanout + (size_t)y * disp.scanout_pitch_px + x0;
 
 		copy_span_u32(dst, src, copy_w);
+	}
+}
+
+int shell_display_get_video_dmabuf(int buf_idx)
+{
+	if (buf_idx < 0 || buf_idx > 1 || !disp.use_drm)
+		return -1;
+	return disp.bufs[buf_idx].dmabuf_fd;
+}
+
+int shell_display_prepare_video_backbuf(int *out_dmabuf_fd)
+{
+	int back;
+
+	if (disp.headless || !disp.use_drm || disp.drm_fd < 0 ||
+	    disp.bufs[0].dmabuf_fd < 0 || disp.bufs[1].dmabuf_fd < 0)
+		return -1;
+
+	back = disp.active_buf ^ 1;
+	if (out_dmabuf_fd)
+		*out_dmabuf_fd = disp.bufs[back].dmabuf_fd;
+	return back;
+}
+
+void shell_display_present_video_backbuf(int buf_idx,
+					 const int (*hud_rects)[4],
+					 int num_hud_rects)
+{
+	struct drm_mode_crtc crtc = { 0 };
+	uint32_t *dst_base;
+	int i, y;
+
+	if (buf_idx < 0 || buf_idx > 1 || !disp.use_drm || disp.drm_fd < 0)
+		return;
+
+	dst_base = disp.bufs[buf_idx].map;
+	if (!dst_base)
+		return;
+
+	/* Composite only the compact HUD pills from cached RAM onto the DMA video frame */
+	for (i = 0; i < num_hud_rects; i++) {
+		int x0 = hud_rects[i][0];
+		int y0 = hud_rects[i][1];
+		int x1 = x0 + hud_rects[i][2];
+		int y1 = y0 + hud_rects[i][3];
+
+		if (x0 < 0)
+			x0 = 0;
+		if (y0 < 0)
+			y0 = 0;
+		if (x1 > (int)disp.scanout_w)
+			x1 = (int)disp.scanout_w;
+		if (y1 > (int)disp.scanout_h)
+			y1 = (int)disp.scanout_h;
+		if (x0 >= x1 || y0 >= y1)
+			continue;
+
+		for (y = y0; y < y1; y++) {
+			const uint32_t *src = disp.backbuf + y * SHELL_SCREEN_W + x0;
+			uint32_t *dst = dst_base + (size_t)y * disp.scanout_pitch_px + x0;
+
+			copy_span_u32(dst, src, x1 - x0);
+		}
+	}
+
+	disp.dmg_x0 = disp.dmg_y0 = disp.dmg_x1 = disp.dmg_y1 = 0;
+	disp.active_buf = buf_idx;
+	disp.fb_id = disp.bufs[buf_idx].fb_id;
+	disp.scanout = dst_base;
+
+	if (disp.have_mode) {
+		crtc.crtc_id = disp.crtc_id;
+		crtc.fb_id = disp.fb_id;
+		crtc.set_connectors_ptr = (uintptr_t)&disp.conn_id;
+		crtc.count_connectors = 1;
+		crtc.mode = disp.mode_720p30;
+		crtc.mode_valid = 1;
+		(void)ioctl(disp.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc);
 	}
 }
 

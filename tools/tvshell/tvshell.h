@@ -170,6 +170,11 @@ uint32_t *shell_display_backbuffer(void);
 void shell_display_damage(int x, int y, int w, int h);
 void shell_display_damage_all(void);
 void shell_display_present(void);
+int shell_display_get_video_dmabuf(int buf_idx);
+int shell_display_prepare_video_backbuf(int *out_dmabuf_fd);
+void shell_display_present_video_backbuf(int buf_idx,
+					 const int (*hud_rects)[4],
+					 int num_hud_rects);
 void shell_display_release(void);
 int shell_display_acquire(void);
 int shell_display_dump_ppm(const char *path);
@@ -243,8 +248,19 @@ const uint32_t *shell_media_get_card_art_fast(const struct giri_media_card *card
 					      int w, int h, bool *is_final_out);
 bool shell_media_preload_next_card(const struct giri_screen *scr);
 const uint32_t *shell_media_get_fullscreen_art(const struct giri_media_card *card);
+void shell_media_get_video_info(const struct giri_media_card *card,
+				int *out_fps, int *out_frame_count,
+				int *out_duration_sec);
 const uint32_t *shell_media_get_video_frame(const struct giri_media_card *card,
 					    int frame_idx);
+bool shell_media_render_video_frame_dmabuf(const struct giri_media_card *card,
+					   int frame_idx, int buf_idx,
+					   int dst_dmabuf_fd);
+void shell_media_audio_start(const struct giri_media_card *card);
+void shell_media_audio_stop(void);
+void shell_media_audio_set_paused(bool paused);
+void shell_media_audio_seek_sec(int elapsed_sec);
+int shell_media_audio_get_frame_idx(int fps, int total_frames);
 bool shell_media_poll_async(void);
 int shell_media_scan_device(struct shell_media_item *items, int max_items, bool video_only);
 

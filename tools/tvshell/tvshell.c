@@ -101,6 +101,9 @@ static struct {
 	struct giri_media_card overlay_card;
 	bool overlay_is_video;
 	bool overlay_playing;
+	bool overlay_hud_dirty;
+	int overlay_fps;
+	int overlay_total_frames;
 	int overlay_elapsed_sec;
 	int overlay_duration_sec;
 	int overlay_frame_idx;
@@ -1650,10 +1653,134 @@ static void render_window_main_incremental(const struct shell_theme *th)
 /*
  * Window 1: Fullscreen 1280x720 Edge-to-Edge Media / Detail Viewer (.media-overlay)
  */
+static void render_video_hud_dock(const struct shell_theme *th,
+				  int (*hud_rects)[4])
+{
+	int bx = 56, by = 28;
+	int badge_w = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 12,
+					      g_ui.overlay_badge) + 22;
+	int src_w = shell_font_measure_role(SHELL_FONT_MONO_MEDIUM, 13,
+					    g_ui.overlay_source);
+	const char *hint = "Menu / Esc = Back";
+	int hw = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 13, hint) + 32;
+	int hx = SHELL_SCREEN_W - 56 - hw;
+	int top_w;
+	int dx = 44, dy = SHELL_SCREEN_H - 202, dw = SHELL_SCREEN_W - 88, dh = 166;
+
+	if (src_w > 560)
+		src_w = 560;
+	top_w = badge_w + 14 + src_w + 24;
+	if (bx - 8 + top_w > hx - 12)
+		top_w = (hx - 12) - (bx - 8);
+
+	hud_rects[0][0] = bx - 8;
+	hud_rects[0][1] = by - 4;
+	hud_rects[0][2] = top_w;
+	hud_rects[0][3] = 36;
+
+	hud_rects[1][0] = hx;
+	hud_rects[1][1] = by - 2;
+	hud_rects[1][2] = hw;
+	hud_rects[1][3] = 32;
+
+	hud_rects[2][0] = dx;
+	hud_rects[2][1] = dy;
+	hud_rects[2][2] = dw;
+	hud_rects[2][3] = dh;
+
+	if (!g_ui.overlay_hud_dirty)
+		return;
+	g_ui.overlay_hud_dirty = false;
+
+	/* 1. Top-left badge + source pill */
+	shell_draw_rect(bx - 8, by - 4, top_w, 36, 0xff0c0f16U);
+	shell_draw_rounded_outline(bx - 8, by - 4, top_w, 36, 8, 1, 0xff263044U);
+	shell_draw_rounded_rect(bx, by, badge_w, 28, 6, th->accent);
+	shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 12,
+				     bx, by, badge_w, 28,
+				     0xffffffffU, g_ui.overlay_badge);
+	shell_font_draw_vcentered(SHELL_FONT_MONO_MEDIUM, 13,
+				  bx + badge_w + 14, by, 28, 0xffe2e8f0U,
+				  g_ui.overlay_source, top_w - badge_w - 26);
+
+	/* 2. Top-right Back pill */
+	shell_draw_rect(hx, by - 2, hw, 32, 0xff0f1218U);
+	shell_draw_rounded_outline(hx, by - 2, hw, 32, 8, 2, th->focus_ring);
+	shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 13,
+				     hx, by - 2, hw, 32,
+				     0xfff8fafcU, hint);
+
+	/* 3. Bottom cinema player dock */
+	shell_draw_rect(dx, dy, dw, dh, 0xff0b0e14U);
+	shell_draw_rounded_outline(dx, dy, dw, dh, 12, 1, 0xff263044U);
+
+	{
+		int px = 56, py = SHELL_SCREEN_H - 190, pw = SHELL_SCREEN_W - 112, ph = 42;
+		const char *st_txt = g_ui.overlay_playing ? "PLAYING" : "PAUSED";
+		int st_w = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 13, st_txt) + 20;
+		char time_buf[32];
+		int tw, tx, tr_w, ty, fill_w;
+		int sy = SHELL_SCREEN_H - 132;
+
+		shell_draw_rounded_rect(px, py, pw, ph, 8, 0xff131822U);
+		shell_draw_rounded_rect(px + 16, py + 8, st_w, 26, 5, 0xfff59e0bU);
+		shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 13,
+					     px + 16, py + 8, st_w, 26,
+					     0xff161513U, st_txt);
+
+		snprintf(time_buf, sizeof(time_buf), "00:%02d / 00:%02d",
+			 g_ui.overlay_elapsed_sec, g_ui.overlay_duration_sec);
+		tw = shell_font_measure_role(SHELL_FONT_MONO_MEDIUM, 14, time_buf);
+		shell_font_draw_vcentered(SHELL_FONT_MONO_MEDIUM, 14,
+					  px + pw - 16 - tw, py, ph,
+					  0xffe2dfd7U, time_buf, tw + 4);
+
+		tx = px + 16 + st_w + 16;
+		tr_w = (px + pw - 16 - tw - 16) - tx;
+		ty = py + (ph - 8) / 2;
+		shell_draw_rounded_rect(tx, ty, tr_w, 8, 4, 0xff2b3548U);
+		fill_w = (tr_w * g_ui.overlay_elapsed_sec) /
+			 (g_ui.overlay_duration_sec > 0 ? g_ui.overlay_duration_sec : 15);
+		if (fill_w > tr_w)
+			fill_w = tr_w;
+		if (fill_w > 0)
+			shell_draw_rounded_rect(tx, ty, fill_w, 8, 4, 0xfff59e0bU);
+
+		shell_font_draw_role(SHELL_FONT_SANS_BOLD, 28,
+				     56, sy, 0xffffffffU,
+				     g_ui.overlay_title, SHELL_SCREEN_W - 112);
+		shell_font_draw_wrapped_role(SHELL_FONT_SANS_MEDIUM, 18,
+					     56, sy + 38, 26, 1120, 2,
+					     0xfff8fafcU, g_ui.overlay_text);
+	}
+}
+
 static void render_window_media_overlay(const struct shell_theme *th)
 {
 	g_ui.main_bg_valid = false;
 	g_ui.backbuf_modal_win = -1;
+
+	/*
+	 * Zero-copy hardware DMABUF video scanout fast path:
+	 * s5l8947x-jpeg (/dev/video2) -> NV12 DMABUF -> s5l8947x-m2sc (/dev/video1)
+	 * -> back DRM dumb buffer DMABUF, then composite only the 3 HUD pills.
+	 */
+	if (g_ui.overlay_is_video) {
+		int vdmabuf_fd = -1;
+		int vbuf_idx = shell_display_prepare_video_backbuf(&vdmabuf_fd);
+
+		if (vbuf_idx >= 0 &&
+		    shell_media_render_video_frame_dmabuf(&g_ui.overlay_card,
+							  g_ui.overlay_frame_idx,
+							  vbuf_idx, vdmabuf_fd)) {
+			int hud_rects[3][4];
+
+			render_video_hud_dock(th, hud_rects);
+			shell_display_present_video_backbuf(vbuf_idx, hud_rects, 3);
+			return;
+		}
+	}
+
 	const uint32_t *fs_art = g_ui.overlay_is_video
 				 ? shell_media_get_video_frame(&g_ui.overlay_card,
 							       g_ui.overlay_frame_idx)
@@ -2242,8 +2369,19 @@ static void open_gallery_item_overlay(int g_idx)
 	g_ui.overlay_card = mc;
 	g_ui.overlay_is_video = it->is_video;
 	g_ui.overlay_playing = it->is_video;
+	g_ui.overlay_hud_dirty = true;
+	g_ui.overlay_fps = 24;
+	g_ui.overlay_total_frames = 360;
 	g_ui.overlay_elapsed_sec = 0;
 	g_ui.overlay_duration_sec = 15;
+	shell_media_audio_stop();
+	if (it->is_video) {
+		shell_media_get_video_info(&g_ui.overlay_card,
+					   &g_ui.overlay_fps,
+					   &g_ui.overlay_total_frames,
+					   &g_ui.overlay_duration_sec);
+		shell_media_audio_start(&g_ui.overlay_card);
+	}
 	g_ui.overlay_frame_idx = 0;
 	g_ui.overlay_last_tick_ms = shell_now_ms();
 	g_ui.overlay_frame_tick_ms = g_ui.overlay_last_tick_ms;
@@ -2273,8 +2411,19 @@ static void open_media_overlay(const char *badge, const struct giri_media_card *
 	g_ui.overlay_card = *mc;
 	g_ui.overlay_is_video = is_video;
 	g_ui.overlay_playing = is_video;
-	g_ui.overlay_elapsed_sec = 4;
+	g_ui.overlay_hud_dirty = true;
+	g_ui.overlay_fps = 24;
+	g_ui.overlay_total_frames = 360;
+	g_ui.overlay_elapsed_sec = 0;
 	g_ui.overlay_duration_sec = 15;
+	shell_media_audio_stop();
+	if (is_video) {
+		shell_media_get_video_info(&g_ui.overlay_card,
+					   &g_ui.overlay_fps,
+					   &g_ui.overlay_total_frames,
+					   &g_ui.overlay_duration_sec);
+		shell_media_audio_start(&g_ui.overlay_card);
+	}
 	g_ui.overlay_frame_idx = 0;
 	g_ui.overlay_last_tick_ms = shell_now_ms();
 	g_ui.overlay_frame_tick_ms = g_ui.overlay_last_tick_ms;
@@ -2512,12 +2661,17 @@ static void handle_key_event(const struct shell_input_event *ev)
 		switch (ev->key) {
 		case SHELL_KEY_MENU:
 		case SHELL_KEY_SELECT:
+			shell_media_audio_stop();
 			g_ui.active_win = GIRI_WIN_MAIN;
 			mark_full_redraw();
 			break;
 		case SHELL_KEY_PLAY_PAUSE:
-			if (g_ui.overlay_is_video)
+			if (g_ui.overlay_is_video) {
 				g_ui.overlay_playing = !g_ui.overlay_playing;
+				shell_media_audio_set_paused(!g_ui.overlay_playing);
+				g_ui.overlay_hud_dirty = true;
+				g_ui.overlay_frame_tick_ms = shell_now_ms();
+			}
 			break;
 		case SHELL_KEY_UP:
 			if (g_ui.overlay_gallery_idx >= 0 && g_ui.gallery_count > 0)
@@ -2529,20 +2683,30 @@ static void handle_key_event(const struct shell_input_event *ev)
 			break;
 		case SHELL_KEY_LEFT:
 			if (g_ui.overlay_is_video) {
+				int fps = g_ui.overlay_fps > 0 ? g_ui.overlay_fps : 24;
+				int tot = g_ui.overlay_total_frames > 0 ? g_ui.overlay_total_frames : 360;
 				g_ui.overlay_elapsed_sec -= 3;
 				if (g_ui.overlay_elapsed_sec < 0)
 					g_ui.overlay_elapsed_sec = 0;
-				g_ui.overlay_frame_idx = g_ui.overlay_elapsed_sec;
+				g_ui.overlay_frame_idx = (g_ui.overlay_elapsed_sec * fps) % tot;
+				shell_media_audio_seek_sec(g_ui.overlay_elapsed_sec);
+				g_ui.overlay_hud_dirty = true;
+				g_ui.overlay_frame_tick_ms = shell_now_ms();
 			} else if (g_ui.overlay_gallery_idx >= 0 && g_ui.gallery_count > 0) {
 				open_gallery_item_overlay(g_ui.overlay_gallery_idx - 1);
 			}
 			break;
 		case SHELL_KEY_RIGHT:
 			if (g_ui.overlay_is_video) {
+				int fps = g_ui.overlay_fps > 0 ? g_ui.overlay_fps : 24;
+				int tot = g_ui.overlay_total_frames > 0 ? g_ui.overlay_total_frames : 360;
 				g_ui.overlay_elapsed_sec += 3;
-				if (g_ui.overlay_elapsed_sec > g_ui.overlay_duration_sec)
-					g_ui.overlay_elapsed_sec = g_ui.overlay_duration_sec;
-				g_ui.overlay_frame_idx = g_ui.overlay_elapsed_sec;
+				if (g_ui.overlay_elapsed_sec >= g_ui.overlay_duration_sec)
+					g_ui.overlay_elapsed_sec = 0;
+				g_ui.overlay_frame_idx = (g_ui.overlay_elapsed_sec * fps) % tot;
+				shell_media_audio_seek_sec(g_ui.overlay_elapsed_sec);
+				g_ui.overlay_hud_dirty = true;
+				g_ui.overlay_frame_tick_ms = shell_now_ms();
 			} else if (g_ui.overlay_gallery_idx >= 0 && g_ui.gallery_count > 0) {
 				open_gallery_item_overlay(g_ui.overlay_gallery_idx + 1);
 			}
@@ -2662,15 +2826,40 @@ static bool tick_animations(uint64_t now)
 
 	if (g_ui.active_win == GIRI_WIN_MEDIA_OVERLAY &&
 	    g_ui.overlay_is_video && g_ui.overlay_playing) {
-		if (now - g_ui.overlay_frame_tick_ms >= 500) {
-			g_ui.overlay_frame_tick_ms = now;
-			g_ui.overlay_frame_idx = (g_ui.overlay_frame_idx + 1) % 15;
-			dirty = true;
-		}
-		if (now - g_ui.overlay_last_tick_ms >= 1000) {
-			g_ui.overlay_last_tick_ms = now;
-			g_ui.overlay_elapsed_sec = (g_ui.overlay_elapsed_sec + 1) %
-						   (g_ui.overlay_duration_sec + 1);
+		int fps = g_ui.overlay_fps > 0 ? g_ui.overlay_fps : 24;
+		int tot = g_ui.overlay_total_frames > 0 ? g_ui.overlay_total_frames : 360;
+		uint64_t frame_ms = 1000ULL / (uint64_t)fps;
+		int aud_fidx = shell_media_audio_get_frame_idx(fps, tot);
+
+		if (aud_fidx >= 0) {
+			if (aud_fidx != g_ui.overlay_frame_idx) {
+				int new_sec;
+
+				g_ui.overlay_frame_idx = aud_fidx;
+				g_ui.overlay_frame_tick_ms = now;
+				new_sec = g_ui.overlay_frame_idx / fps;
+				if (new_sec != g_ui.overlay_elapsed_sec) {
+					g_ui.overlay_elapsed_sec = new_sec;
+					g_ui.overlay_hud_dirty = true;
+				}
+				dirty = true;
+			}
+		} else if (now - g_ui.overlay_frame_tick_ms >= frame_ms) {
+			uint64_t steps = (now - g_ui.overlay_frame_tick_ms) / frame_ms;
+			int new_sec;
+
+			if (steps > 4) {
+				steps = 1;
+				g_ui.overlay_frame_tick_ms = now;
+			} else {
+				g_ui.overlay_frame_tick_ms += steps * frame_ms;
+			}
+			g_ui.overlay_frame_idx = (g_ui.overlay_frame_idx + (int)steps) % tot;
+			new_sec = g_ui.overlay_frame_idx / fps;
+			if (new_sec != g_ui.overlay_elapsed_sec) {
+				g_ui.overlay_elapsed_sec = new_sec;
+				g_ui.overlay_hud_dirty = true;
+			}
 			dirty = true;
 		}
 	}
@@ -2850,6 +3039,51 @@ static void run_benchmark(uint64_t init_disp_us, uint64_t init_font_us, uint64_t
 	t1 = bench_now_us();
 	printf("topic_transition_start  : %8.2f ms (%6.1f FPS)\n",
 	       (t1 - t0) / 1000.0, 1000000.0 / (double)(t1 - t0));
+
+	/* 8. Hardware V4L2 JPEG + M2SC Card & Video Frame Offload */
+	t0 = bench_now_us();
+	int preloaded = 0;
+	while (shell_media_preload_next_card(&g_ui.pending_screen))
+		preloaded++;
+	t1 = bench_now_us();
+	if (preloaded > 0) {
+		printf("hw_card_jpeg_scale (%d)  : %8.2f ms/card\n",
+		       preloaded, (t1 - t0) / (1000.0 * preloaded));
+	}
+
+	{
+		struct giri_media_card vcard;
+		const int VN = 60;
+
+		memset(&vcard, 0, sizeof(vcard));
+		snprintf(vcard.uri, sizeof(vcard.uri), "GX016305.mov");
+		snprintf(vcard.title, sizeof(vcard.title), "Lagoon Speedboat Clip");
+		snprintf(vcard.subtitle, sizeof(vcard.subtitle), "Turquoise Reef · 720p Video");
+		vcard.kind = GIRI_CARD_LOCAL_VIDEO;
+		vcard.preset_art = GIRI_ART_MONSOON_VIDEO;
+		t0 = bench_now_us();
+		for (i = 0; i < VN; i++)
+			(void)shell_media_get_video_frame(&vcard, i);
+		t1 = bench_now_us();
+		printf("hw_video_720p_decode    : %8.2f ms/frame (%6.1f FPS)\n",
+		       (t1 - t0) / (1000.0 * VN), (1000000.0 * VN) / (double)(t1 - t0));
+
+		open_media_overlay("VIDEO STREAM", &vcard, true);
+		shell_media_audio_stop();
+		render_frame();
+		t0 = bench_now_us();
+		for (i = 1; i <= VN; i++) {
+			g_ui.overlay_frame_idx = i;
+			if ((i % 24) == 0) {
+				g_ui.overlay_elapsed_sec = i / 24;
+				g_ui.overlay_hud_dirty = true;
+			}
+			render_frame();
+		}
+		t1 = bench_now_us();
+		printf("video_overlay_playback  : %8.2f ms/frame (%6.1f FPS)\n",
+		       (t1 - t0) / (1000.0 * VN), (1000000.0 * VN) / (double)(t1 - t0));
+	}
 }
 
 int main(int argc, char **argv)
@@ -2979,9 +3213,18 @@ int main(int argc, char **argv)
 		struct shell_input_event ev;
 		int timeout_ms = (g_ui.is_working || g_ui.cards_need_preload) ? 16 :
 				 (g_ui.tts_speaking ||
-				  g_ui.active_win == GIRI_WIN_MEDIA_OVERLAY ||
 				  g_ui.active_win == GIRI_WIN_SETTINGS_MODAL) ? 30 : 250;
 		bool dirty = false;
+
+		if (g_ui.active_win == GIRI_WIN_MEDIA_OVERLAY &&
+		    g_ui.overlay_is_video && g_ui.overlay_playing) {
+			int fps = g_ui.overlay_fps > 0 ? g_ui.overlay_fps : 24;
+			uint64_t frame_ms = 1000ULL / (uint64_t)fps;
+			uint64_t now = shell_now_ms();
+			uint64_t elapsed = (now >= g_ui.overlay_frame_tick_ms)
+					   ? (now - g_ui.overlay_frame_tick_ms) : 0;
+			timeout_ms = (elapsed >= frame_ms) ? 0 : (int)(frame_ms - elapsed);
+		}
 
 		if (shell_input_poll(&ev, timeout_ms)) {
 			handle_key_event(&ev);
