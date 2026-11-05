@@ -96,12 +96,12 @@ to_baseline_720p() {
 	# Preserve full vertical framing on portrait (3:4, 2:3) and near-square (8:7) photos
 	if [ -n "$w" ] && [ -n "$h" ] && [ "$((w * 10))" -lt "$((h * 13))" ]; then
 		"$FFMPEG" -y -hide_banner -loglevel error -i "$in_img" \
-			-filter_complex "[0:v]scale=1280:720:force_original_aspect_ratio=increase:flags=lanczos,crop=1280:720,gblur=sigma=32,eq=brightness=-0.28:saturation=0.80[bg];[0:v]scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos+accurate_rnd+full_chroma_int,unsharp=3:3:0.35:3:3:0.0[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuvj420p" \
-			-frames:v 1 -q:v 1 -qmin 1 -qmax 1 "$dst"
+			-filter_complex "[0:v]scale=1280:720:force_original_aspect_ratio=increase:flags=lanczos+accurate_rnd+full_chroma_int:in_color_matrix=auto:out_color_matrix=bt601:in_range=auto:out_range=full,crop=1280:720,gblur=sigma=32,eq=brightness=-0.28:saturation=0.80[bg];[0:v]scale=1280:720:force_original_aspect_ratio=decrease:flags=lanczos+accurate_rnd+full_chroma_int:in_color_matrix=auto:out_color_matrix=bt601:in_range=auto:out_range=full,unsharp=3:3:0.35:3:3:0.0[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2,format=yuvj420p" \
+			-frames:v 1 -q:v 1 -qmin 1 -qmax 1 -color_range pc -colorspace bt470bg "$dst"
 	else
 		"$FFMPEG" -y -hide_banner -loglevel error -i "$in_img" \
-			-vf "scale=1280:720:force_original_aspect_ratio=increase:flags=lanczos+accurate_rnd+full_chroma_int,crop=1280:720,unsharp=3:3:0.35:3:3:0.0,format=yuvj420p" \
-			-frames:v 1 -q:v 1 -qmin 1 -qmax 1 "$dst"
+			-vf "scale=1280:720:force_original_aspect_ratio=increase:flags=lanczos+accurate_rnd+full_chroma_int:in_color_matrix=auto:out_color_matrix=bt601:in_range=auto:out_range=full,crop=1280:720,unsharp=3:3:0.35:3:3:0.0,format=yuvj420p" \
+			-frames:v 1 -q:v 1 -qmin 1 -qmax 1 -color_range pc -colorspace bt470bg "$dst"
 	fi
 	rm -f "$TMP_STAGE"
 }
@@ -121,10 +121,11 @@ if [ -d "$GALLERY_SRC" ]; then
 			;;
 		*.mov|*.MOV|*.mp4|*.MP4)
 			out_vid="$GALLERY_OUT/$bn"
-			if [ ! -s "$out_vid" ]; then
+			if [ "${FORCE_REBUILD:-0}" = "1" ] || [ ! -s "$out_vid" ]; then
 				"$FFMPEG" -y -hide_banner -loglevel error -i "$f" \
-					-vf "fps=24,scale=1280:720:force_original_aspect_ratio=increase:flags=lanczos,crop=1280:720,format=yuvj420p" \
-					-c:v mjpeg -q:v 3 -pix_fmt yuvj420p \
+					-vf "fps=24,scale=1280:720:force_original_aspect_ratio=increase:flags=lanczos+accurate_rnd+full_chroma_int:in_color_matrix=auto:out_color_matrix=bt601:in_range=auto:out_range=full,crop=1280:720,unsharp=3:3:0.25:3:3:0.0,format=yuvj420p" \
+					-frames:v 480 -c:v mjpeg -q:v 2 -qmin 1 -qmax 2 -pix_fmt yuvj420p \
+					-color_range pc -colorspace bt470bg \
 					-c:a pcm_s16le -ar 48000 -ac 2 \
 					-f mov "$out_vid"
 			fi
@@ -143,7 +144,9 @@ prepare_placeholder() {
 	raw="$RAW_OUT/$name.jpg"
 
 	if [ -s "$raw" ]; then
-		to_baseline_720p "$raw" "$out"
+		if [ "${FORCE_REBUILD:-0}" = "1" ] || [ ! -s "$out" ]; then
+			to_baseline_720p "$raw" "$out"
+		fi
 		return 0
 	fi
 	if [ -s "$out" ]; then
@@ -159,13 +162,13 @@ prepare_placeholder "weather_sky"     "IMG_6418.jpeg"
 prepare_placeholder "monsoon_video"   "IMG_6455.jpeg"
 prepare_placeholder "waterfall_video" "IMG_9481.jpeg"
 prepare_placeholder "shola_mist"      "IMG_6455.jpeg"
-prepare_placeholder "app_chess"       "IMG_8734.mov"
-prepare_placeholder "app_radio"       "IMG_8624.mov"
-prepare_placeholder "news_world"      "IMG_8734.mov"
+prepare_placeholder "app_chess"       "IMG_9505.jpeg"
+prepare_placeholder "app_radio"       "IMG_9455.jpeg"
+prepare_placeholder "news_world"      "IMG_9481.jpeg"
 prepare_placeholder "news_transit"    "IMG_9368.jpeg"
 prepare_placeholder "news_climate"    "IMG_6455.jpeg"
 prepare_placeholder "news_water"      "DSC04988.jpeg"
-prepare_placeholder "sci_space"       "IMG_8734.mov"
+prepare_placeholder "sci_space"       "IMG_9412.jpeg"
 prepare_placeholder "sci_energy"      "IMG_6397.jpeg"
 prepare_placeholder "sci_forest"      "IMG_9403.jpeg"
 prepare_placeholder "sci_ocean"       "GOPR6262.jpeg"

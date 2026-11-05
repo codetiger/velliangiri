@@ -581,7 +581,10 @@ static void render_player_view(const struct shell_theme *th)
 	 * 1. Top-Left HUD Box (64, 32, 580, 40) — cleared to opaque dark
 	 *    cinema surface first so Grid View never bleeds through!
 	 */
-	shell_draw_rect(64, 32, 580, 40, 0xff120f0dU);
+	if (direct_dmabuf_ok)
+		shell_draw_rect(64, 32, 580, 40, 0xff120f0dU);
+	else
+		shell_draw_rounded_rect(64, 32, 580, 40, 10, 0xff120f0dU);
 	shell_draw_rounded_outline(64, 32, 580, 40, 10, 1, 0xff3b3530U);
 
 	const char *b_str = it->is_video ? "VIDEO" : "PHOTO";
@@ -603,7 +606,10 @@ static void render_player_view(const struct shell_theme *th)
 	 * 2. Top-Right HUD Box (940, 32, 276, 40) — cleared to opaque dark
 	 *    cinema surface first so timer updates never ghost over old text!
 	 */
-	shell_draw_rect(940, 32, 276, 40, 0xff120f0dU);
+	if (direct_dmabuf_ok)
+		shell_draw_rect(940, 32, 276, 40, 0xff120f0dU);
+	else
+		shell_draw_rounded_rect(940, 32, 276, 40, 10, 0xff120f0dU);
 	shell_draw_rounded_outline(940, 32, 276, 40, 10, 1,
 				   g_mg.player_playing ? th->accent : 0xff3b3530U);
 
@@ -627,7 +633,10 @@ static void render_player_view(const struct shell_theme *th)
 	 * 3. Bottom Dock Panel (64, 544, 1152, 140) — cleared to opaque dark
 	 *    cinema surface so video & photo overlays are 100% artifact-free.
 	 */
-	shell_draw_rect(64, 544, 1152, 140, 0xff120f0dU);
+	if (direct_dmabuf_ok)
+		shell_draw_rect(64, 544, 1152, 140, 0xff120f0dU);
+	else
+		shell_draw_rounded_rect(64, 544, 1152, 140, 14, 0xff120f0dU);
 	shell_draw_rounded_outline(64, 544, 1152, 140, 14, 1, 0xff3b3530U);
 
 	shell_font_draw_role(SHELL_FONT_SANS_BOLD, 22,
@@ -648,9 +657,9 @@ static void render_player_view(const struct shell_theme *th)
 			     : 0;
 		if (fill_w > bar_w)
 			fill_w = bar_w;
-		shell_draw_rect(bar_x, bar_y, bar_w, 5, 0xff352f2bU);
+		shell_draw_rounded_rect(bar_x, bar_y, bar_w, 6, 3, 0xff352f2bU);
 		if (fill_w > 0)
-			shell_draw_rect(bar_x, bar_y, fill_w, 5, th->accent);
+			shell_draw_rounded_rect(bar_x, bar_y, fill_w, 6, 3, th->accent);
 	}
 
 	/* Control Pills */

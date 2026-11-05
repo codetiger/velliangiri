@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-only */
 /*
- * S5L8947X 720p30 HDMI + rgbout pre-kernel display initialization
+ * S5L8947X 720p60 HDMI + rgbout pre-kernel display initialization
  *
  * Configures:
  *   - PMGR display clock gates at 0x3f101008 + n * 4 (gates 15, 21, 20, 25, 80)
@@ -8,7 +8,7 @@
  *     (stride 5120) from reserved RAM at 0x9e400000
  *   - Output stage at 0x39600000 (gamma LUTs + timing)
  *   - HDMI transmitter & PHY bridge at 0x39700000 for 74.25 MHz
- *     (720p@30Hz, VIC 62; the board DT asks the kernel for the same
+ *     (720p@60Hz, VIC 4; the board DT asks the kernel for the same
  *     mode through apple,preferred-mode, so the handover keeps the raster)
  */
 
@@ -23,11 +23,11 @@
 #include "splash.h"
 #endif
 
-/* CEA-861 1280x720p30 (VIC 62): 74.25 MHz, positive syncs */
+/* CEA-861 1280x720p60 (VIC 4): 74.25 MHz, positive syncs */
 #define S5L_FB_PHYS		0x9e400000U
 #define S5L_FB_W		1280
 #define S5L_FB_H		720
-#define S5L_HFP			1760
+#define S5L_HFP			110
 #define S5L_HSW			40
 #define S5L_HBP			220
 #define S5L_VFP			5
@@ -370,9 +370,9 @@ static void hdmi_color_init(void)
 	hdmi_hmask(HDMI_VIDEO_PATTERN_GEN, 0x01, 0);
 }
 
-/* RGB, 16:9, full quantization range (Q = 2), VIC 62 (1280x720p30) */
+/* RGB, 16:9, full quantization range (Q = 2), VIC 4 (1280x720p60) */
 static const uint8_t hdmi_avi[13] = {
-	0x10, 0x68, 0x08, 0x3e, 0x00, 0, 0, 0, 0, 0, 0, 0, 0
+	0x10, 0x68, 0x08, 0x04, 0x00, 0, 0, 0, 0, 0, 0, 0, 0
 };
 
 static const uint8_t hdmi_phy_74250[31] = {
@@ -417,7 +417,7 @@ static int hdmi_start_video(const uint8_t *phy_cfg, int hdmi_mode)
 		hdmi_hw(HDMI_AVI_HEADER0, 0x82, 1);
 		hdmi_hw(HCORE(0x714), 0x02, 1);
 		hdmi_hw(HCORE(0x718), 0x0d, 1);
-		hdmi_hw(HDMI_AVI_CHECK_SUM, 0xb1, 1);
+		hdmi_hw(HDMI_AVI_CHECK_SUM, 0xeb, 1);
 		for (i = 0; i < 13; i++)
 			hdmi_hw(HDMI_AVI_BYTE(i + 1), hdmi_avi[i], 1);
 		hdmi_hmask(HDMI_AVI_CON, 0x03, 0x02);

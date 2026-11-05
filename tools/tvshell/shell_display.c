@@ -131,13 +131,6 @@ struct drm_prime_handle {
 	int32_t fd;
 };
 
-static const uint8_t bayer4x4[16] = {
-	 0,  8,  2, 10,
-	12,  4, 14,  6,
-	 3, 11,  1,  9,
-	15,  7, 13,  5,
-};
-
 #define SHELL_DRM_BUF_COUNT		3
 
 struct drm_scanout_buf {
@@ -168,7 +161,11 @@ static struct {
 	uint32_t scanout_h;
 
 	uint32_t *backbuf;
-	int dmg_x0, dmg_y0, dmg_x1, dmg_y1;
+#define MAX_DMG_RECTS		8
+	struct {
+		int x0, y0, x1, y1;
+	} dmg_rects[MAX_DMG_RECTS];
+	int dmg_count;
 } disp = {
 	.drm_fd = -1,
 	.fb_fd = -1,
@@ -428,22 +425,33 @@ static bool drm_find_720p30(int fd)
 
 	for (i = 0; i < conn.count_modes; i++) {
 		if (modes[i].hdisplay == 1280 && modes[i].vdisplay == 720 &&
-		    modes[i].vrefresh == 30) {
+		    modes[i].vrefresh == 60) {
 			disp.mode_720p30 = modes[i];
 			disp.have_mode = true;
 			return true;
 		}
 	}
-	for (i = 0; i < conn.count_modes; i++) {
-		if (modes[i].hdisplay == 1280 && modes[i].vdisplay == 720) {
-			disp.mode_720p30 = modes[i];
-			disp.have_mode = true;
-			return true;
-		}
+	{
+		/* CEA-861 VIC 4: 1280x720@60 (74.25 MHz, positive syncs) */
+		static const struct drm_mode_modeinfo cea_720p60 = {
+			.clock = 74250,
+			.hdisplay = 1280,
+			.hsync_start = 1390,
+			.hsync_end = 1430,
+			.htotal = 1650,
+			.vdisplay = 720,
+			.vsync_start = 725,
+			.vsync_end = 730,
+			.vtotal = 750,
+			.vrefresh = 60,
+			.flags = 0x05,
+			.type = 0x40,
+			.name = "1280x720",
+		};
+		disp.mode_720p30 = cea_720p60;
+		disp.have_mode = true;
+		return true;
 	}
-	disp.mode_720p30 = modes[0];
-	disp.have_mode = true;
-	return true;
 }
 
 static void destroy_drm_buf(int idx)
@@ -606,10 +614,10 @@ static void ensure_720p30_and_gamma(void)
 		ssize_t n = read(fd, cur, sizeof(cur) - 1);
 
 		close(fd);
-		if (n > 0 && strncmp(cur, "1280x720@30", 11) == 0)
+		if (n > 0 && strncmp(cur, "1280x720@60", 11) == 0)
 			return;
 	}
-	write_sysfs_str("/sys/module/s5l8947x_drm/parameters/preferred_mode", "1280x720@30\n");
+	write_sysfs_str("/sys/module/s5l8947x_drm/parameters/preferred_mode", "1280x720@60\n");
 }
 
 int shell_display_init(bool headless)
@@ -620,10 +628,7 @@ int shell_display_init(bool headless)
 	if (!disp.backbuf)
 		return -ENOMEM;
 
-	disp.dmg_x0 = 0;
-	disp.dmg_y0 = 0;
-	disp.dmg_x1 = SHELL_SCREEN_W;
-	disp.dmg_y1 = SHELL_SCREEN_H;
+	shell_display_damage_all();
 
 	if (headless)
 		return 0;
@@ -686,7 +691,7 @@ uint32_t *shell_display_backbuffer(void)
 
 void shell_display_damage(int x, int y, int w, int h)
 {
-	int x1, y1;
+	int x1, y1, i;
 
 	if (w <= 0 || h <= 0)
 		return;
@@ -707,60 +712,82 @@ void shell_display_damage(int x, int y, int w, int h)
 	if (x >= x1 || y >= y1)
 		return;
 
-	if (disp.dmg_x0 >= disp.dmg_x1 || disp.dmg_y0 >= disp.dmg_y1) {
-		disp.dmg_x0 = x;
-		disp.dmg_y0 = y;
-		disp.dmg_x1 = x1;
-		disp.dmg_y1 = y1;
+	for (i = 0; i < disp.dmg_count; i++) {
+		if (x <= disp.dmg_rects[i].x1 && x1 >= disp.dmg_rects[i].x0 &&
+		    y <= disp.dmg_rects[i].y1 && y1 >= disp.dmg_rects[i].y0) {
+			if (x < disp.dmg_rects[i].x0)
+				disp.dmg_rects[i].x0 = x;
+			if (y < disp.dmg_rects[i].y0)
+				disp.dmg_rects[i].y0 = y;
+			if (x1 > disp.dmg_rects[i].x1)
+				disp.dmg_rects[i].x1 = x1;
+			if (y1 > disp.dmg_rects[i].y1)
+				disp.dmg_rects[i].y1 = y1;
+			return;
+		}
+	}
+
+	if (disp.dmg_count < MAX_DMG_RECTS) {
+		disp.dmg_rects[disp.dmg_count].x0 = x;
+		disp.dmg_rects[disp.dmg_count].y0 = y;
+		disp.dmg_rects[disp.dmg_count].x1 = x1;
+		disp.dmg_rects[disp.dmg_count].y1 = y1;
+		disp.dmg_count++;
 	} else {
-		if (x < disp.dmg_x0)
-			disp.dmg_x0 = x;
-		if (y < disp.dmg_y0)
-			disp.dmg_y0 = y;
-		if (x1 > disp.dmg_x1)
-			disp.dmg_x1 = x1;
-		if (y1 > disp.dmg_y1)
-			disp.dmg_y1 = y1;
+		if (x < disp.dmg_rects[0].x0)
+			disp.dmg_rects[0].x0 = x;
+		if (y < disp.dmg_rects[0].y0)
+			disp.dmg_rects[0].y0 = y;
+		if (x1 > disp.dmg_rects[0].x1)
+			disp.dmg_rects[0].x1 = x1;
+		if (y1 > disp.dmg_rects[0].y1)
+			disp.dmg_rects[0].y1 = y1;
 	}
 }
 
 void shell_display_damage_all(void)
 {
-	disp.dmg_x0 = 0;
-	disp.dmg_y0 = 0;
-	disp.dmg_x1 = SHELL_SCREEN_W;
-	disp.dmg_y1 = SHELL_SCREEN_H;
+	disp.dmg_rects[0].x0 = 0;
+	disp.dmg_rects[0].y0 = 0;
+	disp.dmg_rects[0].x1 = SHELL_SCREEN_W;
+	disp.dmg_rects[0].y1 = SHELL_SCREEN_H;
+	disp.dmg_count = 1;
 }
 
 void shell_display_present(void)
 {
-	int y, x0, y0, x1, y1, copy_w;
+	int r, y;
 
-	if (disp.dmg_x0 >= disp.dmg_x1 || disp.dmg_y0 >= disp.dmg_y1)
+	if (disp.dmg_count <= 0)
 		return;
-	x0 = disp.dmg_x0;
-	y0 = disp.dmg_y0;
-	x1 = disp.dmg_x1;
-	y1 = disp.dmg_y1;
-	disp.dmg_x0 = disp.dmg_y0 = disp.dmg_x1 = disp.dmg_y1 = 0;
-
-	if (disp.headless || !disp.scanout)
+	if (disp.headless || !disp.scanout) {
+		disp.dmg_count = 0;
 		return;
-
-	if (x1 > (int)disp.scanout_w)
-		x1 = (int)disp.scanout_w;
-	if (y1 > (int)disp.scanout_h)
-		y1 = (int)disp.scanout_h;
-	copy_w = x1 - x0;
-	if (copy_w <= 0)
-		return;
-
-	for (y = y0; y < y1; y++) {
-		const uint32_t *src = disp.backbuf + y * SHELL_SCREEN_W + x0;
-		uint32_t *dst = disp.scanout + (size_t)y * disp.scanout_pitch_px + x0;
-
-		copy_span_u32(dst, src, copy_w);
 	}
+
+	for (r = 0; r < disp.dmg_count; r++) {
+		int x0 = disp.dmg_rects[r].x0;
+		int y0 = disp.dmg_rects[r].y0;
+		int x1 = disp.dmg_rects[r].x1;
+		int y1 = disp.dmg_rects[r].y1;
+		int copy_w;
+
+		if (x1 > (int)disp.scanout_w)
+			x1 = (int)disp.scanout_w;
+		if (y1 > (int)disp.scanout_h)
+			y1 = (int)disp.scanout_h;
+		copy_w = x1 - x0;
+		if (copy_w <= 0 || y0 >= y1)
+			continue;
+
+		for (y = y0; y < y1; y++) {
+			const uint32_t *src = disp.backbuf + y * SHELL_SCREEN_W + x0;
+			uint32_t *dst = disp.scanout + (size_t)y * disp.scanout_pitch_px + x0;
+
+			copy_span_u32(dst, src, copy_w);
+		}
+	}
+	disp.dmg_count = 0;
 }
 
 int shell_display_get_video_dmabuf(int buf_idx)
@@ -772,16 +799,13 @@ int shell_display_get_video_dmabuf(int buf_idx)
 
 int shell_display_prepare_video_backbuf(int *out_dmabuf_fd)
 {
-	int back, i;
+	const int back = 1;
 
 	if (disp.headless || !disp.use_drm || disp.drm_fd < 0)
 		return -1;
-	for (i = 0; i < SHELL_DRM_BUF_COUNT; i++) {
-		if (disp.bufs[i].dmabuf_fd < 0)
-			return -1;
-	}
+	if (disp.bufs[back].dmabuf_fd < 0 || !disp.bufs[back].map)
+		return -1;
 
-	back = (disp.active_buf + 1) % SHELL_DRM_BUF_COUNT;
 	if (out_dmabuf_fd)
 		*out_dmabuf_fd = disp.bufs[back].dmabuf_fd;
 	return back;
@@ -791,7 +815,6 @@ void shell_display_present_video_backbuf(int buf_idx,
 					 const int (*hud_rects)[4],
 					 int num_hud_rects)
 {
-	struct drm_mode_crtc crtc = { 0 };
 	uint32_t *dst_base;
 	int i, y;
 
@@ -799,49 +822,94 @@ void shell_display_present_video_backbuf(int buf_idx,
 		return;
 
 	dst_base = disp.bufs[buf_idx].map;
-	if (!dst_base)
+	if (!dst_base || !disp.scanout)
 		return;
 
-	/* Composite only the compact HUD pills from cached RAM onto the DMA video frame */
+	/*
+	 * Composite the compact HUD pills from cached RAM onto the offscreen
+	 * DMA video frame while respecting each pill's anti-aliased rounded
+	 * corners, then blit the completed frame to the active scanout buffer
+	 * in a single top-to-bottom pass without unsynchronized SETCRTC flips.
+	 */
 	for (i = 0; i < num_hud_rects; i++) {
-		int x0 = hud_rects[i][0];
-		int y0 = hud_rects[i][1];
-		int x1 = x0 + hud_rects[i][2];
-		int y1 = y0 + hud_rects[i][3];
+		int rx = hud_rects[i][0];
+		int ry = hud_rects[i][1];
+		int rw = hud_rects[i][2];
+		int rh = hud_rects[i][3];
+		int radius = (rh >= 150) ? 12 : ((rh >= 100) ? 14 : ((rh >= 38) ? 10 : 8));
+		int py, px;
 
-		if (x0 < 0)
-			x0 = 0;
-		if (y0 < 0)
-			y0 = 0;
-		if (x1 > (int)disp.scanout_w)
-			x1 = (int)disp.scanout_w;
-		if (y1 > (int)disp.scanout_h)
-			y1 = (int)disp.scanout_h;
-		if (x0 >= x1 || y0 >= y1)
+		if (rw <= 0 || rh <= 0)
 			continue;
+		if (radius * 2 > rw)
+			radius = rw / 2;
+		if (radius * 2 > rh)
+			radius = rh / 2;
 
-		for (y = y0; y < y1; y++) {
-			const uint32_t *src = disp.backbuf + y * SHELL_SCREEN_W + x0;
-			uint32_t *dst = dst_base + (size_t)y * disp.scanout_pitch_px + x0;
+		for (py = 0; py < rh; py++) {
+			int sy = ry + py;
 
-			copy_span_u32(dst, src, x1 - x0);
+			if (sy < 0 || sy >= (int)disp.scanout_h)
+				continue;
+			const uint32_t *src_row = disp.backbuf + sy * SHELL_SCREEN_W;
+			uint32_t *dst_row = dst_base + (size_t)sy * disp.scanout_pitch_px;
+
+			if (py >= radius && py < rh - radius) {
+				int x0 = rx < 0 ? 0 : rx;
+				int x1 = (rx + rw > (int)disp.scanout_w) ? (int)disp.scanout_w : (rx + rw);
+
+				if (x1 > x0)
+					copy_span_u32(dst_row + x0, src_row + x0, x1 - x0);
+				continue;
+			}
+
+			int cy = (py < radius) ? py : (rh - 1 - py);
+
+			for (px = 0; px < radius; px++) {
+				int sx = rx + px;
+
+				if (sx < 0 || sx >= (int)disp.scanout_w)
+					continue;
+				uint32_t cov = g_corner_luts_ready ? g_corner_cov_lut[radius][cy][px] : 255U;
+				if (cov >= 255)
+					dst_row[sx] = src_row[sx];
+				else if (cov > 0)
+					dst_row[sx] = blend_pixel(dst_row[sx], src_row[sx], cov);
+			}
+
+			int mid_x0 = rx + radius;
+			int mid_x1 = rx + rw - radius;
+			if (mid_x0 < 0)
+				mid_x0 = 0;
+			if (mid_x1 > (int)disp.scanout_w)
+				mid_x1 = (int)disp.scanout_w;
+			if (mid_x1 > mid_x0)
+				copy_span_u32(dst_row + mid_x0, src_row + mid_x0, mid_x1 - mid_x0);
+
+			for (px = rw - radius; px < rw; px++) {
+				int sx = rx + px;
+				int cx = rw - 1 - px;
+
+				if (sx < 0 || sx >= (int)disp.scanout_w)
+					continue;
+				uint32_t cov = g_corner_luts_ready ? g_corner_cov_lut[radius][cy][cx] : 255U;
+				if (cov >= 255)
+					dst_row[sx] = src_row[sx];
+				else if (cov > 0)
+					dst_row[sx] = blend_pixel(dst_row[sx], src_row[sx], cov);
+			}
 		}
 	}
 
-	disp.dmg_x0 = disp.dmg_y0 = disp.dmg_x1 = disp.dmg_y1 = 0;
-	disp.active_buf = buf_idx;
-	disp.fb_id = disp.bufs[buf_idx].fb_id;
-	disp.scanout = dst_base;
+	if (dst_base != disp.scanout) {
+		for (y = 0; y < (int)disp.scanout_h; y++) {
+			const uint32_t *src = dst_base + (size_t)y * disp.scanout_pitch_px;
+			uint32_t *dst = disp.scanout + (size_t)y * disp.scanout_pitch_px;
 
-	if (disp.have_mode) {
-		crtc.crtc_id = disp.crtc_id;
-		crtc.fb_id = disp.fb_id;
-		crtc.set_connectors_ptr = (uintptr_t)&disp.conn_id;
-		crtc.count_connectors = 1;
-		crtc.mode = disp.mode_720p30;
-		crtc.mode_valid = 1;
-		(void)ioctl(disp.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc);
+			copy_span_u32(dst, src, (int)disp.scanout_w);
+		}
 	}
+	disp.dmg_count = 0;
 }
 
 void shell_display_release(void)
@@ -1355,7 +1423,7 @@ void shell_draw_card_bottom_scrim(int card_x, int card_y, int card_w, int card_h
 			alpha_f = 0.32f * (1.0f - t);
 		}
 
-		int base_a = (int)(alpha_f * 255.0f);
+		int base_a = (int)(alpha_f * 255.0f + 0.5f);
 		if (base_a <= 0)
 			continue;
 		if (base_a > 255)
@@ -1393,25 +1461,23 @@ void shell_draw_card_bottom_scrim(int card_x, int card_y, int card_w, int card_h
  */
 void shell_draw_top_scrim(int w, int h)
 {
-	int py, px;
+	int py;
+	int cw = (w > SHELL_SCREEN_W) ? SHELL_SCREEN_W : w;
 
+	if (cw <= 0)
+		return;
 	for (py = 0; py < h && py < SHELL_SCREEN_H; py++) {
 		uint32_t *row = disp.backbuf + py * SHELL_SCREEN_W;
 		float t = (float)py / (float)(h > 1 ? h - 1 : 1);
 		float alpha_f = (t <= 0.65f) ?
 			(0.88f + (0.45f - 0.88f) * (t / 0.65f)) :
 			(0.45f * (1.0f - (t - 0.65f) / 0.35f));
-		int base_a = (int)(alpha_f * 255.0f);
-		const uint8_t *bayer_row = &bayer4x4[(py & 3) * 4];
+		int base_a = (int)(alpha_f * 255.0f + 0.5f);
 
-		for (px = 0; px < w && px < SHELL_SCREEN_W; px++) {
-			int a = base_a + (((int)bayer_row[px & 3] - 7) >> 2);
-
-			if (a > 0) {
-				if (a > 255)
-					a = 255;
-				row[px] = blend_pixel(row[px], 0xff06080cU, (uint32_t)a);
-			}
+		if (base_a > 0) {
+			if (base_a > 255)
+				base_a = 255;
+			blend_span_const_alpha(row, cw, 0xff06080cU, (uint8_t)base_a);
 		}
 	}
 	shell_display_damage(0, 0, w, h);
@@ -1424,8 +1490,11 @@ void shell_draw_top_scrim(int w, int h)
  */
 void shell_draw_bottom_scrim(int y0, int w, int h)
 {
-	int py, px;
+	int py;
+	int cw = (w > SHELL_SCREEN_W) ? SHELL_SCREEN_W : w;
 
+	if (cw <= 0)
+		return;
 	for (py = 0; py < h; py++) {
 		int sy = y0 + py;
 
@@ -1442,17 +1511,12 @@ void shell_draw_bottom_scrim(int y0, int w, int h)
 		else
 			alpha_f = 0.35f * (1.0f - (dist - 0.82f) / 0.18f);
 
-		int base_a = (int)(alpha_f * 255.0f);
-		const uint8_t *bayer_row = &bayer4x4[(sy & 3) * 4];
+		int base_a = (int)(alpha_f * 255.0f + 0.5f);
 
-		for (px = 0; px < w && px < SHELL_SCREEN_W; px++) {
-			int a = base_a + (((int)bayer_row[px & 3] - 7) >> 2);
-
-			if (a > 0) {
-				if (a > 255)
-					a = 255;
-				row[px] = blend_pixel(row[px], 0xff06080cU, (uint32_t)a);
-			}
+		if (base_a > 0) {
+			if (base_a > 255)
+				base_a = 255;
+			blend_span_const_alpha(row, cw, 0xff06080cU, (uint8_t)base_a);
 		}
 	}
 	shell_display_damage(0, y0, w, h);
@@ -1536,17 +1600,14 @@ void shell_draw_rounded_bitmap_stride(int x, int y, int w, int h, int stride,
 				      bool zoom_slightly)
 {
 	int py, px;
-	uint16_t x0_lut[512];
 
+	(void)zoom_slightly;
 	if (!pixels || w <= 0 || h <= 0 || stride < w)
 		return;
 	if (radius * 2 > w)
 		radius = w / 2;
 	if (radius * 2 > h)
 		radius = h / 2;
-
-	(void)x0_lut;
-	zoom_slightly = false;
 
 	for (py = 0; py < h; py++) {
 		int sy = y + py;
@@ -1555,73 +1616,40 @@ void shell_draw_rounded_bitmap_stride(int x, int y, int w, int h, int stride,
 			continue;
 		uint32_t *row = disp.backbuf + sy * SHELL_SCREEN_W;
 		bool is_corner_row = (py < radius || py >= h - radius);
-
-		if (!zoom_slightly) {
-			const uint32_t *row0 = pixels + py * stride;
-
-			if (!is_corner_row && x >= 0 && x + w <= SHELL_SCREEN_W) {
-				copy_span_u32(row + x, row0, w);
-				continue;
-			}
-			if (is_corner_row && x >= 0 && x + w <= SHELL_SCREEN_W) {
-				for (px = 0; px < radius; px++) {
-					uint32_t a = rounded_rect_cov255(px, py, w, h, radius);
-					if (a >= 255)
-						row[x + px] = row0[px] | 0xff000000U;
-					else if (a > 0)
-						row[x + px] = blend_pixel(row[x + px], row0[px], a);
-				}
-				copy_span_u32(row + x + radius, row0 + radius, w - 2 * radius);
-				for (px = w - radius; px < w; px++) {
-					uint32_t a = rounded_rect_cov255(px, py, w, h, radius);
-					if (a >= 255)
-						row[x + px] = row0[px] | 0xff000000U;
-					else if (a > 0)
-						row[x + px] = blend_pixel(row[x + px], row0[px], a);
-				}
-				continue;
-			}
-
-			for (px = 0; px < w; px++) {
-				int sx = x + px;
-				if (sx < 0 || sx >= SHELL_SCREEN_W)
-					continue;
-				uint32_t a = rounded_rect_cov255(px, py, w, h, radius);
-				if (a >= 255)
-					row[sx] = row0[px] | 0xff000000U;
-				else if (a > 0)
-					row[sx] = blend_pixel(row[sx], row0[px], a);
-			}
-			continue;
-		}
-
-		/* Fast LUT-driven 1.03x center zoom on focused card artwork */
-		int y_q8 = (h << 7) + ((py * 2 - h) * 124) + 128;
-		if (y_q8 < 0)
-			y_q8 = 0;
-		if (y_q8 > ((h - 1) << 8))
-			y_q8 = (h - 1) << 8;
-		const uint32_t *row0 = pixels + (y_q8 >> 8) * stride;
+		const uint32_t *row0 = pixels + py * stride;
 
 		if (!is_corner_row && x >= 0 && x + w <= SHELL_SCREEN_W) {
-			uint32_t *dst_row = row + x;
-			for (px = 0; px < w; px++)
-				dst_row[px] = row0[x0_lut[px]];
+			copy_span_u32(row + x, row0, w);
+			continue;
+		}
+		if (is_corner_row && x >= 0 && x + w <= SHELL_SCREEN_W) {
+			for (px = 0; px < radius; px++) {
+				uint32_t a = rounded_rect_cov255(px, py, w, h, radius);
+				if (a >= 255)
+					row[x + px] = row0[px] | 0xff000000U;
+				else if (a > 0)
+					row[x + px] = blend_pixel(row[x + px], row0[px], a);
+			}
+			copy_span_u32(row + x + radius, row0 + radius, w - 2 * radius);
+			for (px = w - radius; px < w; px++) {
+				uint32_t a = rounded_rect_cov255(px, py, w, h, radius);
+				if (a >= 255)
+					row[x + px] = row0[px] | 0xff000000U;
+				else if (a > 0)
+					row[x + px] = blend_pixel(row[x + px], row0[px], a);
+			}
 			continue;
 		}
 
 		for (px = 0; px < w; px++) {
 			int sx = x + px;
-
 			if (sx < 0 || sx >= SHELL_SCREEN_W)
 				continue;
-			uint32_t a = is_corner_row ? rounded_rect_cov255(px, py, w, h, radius) : 255U;
-			uint32_t sample = row0[x0_lut[px]];
-
+			uint32_t a = rounded_rect_cov255(px, py, w, h, radius);
 			if (a >= 255)
-				row[sx] = sample;
+				row[sx] = row0[px] | 0xff000000U;
 			else if (a > 0)
-				row[sx] = blend_pixel(row[sx], sample, a);
+				row[sx] = blend_pixel(row[sx], row0[px], a);
 		}
 	}
 	shell_display_damage(x, y, w, h);

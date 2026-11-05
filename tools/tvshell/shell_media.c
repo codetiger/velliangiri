@@ -173,11 +173,13 @@ static uint32_t *scale_cover_bilinear(const uint32_t *src, int src_w, int src_h,
 			uint32_t rb = (((c00 & 0x00ff00ffU) * w00 +
 					(c10 & 0x00ff00ffU) * w10 +
 					(c01 & 0x00ff00ffU) * w01 +
-					(c11 & 0x00ff00ffU) * w11) >> 8) & 0x00ff00ffU;
+					(c11 & 0x00ff00ffU) * w11 +
+					0x00800080U) >> 8) & 0x00ff00ffU;
 			uint32_t g  = (((c00 & 0x0000ff00U) * w00 +
 					(c10 & 0x0000ff00U) * w10 +
 					(c01 & 0x0000ff00U) * w01 +
-					(c11 & 0x0000ff00U) * w11) >> 8) & 0x0000ff00U;
+					(c11 & 0x0000ff00U) * w11 +
+					0x00008000U) >> 8) & 0x0000ff00U;
 
 			drow[x] = 0xff000000U | rb | g;
 		}
@@ -1070,13 +1072,30 @@ static void downsample_2x2_xrgb(const uint32_t *src, int dst_w, int dst_h, uint3
 {
 	int src_stride = dst_w * 2;
 	int y, x;
+#ifdef __ARM_NEON
+	uint8x8_t alpha_mask = vreinterpret_u8_u32(vdup_n_u32(0xff000000U));
+#endif
 
 	for (y = 0; y < dst_h; y++) {
 		const uint32_t *r0 = src + (size_t)(y * 2) * src_stride;
 		const uint32_t *r1 = r0 + src_stride;
 		uint32_t *out = dst + (size_t)y * dst_w;
 
-		for (x = 0; x < dst_w; x++) {
+		x = 0;
+#ifdef __ARM_NEON
+		for (; x + 2 <= dst_w; x += 2) {
+			uint8x16_t row0 = vld1q_u8((const uint8_t *)(r0 + x * 2));
+			uint8x16_t row1 = vld1q_u8((const uint8_t *)(r1 + x * 2));
+			uint16x8_t sum01 = vaddl_u8(vget_low_u8(row0), vget_low_u8(row1));
+			uint16x8_t sum23 = vaddl_u8(vget_high_u8(row0), vget_high_u8(row1));
+			uint16x4_t p0 = vadd_u16(vget_low_u16(sum01), vget_high_u16(sum01));
+			uint16x4_t p1 = vadd_u16(vget_low_u16(sum23), vget_high_u16(sum23));
+			uint8x8_t avg = vrshrn_n_u16(vcombine_u16(p0, p1), 2);
+
+			vst1_u8((uint8_t *)(out + x), vorr_u8(avg, alpha_mask));
+		}
+#endif
+		for (; x < dst_w; x++) {
 			uint32_t p00 = r0[x * 2 + 0];
 			uint32_t p01 = r0[x * 2 + 1];
 			uint32_t p10 = r1[x * 2 + 0];
@@ -2758,7 +2777,7 @@ static const uint32_t *ensure_preset_art_loaded(enum giri_preset_art preset)
 
 	if (preset < 0 || preset >= GIRI_ART_COUNT)
 		preset = GIRI_ART_DAWN_RIDGE;
-	if (g_art_cache[preset].card_275)
+	if (g_art_cache[preset].card_275 && g_art_cache[preset].tile_275x164)
 		return g_art_cache[preset].card_275;
 
 	ph_name = preset_placeholder_names[preset];
@@ -3297,12 +3316,11 @@ const uint32_t *shell_media_get_card_art_fast(const struct giri_media_card *card
 		}
 	}
 
+	(void)ensure_preset_art_loaded(preset);
 	if (!g_art_cache[preset].card_275 && preset != GIRI_ART_DOOM_GAME)
 		g_art_cache[preset].card_275 = rasterize_preset_surface(preset, 275, 312);
 	if (want_tile && !g_art_cache[preset].tile_275x164 && preset != GIRI_ART_DOOM_GAME)
 		g_art_cache[preset].tile_275x164 = rasterize_preset_surface(preset, 275, 164);
-
-	(void)ensure_preset_art_loaded(preset);
 	if (want_tile && g_art_cache[preset].tile_275x164)
 		return g_art_cache[preset].tile_275x164;
 	return g_art_cache[preset].card_275;
@@ -3421,8 +3439,8 @@ static void compute_pan_zoom_crop(int src_w, int src_h, int frame_idx,
 		step += 360;
 	phase = (step <= 180) ? step : (360 - step);
 
-	dw = ((base_r.width * 12) / 100) & ~1;
-	dh = ((base_r.height * 12) / 100) & ~1;
+	dw = ((base_r.width * 6) / 100) & ~1;
+	dh = ((base_r.height * 6) / 100) & ~1;
 	anim_r->width = (base_r.width - (dw * phase) / 180) & ~1;
 	anim_r->height = (base_r.height - (dh * phase) / 180) & ~1;
 	if (anim_r->width < 64 || anim_r->height < 64) {

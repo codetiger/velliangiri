@@ -213,12 +213,12 @@
 &display_pipe {
 	status = "okay";
 	/*
-	 * Start in 720p30, the same raster the pre-kernel loader scans out,
+	 * Start in 720p60, the same raster the pre-kernel loader scans out,
 	 * so the handover to the 1280x720 TV shell does not change the mode.
 	 * External apps can switch modes as needed, and
 	 * s5l8947x_drm.preferred_mode still overrides at runtime.
 	 */
-	apple,preferred-mode = "1280x720@30";
+	apple,preferred-mode = "1280x720@60";
 };
 
 /* Audio (I2S0..I2S3 to HDMI, S/PDIF to optical) */

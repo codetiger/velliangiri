@@ -169,6 +169,10 @@ struct m2sc_dev {
 	u32 version;
 	struct dentry *debugfs;
 
+	u32 cached_steps[4];
+	u32 cached_h_words[2][M2SC_PHASES][4];
+	u32 cached_v_words[2][M2SC_PHASES][2];
+
 	struct v4l2_device v4l2;
 	struct video_device vdev;
 	struct v4l2_m2m_dev *m2m;
@@ -288,28 +292,49 @@ static u32 m2sc_pair(const s16 *c, unsigned int k)
 	return (u16)c[k] | (u32)(u16)c[k + 1] << 16;
 }
 
-static void m2sc_write_filters(struct m2sc_dev *m, u32 hstep, u32 vstep)
+static void m2sc_write_filters(struct m2sc_dev *m, u32 hstep, u32 vstep,
+			       u32 chstep, u32 cvstep)
 {
 	static const u32 h_banks[] = { M2SC_COEF_H_LUMA, M2SC_COEF_H_CHROMA };
 	static const u32 v_banks[] = { M2SC_COEF_V_LUMA, M2SC_COEF_V_CHROMA };
+	u32 h_steps[2] = { hstep, chstep };
+	u32 v_steps[2] = { vstep, cvstep };
 	unsigned int b, p;
 	s16 hc[8], vc[4];
 
-	for (p = 0; p < M2SC_PHASES; p++) {
-		m2sc_make_filter(hstep, 8, p, hc);
-		m2sc_make_filter(vstep, 4, p, vc);
+	if (m->cached_steps[0] != hstep || m->cached_steps[1] != vstep ||
+	    m->cached_steps[2] != chstep || m->cached_steps[3] != cvstep) {
 		for (b = 0; b < 2; b++) {
+			for (p = 0; p < M2SC_PHASES; p++) {
+				m2sc_make_filter(h_steps[b], 8, p, hc);
+				m2sc_make_filter(v_steps[b], 4, p, vc);
+				/* words hold taps (6,7) (4,5) (2,3) (0,1), low half first */
+				m->cached_h_words[b][p][0] = m2sc_pair(hc, 6);
+				m->cached_h_words[b][p][1] = m2sc_pair(hc, 4);
+				m->cached_h_words[b][p][2] = m2sc_pair(hc, 2);
+				m->cached_h_words[b][p][3] = m2sc_pair(hc, 0);
+				/* words hold taps (2,3) (0,1) */
+				m->cached_v_words[b][p][0] = m2sc_pair(vc, 2);
+				m->cached_v_words[b][p][1] = m2sc_pair(vc, 0);
+			}
+		}
+		m->cached_steps[0] = hstep;
+		m->cached_steps[1] = vstep;
+		m->cached_steps[2] = chstep;
+		m->cached_steps[3] = cvstep;
+	}
+
+	for (b = 0; b < 2; b++) {
+		for (p = 0; p < M2SC_PHASES; p++) {
 			void __iomem *h = m->base + h_banks[b] + 16 * p;
 			void __iomem *v = m->base + v_banks[b] + 8 * p;
 
-			/* words hold taps (6,7) (4,5) (2,3) (0,1), low half first */
-			writel(m2sc_pair(hc, 6), h);
-			writel(m2sc_pair(hc, 4), h + 4);
-			writel(m2sc_pair(hc, 2), h + 8);
-			writel(m2sc_pair(hc, 0), h + 12);
-			/* words hold taps (2,3) (0,1) */
-			writel(m2sc_pair(vc, 2), v);
-			writel(m2sc_pair(vc, 0), v + 4);
+			writel(m->cached_h_words[b][p][0], h);
+			writel(m->cached_h_words[b][p][1], h + 4);
+			writel(m->cached_h_words[b][p][2], h + 8);
+			writel(m->cached_h_words[b][p][3], h + 12);
+			writel(m->cached_v_words[b][p][0], v);
+			writel(m->cached_v_words[b][p][1], v + 4);
 		}
 	}
 }
@@ -414,7 +439,9 @@ static int m2sc_run(struct m2sc_dev *m, const struct m2sc_job *j)
 	vstep = ((s->height << 16) / d->height) & M2SC_STEP_MASK;
 	writel(hstep, m->base + M2SC_HSTEP);
 	writel(vstep, m->base + M2SC_VSTEP);
-	m2sc_write_filters(m, hstep, vstep);
+	m2sc_write_filters(m, hstep, vstep,
+			   hstep / max_t(u32, s->fmt->hsub, 1),
+			   vstep / max_t(u32, s->fmt->vsub, 1));
 	writel(0, m->base + M2SC_DITHER);
 	writel(readl(m->base + M2SC_ROT) & ~M2SC_ROT_MASK, m->base + M2SC_ROT);
 
