@@ -66,6 +66,7 @@
 
 /* rgbout (0x3a200000) */
 #define RGB_SIZE		0x1030
+#define RGB_FRAME_COUNT		0x1034	/* +1 per scanned-out frame */
 #define RGB_CTL			0x1038
 #define RGB_CFG			0x104c
 #define RGB_105C		0x105c
@@ -187,12 +188,23 @@ struct s5l_irq_probe {
 };
 
 /*
- * Highest pixel clock with a clean HDMI link on this board. 1280x1024@60
- * (108 MHz) is clean; at 121.75 MHz the sink sees bit errors and from
- * 146.25 MHz it does not lock, although the PHY reports lock with the
- * stock configuration. 1080p is therefore offered at 30 Hz and below.
+ * Highest pixel clock the PHY is ever driven at. 1280x1024@60 (108 MHz) was
+ * once clean; at 121.75 MHz the sink sees bit errors and from 146.25 MHz it
+ * does not lock, although the PHY reports lock with the stock configuration.
  */
 #define S5L_MAX_PIXCLK_KHZ	108000
+
+/*
+ * Pixel clock limit actually applied to modes. Measured on j33iap with a
+ * static frame (no rendering): 25.175, 40, 54 and 64.109 MHz are clean,
+ * while 72 and 74.25 MHz show sparkles and short black-outs on the sink,
+ * at any refresh rate. The PHY reports lock throughout. Raise it at
+ * runtime to re-test faster links.
+ */
+static unsigned int max_pixclk_khz = 65000;
+module_param(max_pixclk_khz, uint, 0644);
+MODULE_PARM_DESC(max_pixclk_khz,
+	"highest pixel clock offered, kHz (default 65000, at most 108000)");
 
 static const char * const s5l_clk_names[] = {
 	"hperf-rt-a", "rgbout-a", "hperf-rt-b", "rgbout-b", "hdmi",
@@ -420,6 +432,7 @@ struct s5l_display {
 	struct mutex lock;	/* HDMI registers shared with the audio bridge */
 	struct delayed_work hpd_work;
 	bool hpd_present;
+	unsigned int hpd_flips;	/* consecutive polls disagreeing with hpd_present */
 	bool scaler_enabled;
 	bool audio_enabled;
 	unsigned int audio_rate;
@@ -429,6 +442,15 @@ struct s5l_display {
 	unsigned long tmds_hz;
 	struct hrtimer vblank_timer;
 	ktime_t vblank_period;
+	/* vblank tracking against RGB_FRAME_COUNT, see s5l_vblank_timer() */
+	u32 last_frame;
+	unsigned int frame_polls;
+	/* flip waiting for the next frame boundary, under flip_lock */
+	spinlock_t flip_lock;
+	bool flip_pending;
+	dma_addr_t flip_pa;
+	u32 flip_pitch;
+	struct drm_pending_vblank_event *flip_event;
 	struct s5l_irq_probe probe;
 	/* the buffer the plane is scanning out now, for the GPU bring-up path */
 	phys_addr_t fb_pa;
@@ -494,11 +516,11 @@ MODULE_PARM_DESC(preferred_mode,
 /*
  * The display path has no frame interrupt: the output-stage status only
  * carries error bits and all three display lines stay silent while the
- * display runs. Report a vblank at the mode's refresh rate from an hrtimer
- * instead, so page flips complete on time and FBIO_WAITFORVSYNC blocks.
- * This is pacing, not phase: the timer is not locked to the scanout, so it
- * reduces tearing without guaranteeing it. Off gives the old behaviour of
- * completing every flip immediately.
+ * display runs. Report a vblank from an hrtimer instead, so page flips
+ * complete on time and FBIO_WAITFORVSYNC blocks. The timer is phase-locked
+ * to the pipe's frame counter (RGB_FRAME_COUNT): it wakes shortly before
+ * the expected frame boundary and polls the counter until it moves. Off
+ * gives the old behaviour of completing every flip immediately.
  */
 static bool vblank_sim = true;
 module_param(vblank_sim, bool, 0444);
@@ -1041,7 +1063,7 @@ static enum drm_mode_status s5l_mode_ok(const struct drm_display_mode *m)
 		return MODE_BAD;
 	if (m->hsync_start - m->hdisplay < 2)
 		return MODE_HSYNC;
-	if (m->clock > S5L_MAX_PIXCLK_KHZ)
+	if (m->clock > min_t(unsigned int, max_pixclk_khz, S5L_MAX_PIXCLK_KHZ))
 		return MODE_CLOCK_HIGH;
 	if (!s5l_phy_find((unsigned long)m->clock * 1000))
 		return MODE_CLOCK_RANGE;
@@ -1080,13 +1102,82 @@ static void s5l_complete_event(struct drm_crtc *crtc, bool wait_vblank)
 	spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
 }
 
+/* Poll step and budget while waiting for the frame counter to move */
+#define S5L_VBL_POLL_NS		(100 * NSEC_PER_USEC)
+#define S5L_VBL_EARLY_NS	(600 * NSEC_PER_USEC)
+#define S5L_VBL_POLL_MAX	40
+
+static void s5l_write_plane_addr(struct s5l_display *d, dma_addr_t pa, u32 pitch)
+{
+	void __iomem *p = d->rgbout + RGB_PLANE0;
+
+	writel(pa, p + PLANE_ADDR);
+	writel((readl(p + PLANE_STRIDE) & 0x3fU) | (pitch & ~0x3fU),
+	       p + PLANE_STRIDE);
+	writel(RGB_COMMIT_VAL, d->rgbout + RGB_COMMIT);
+}
+
+/*
+ * Frame boundary: program a waiting flip and arm its event for the next
+ * boundary, by which time the pipe has fetched a whole frame from the new
+ * buffer. Programming the address right after the counter moves keeps the
+ * switch out of the middle of a frame whether or not the plane registers
+ * are double-buffered.
+ */
+static void s5l_vblank_latch(struct s5l_display *d)
+{
+	struct drm_crtc *crtc = &d->pipe.crtc;
+	struct drm_pending_vblank_event *event = NULL;
+	bool had = false;
+
+	spin_lock(&d->flip_lock);
+	if (d->flip_pending) {
+		s5l_write_plane_addr(d, d->flip_pa, d->flip_pitch);
+		d->flip_pending = false;
+		event = d->flip_event;
+		d->flip_event = NULL;
+		had = true;
+	}
+	spin_unlock(&d->flip_lock);
+
+	if (had && !event)
+		drm_crtc_vblank_put(crtc);
+
+	/*
+	 * The vblank reference s5l_pipe_update() took passes to the armed
+	 * event and is dropped when the event is sent.
+	 */
+	if (event) {
+		spin_lock(&crtc->dev->event_lock);
+		drm_crtc_arm_vblank_event(crtc, event);
+		spin_unlock(&crtc->dev->event_lock);
+	}
+}
+
 static enum hrtimer_restart s5l_vblank_timer(struct hrtimer *timer)
 {
 	struct s5l_display *d = container_of(timer, struct s5l_display,
 					     vblank_timer);
+	u32 frame = readl(d->rgbout + RGB_FRAME_COUNT);
+	ktime_t next;
+
+	if (frame == d->last_frame && d->frame_polls < S5L_VBL_POLL_MAX) {
+		d->frame_polls++;
+		hrtimer_forward_now(timer, ns_to_ktime(S5L_VBL_POLL_NS));
+		return HRTIMER_RESTART;
+	}
+	/*
+	 * The counter moved, or did not within the budget (pipe stopped):
+	 * then run free at the mode's period, as before.
+	 */
+	d->last_frame = frame;
+	d->frame_polls = 0;
 
 	drm_crtc_handle_vblank(&d->pipe.crtc);
-	hrtimer_forward_now(timer, d->vblank_period);
+	s5l_vblank_latch(d);
+
+	next = ktime_sub_ns(d->vblank_period, S5L_VBL_EARLY_NS);
+	hrtimer_forward_now(timer, next);
 	return HRTIMER_RESTART;
 }
 
@@ -1187,8 +1278,26 @@ static void s5l_pipe_disable(struct drm_simple_display_pipe *pipe)
 {
 	struct s5l_display *d = to_s5l(pipe->crtc.dev);
 
-	if (vblank_sim)
+	if (vblank_sim) {
+		struct drm_pending_vblank_event *event;
+		unsigned long flags;
+		bool had;
+
 		hrtimer_cancel(&d->vblank_timer);
+		spin_lock_irqsave(&d->flip_lock, flags);
+		had = d->flip_pending;
+		event = d->flip_event;
+		d->flip_pending = false;
+		d->flip_event = NULL;
+		spin_unlock_irqrestore(&d->flip_lock, flags);
+		if (event) {
+			spin_lock_irqsave(&pipe->crtc.dev->event_lock, flags);
+			drm_crtc_send_vblank_event(&pipe->crtc, event);
+			spin_unlock_irqrestore(&pipe->crtc.dev->event_lock, flags);
+		}
+		if (had)
+			drm_crtc_vblank_put(&pipe->crtc);
+	}
 
 	mutex_lock(&d->lock);
 	s5l_hdmi_stop(d);
@@ -1212,20 +1321,47 @@ static void s5l_pipe_update(struct drm_simple_display_pipe *pipe,
 			    struct drm_plane_state *old_state)
 {
 	struct s5l_display *d = to_s5l(pipe->crtc.dev);
+	struct drm_crtc *crtc = &pipe->crtc;
 	struct drm_plane_state *state = pipe->plane.state;
 	struct drm_framebuffer *fb = state->fb;
+	unsigned long flags;
 
-	if (fb && pipe->crtc.state->active) {
-		void __iomem *p = d->rgbout + RGB_PLANE0;
-
+	if (fb && crtc->state->active) {
 		d->fb_pa = drm_fb_dma_get_gem_addr(fb, state, 0);
 		d->fb_stride = fb->pitches[0];
 		d->fb_w = fb->width;
 		d->fb_h = fb->height;
-		writel(d->fb_pa, p + PLANE_ADDR);
-		writel((readl(p + PLANE_STRIDE) & 0x3fU) | (fb->pitches[0] & ~0x3fU),
-		       p + PLANE_STRIDE);
-		writel(RGB_COMMIT_VAL, d->rgbout + RGB_COMMIT);
+
+		/*
+		 * With the synthesized vblank running, hand the new address
+		 * to the timer, which writes it at the next frame boundary
+		 * and completes the event one frame later.
+		 */
+		if (vblank_sim && d->vblank_period &&
+		    drm_crtc_vblank_get(crtc) == 0) {
+			struct drm_pending_vblank_event *stale = NULL;
+
+			spin_lock_irqsave(&d->flip_lock, flags);
+			if (d->flip_pending) {
+				/* superseded before it reached the screen */
+				stale = d->flip_event;
+				drm_crtc_vblank_put(crtc);
+			}
+			d->flip_pa = d->fb_pa;
+			d->flip_pitch = fb->pitches[0];
+			d->flip_event = crtc->state->event;
+			d->flip_pending = true;
+			crtc->state->event = NULL;
+			spin_unlock_irqrestore(&d->flip_lock, flags);
+
+			if (stale) {
+				spin_lock_irqsave(&crtc->dev->event_lock, flags);
+				drm_crtc_send_vblank_event(crtc, stale);
+				spin_unlock_irqrestore(&crtc->dev->event_lock, flags);
+			}
+		} else {
+			s5l_write_plane_addr(d, d->fb_pa, fb->pitches[0]);
+		}
 
 		spin_lock(&d->fb_lock);
 		d->scanout.phys = d->fb_pa;
@@ -1242,7 +1378,7 @@ static void s5l_pipe_update(struct drm_simple_display_pipe *pipe,
 		spin_unlock(&d->fb_lock);
 	}
 
-	s5l_complete_event(&pipe->crtc, pipe->crtc.state->active);
+	s5l_complete_event(crtc, crtc->state->active);
 }
 
 static int s5l_pipe_enable_vblank(struct drm_simple_display_pipe *pipe)
@@ -1251,7 +1387,11 @@ static int s5l_pipe_enable_vblank(struct drm_simple_display_pipe *pipe)
 
 	if (!vblank_sim || !d->vblank_period)
 		return -EOPNOTSUPP;
-	hrtimer_start(&d->vblank_timer, d->vblank_period, HRTIMER_MODE_REL);
+	d->last_frame = readl(d->rgbout + RGB_FRAME_COUNT);
+	d->frame_polls = 0;
+	hrtimer_start(&d->vblank_timer,
+		      ktime_sub_ns(d->vblank_period, S5L_VBL_EARLY_NS),
+		      HRTIMER_MODE_REL);
 	return 0;
 }
 
@@ -1384,6 +1524,17 @@ static const struct drm_display_mode s5l_cea_720p60 = {
 		 DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_PVSYNC),
 };
 
+/*
+ * 1280x720@60 with CVT reduced blanking (64.109 MHz, +H -V): 720p60 below
+ * the board's clean-link limit, where CEA 720p60 needs 74.25 MHz.
+ */
+static const struct drm_display_mode s5l_rb_720p60 = {
+	DRM_MODE("1280x720", DRM_MODE_TYPE_DRIVER, 64109,
+		 1280, 1328, 1360, 1440, 0,
+		 720, 723, 728, 741, 0,
+		 DRM_MODE_FLAG_PHSYNC | DRM_MODE_FLAG_NVSYNC),
+};
+
 /* CEA-861 VIC 62: 1280x720@30 (74.25 MHz) */
 static const struct drm_display_mode s5l_cea_720p30 = {
 	DRM_MODE("1280x720", DRM_MODE_TYPE_DRIVER, 74250,
@@ -1417,6 +1568,7 @@ static int s5l_conn_get_modes(struct drm_connector *conn)
 	if (!n) {
 		/* No EDID: offer 720p60 (Stage-1 mode), 720p30 and 1080p30 */
 		n = s5l_add_mode(conn, &s5l_cea_720p60);
+		n += s5l_add_mode(conn, &s5l_rb_720p60);
 		n += s5l_add_mode(conn, &s5l_cea_720p30);
 		n += s5l_add_mode(conn, &s5l_cea_1080p30);
 		n += drm_add_modes_noedid(conn, 1280, 720);
@@ -1434,6 +1586,7 @@ static int s5l_conn_get_modes(struct drm_connector *conn)
 		if (sscanf(s5l_preferred_mode, "%ux%u", &w, &h) == 2) {
 			if (w == 1280 && h == 720) {
 				n += s5l_add_mode(conn, &s5l_cea_720p60);
+				n += s5l_add_mode(conn, &s5l_rb_720p60);
 				n += s5l_add_mode(conn, &s5l_cea_720p30);
 			}
 			if (w == 1920 && h == 1080)
@@ -1498,13 +1651,21 @@ static const struct drm_driver s5l_drm_driver = {
 /*
  * Hot-plug: the HPD register is polled. A change re-probes the connector,
  * and the audio packets stop while the sink is away and come back with it.
+ * A change must be seen on S5L_HPD_DEBOUNCE consecutive polls: a sink
+ * briefly dropping HPD (as TVs do while they resync) must not cause a
+ * re-probe, which the fbdev client answers with a modeset.
  */
+#define S5L_HPD_DEBOUNCE	3
+
 static void s5l_hpd_poll(struct work_struct *work)
 {
 	struct s5l_display *d = container_of(work, struct s5l_display, hpd_work.work);
 	bool present = readl(d->hdmi + HDMI_HPD_STATUS) & 1;
 
-	if (present != d->hpd_present) {
+	if (present == d->hpd_present) {
+		d->hpd_flips = 0;
+	} else if (++d->hpd_flips >= S5L_HPD_DEBOUNCE) {
+		d->hpd_flips = 0;
 		d->hpd_present = present;
 		drm_edid_free(d->cached_edid);
 		d->cached_edid = NULL;
@@ -1867,6 +2028,7 @@ static int s5l_probe(struct platform_device *pdev)
 	d->audio_channels = 2;
 	mutex_init(&d->lock);
 	spin_lock_init(&d->fb_lock);
+	spin_lock_init(&d->flip_lock);
 	mutex_init(&d->probe.lock);
 	platform_set_drvdata(pdev, d);
 

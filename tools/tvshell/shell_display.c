@@ -18,6 +18,7 @@
 #include <linux/kd.h>
 #endif
 #include <math.h>
+#include <poll.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -49,6 +50,14 @@
 #define DRM_IOCTL_MODE_CREATE_DUMB	DRM_IOWR(0xb2, struct drm_mode_create_dumb)
 #define DRM_IOCTL_MODE_MAP_DUMB		DRM_IOWR(0xb3, struct drm_mode_map_dumb)
 #define DRM_IOCTL_MODE_DESTROY_DUMB	DRM_IOWR(0xb4, struct drm_mode_destroy_dumb)
+
+#define DRM_MODE_PAGE_FLIP_EVENT	0x01
+#define DRM_EVENT_FLIP_COMPLETE		0x02
+
+struct drm_event {
+	uint32_t type;
+	uint32_t length;
+};
 
 struct drm_mode_modeinfo {
 	uint32_t clock;
@@ -162,7 +171,11 @@ static struct {
 	uint32_t orig_fb_id;
 	struct drm_scanout_buf bufs[SHELL_DRM_BUF_COUNT];
 	int active_buf;
-	struct drm_mode_modeinfo mode_720p60;
+	/* Buffer scanned out before active_buf; may still be on screen until
+	 * the pending flip completes, so it is never rendered into. */
+	int prev_buf;
+	bool flip_pending;
+	struct drm_mode_modeinfo mode_720p;
 	bool have_mode;
 
 	uint32_t *scanout;
@@ -184,12 +197,43 @@ static struct {
 	.fb_fd = -1,
 	.tty_fd = -1,
 	.last_gpu_buf = -1,
+	.active_buf = -1,
+	.prev_buf = -1,
 	.bufs = {
 		{ .dmabuf_fd = -1 },
 		{ .dmabuf_fd = -1 },
 		{ .dmabuf_fd = -1 },
 	},
 };
+
+/*
+ * Display refresh rate in Hz. 60 unless /etc/tvshell/refresh_hz names
+ * another 1280x720 rate the sink offers (for example 30 or 50), so the rate
+ * can be changed for testing without a rebuild.
+ */
+#define SHELL_REFRESH_FILE	"/etc/tvshell/refresh_hz"
+
+static unsigned int shell_refresh_hz(void)
+{
+	static unsigned int hz;
+	char buf[16] = { 0 };
+	int fd;
+
+	if (hz)
+		return hz;
+	hz = 60;
+	fd = open(SHELL_REFRESH_FILE, O_RDONLY | O_CLOEXEC);
+	if (fd >= 0) {
+		if (read(fd, buf, sizeof(buf) - 1) > 0) {
+			unsigned int v = (unsigned int)strtoul(buf, NULL, 10);
+
+			if (v >= 24 && v <= 60)
+				hz = v;
+		}
+		close(fd);
+	}
+	return hz;
+}
 
 static void write_sysfs_str(const char *path, const char *val)
 {
@@ -414,7 +458,7 @@ uint8_t shell_sdf_corner_stroke(int radius, int thickness, int cy, int cx)
 	return g_corner_stroke_lut[radius][thickness][cy][cx];
 }
 
-static bool drm_find_720p60(int fd)
+static bool drm_find_720p(int fd)
 {
 	struct drm_mode_card_res res = { 0 };
 	uint32_t conns[8] = { 0 }, crtcs[8] = { 0 };
@@ -459,9 +503,9 @@ static bool drm_find_720p60(int fd)
 
 	for (i = 0; i < conn.count_modes; i++) {
 		if (modes[i].hdisplay == 1280 && modes[i].vdisplay == 720 &&
-		    modes[i].vrefresh == 60) {
+		    modes[i].vrefresh == shell_refresh_hz()) {
 			if (modes[i].type & 0x08) {
-				disp.mode_720p60 = modes[i];
+				disp.mode_720p = modes[i];
 				disp.have_mode = true;
 				return true;
 			}
@@ -470,94 +514,131 @@ static bool drm_find_720p60(int fd)
 		}
 	}
 	if (fallback_idx >= 0) {
-		disp.mode_720p60 = modes[fallback_idx];
+		disp.mode_720p = modes[fallback_idx];
 		disp.have_mode = true;
 		return true;
 	}
 	{
-		/* CEA-861 VIC 4: 1280x720@60 (74.25 MHz, positive syncs) */
-		static const struct drm_mode_modeinfo cea_720p60 = {
-			.clock = 74250,
+		/*
+		 * 1280x720@60 with CVT reduced blanking (64.109 MHz, +H -V):
+		 * the HDMI link on this board is only clean below ~65 MHz, so
+		 * the driver no longer offers CEA 720p60 (74.25 MHz).
+		 */
+		static const struct drm_mode_modeinfo rb_720p60 = {
+			.clock = 64109,
 			.hdisplay = 1280,
-			.hsync_start = 1390,
-			.hsync_end = 1430,
-			.htotal = 1650,
+			.hsync_start = 1328,
+			.hsync_end = 1360,
+			.htotal = 1440,
 			.vdisplay = 720,
-			.vsync_start = 725,
-			.vsync_end = 730,
-			.vtotal = 750,
+			.vsync_start = 723,
+			.vsync_end = 728,
+			.vtotal = 741,
 			.vrefresh = 60,
-			.flags = 0x05,
+			.flags = 0x09,
 			.type = 0x48,
 			.name = "1280x720",
 		};
-		disp.mode_720p60 = cea_720p60;
+		disp.mode_720p = rb_720p60;
 		disp.have_mode = true;
 		return true;
 	}
 }
 
-static void ensure_hdmi_phy_latch(void)
+/*
+ * Wait for the page flip issued by drm_flip_fb() to complete. The kernel
+ * sends DRM_EVENT_FLIP_COMPLETE once the new buffer is latched; until then
+ * the previous buffer may still be scanned out and must not be reused.
+ */
+static void drm_wait_flip(void)
 {
-#ifdef __linux__
-	int fd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
-	volatile uint32_t *phy;
+	char evbuf[256];
+	int tries;
 
-	if (fd < 0)
-		return;
-	phy = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x39780000);
-	if (phy != MAP_FAILED) {
-		uint32_t w1 = phy[0x8c / 4];
+	for (tries = 0; disp.flip_pending && tries < 4; tries++) {
+		struct pollfd pfd = { .fd = disp.drm_fd, .events = POLLIN };
+		ssize_t n, off;
 
-		if ((w1 & 0x00ffffffU) == 0x00f82040U &&
-		    (w1 >> 24) != (((w1 >> 3) & 0xffU))) {
-			uint32_t fix_w1 = (w1 & 0x00ffffffU) |
-					  (((w1 >> 3) & 0xffU) << 24);
-			int i;
+		if (poll(&pfd, 1, 50) <= 0)
+			continue;
+		n = read(disp.drm_fd, evbuf, sizeof(evbuf));
+		for (off = 0; n > 0 && off + (ssize_t)sizeof(struct drm_event) <= n;) {
+			const struct drm_event *ev = (const void *)(evbuf + off);
 
-			for (i = 0; i < 100 && (phy[0x84 / 4] & 1U); i++)
-				;
-			phy[0xa4 / 4] = (phy[0xa4 / 4] & 0x00ffffffU);
-			for (i = 0; i < 100 && (phy[0x84 / 4] & 1U); i++)
-				;
-			phy[0x8c / 4] = fix_w1;
-			for (i = 0; i < 100 && (phy[0x84 / 4] & 1U); i++)
-				;
-			phy[0xa4 / 4] = (phy[0xa4 / 4] & 0x00ffffffU) | 0x80000000U;
-			for (i = 0; i < 100 && (phy[0x84 / 4] & 1U); i++)
-				;
+			if (ev->length < sizeof(*ev))
+				break;
+			if (ev->type == DRM_EVENT_FLIP_COMPLETE)
+				disp.flip_pending = false;
+			off += ev->length;
 		}
-		munmap((void *)phy, 4096);
 	}
-	close(fd);
-#endif
+	/* Never wedge the UI on a lost event */
+	disp.flip_pending = false;
 }
 
+/*
+ * Queue a flip to @fb_id, synchronised to the display's frame. At most one
+ * flip is in flight: the previous one is waited for first, so the kernel
+ * never answers -EBUSY and no frame is shown out of order. SETCRTC is only
+ * used when the CRTC cannot flip (it is off or was taken over by fbdev).
+ */
 static int drm_flip_fb(uint32_t fb_id)
 {
 	struct drm_mode_crtc_page_flip flip = {
 		.crtc_id = disp.crtc_id,
 		.fb_id = fb_id,
+		.flags = DRM_MODE_PAGE_FLIP_EVENT,
 	};
 	struct drm_mode_crtc crtc = { 0 };
-	int ret;
 
 	if (disp.drm_fd < 0 || fb_id == 0)
 		return -1;
-	if (ioctl(disp.drm_fd, DRM_IOCTL_MODE_PAGE_FLIP, &flip) == 0)
+	drm_wait_flip();
+	if (ioctl(disp.drm_fd, DRM_IOCTL_MODE_PAGE_FLIP, &flip) == 0) {
+		disp.flip_pending = true;
 		return 0;
+	}
+	if (errno == EBUSY) {
+		usleep(2000);
+		if (ioctl(disp.drm_fd, DRM_IOCTL_MODE_PAGE_FLIP, &flip) == 0) {
+			disp.flip_pending = true;
+			return 0;
+		}
+	}
 	if (!disp.have_mode)
 		return -1;
 	crtc.crtc_id = disp.crtc_id;
 	crtc.fb_id = fb_id;
 	crtc.set_connectors_ptr = (uintptr_t)&disp.conn_id;
 	crtc.count_connectors = 1;
-	crtc.mode = disp.mode_720p60;
+	crtc.mode = disp.mode_720p;
 	crtc.mode_valid = 1;
-	ret = ioctl(disp.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc);
-	if (ret == 0)
-		ensure_hdmi_phy_latch();
-	return ret;
+	return ioctl(disp.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc);
+}
+
+/* Record a successful flip to @idx */
+static void drm_set_front(int idx)
+{
+	if (idx != disp.active_buf)
+		disp.prev_buf = disp.active_buf;
+	disp.active_buf = idx;
+	disp.fb_id = disp.bufs[idx].fb_id;
+	disp.scanout = disp.bufs[idx].map;
+}
+
+/*
+ * A buffer that is neither on screen nor possibly still on screen behind a
+ * pending flip: with three buffers there is always one.
+ */
+static int drm_pick_back_buf(void)
+{
+	int i;
+
+	for (i = 0; i < SHELL_DRM_BUF_COUNT; i++)
+		if (i != disp.active_buf && i != disp.prev_buf &&
+		    disp.bufs[i].fb_id != 0)
+			return i;
+	return disp.active_buf == 0 ? 1 : 0;
 }
 
 static void destroy_drm_buf(int idx)
@@ -595,7 +676,7 @@ static int setup_drm_scanout(void)
 		if (fd < 0)
 			continue;
 		(void)ioctl(fd, DRM_IOCTL_SET_MASTER, 0);
-		if (drm_find_720p60(fd)) {
+		if (drm_find_720p(fd)) {
 			disp.drm_fd = fd;
 			break;
 		}
@@ -613,8 +694,8 @@ static int setup_drm_scanout(void)
 			if (orig_crtc.mode_valid &&
 			    orig_crtc.mode.hdisplay == 1280 &&
 			    orig_crtc.mode.vdisplay == 720 &&
-			    orig_crtc.mode.vrefresh == 60) {
-				disp.mode_720p60 = orig_crtc.mode;
+			    orig_crtc.mode.vrefresh == shell_refresh_hz()) {
+				disp.mode_720p = orig_crtc.mode;
 				disp.have_mode = true;
 			}
 		}
@@ -668,9 +749,10 @@ static int setup_drm_scanout(void)
 	}
 
 	disp.active_buf = -1;
+	disp.prev_buf = -1;
+	disp.flip_pending = false;
 	disp.fb_id = disp.bufs[0].fb_id;
 	disp.scanout = disp.bufs[0].map;
-	ensure_hdmi_phy_latch();
 
 	disp.use_drm = true;
 	return 0;
@@ -715,9 +797,9 @@ static int setup_fbdev_scanout(void)
 #endif
 }
 
-static void ensure_720p60_and_gamma(void)
+static void ensure_720p_mode_and_gamma(void)
 {
-	char cur[64] = { 0 };
+	char cur[64] = { 0 }, want[32];
 	int fd;
 
 	write_sysfs_str("/sys/bus/platform/devices/3a200000.display-controller/gamma_brightness", "100\n");
@@ -728,10 +810,13 @@ static void ensure_720p60_and_gamma(void)
 		ssize_t n = read(fd, cur, sizeof(cur) - 1);
 
 		close(fd);
-		if (n > 0 && strncmp(cur, "1280x720@60", 11) == 0)
+		snprintf(want, sizeof(want), "1280x720@%u", shell_refresh_hz());
+		if (n > 0 && strncmp(cur, want, strlen(want)) == 0 &&
+		    (cur[strlen(want)] == '\n' || cur[strlen(want)] == '\0'))
 			return;
 	}
-	write_sysfs_str("/sys/module/s5l8947x_drm/parameters/preferred_mode", "1280x720@60\n");
+	snprintf(want, sizeof(want), "1280x720@%u\n", shell_refresh_hz());
+	write_sysfs_str("/sys/module/s5l8947x_drm/parameters/preferred_mode", want);
 }
 
 int shell_display_init(bool headless)
@@ -755,7 +840,7 @@ int shell_display_init(bool headless)
 		return 0;
 	}
 
-	ensure_720p60_and_gamma();
+	ensure_720p_mode_and_gamma();
 
 	disp.tty_fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
 	if (disp.tty_fd >= 0) {
@@ -816,6 +901,7 @@ void shell_display_close(void)
 
 		if (disp.orig_fb_id != 0)
 			(void)drm_flip_fb(disp.orig_fb_id);
+		drm_wait_flip();
 		for (i = 0; i < SHELL_DRM_BUF_COUNT; i++)
 			destroy_drm_buf(i);
 		disp.scanout = NULL;
@@ -923,14 +1009,11 @@ void shell_display_present(void)
 			disp.dmg_count = 0;
 			return;
 		}
-		next_buf = (disp.active_buf == 0) ? 1 : 0;
+		next_buf = drm_pick_back_buf();
 		if (shell_gpu_flush(next_buf, disp.last_gpu_buf) == 0) {
 			disp.last_gpu_buf = next_buf;
-			if (drm_flip_fb(disp.bufs[next_buf].fb_id) == 0) {
-				disp.active_buf = next_buf;
-				disp.fb_id = disp.bufs[next_buf].fb_id;
-				disp.scanout = disp.bufs[next_buf].map;
-			}
+			if (drm_flip_fb(disp.bufs[next_buf].fb_id) == 0)
+				drm_set_front(next_buf);
 		}
 		disp.dmg_count = 0;
 		return;
@@ -938,6 +1021,15 @@ void shell_display_present(void)
 
 	if (disp.dmg_count <= 0)
 		return;
+	/*
+	 * The CPU path draws into bufs[0]. When a video frame put another
+	 * buffer on screen, bufs[0] holds an older frame, so refresh all of it
+	 * rather than only the damage, or old content flashes up around it.
+	 */
+	if (disp.use_drm && disp.active_buf != 0) {
+		shell_display_damage_all();
+		disp.scanout = disp.bufs[0].map;
+	}
 	if (disp.headless || !disp.scanout) {
 		disp.dmg_count = 0;
 		return;
@@ -966,10 +1058,8 @@ void shell_display_present(void)
 		}
 	}
 	if (disp.use_drm && disp.drm_fd >= 0 && disp.active_buf != 0) {
-		if (drm_flip_fb(disp.bufs[0].fb_id) == 0) {
-			disp.active_buf = 0;
-			disp.fb_id = disp.bufs[0].fb_id;
-		}
+		if (drm_flip_fb(disp.bufs[0].fb_id) == 0)
+			drm_set_front(0);
 	}
 	disp.dmg_count = 0;
 }
@@ -987,7 +1077,7 @@ int shell_display_get_video_dmabuf(int buf_idx)
 
 int shell_display_prepare_video_backbuf(int *out_dmabuf_fd)
 {
-	int back = (disp.active_buf == 1) ? 2 : 1;
+	int back = drm_pick_back_buf();
 
 	if (disp.headless || !disp.use_drm || disp.drm_fd < 0) {
 		int fd = shell_gpu_target_dmabuf_fd(1);
@@ -1025,9 +1115,7 @@ void shell_display_present_video_backbuf(int buf_idx,
 		if (!disp.headless && disp.use_drm && disp.drm_fd >= 0 &&
 		    disp.bufs[buf_idx].fb_id != 0) {
 			if (drm_flip_fb(disp.bufs[buf_idx].fb_id) == 0) {
-				disp.active_buf = buf_idx;
-				disp.fb_id = disp.bufs[buf_idx].fb_id;
-				disp.scanout = disp.bufs[buf_idx].map;
+				drm_set_front(buf_idx);
 				disp.last_gpu_buf = buf_idx;
 			}
 		} else if (disp.headless) {
@@ -1122,8 +1210,8 @@ void shell_display_present_video_backbuf(int buf_idx,
 
 	if (disp.bufs[buf_idx].fb_id != 0) {
 		if (drm_flip_fb(disp.bufs[buf_idx].fb_id) == 0) {
-			disp.active_buf = buf_idx;
-			disp.fb_id = disp.bufs[buf_idx].fb_id;
+			drm_set_front(buf_idx);
+			disp.scanout = disp.bufs[0].map;
 			disp.dmg_count = 0;
 			return;
 		}
@@ -1145,8 +1233,10 @@ void shell_display_release(void)
 	if (disp.use_drm && disp.drm_fd >= 0) {
 		if (disp.orig_fb_id != 0)
 			(void)drm_flip_fb(disp.orig_fb_id);
+		drm_wait_flip();
 		(void)ioctl(disp.drm_fd, DRM_IOCTL_DROP_MASTER, 0);
 		disp.active_buf = -1;
+		disp.prev_buf = -1;
 #ifdef __linux__
 		{
 			int fbfd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
@@ -1168,11 +1258,13 @@ void shell_display_release(void)
 
 int shell_display_acquire(void)
 {
-	ensure_720p60_and_gamma();
+	ensure_720p_mode_and_gamma();
 
 	if (disp.use_drm && disp.drm_fd >= 0) {
 		(void)ioctl(disp.drm_fd, DRM_IOCTL_SET_MASTER, 0);
 		disp.active_buf = -1;
+		disp.prev_buf = -1;
+		disp.flip_pending = false;
 		disp.last_gpu_buf = -1;
 		disp.fb_id = disp.bufs[0].fb_id;
 		disp.scanout = disp.bufs[0].map;

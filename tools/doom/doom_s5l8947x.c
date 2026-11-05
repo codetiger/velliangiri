@@ -110,6 +110,7 @@ float libsamplerate_scale = 0.65f;
 static int fb_fd = -1;
 static uint32_t *fb_mem;
 static size_t fb_mmap_len;
+static bool fb_vsync_ok = true;
 static uint32_t fb_width = FB_TARGET_W;
 static uint32_t fb_height = FB_TARGET_H;
 static uint32_t fb_stride_px = FB_TARGET_W;
@@ -1421,6 +1422,18 @@ void DG_DrawFrame(void)
 
 #ifdef __linux__
 	poll_linux_input();
+
+	/*
+	 * /dev/fb0 is a single buffer that is always being scanned out. Start
+	 * the top-to-bottom copy at the frame boundary: the copy runs ahead of
+	 * the scan, so the frame goes out whole instead of torn between two.
+	 */
+	if (fb_mem && fb_fd >= 0 && fb_vsync_ok) {
+		uint32_t crtc = 0;
+
+		if (ioctl(fb_fd, FBIO_WAITFORVSYNC, &crtc) < 0)
+			fb_vsync_ok = false;
+	}
 #endif
 
 	/*
