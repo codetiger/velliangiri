@@ -449,30 +449,30 @@ static bool drm_find_720p30(int fd)
 
 	for (i = 0; i < conn.count_modes; i++) {
 		if (modes[i].hdisplay == 1280 && modes[i].vdisplay == 720 &&
-		    modes[i].vrefresh == 60) {
+		    modes[i].vrefresh == 30) {
 			disp.mode_720p30 = modes[i];
 			disp.have_mode = true;
 			return true;
 		}
 	}
 	{
-		/* CEA-861 VIC 4: 1280x720@60 (74.25 MHz, positive syncs) */
-		static const struct drm_mode_modeinfo cea_720p60 = {
+		/* CEA-861 VIC 62: 1280x720@30 (74.25 MHz, positive syncs) */
+		static const struct drm_mode_modeinfo cea_720p30 = {
 			.clock = 74250,
 			.hdisplay = 1280,
-			.hsync_start = 1390,
-			.hsync_end = 1430,
-			.htotal = 1650,
+			.hsync_start = 3040,
+			.hsync_end = 3080,
+			.htotal = 3300,
 			.vdisplay = 720,
 			.vsync_start = 725,
 			.vsync_end = 730,
 			.vtotal = 750,
-			.vrefresh = 60,
+			.vrefresh = 30,
 			.flags = 0x05,
 			.type = 0x40,
 			.name = "1280x720",
 		};
-		disp.mode_720p30 = cea_720p60;
+		disp.mode_720p30 = cea_720p30;
 		disp.have_mode = true;
 		return true;
 	}
@@ -646,10 +646,10 @@ static void ensure_720p30_and_gamma(void)
 		ssize_t n = read(fd, cur, sizeof(cur) - 1);
 
 		close(fd);
-		if (n > 0 && strncmp(cur, "1280x720@60", 11) == 0)
+		if (n > 0 && strncmp(cur, "1280x720@30", 11) == 0)
 			return;
 	}
-	write_sysfs_str("/sys/module/s5l8947x_drm/parameters/preferred_mode", "1280x720@60\n");
+	write_sysfs_str("/sys/module/s5l8947x_drm/parameters/preferred_mode", "1280x720@30\n");
 }
 
 int shell_display_init(bool headless)

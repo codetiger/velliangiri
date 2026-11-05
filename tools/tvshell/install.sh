@@ -82,7 +82,7 @@ if [ "$INSTALL_APP" = "1" ]; then
 	fi
 
 	echo "==> restarting /bin/tvshell on $DEST"
-	$SSH "killall doom tvshell 2>/dev/null || true; sleep 0.2; nohup /bin/tvshell >/dev/null 2>&1 </dev/null &"
+	$SSH "killall doom tvshell 2>/dev/null || true; sleep 1.5; pidof tvshell >/dev/null 2>&1 || nohup /bin/tvshell >/dev/null 2>&1 </dev/null &"
 fi
 
 if [ "$INSTALL_MEDIA" = "1" ]; then

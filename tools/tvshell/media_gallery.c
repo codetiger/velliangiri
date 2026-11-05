@@ -537,11 +537,13 @@ static void render_player_view(const struct shell_theme *th)
 	int dst_dmabuf_fd = -1;
 
 	if (g_mg.player_is_video) {
-		buf_idx = shell_display_prepare_video_backbuf(&dst_dmabuf_fd);
-		if (buf_idx >= 0 && dst_dmabuf_fd >= 0) {
-			direct_dmabuf_ok = shell_media_render_video_frame_dmabuf(
-				&g_mg.player_card, g_mg.player_frame_idx,
-				buf_idx, dst_dmabuf_fd);
+		if (!shell_gpu_active()) {
+			buf_idx = shell_display_prepare_video_backbuf(&dst_dmabuf_fd);
+			if (buf_idx >= 0 && dst_dmabuf_fd >= 0) {
+				direct_dmabuf_ok = shell_media_render_video_frame_dmabuf(
+					&g_mg.player_card, g_mg.player_frame_idx,
+					buf_idx, dst_dmabuf_fd);
+			}
 		}
 		if (!direct_dmabuf_ok) {
 			const uint32_t *art = shell_media_get_video_frame(
@@ -550,8 +552,7 @@ static void render_player_view(const struct shell_theme *th)
 				shell_draw_bitmap_xrgb(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, art);
 			else
 				shell_draw_rect(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, 0xff0c0a09U);
-		} else if (!g_mg.player_hud_dirty && g_mg.player_hud_visible &&
-			   !shell_gpu_active()) {
+		} else if (!g_mg.player_hud_dirty && g_mg.player_hud_visible) {
 			shell_display_present_video_backbuf(buf_idx, g_mg_hud_rects, 3);
 			return;
 		} else if (!g_mg.player_hud_visible) {

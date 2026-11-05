@@ -1699,12 +1699,14 @@ static void render_window_media_overlay(const struct shell_theme *th)
 	g_ui.backbuf_modal_win = -1;
 
 	/*
-	 * Zero-copy hardware DMABUF video scanout fast path:
+	 * Zero-copy hardware DMABUF video scanout fast path (software HUD mode):
 	 * s5l8947x-jpeg (/dev/video2) -> NV12 DMABUF -> s5l8947x-m2sc (/dev/video1)
-	 * -> back DRM dumb buffer DMABUF, then composite only the 3 HUD pills
-	 * (via SGX543 hardware background tile reload when GPU is active).
+	 * -> back DRM dumb buffer DMABUF, then composite only the 3 HUD pills.
+	 * When SGX543 is active, shell_media_get_video_frame() uses zero-copy
+	 * M2SC1 DMABUF into Atlas 2 and composites in a single pass into bufs[0]
+	 * without per-frame DRM_IOCTL_MODE_SETCRTC flips.
 	 */
-	if (g_ui.overlay_is_video) {
+	if (g_ui.overlay_is_video && !shell_gpu_active()) {
 		int vdmabuf_fd = -1;
 		int vbuf_idx = shell_display_prepare_video_backbuf(&vdmabuf_fd);
 
