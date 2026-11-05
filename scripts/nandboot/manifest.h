@@ -59,8 +59,6 @@ uint32_t boot_crc32(const void *data, uint32_t len);
 
 int fmi_boot_init(void);
 int fmi_boot_read_page(uint32_t row, void *data_dst, void *meta_dst);
-int fmi_boot_erase_block(uint32_t row);
-int fmi_boot_write_page(uint32_t row, const void *data_src, const void *meta_src);
 
 int boot_load_from_nand(void *image_dst, void *dtb_dst, uint8_t *chosen_slot);
 

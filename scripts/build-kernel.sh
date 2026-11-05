@@ -36,28 +36,44 @@ if [ "${CLEAN}" = 1 ]; then
 	make -C "${TREE}" mrproper
 fi
 
-echo "[kernel] Generating .config (multi_v7_defconfig + s5l8947x.config + s5l8947x-trim.config) ..."
-make -C "${TREE}" multi_v7_defconfig >/dev/null
-"${TREE}/scripts/kconfig/merge_config.sh" -m -O "${TREE}" \
-	"${TREE}/.config" "${CONFIG_BASE}" "${CONFIG_TRIM}" >/dev/null
-
+NEED_CONFIG=0
+if [ "${CLEAN}" = 1 ] || [ ! -f "${TREE}/.config" ] || \
+   [ "${CONFIG_BASE}" -nt "${TREE}/.config" ] || \
+   [ "${CONFIG_TRIM}" -nt "${TREE}/.config" ] || \
+   [ "${BASH_SOURCE[0]}" -nt "${TREE}/.config" ]; then
+	NEED_CONFIG=1
+fi
 if [ "${EMBED_INITRAMFS:-1}" = 1 ] && [ -f "${INITRAMFS_CPIO}" ]; then
-	echo "[kernel] Embedding uncompressed initramfs (${INITRAMFS_CPIO}) for single-stream XZ ..."
-	FRAG="$(mktemp)"
-	{
-		echo "CONFIG_INITRAMFS_SOURCE=\"${INITRAMFS_CPIO}\""
-		echo "CONFIG_INITRAMFS_COMPRESSION_NONE=y"
-	} > "${FRAG}"
-	"${TREE}/scripts/kconfig/merge_config.sh" -m -O "${TREE}" \
-		"${TREE}/.config" "${FRAG}" >/dev/null
-	rm -f "${FRAG}"
+	if ! grep -q "CONFIG_INITRAMFS_SOURCE=\"${INITRAMFS_CPIO}\"" "${TREE}/.config" 2>/dev/null; then
+		NEED_CONFIG=1
+	fi
+elif grep -q 'CONFIG_INITRAMFS_SOURCE="[^"]' "${TREE}/.config" 2>/dev/null; then
+	NEED_CONFIG=1
 fi
 
-make -C "${TREE}" olddefconfig >/dev/null
+if [ "${NEED_CONFIG}" = 1 ]; then
+	echo "[kernel] Generating .config (multi_v7_defconfig + s5l8947x.config + s5l8947x-trim.config) ..."
+	make -C "${TREE}" multi_v7_defconfig >/dev/null
+	"${TREE}/scripts/kconfig/merge_config.sh" -m -O "${TREE}" \
+		"${TREE}/.config" "${CONFIG_BASE}" "${CONFIG_TRIM}" >/dev/null
 
-# merge_config.sh puts its temporaries in the caller's directory and only
-# removes them on a clean exit
-rm -f "${ROOT}"/.tmp.config.* "${ROOT}"/.merge_tmp.config.*
+	if [ "${EMBED_INITRAMFS:-1}" = 1 ] && [ -f "${INITRAMFS_CPIO}" ]; then
+		echo "[kernel] Embedding uncompressed initramfs (${INITRAMFS_CPIO}) for single-stream XZ ..."
+		FRAG="$(mktemp)"
+		{
+			echo "CONFIG_INITRAMFS_SOURCE=\"${INITRAMFS_CPIO}\""
+			echo "CONFIG_INITRAMFS_COMPRESSION_NONE=y"
+		} > "${FRAG}"
+		"${TREE}/scripts/kconfig/merge_config.sh" -m -O "${TREE}" \
+			"${TREE}/.config" "${FRAG}" >/dev/null
+		rm -f "${FRAG}"
+	fi
+
+	make -C "${TREE}" olddefconfig >/dev/null
+	rm -f "${ROOT}"/.tmp.config.* "${ROOT}"/.merge_tmp.config.*
+else
+	echo "[kernel] Reusing up-to-date ${TREE}/.config (incremental build) ..."
+fi
 
 echo "[kernel] Verifying required S5L8947X config symbols ..."
 awk -f "${ROOT}/scripts/check-config-fragment.awk" "${CONFIG_BASE}" "${TREE}/.config"

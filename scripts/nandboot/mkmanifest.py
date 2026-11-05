@@ -36,6 +36,8 @@ def pack_slot(image_bytes: bytes, dtb_bytes: bytes, start_peb: int) -> bytes:
         extents.append((slc_row(peb, 0), cnt))
         rem -= cnt
         peb += 1
+    if rem > 0:
+        raise ValueError(f"Kernel Image ({img_size} B) exceeds 8-PEB (16 MiB) slot limit")
     while len(extents) < 8:
         extents.append((0, 0))
 

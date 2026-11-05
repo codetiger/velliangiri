@@ -61,10 +61,17 @@ static inline uint32_t sample_doom_poster_bilinear(float sx, float sy)
 	float fx = sx - (float)x0;
 	float fy = sy - (float)y0;
 
+#ifdef HAVE_DOOM_POSTER_PALETTE
+	uint32_t c00 = doom_poster_palette[doom_poster_idx_320x200[y0 * 320 + x0]];
+	uint32_t c10 = doom_poster_palette[doom_poster_idx_320x200[y0 * 320 + x1]];
+	uint32_t c01 = doom_poster_palette[doom_poster_idx_320x200[y1 * 320 + x0]];
+	uint32_t c11 = doom_poster_palette[doom_poster_idx_320x200[y1 * 320 + x1]];
+#else
 	uint32_t c00 = doom_poster_320x200[y0 * 320 + x0];
 	uint32_t c10 = doom_poster_320x200[y0 * 320 + x1];
 	uint32_t c01 = doom_poster_320x200[y1 * 320 + x0];
 	uint32_t c11 = doom_poster_320x200[y1 * 320 + x1];
+#endif
 
 	float w00 = (1.0f - fx) * (1.0f - fy);
 	float w10 = fx * (1.0f - fy);
@@ -2560,6 +2567,8 @@ static bool resolve_media_path(const char *uri, char *out, size_t out_sz)
 
 		static const char *const mdirs[] = {
 			"/mnt/data/linux/media",
+			"/mnt/data/linux/media/photos",
+			"/mnt/data/linux/media/videos",
 			"/usr/local/share/tvshell/media",
 			"/usr/share/tvshell/media",
 			"build/dl/gallery",
@@ -2622,12 +2631,35 @@ static bool check_or_start_url_fetch(const char *url, char *local_out, size_t ou
 					if (devnull > 2)
 						close(devnull);
 				}
-				/* Try wget first (BusyBox / Alpine), then curl */
-				char cmd[1536];
-				snprintf(cmd, sizeof(cmd),
-					 "(wget -q -T 8 -O '%s' '%s' || curl -fsSL --max-time 8 -o '%s' '%s') && mv '%s' '%s'",
-					 tmp_path, url, tmp_path, url, tmp_path, local_out);
-				execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
+				/* Try wget first (BusyBox / Alpine), then curl without invoking /bin/sh */
+				int status = 0;
+				pid_t dl_pid = fork();
+				if (dl_pid == 0) {
+					char *wget_argv[] = {
+						"wget", "-q", "-T", "8",
+						"-O", tmp_path, (char *)url, NULL
+					};
+					execvp("wget", wget_argv);
+					_exit(127);
+				}
+				if (dl_pid < 0 || waitpid(dl_pid, &status, 0) < 0 ||
+				    !WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+					dl_pid = fork();
+					if (dl_pid == 0) {
+						char *curl_argv[] = {
+							"curl", "-fsSL", "--max-time", "8",
+							"-o", tmp_path, (char *)url, NULL
+						};
+						execvp("curl", curl_argv);
+						_exit(127);
+					}
+					if (dl_pid < 0 || waitpid(dl_pid, &status, 0) < 0 ||
+					    !WIFEXITED(status) || WEXITSTATUS(status) != 0)
+						_exit(1);
+				}
+				if (rename(tmp_path, local_out) == 0)
+					_exit(0);
+				unlink(tmp_path);
 				_exit(1);
 			} else if (pid > 0) {
 				g_fetches[i].pid = pid;
@@ -2685,31 +2717,72 @@ static struct uri_cache_entry *find_uri_cache_entry(const char *resolved_path)
 	return NULL;
 }
 
-static struct uri_cache_entry *get_uri_cache_entry(const char *resolved_path, bool need_fs)
+static void evict_excess_fs_720p(const struct uri_cache_entry *keep)
+{
+	while (1) {
+		int i, active_fs = 0, oldest_idx = -1;
+		uint64_t oldest_clk = UINT64_MAX;
+
+		for (i = 0; i < URI_CACHE_SLOTS; i++) {
+			if (&g_uri_cache[i] == keep || !g_uri_cache[i].fs_720p)
+				continue;
+			active_fs++;
+			if (g_uri_cache[i].last_used < oldest_clk) {
+				oldest_clk = g_uri_cache[i].last_used;
+				oldest_idx = i;
+			}
+		}
+		if (active_fs < 2 || oldest_idx < 0)
+			break;
+		free(g_uri_cache[oldest_idx].fs_720p);
+		g_uri_cache[oldest_idx].fs_720p = NULL;
+	}
+}
+
+static struct uri_cache_entry *get_uri_cache_entry(const char *resolved_path,
+						   bool need_card,
+						   bool need_tile,
+						   bool need_fs)
 {
 	int i, victim = 0;
 	uint64_t oldest = UINT64_MAX;
 	struct uri_cache_entry *hit = find_uri_cache_entry(resolved_path);
 
 	if (hit) {
-		if (need_fs && !hit->fs_720p) {
+		bool miss_card = need_card && !hit->card_275;
+		bool miss_tile = need_tile && !hit->tile_275x164;
+		bool miss_fs   = need_fs   && !hit->fs_720p;
+
+		if (!miss_card && !miss_tile && !miss_fs)
+			return hit;
+		if (miss_fs)
+			evict_excess_fs_720p(hit);
 #ifdef __linux__
-			if (hw_decode_and_scale_jpeg_file(resolved_path, NULL, NULL,
-							  &hit->fs_720p, NULL))
-				return hit;
+		if (hw_decode_and_scale_jpeg_file(resolved_path,
+						  miss_card ? &hit->card_275 : NULL,
+						  miss_tile ? &hit->tile_275x164 : NULL,
+						  miss_fs   ? &hit->fs_720p : NULL,
+						  NULL))
+			return hit;
 #endif
-			int rw = 0, rh = 0;
-			uint32_t *raw = decode_image_file_raw(resolved_path, &rw, &rh);
-			if (raw) {
+		int rw = 0, rh = 0;
+		uint32_t *raw = decode_image_file_raw(resolved_path, &rw, &rh);
+		if (raw) {
+			if (miss_card)
+				hit->card_275 = scale_cover_bilinear(raw, rw, rh, 275, 312);
+			if (miss_tile)
+				hit->tile_275x164 = scale_cover_bilinear(raw, rw, rh, 275, 164);
+			if (miss_fs) {
 				if (rw == SHELL_SCREEN_W && rh == SHELL_SCREEN_H) {
 					hit->fs_720p = raw;
+					raw = NULL;
 				} else {
 					hit->fs_720p = scale_cover_bilinear(raw, rw, rh,
 									    SHELL_SCREEN_W,
 									    SHELL_SCREEN_H);
-					free(raw);
 				}
 			}
+			free(raw);
 		}
 		return hit;
 	}
@@ -2721,14 +2794,20 @@ static struct uri_cache_entry *get_uri_cache_entry(const char *resolved_path, bo
 		}
 	}
 
+	if (need_fs)
+		evict_excess_fs_720p(&g_uri_cache[victim]);
+
 #ifdef __linux__
 	{
 		uint32_t *hw_card = NULL;
 		uint32_t *hw_tile = NULL;
 		uint32_t *hw_fs = NULL;
 
-		if (hw_decode_and_scale_jpeg_file(resolved_path, &hw_card, &hw_tile,
-						  need_fs ? &hw_fs : NULL, NULL)) {
+		if (hw_decode_and_scale_jpeg_file(resolved_path,
+						  need_card ? &hw_card : NULL,
+						  need_tile ? &hw_tile : NULL,
+						  need_fs   ? &hw_fs : NULL,
+						  NULL)) {
 			struct uri_cache_entry *e = &g_uri_cache[victim];
 
 			free(e->card_275);
@@ -2758,58 +2837,60 @@ static struct uri_cache_entry *get_uri_cache_entry(const char *resolved_path, bo
 
 	snprintf(e->path, sizeof(e->path), "%s", resolved_path);
 	e->last_used = ++g_cache_clock;
-	e->card_275 = scale_cover_bilinear(raw, rw, rh, 275, 312);
-	e->tile_275x164 = scale_cover_bilinear(raw, rw, rh, 275, 164);
-	if (rw == SHELL_SCREEN_W && rh == SHELL_SCREEN_H) {
-		e->fs_720p = raw;
-	} else {
-		if (need_fs)
+	if (need_card)
+		e->card_275 = scale_cover_bilinear(raw, rw, rh, 275, 312);
+	if (need_tile)
+		e->tile_275x164 = scale_cover_bilinear(raw, rw, rh, 275, 164);
+	if (need_fs) {
+		if (rw == SHELL_SCREEN_W && rh == SHELL_SCREEN_H) {
+			e->fs_720p = raw;
+			raw = NULL;
+		} else {
 			e->fs_720p = scale_cover_bilinear(raw, rw, rh, SHELL_SCREEN_W, SHELL_SCREEN_H);
-		free(raw);
+		}
 	}
+	free(raw);
 	return e;
 }
 
-static const uint32_t *ensure_preset_art_loaded(enum giri_preset_art preset)
+static const uint32_t *ensure_preset_art_loaded(enum giri_preset_art preset, bool want_tile)
 {
 	char ph_path[256];
 	const char *ph_name;
+	bool need_card = !want_tile && !g_art_cache[preset < GIRI_ART_COUNT && preset >= 0 ? preset : 0].card_275;
+	bool need_tile = want_tile && !g_art_cache[preset < GIRI_ART_COUNT && preset >= 0 ? preset : 0].tile_275x164;
 
 	if (preset < 0 || preset >= GIRI_ART_COUNT)
 		preset = GIRI_ART_DAWN_RIDGE;
-	if (g_art_cache[preset].card_275 && g_art_cache[preset].tile_275x164)
-		return g_art_cache[preset].card_275;
+	if (!need_card && !need_tile)
+		return want_tile ? g_art_cache[preset].tile_275x164 : g_art_cache[preset].card_275;
 
 	ph_name = preset_placeholder_names[preset];
 	if (ph_name && resolve_placeholder_path(ph_name, ph_path, sizeof(ph_path))) {
 #ifdef __linux__
 		if (hw_decode_and_scale_jpeg_file(ph_path,
-						  &g_art_cache[preset].card_275,
-						  &g_art_cache[preset].tile_275x164,
+						  need_card ? &g_art_cache[preset].card_275 : NULL,
+						  need_tile ? &g_art_cache[preset].tile_275x164 : NULL,
 						  NULL, NULL))
-			return g_art_cache[preset].card_275;
+			return want_tile ? g_art_cache[preset].tile_275x164 : g_art_cache[preset].card_275;
 #endif
 		int rw = 0, rh = 0;
 		uint32_t *raw = decode_image_file_raw(ph_path, &rw, &rh);
 		if (raw) {
-			g_art_cache[preset].card_275 = scale_cover_bilinear(raw, rw, rh, 275, 312);
-			g_art_cache[preset].tile_275x164 = scale_cover_bilinear(raw, rw, rh, 275, 164);
-			if (rw == SHELL_SCREEN_W && rh == SHELL_SCREEN_H) {
-				g_art_cache[preset].fs_720p = raw;
-			} else {
-				g_art_cache[preset].fs_720p = scale_cover_bilinear(raw, rw, rh,
-										   SHELL_SCREEN_W,
-										   SHELL_SCREEN_H);
-				free(raw);
-			}
-			return g_art_cache[preset].card_275;
+			if (need_card)
+				g_art_cache[preset].card_275 = scale_cover_bilinear(raw, rw, rh, 275, 312);
+			if (need_tile)
+				g_art_cache[preset].tile_275x164 = scale_cover_bilinear(raw, rw, rh, 275, 164);
+			free(raw);
+			return want_tile ? g_art_cache[preset].tile_275x164 : g_art_cache[preset].card_275;
 		}
 	}
 
-	g_art_cache[preset].card_275 = rasterize_preset_surface(preset, 275, 312);
-	if (!g_art_cache[preset].tile_275x164)
+	if (need_card)
+		g_art_cache[preset].card_275 = rasterize_preset_surface(preset, 275, 312);
+	if (need_tile)
 		g_art_cache[preset].tile_275x164 = rasterize_preset_surface(preset, 275, 164);
-	return g_art_cache[preset].card_275;
+	return want_tile ? g_art_cache[preset].tile_275x164 : g_art_cache[preset].card_275;
 }
 
 static bool qt_mov_open_for_card(const struct giri_media_card *card)
@@ -3053,9 +3134,16 @@ static void *alsa_video_audio_worker(void *arg)
 				.frames = VID_OPT_PERIOD_FRAMES,
 			};
 			for (i = 0; i < VID_OPT_PERIOD_FRAMES; i++) {
-				int s = (i * VID_PCM_PERIOD_FRAMES) / VID_OPT_PERIOD_FRAMES;
-				opt_buf[i * 2]     = period_buf[s * 2];
-				opt_buf[i * 2 + 1] = period_buf[s * 2 + 1];
+				uint32_t pos_q10 = ((uint32_t)i * (VID_PCM_PERIOD_FRAMES << 10)) /
+						   VID_OPT_PERIOD_FRAMES;
+				uint32_t s0 = pos_q10 >> 10;
+				uint32_t s1 = (s0 + 1 < VID_PCM_PERIOD_FRAMES) ? (s0 + 1) : s0;
+				int32_t frac = (int32_t)(pos_q10 & 0x3ffU);
+				int32_t l0 = period_buf[s0 * 2],     l1 = period_buf[s1 * 2];
+				int32_t r0 = period_buf[s0 * 2 + 1], r1 = period_buf[s1 * 2 + 1];
+
+				opt_buf[i * 2]     = (int16_t)(l0 + (((l1 - l0) * frac) >> 10));
+				opt_buf[i * 2 + 1] = (int16_t)(r0 + (((r1 - r0) * frac) >> 10));
 			}
 			if (ioctl(opt_fd, SNDRV_PCM_IOCTL_WRITEI_FRAMES, &xfer_opt) < 0 &&
 			    errno == EPIPE) {
@@ -3189,10 +3277,10 @@ void shell_media_init(void)
 	memset(g_fetches, 0, sizeof(g_fetches));
 
 	/* Pre-warm only the 4 Home Screen card presets; others load on demand */
-	(void)ensure_preset_art_loaded(GIRI_ART_DAWN_RIDGE);
-	(void)ensure_preset_art_loaded(GIRI_ART_WEATHER_SKY);
-	(void)ensure_preset_art_loaded(GIRI_ART_MONSOON_VIDEO);
-	(void)ensure_preset_art_loaded(GIRI_ART_DOOM_GAME);
+	(void)ensure_preset_art_loaded(GIRI_ART_DAWN_RIDGE, false);
+	(void)ensure_preset_art_loaded(GIRI_ART_WEATHER_SKY, false);
+	(void)ensure_preset_art_loaded(GIRI_ART_MONSOON_VIDEO, false);
+	(void)ensure_preset_art_loaded(GIRI_ART_DOOM_GAME, false);
 }
 
 void shell_media_release_hw(void)
@@ -3267,7 +3355,10 @@ const uint32_t *shell_media_get_card_art(const struct giri_media_card *card,
 			preset = card->preset_art;
 
 		if (resolve_card_image_path(card, resolved, sizeof(resolved))) {
-			struct uri_cache_entry *e = get_uri_cache_entry(resolved, false);
+			struct uri_cache_entry *e = get_uri_cache_entry(resolved,
+									!want_tile,
+									want_tile,
+									false);
 			if (e) {
 				if (want_tile && e->tile_275x164)
 					return e->tile_275x164;
@@ -3277,10 +3368,7 @@ const uint32_t *shell_media_get_card_art(const struct giri_media_card *card,
 		}
 	}
 
-	(void)ensure_preset_art_loaded(preset);
-	if (want_tile && g_art_cache[preset].tile_275x164)
-		return g_art_cache[preset].tile_275x164;
-	return g_art_cache[preset].card_275;
+	return ensure_preset_art_loaded(preset, want_tile);
 }
 
 /*
@@ -3308,7 +3396,7 @@ const uint32_t *shell_media_get_card_art_fast(const struct giri_media_card *card
 			if (e) {
 				if (want_tile && e->tile_275x164)
 					return e->tile_275x164;
-				if (e->card_275)
+				if (!want_tile && e->card_275)
 					return e->card_275;
 			}
 			if (is_final_out)
@@ -3316,8 +3404,8 @@ const uint32_t *shell_media_get_card_art_fast(const struct giri_media_card *card
 		}
 	}
 
-	(void)ensure_preset_art_loaded(preset);
-	if (!g_art_cache[preset].card_275 && preset != GIRI_ART_DOOM_GAME)
+	(void)ensure_preset_art_loaded(preset, want_tile);
+	if (!g_art_cache[preset].card_275 && !want_tile && preset != GIRI_ART_DOOM_GAME)
 		g_art_cache[preset].card_275 = rasterize_preset_surface(preset, 275, 312);
 	if (want_tile && !g_art_cache[preset].tile_275x164 && preset != GIRI_ART_DOOM_GAME)
 		g_art_cache[preset].tile_275x164 = rasterize_preset_surface(preset, 275, 164);
@@ -3327,9 +3415,7 @@ const uint32_t *shell_media_get_card_art_fast(const struct giri_media_card *card
 }
 
 /*
- * Incrementally decode and cache at most ONE uncached card image from @scr.
- * Returns true if a card was decoded (or more cards remain), false when all
- * 4 cards in @scr have their final artwork cached.
+ * Incrementally decode and cache at most ONE uncached gallery tile image.
  */
 bool shell_media_preload_card_one(const struct giri_media_card *card)
 {
@@ -3338,8 +3424,10 @@ bool shell_media_preload_card_one(const struct giri_media_card *card)
 	if (!card)
 		return false;
 	if (resolve_card_image_path(card, resolved, sizeof(resolved))) {
-		if (!find_uri_cache_entry(resolved)) {
-			(void)get_uri_cache_entry(resolved, false);
+		struct uri_cache_entry *e = find_uri_cache_entry(resolved);
+
+		if (!e || !e->tile_275x164) {
+			(void)get_uri_cache_entry(resolved, false, true, false);
 			return true;
 		}
 	}
@@ -3358,8 +3446,10 @@ bool shell_media_preload_next_card(const struct giri_screen *scr)
 		const struct giri_media_card *card = &scr->media_cards[i];
 
 		if (resolve_card_image_path(card, resolved, sizeof(resolved))) {
-			if (!find_uri_cache_entry(resolved)) {
-				(void)get_uri_cache_entry(resolved, false);
+			struct uri_cache_entry *e = find_uri_cache_entry(resolved);
+
+			if (!e || !e->card_275) {
+				(void)get_uri_cache_entry(resolved, true, false, false);
 				return true;
 			}
 		}
@@ -3377,13 +3467,16 @@ const uint32_t *shell_media_get_fullscreen_art(const struct giri_media_card *car
 			preset = card->preset_art;
 
 		if (resolve_card_image_path(card, resolved, sizeof(resolved))) {
-			struct uri_cache_entry *e = get_uri_cache_entry(resolved, true);
+			struct uri_cache_entry *e = get_uri_cache_entry(resolved,
+									false,
+									false,
+									true);
 			if (e && e->fs_720p)
 				return e->fs_720p;
 		}
 	}
 
-	(void)ensure_preset_art_loaded(preset);
+	(void)ensure_preset_art_loaded(preset, false);
 	if (!g_art_cache[preset].fs_720p) {
 		char ph_path[256];
 		const char *ph_name = preset_placeholder_names[preset];
@@ -3774,6 +3867,8 @@ int shell_media_scan_device(struct shell_media_item *items, int max_items, bool 
 {
 	static const char *const scan_dirs[] = {
 		"/mnt/data/linux/media",
+		"/mnt/data/linux/media/photos",
+		"/mnt/data/linux/media/videos",
 		"/usr/local/share/tvshell/media",
 		"/usr/share/tvshell/media",
 		"build/dl/gallery",

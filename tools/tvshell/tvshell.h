@@ -275,5 +275,6 @@ uint64_t shell_now_ms(void);
 
 /* media_gallery.c */
 int media_gallery_run(enum shell_theme_id theme_id);
+int media_gallery_main(int argc, char **argv);
 
 #endif /* TVSHELL_H */

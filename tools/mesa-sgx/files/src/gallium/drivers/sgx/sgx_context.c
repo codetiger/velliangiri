@@ -754,15 +754,8 @@ sgx_create_shader_state(struct pipe_context *pctx, const struct pipe_shader_stat
    if (s->type != PIPE_SHADER_IR_NIR)
       return sh;
    sh->nir = s->ir.nir;
-   if (sh->nir->info.stage == MESA_SHADER_VERTEX)
+   if (sh->nir->info.stage == MESA_SHADER_VERTEX) {
       sh->vs_nattrs = sgx_vs_attr_count(sh->nir);
-   if (sh->nir->info.stage == MESA_SHADER_VERTEX && ctx->draw) {
-      struct pipe_shader_state copy = *s;
-
-      copy.ir.nir = nir_shader_clone(NULL, sh->nir);
-      sh->draw = draw_create_vertex_shader(ctx->draw, &copy);
-      if (!sh->draw)
-         mesa_logw("sgx: the draw module did not take a vertex shader");
    } else if (sh->nir->info.stage == MESA_SHADER_FRAGMENT) {
       char why[128];
 
@@ -770,7 +763,6 @@ sgx_create_shader_state(struct pipe_context *pctx, const struct pipe_shader_stat
       if (ctx->draw)
          sh->draw_fs = draw_create_fragment_shader(ctx->draw, s);
 
-      sgx_fs_colour_analyse(sh->nir, &sh->colour);
       /* SGX_NOCOMPILE=1: M13a's way only */
       if (!debug_get_bool_option("SGX_NOCOMPILE", false)) {
          sh->compiled = sgx_compile_fs(sh->nir, NULL, why, sizeof(why));
@@ -788,6 +780,8 @@ sgx_create_shader_state(struct pipe_context *pctx, const struct pipe_shader_stat
                mesa_logi("sgx:   %016llx", (unsigned long long)sh->compiled->prog.code[i]);
          }
       }
+      if (!sh->compiled)
+         sgx_fs_colour_analyse(sh->nir, &sh->colour);
    }
    return sh;
 }

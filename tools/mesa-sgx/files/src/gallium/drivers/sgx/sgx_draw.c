@@ -2452,13 +2452,18 @@ gpu_vs_draw(struct sgx_context *ctx, const struct pipe_draw_info *info,
       if (!indices)
          return false;
       indices = (const uint8_t *)indices + draw->start * info->index_size;
-      for (unsigned i = 0; i < draw->count; i++) {
-         unsigned x;
+      if (info->index_bounds_valid) {
+         lo = info->min_index;
+         hi = info->max_index;
+      } else {
+         for (unsigned i = 0; i < draw->count; i++) {
+            unsigned x;
 
-         if (!index_at(indices, info->index_size, i, &x))
-            return false;
-         lo = MIN2(lo, x);
-         hi = MAX2(hi, x);
+            if (!index_at(indices, info->index_size, i, &x))
+               return false;
+            lo = MIN2(lo, x);
+            hi = MAX2(hi, x);
+         }
       }
    } else {
       lo = draw->start;
@@ -2768,7 +2773,7 @@ sgx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
    const void *indices = NULL;
    unsigned i;
 
-   if (indirect || !draw || !ctx->vs || !ctx->vs->draw)
+   if (indirect || !draw || !ctx->vs || (!ctx->vs->nir && !ctx->vs->draw))
       return;
    /* (M43) under a render condition that says no: nothing */
    if (!sgx_render_condition_ok(ctx))
@@ -2816,6 +2821,20 @@ sgx_draw_vbo(struct pipe_context *pctx, const struct pipe_draw_info *info,
          return;
       draws += i;
       num_draws -= i;
+   }
+
+   if (!ctx->vs->draw) {
+      struct pipe_shader_state copy = {
+         .type = PIPE_SHADER_IR_NIR,
+         .ir.nir = nir_shader_clone(NULL, ctx->vs->nir),
+      };
+
+      ctx->vs->draw = draw_create_vertex_shader(draw, &copy);
+      if (!ctx->vs->draw) {
+         mesa_logw("sgx: the draw module did not take a vertex shader");
+         return;
+      }
+      draw_bind_vertex_shader(draw, ctx->vs->draw);
    }
 
    /* the draw module's way: its buffers mapped for it */

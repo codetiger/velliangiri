@@ -1,23 +1,23 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * Bare-metal FMI0 + Central DMA (CDMA) page reader and single-page PIO
- * programmer for the S5L8947X Stage-1 NAND boot loader.
+ * Bare-metal FMI0 + Central DMA (CDMA) page reader for the S5L8947X
+ * Stage-1 NAND boot loader.
  *
  * Uses the exact register model from drivers/mtd/devices/s5l8947x-fmi.c and
  * drivers/dma/s5l8947x-cdma.c:
  *   FMI0 host       0x31200000 (data FIFO +0x14, meta FIFO +0x18)
- *   FMI0 sequencer  0x31201000
- *   FMI0 ECC        0x31202000
+ *   FMI0 sequencer  0x31240000
+ *   FMI0 ECC        0x31280000
  *   CDMA global     0x37000000
- *   CDMA channel 5  0x37005000 (FMI0 data, request 4, 32-bit width)
- *   CDMA channel 6  0x37006000 (FMI0 meta, request 5, 8-bit width)
+ *   CDMA channel 5  0x37005000 (FMI0 data, request 0, 32-bit width)
+ *   CDMA channel 6  0x37006000 (FMI0 meta, request 1, 8-bit width)
  */
 
 #include "manifest.h"
 
 #define FMI_HOST	0x31200000U
-#define FMI_SEQ		0x31201000U
-#define FMI_ECC		0x31202000U
+#define FMI_SEQ		0x31240000U
+#define FMI_ECC		0x31280000U
 
 #define FMI_H_CFG	0x00U
 #define FMI_H_CMD	0x04U
@@ -182,7 +182,7 @@ static int fmi_pio(void *buf, unsigned int len, int write)
 {
 	uint32_t *w = (uint32_t *)buf;
 	uint8_t *b = (uint8_t *)buf;
-	uint32_t shape = ((len - 1U) << 8) & 0x0007ff00U;
+	uint32_t shape = ((len & 0x7ffU) << 8) | 1U;
 	uint32_t words = len / 4U;
 	uint32_t i, t;
 
@@ -373,9 +373,9 @@ int fmi_boot_read_page(uint32_t row, void *data_dst, void *meta_dst)
 
 	__asm__ volatile("dsb sy" ::: "memory");
 
-	cdma_start_chan(CDMA_CH5, (4U << 16) | (1U << 7) | (2U << 2),
+	cdma_start_chan(CDMA_CH5, (0U << 16) | (1U << 7) | (2U << 2),
 			0x00200014U, (uint32_t)&data_segs[0]);
-	cdma_start_chan(CDMA_CH6, (5U << 16) | (1U << 7),
+	cdma_start_chan(CDMA_CH6, (1U << 16) | (1U << 7),
 			0x00200018U, (uint32_t)&meta_segs[0]);
 
 	mmio_w32(FMI_HOST + FMI_H_CMD, 6U);
@@ -384,8 +384,8 @@ int fmi_boot_read_page(uint32_t row, void *data_dst, void *meta_dst)
 	mmio_w32(FMI_SEQ + FMI_S_TIMING, 0x2111U | (1U << 20));
 	mmio_w32(FMI_HOST + FMI_H_CFG, 3U);
 
-	/* 4 logical pages of 4096B data + 16B meta */
-	shape = 3U | (4095U << 8) | (16U << 19) | (16U << 25);
+	/* 4 logical pages of 4 x 1024B sectors + 16B meta */
+	shape = 4U | (1024U << 8) | (16U << 19) | (16U << 25);
 	mmio_w32(FMI_HOST + FMI_H_SHAPE, shape);
 
 	for (i = 0; i < 4U; i++) {
@@ -417,73 +417,4 @@ int fmi_boot_read_page(uint32_t row, void *data_dst, void *meta_dst)
 	fmi_op_end();
 
 	return (st == 0x40 || st == 0x42 || st == 0x49) ? 0 : -1;
-}
-
-int fmi_boot_erase_block(uint32_t row)
-{
-	int st;
-
-	fmi_ce(1);
-	fmi_quiesce();
-	if (fmi_cmd(MN_CMD_ERASE, 1U | 8U | 2U, row, 0, 4)) {
-		fmi_op_end();
-		return -1;
-	}
-	st = fmi_status_from(MN_CMD_NEXT_STATUS, 1U);
-	if (st >= 0 && !(st & MN_ST_GENERAL_ERROR))
-		st = fmi_status_from(MN_CMD_OP_STATUS, 3U);
-	fmi_op_end();
-	if (st < 0 || (st & (MN_ST_FAIL | MN_ST_GENERAL_ERROR))) {
-		fmi_set_feature(0x3380U, 1U);
-		return -1;
-	}
-	return 0;
-}
-
-int fmi_boot_write_page(uint32_t row, const void *data_src, const void *meta_src)
-{
-	const uint8_t *d = (const uint8_t *)data_src;
-	const uint8_t *m = (const uint8_t *)meta_src;
-	uint8_t blank_meta[16];
-	uint32_t lp, s;
-	int st;
-
-	for (s = 0; s < 16U; s++)
-		blank_meta[s] = 0xffU;
-
-	fmi_ce(1);
-	fmi_quiesce();
-	if (fmi_cmd(MN_CMD_PROGRAM, 1U | 8U, row, 0, 4)) {
-		fmi_ce(0);
-		return -1;
-	}
-	for (lp = 0; lp < 4U; lp++) {
-		const uint8_t *lp_d = d + lp * 4096U;
-		const uint8_t *lp_m = m ? (m + lp * 16U) : blank_meta;
-
-		if (fmi_pio((void *)lp_d, 1024U, 1) ||
-		    fmi_pio((void *)lp_m, 16U, 1)) {
-			fmi_ce(0);
-			return -1;
-		}
-		for (s = 1U; s < 4U; s++) {
-			if (fmi_pio((void *)(lp_d + s * 1024U), 1024U, 1)) {
-				fmi_ce(0);
-				return -1;
-			}
-		}
-	}
-	if (fmi_cmd(MN_CMD_PROG_CONFIRM, 1U, 0, 0, 0)) {
-		fmi_ce(0);
-		return -1;
-	}
-	st = fmi_status_from(MN_CMD_NEXT_STATUS, 1U);
-	mmio_w32(FMI_HOST + FMI_H_CMD, 6U);
-	fmi_ce(0);
-	fmi_quiesce();
-	if (st < 0 || (st & (MN_ST_FAIL | MN_ST_GENERAL_ERROR))) {
-		fmi_set_feature(0x3380U, 1U);
-		return -1;
-	}
-	return 0;
 }

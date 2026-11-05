@@ -29,41 +29,45 @@
 
 static const uint8_t *data;
 static size_t size;
-/* end of the run each record belongs to: 0 unknown, 1 none, else end + 2 */
-static size_t *run_end;
+/* 1-bit bitmap of records already visited as part of a valid HCI command run */
+static uint8_t *visited;
+
+static inline int is_visited(size_t o)
+{
+	return (visited[o >> 3] >> (o & 7)) & 1;
+}
+
+static inline void mark_visited(size_t o)
+{
+	visited[o >> 3] |= (uint8_t)(1u << (o & 7));
+}
 
 static size_t walk(size_t start)
 {
-	size_t o = start, e, p;
+	size_t o = start, e = 0, p;
 
 	for (;;) {
-		if (run_end[o]) {
-			e = run_end[o];
+		if (o + 3 > size || data[o + 1] != OP_HI_VENDOR)
 			break;
-		}
-		if (o + 3 > size || data[o + 1] != OP_HI_VENDOR) {
-			e = 1;
-			break;
-		}
 		if (data[o] == OP_LAUNCH_RAM) {
 			e = o + 3 + data[o + 2];
-			e = e > size ? 1 : e + 2;
+			if (e > size)
+				e = 0;
 			break;
 		}
 		o += 3 + data[o + 2];
-		if (o >= size) {
-			e = 1;
+		if (o >= size)
 			break;
+	}
+	if (e && e - start >= MIN_PATCH) {
+		for (p = start; p + 3 <= size && data[p + 1] == OP_HI_VENDOR;
+		     p += 3 + data[p + 2]) {
+			mark_visited(p);
+			if (data[p] == OP_LAUNCH_RAM)
+				break;
 		}
 	}
-	/* record the result along the path so later starts stop early */
-	for (p = start; p + 3 <= size && !run_end[p] && data[p + 1] == OP_HI_VENDOR;
-	     p += 3 + data[p + 2]) {
-		run_end[p] = e;
-		if (data[p] == OP_LAUNCH_RAM)
-			break;
-	}
-	return e < 2 ? 0 : e - 2;
+	return e;
 }
 
 static int contains(const uint8_t *p, size_t len, const char *name)
@@ -99,8 +103,8 @@ int main(int argc, char **argv)
 	}
 	size = (size_t)sz;
 	buf = malloc(size);
-	run_end = calloc(size, sizeof(*run_end));
-	if (!buf || !run_end || fread(buf, 1, size, f) != size) {
+	visited = calloc((size + 7) / 8, 1);
+	if (!buf || !visited || fread(buf, 1, size, f) != size) {
 		fprintf(stderr, "hcdcarve: cannot read %s\n", argv[1]);
 		return 2;
 	}
@@ -111,7 +115,7 @@ int main(int argc, char **argv)
 		if (data[start] != OP_WRITE_RAM || data[start + 1] != OP_HI_VENDOR)
 			continue;
 		/* only the first record of a run starts a candidate */
-		if (run_end[start])
+		if (is_visited(start))
 			continue;
 		end = walk(start);
 		if (!end || end - start < MIN_PATCH)

@@ -329,12 +329,12 @@ static void m2sc_write_filters(struct m2sc_dev *m, u32 hstep, u32 vstep,
 			void __iomem *h = m->base + h_banks[b] + 16 * p;
 			void __iomem *v = m->base + v_banks[b] + 8 * p;
 
-			writel(m->cached_h_words[b][p][0], h);
-			writel(m->cached_h_words[b][p][1], h + 4);
-			writel(m->cached_h_words[b][p][2], h + 8);
-			writel(m->cached_h_words[b][p][3], h + 12);
-			writel(m->cached_v_words[b][p][0], v);
-			writel(m->cached_v_words[b][p][1], v + 4);
+			writel_relaxed(m->cached_h_words[b][p][0], h);
+			writel_relaxed(m->cached_h_words[b][p][1], h + 4);
+			writel_relaxed(m->cached_h_words[b][p][2], h + 8);
+			writel_relaxed(m->cached_h_words[b][p][3], h + 12);
+			writel_relaxed(m->cached_v_words[b][p][0], v);
+			writel_relaxed(m->cached_v_words[b][p][1], v + 4);
 		}
 	}
 }
@@ -344,7 +344,7 @@ static void m2sc_write_matrix(struct m2sc_dev *m, const s16 *mat)
 	unsigned int i;
 
 	for (i = 0; i < 9; i++)
-		writel((u16)mat[i] & 0xfff, m->base + M2SC_CSC(i));
+		writel_relaxed((u16)mat[i] & 0xfff, m->base + M2SC_CSC(i));
 }
 
 /* Strides as the block wants them: plane 0 in pixels, plane 1 in bytes */

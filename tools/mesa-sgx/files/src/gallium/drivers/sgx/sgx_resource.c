@@ -275,7 +275,7 @@ sgx_resource_from_handle(struct pipe_screen *pscreen, const struct pipe_resource
  * (M37): x's bits spread to the odd places, y's to the even ones, for the
  * square's side -- not a loop and two divisions a texel. */
 struct twiddle {
-   uint32_t *mx, *my;           /* the side's entries each */
+   uint32_t mx[2048], my[2048]; /* the side's entries each */
    unsigned shift;              /* log2 of the side */
    bool wide;                   /* the squares go along x */
 };
@@ -285,11 +285,10 @@ twiddle_init(struct twiddle *t, unsigned w, unsigned h)
 {
    unsigned m = MIN2(w, h);
 
+   if (m > ARRAY_SIZE(t->mx))
+      return false;
    t->shift = util_logbase2(m);
    t->wide = w >= h;
-   if (!(t->mx = MALLOC(2 * m * sizeof(uint32_t))))
-      return false;
-   t->my = t->mx + m;
    for (unsigned v = 0; v < m; v++) {
       t->mx[v] = t->my[v] = 0;
       for (unsigned b = 0; (1u << b) < m; b++) {
@@ -633,7 +632,6 @@ copy_texture(struct sgx_context *ctx, struct sgx_resource *res, unsigned first)
          } else {
             copy_level(res, first + l, f, dst, dw, dh, scale, 0, 0, dw, dh, row, &t);
          }
-         FREE(t.mx);
          dst += dw * dh * b;
       }
    }
@@ -646,9 +644,15 @@ copy_texture(struct sgx_context *ctx, struct sgx_resource *res, unsigned first)
       FREE(out);
    /* SGX_TEX_PROBE=1: a cube map's copy holds each texel's own index
     * instead (finding the layout: glmip --probe) */
-   if (faces > 1 && b == 4 && getenv("SGX_TEX_PROBE"))
-      for (uint32_t i = 0; i < size / 4; i++)
-         ((uint32_t *)res->tw->map)[i] = 0xff000000u | i;
+   {
+      static int probe = -1;
+
+      if (probe < 0)
+         probe = getenv("SGX_TEX_PROBE") != NULL;
+      if (faces > 1 && b == 4 && probe)
+         for (uint32_t i = 0; i < size / 4; i++)
+            ((uint32_t *)res->tw->map)[i] = 0xff000000u | i;
+   }
    /* SGX_DEBUG=copies: each copy made, what of it and why */
    {
       static int on = -1;

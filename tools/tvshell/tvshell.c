@@ -107,14 +107,8 @@ static struct {
 	int overlay_elapsed_sec;
 	int overlay_duration_sec;
 	int overlay_frame_idx;
-	int overlay_gallery_idx;
 	uint64_t overlay_last_tick_ms;
 	uint64_t overlay_frame_tick_ms;
-
-	/* On-device Gallery Media state (research/gallery) */
-	struct shell_media_item gallery_items[SHELL_MAX_GALLERY_ITEMS];
-	int gallery_count;
-	int gallery_page;
 
 	/* Window 2: Ask Giri Modal state */
 	int ask_focus_idx;	/* 0 = input/submit, 1..7 = chips, 8 = Close */
@@ -948,105 +942,6 @@ static void fill_card_uri(struct giri_media_card *mc, const char *id,
 	derive_card_action_label(mc);
 }
 
-static void populate_gallery_screen(struct giri_screen *scr, int page)
-{
-	int i;
-
-	if (g_ui.gallery_count <= 0) {
-		g_ui.gallery_count = shell_media_scan_device(g_ui.gallery_items,
-							     SHELL_MAX_GALLERY_ITEMS,
-							     false);
-	}
-
-	int total_items = g_ui.gallery_count;
-	int total_pages = (total_items + 3) / 4;
-	if (total_pages < 1)
-		total_pages = 1;
-	page = ((page % total_pages) + total_pages) % total_pages;
-	g_ui.gallery_page = page;
-
-	memset(scr, 0, sizeof(*scr));
-	snprintf(scr->schema_version, sizeof(scr->schema_version), "1.2");
-	snprintf(scr->screen_id, sizeof(scr->screen_id), "screen_media_library");
-	snprintf(scr->page_type, sizeof(scr->page_type), "media");
-	snprintf(scr->prompt_title, sizeof(scr->prompt_title),
-		 "Photos & Videos on This Device");
-
-	if (total_items > 0) {
-		int first_num = page * 4 + 1;
-		int last_num = page * 4 + 4;
-		if (last_num > total_items)
-			last_num = total_items;
-
-		snprintf(scr->summary.title, sizeof(scr->summary.title),
-			 "On-Device Gallery · %d Photos & 720p Videos on Velliangiri OS",
-			 total_items);
-		snprintf(scr->summary.text, sizeof(scr->summary.text),
-			 "Select any photo or video card below for 1280×720 fullscreen viewing. Inside the fullscreen viewer, press Left or Right on your remote to browse all %d gallery items, or use Next 4 below.",
-			 total_items);
-		snprintf(scr->summary.source_caption, sizeof(scr->summary.source_caption),
-			 "Showing %d–%d of %d · Page %d/%d",
-			 first_num & 0xff, last_num & 0xff, total_items & 0xff,
-			 (page + 1) & 0xff, total_pages & 0xff);
-
-		for (i = 0; i < SHELL_CARD_COUNT; i++) {
-			int g_idx = (page * 4 + i) % total_items;
-			const struct shell_media_item *it = &g_ui.gallery_items[g_idx];
-			char id_buf[32];
-
-			snprintf(id_buf, sizeof(id_buf), "gal_%d", g_idx);
-			fill_card_uri(&scr->media_cards[i], id_buf,
-				      it->title, it->subtitle,
-				      it->badge, it->meta_pill,
-				      it->is_video ? GIRI_CARD_LOCAL_VIDEO : GIRI_CARD_LOCAL_PHOTO,
-				      it->is_video ? GIRI_ART_MONSOON_VIDEO : GIRI_ART_DAWN_RIDGE,
-				      it->path,
-				      it->is_video ? "play_video" : "open_image",
-				      it->is_video ? "media.play_video" : "media.open_image",
-				      it->title, it->detail[0] ? it->detail : it->subtitle);
-		}
-	} else {
-		snprintf(scr->summary.title, sizeof(scr->summary.title),
-			 "1280×720 Widescreen Streams, Nature Clips & On-Device Media");
-		snprintf(scr->summary.text, sizeof(scr->summary.text),
-			 "Select any card below to open the edge-to-edge 1280×720 fullscreen viewer. Use the Play/Pause button on your remote to control playback and press Menu at any time to return to Giri.");
-		snprintf(scr->summary.source_caption, sizeof(scr->summary.source_caption),
-			 "Velliangiri OS · Media Library");
-
-		fill_card_uri(&scr->media_cards[0], "vid_1", "Dawn Over Seventh Hill",
-			      "Golden Hour Ridge Time-Lapse", "VIDEO", "00:15",
-			      GIRI_CARD_PAGE_VIDEO, GIRI_ART_DAWN_RIDGE, "dawn_ridge.jpg",
-			      "play_video", "media.play_video", "Dawn Over Seventh Hill",
-			      "Widescreen 720p time-lapse capturing first light breaking across the seven hills of Velliangiri.");
-		fill_card_uri(&scr->media_cards[1], "vid_2", "Siruvani Gorge Cascade",
-			      "High-Altitude Forest Waterfall", "VIDEO", "00:18",
-			      GIRI_CARD_PAGE_VIDEO, GIRI_ART_WATERFALL_VIDEO, "waterfall_video.jpg",
-			      "play_video", "media.play_video", "Siruvani Gorge Cascade",
-			      "Crystal-clear mountain streams plunging down twin granite cliffs in the Western Ghats.");
-		fill_card_uri(&scr->media_cards[2], "vid_3", "Monsoon Cloud Sweep",
-			      "Palghat Gap Atmospheric Flow", "STREAM", "00:15",
-			      GIRI_CARD_PAGE_VIDEO, GIRI_ART_MONSOON_VIDEO, "monsoon_video.jpg",
-			      "play_video", "media.play_video", "Monsoon Cloud Sweep",
-			      "Dramatic southwest monsoon clouds rolling across the shola canopy and foothill valleys.");
-		fill_card_uri(&scr->media_cards[3], "vid_4", "Shola Valley Morning",
-			      "Emerald Mist & Birdsong Panorama", "PHOTO", "HD",
-			      GIRI_CARD_LOCAL_PHOTO, GIRI_ART_SHOLA_MIST, "shola_mist.jpg",
-			      "open_image", "media.open_image", "Shola Valley Morning",
-			      "High-dynamic-range still photograph of morning mist suspended above the shola evergreen canopy.");
-	}
-
-	char next_lbl[64];
-	snprintf(next_lbl, sizeof(next_lbl),
-		 "Next 4 photos & videos (Page %d/%d)",
-		 (((page + 1) % total_pages) + 1) & 0xff, total_pages & 0xff);
-
-	set_standard_footer(scr,
-		next_lbl, SHELL_SYM_IMAGE,
-		"gallery_next_page", "media.get_library", "Watch photos and videos on this device",
-		"Explore apps and Play Doom on TV", SHELL_SYM_GAME,
-		"ask_giri", "apps.list_and_install", "Play Doom");
-}
-
 static void build_topic_screen(const char *query, struct giri_screen *scr)
 {
 	memset(scr, 0, sizeof(*scr));
@@ -1851,9 +1746,7 @@ static void render_window_media_overlay(const struct shell_theme *th)
 				  g_ui.overlay_source, 640);
 
 	/* Selectable right Back pill ("Menu / Esc = Back") -> 2px focus_ring border */
-	const char *hint = (g_ui.overlay_gallery_idx >= 0 && !g_ui.overlay_is_video)
-			   ? "Left/Right = Browse · Menu = Back"
-			   : "Menu / Esc = Back";
+	const char *hint = "Menu / Esc = Back";
 	int hw = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 13, hint) + 32;
 	int hx = SHELL_SCREEN_W - 56 - hw;
 	shell_draw_rounded_rect_alpha(hx, by - 2, hw, 32, 8, 0xff0f1218U, 210);
@@ -2401,69 +2294,8 @@ static void complete_topic_transition(void)
 	}
 }
 
-static void open_gallery_item_overlay(int g_idx)
-{
-	if (g_ui.gallery_count <= 0)
-		return;
-	g_idx = ((g_idx % g_ui.gallery_count) + g_ui.gallery_count) % g_ui.gallery_count;
-	g_ui.overlay_gallery_idx = g_idx;
-
-	const struct shell_media_item *it = &g_ui.gallery_items[g_idx];
-	struct giri_media_card mc;
-	char id_buf[32];
-
-	snprintf(id_buf, sizeof(id_buf), "gal_%d", g_idx);
-	fill_card_uri(&mc, id_buf, it->title, it->subtitle,
-		      it->badge, it->meta_pill,
-		      it->is_video ? GIRI_CARD_LOCAL_VIDEO : GIRI_CARD_LOCAL_PHOTO,
-		      it->is_video ? GIRI_ART_MONSOON_VIDEO : GIRI_ART_DAWN_RIDGE,
-		      it->path,
-		      it->is_video ? "play_video" : "open_image",
-		      it->is_video ? "media.play_video" : "media.open_image",
-		      it->title, it->detail[0] ? it->detail : it->subtitle);
-
-	g_ui.tts_speaking = false;
-	g_ui.active_win = GIRI_WIN_MEDIA_OVERLAY;
-	snprintf(g_ui.overlay_badge, sizeof(g_ui.overlay_badge),
-		 "%s", it->is_video ? "VIDEO STREAM" : "PHOTO VIEW");
-	snprintf(g_ui.overlay_source, sizeof(g_ui.overlay_source),
-		 "%s · Item %d of %d on Device",
-		 it->subtitle, g_idx + 1, g_ui.gallery_count);
-	snprintf(g_ui.overlay_title, sizeof(g_ui.overlay_title), "%s", mc.title);
-	snprintf(g_ui.overlay_text, sizeof(g_ui.overlay_text),
-		 "%s", mc.detail_text[0] ? mc.detail_text : mc.subtitle);
-	g_ui.overlay_card = mc;
-	g_ui.overlay_is_video = it->is_video;
-	g_ui.overlay_playing = it->is_video;
-	g_ui.overlay_hud_dirty = true;
-	g_ui.overlay_fps = 24;
-	g_ui.overlay_total_frames = 360;
-	g_ui.overlay_elapsed_sec = 0;
-	g_ui.overlay_duration_sec = 15;
-	shell_media_audio_stop();
-	if (it->is_video) {
-		shell_media_get_video_info(&g_ui.overlay_card,
-					   &g_ui.overlay_fps,
-					   &g_ui.overlay_total_frames,
-					   &g_ui.overlay_duration_sec);
-		shell_media_audio_start(&g_ui.overlay_card);
-	}
-	g_ui.overlay_frame_idx = 0;
-	g_ui.overlay_last_tick_ms = shell_now_ms();
-	g_ui.overlay_frame_tick_ms = g_ui.overlay_last_tick_ms;
-}
-
 static void open_media_overlay(const char *badge, const struct giri_media_card *mc, bool is_video)
 {
-	int g_idx = -1;
-
-	if (mc && strncmp(mc->id, "gal_", 4) == 0 && g_ui.gallery_count > 0) {
-		g_idx = atoi(mc->id + 4);
-		open_gallery_item_overlay(g_idx);
-		return;
-	}
-
-	g_ui.overlay_gallery_idx = -1;
 	g_ui.tts_speaking = false;
 	g_ui.active_win = GIRI_WIN_MEDIA_OVERLAY;
 	snprintf(g_ui.overlay_badge, sizeof(g_ui.overlay_badge), "%s", badge);
@@ -2501,16 +2333,6 @@ static void execute_action(const struct giri_action *act, const struct giri_medi
 		return;
 	if (g_ui.is_working)
 		complete_topic_transition();
-
-	if (strcmp(act->type, "gallery_next_page") == 0) {
-		populate_gallery_screen(&g_ui.history[g_ui.history_idx],
-					g_ui.gallery_page + 1);
-		g_ui.cards_need_preload = true;
-		g_ui.dirty_slots |= 0x02;
-		g_ui.dirty_cards = 0x0f;
-		g_ui.dirty_footer |= (1U << 1);
-		return;
-	}
 
 	if (strcmp(act->type, "open_prompt_box") == 0 ||
 	    strcmp(act->capability, "ui.open_prompt") == 0) {
@@ -2750,14 +2572,6 @@ static void handle_key_event(const struct shell_input_event *ev)
 				g_ui.overlay_frame_tick_ms = shell_now_ms();
 			}
 			break;
-		case SHELL_KEY_UP:
-			if (g_ui.overlay_gallery_idx >= 0 && g_ui.gallery_count > 0)
-				open_gallery_item_overlay(g_ui.overlay_gallery_idx - 1);
-			break;
-		case SHELL_KEY_DOWN:
-			if (g_ui.overlay_gallery_idx >= 0 && g_ui.gallery_count > 0)
-				open_gallery_item_overlay(g_ui.overlay_gallery_idx + 1);
-			break;
 		case SHELL_KEY_LEFT:
 			if (g_ui.overlay_is_video) {
 				int fps = g_ui.overlay_fps > 0 ? g_ui.overlay_fps : 24;
@@ -2769,8 +2583,6 @@ static void handle_key_event(const struct shell_input_event *ev)
 				shell_media_audio_seek_sec(g_ui.overlay_elapsed_sec);
 				g_ui.overlay_hud_dirty = true;
 				g_ui.overlay_frame_tick_ms = shell_now_ms();
-			} else if (g_ui.overlay_gallery_idx >= 0 && g_ui.gallery_count > 0) {
-				open_gallery_item_overlay(g_ui.overlay_gallery_idx - 1);
 			}
 			break;
 		case SHELL_KEY_RIGHT:
@@ -2784,8 +2596,6 @@ static void handle_key_event(const struct shell_input_event *ev)
 				shell_media_audio_seek_sec(g_ui.overlay_elapsed_sec);
 				g_ui.overlay_hud_dirty = true;
 				g_ui.overlay_frame_tick_ms = shell_now_ms();
-			} else if (g_ui.overlay_gallery_idx >= 0 && g_ui.gallery_count > 0) {
-				open_gallery_item_overlay(g_ui.overlay_gallery_idx + 1);
 			}
 			break;
 		default:
@@ -3173,12 +2983,14 @@ int main(int argc, char **argv)
 	int lock_fd = -1;
 	int i;
 
+	if (argc > 0 && argv[0] && strstr(argv[0], "media-gallery") != NULL)
+		return media_gallery_main(argc, argv);
+
 	memset(&g_ui, 0, sizeof(g_ui));
 	g_ui.theme_id = SHELL_THEME_PAPER;
 	g_ui.active_win = GIRI_WIN_MAIN;
 	g_ui.focus_zone = GIRI_ZONE_CARDS;
 	g_ui.nav_sound_enabled = true;
-	g_ui.overlay_gallery_idx = -1;
 	mark_full_redraw();
 
 	for (i = 1; i < argc; i++) {

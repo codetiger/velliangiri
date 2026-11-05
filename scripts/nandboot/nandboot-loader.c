@@ -24,32 +24,6 @@
 
 extern void jump_to_linux(uint32_t image_phys, uint32_t dtb_phys);
 
-/*
- * Patch the first occurrence of "ubiblock0_0" / "slot=a" in the loaded DTB's
- * bootargs string in-place when booting from slot B (slot == 1), so the
- * kernel mounts /dev/ubiblock0_1 (rootfs_b) without needing libfdt.
- */
-static void patch_dtb_slot(uint8_t *dtb, uint32_t max_len, uint8_t slot)
-{
-	uint32_t i;
-
-	if (slot != 1U || max_len < 16U)
-		return;
-	for (i = 0; i + 11U <= max_len; i++) {
-		if (dtb[i + 0] == 'u' && dtb[i + 1] == 'b' &&
-		    dtb[i + 2] == 'i' && dtb[i + 3] == 'b' &&
-		    dtb[i + 4] == 'l' && dtb[i + 5] == 'o' &&
-		    dtb[i + 6] == 'c' && dtb[i + 7] == 'k' &&
-		    dtb[i + 8] == '0' && dtb[i + 9] == '_' &&
-		    dtb[i + 10] == '0')
-			dtb[i + 10] = '1';
-		if (dtb[i + 0] == 's' && dtb[i + 1] == 'l' &&
-		    dtb[i + 2] == 'o' && dtb[i + 3] == 't' &&
-		    dtb[i + 4] == '=' && dtb[i + 5] == 'a')
-			dtb[i + 5] = 'b';
-	}
-}
-
 void linux_boot_main(void)
 {
 	uint8_t slot = 0;
@@ -57,10 +31,8 @@ void linux_boot_main(void)
 	pmgr_init_apply_gates();
 	hdmi_boot_init();
 
-	if (boot_load_from_nand((void *)IMAGE_PHYS, (void *)DTB_PHYS, &slot) == 0) {
-		patch_dtb_slot((uint8_t *)DTB_PHYS, 65536U, slot);
+	if (boot_load_from_nand((void *)IMAGE_PHYS, (void *)DTB_PHYS, &slot) == 0)
 		jump_to_linux(IMAGE_PHYS, DTB_PHYS);
-	}
 
 	/* If both NAND slots fail CRC, spin until the hardware watchdog resets */
 	for (;;)

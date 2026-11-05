@@ -21,6 +21,18 @@ _start:
 	cpsid	if
 	msr	cpsr_c, #0xd3
 
+	/* Invalidate I-cache + branch predictor and enable SCTLR.I + SCTLR.Z */
+	mov	r0, #0
+	mcr	p15, 0, r0, c7, c5, 0
+	mcr	p15, 0, r0, c7, c5, 6
+	dsb
+	isb
+	mrc	p15, 0, r0, c1, c0, 0
+	orr	r0, r0, #(1 << 11)
+	orr	r0, r0, #(1 << 12)
+	mcr	p15, 0, r0, c1, c0, 0
+	isb
+
 	ldr	sp, =0x80007000
 	bl	linux_boot_main
 1:	wfi

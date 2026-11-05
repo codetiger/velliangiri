@@ -114,6 +114,7 @@
 
 #define RING_SIZE		128
 #define RX_BUF_SIZE		1536
+#define RX_COPYBREAK		256
 #define JABBER_SIZE		0x600
 #define MAX_FRAME		(ETH_FRAME_LEN + ETH_FCS_LEN + 4)
 
@@ -447,12 +448,14 @@ static int s5l_fe_poll(struct napi_struct *napi, int budget)
 	struct net_device *ndev = p->ndev;
 	int done = 0;
 
+	s5l_fe_tx_complete(p);
+
 	while (done < budget) {
 		unsigned int i = p->rx_next;
 		struct s5l_fe_desc *d = &p->rx_ring[i];
 		struct s5l_fe_buf *b = &p->rx_buf[i];
 		u32 status = le32_to_cpu(d->status);
-		unsigned int len;
+		unsigned int len, pkt_len;
 		struct sk_buff *skb;
 
 		if (status & DESC_OWN)
@@ -467,18 +470,41 @@ static int s5l_fe_poll(struct napi_struct *napi, int budget)
 			dma_wmb();
 			d->status = cpu_to_le32(DESC_OWN);
 		} else {
+			pkt_len = len - ETH_FCS_LEN;
+			if (pkt_len <= RX_COPYBREAK) {
+				skb = napi_alloc_skb(napi, pkt_len);
+				if (skb) {
+					dma_sync_single_for_cpu(p->dev, b->dma,
+								pkt_len,
+								DMA_FROM_DEVICE);
+					skb_put_data(skb, b->skb->data, pkt_len);
+					dma_sync_single_for_device(p->dev, b->dma,
+								   pkt_len,
+								   DMA_FROM_DEVICE);
+					dma_wmb();
+					d->status = cpu_to_le32(DESC_OWN);
+					goto rx_deliver;
+				}
+			}
 			skb = b->skb;
 			dma_unmap_single(p->dev, b->dma, RX_BUF_SIZE, DMA_FROM_DEVICE);
 			b->skb = NULL;
-			skb_put(skb, len - ETH_FCS_LEN);
+			skb_put(skb, pkt_len);
+			if (s5l_fe_rx_refill(p, i)) {
+				ndev->stats.rx_dropped++;
+				p->rx_next = (i + 1) % RING_SIZE;
+				skb->protocol = eth_type_trans(skb, ndev);
+				ndev->stats.rx_packets++;
+				ndev->stats.rx_bytes += skb->len;
+				napi_gro_receive(napi, skb);
+				done++;
+				break;
+			}
+rx_deliver:
 			skb->protocol = eth_type_trans(skb, ndev);
 			ndev->stats.rx_packets++;
 			ndev->stats.rx_bytes += skb->len;
 			napi_gro_receive(napi, skb);
-			if (s5l_fe_rx_refill(p, i)) {
-				ndev->stats.rx_dropped++;
-				break;
-			}
 		}
 		p->rx_next = (i + 1) % RING_SIZE;
 		done++;
@@ -490,7 +516,7 @@ static int s5l_fe_poll(struct napi_struct *napi, int budget)
 		unsigned long flags;
 
 		spin_lock_irqsave(&p->lock, flags);
-		p->int_mask |= DMA_INT_RX;
+		p->int_mask |= DMA_INT_RX | DMA_INT_TX_DONE;
 		fe_wr(p, DMA_INT_ENABLE, p->int_mask);
 		spin_unlock_irqrestore(&p->lock, flags);
 	}
@@ -508,11 +534,9 @@ static irqreturn_t s5l_fe_interrupt(int irq, void *dev_id)
 
 	if (status & DMA_INT_MAC)
 		fe_wr(p, MAC_INT_STATUS, fe_rd(p, MAC_INT_STATUS));
-	if (status & DMA_INT_TX_DONE)
-		s5l_fe_tx_complete(p);
-	if (status & DMA_INT_RX) {
+	if (status & (DMA_INT_RX | DMA_INT_TX_DONE)) {
 		spin_lock(&p->lock);
-		p->int_mask &= ~DMA_INT_RX;
+		p->int_mask &= ~(DMA_INT_RX | DMA_INT_TX_DONE);
 		fe_wr(p, DMA_INT_ENABLE, p->int_mask);
 		spin_unlock(&p->lock);
 		napi_schedule(&p->napi);
@@ -676,7 +700,7 @@ static int s5l_fe_probe(struct platform_device *pdev)
 
 	ret = s5l_fe_mdio_init(p);
 	if (ret)
-		return ret;
+		goto err_reg;
 
 	p->phy = of_phy_get_and_connect(ndev, np, s5l_fe_adjust_link);
 	if (!p->phy) {
@@ -703,6 +727,9 @@ err_phy:
 	phy_disconnect(p->phy);
 err_mdio:
 	mdiobus_unregister(p->mii);
+err_reg:
+	if (p->phy_supply)
+		regulator_disable(p->phy_supply);
 	return ret;
 }
 

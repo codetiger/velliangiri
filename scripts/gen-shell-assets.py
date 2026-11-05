@@ -890,7 +890,7 @@ def write_u8_array(w, name: str, arr):
 
 
 def extract_doom_titlepic():
-    """Extract 320x200 XRGB8888 TITLEPIC from doom1.wad if present in build/dl or research."""
+    """Extract 256-entry XRGB8888 PLAYPAL + 320x200 8-bit indexed TITLEPIC from doom1.wad if present."""
     candidates = [
         "build/dl/doom/doom1.wad",
         "research/doom-wads/Doom1.WAD",
@@ -925,8 +925,12 @@ def extract_doom_titlepic():
             w, h, _, _ = struct.unpack("<HHhh", pic[:8])
             if w != 320 or h != 200:
                 continue
+            pal_u32 = [
+                0xFF000000 | (pal[c * 3] << 16) | (pal[c * 3 + 1] << 8) | pal[c * 3 + 2]
+                for c in range(256)
+            ]
             col_ofs = struct.unpack(f"<{w}I", pic[8 : 8 + 4 * w])
-            out = [0xFF000000] * (w * h)
+            idx_u8 = [0] * (w * h)
             for x in range(w):
                 p = col_ofs[x]
                 while p < len(pic):
@@ -937,13 +941,9 @@ def extract_doom_titlepic():
                     for k in range(length):
                         y = topdelta + k
                         if 0 <= y < h:
-                            c = pic[p + 3 + k]
-                            r = pal[c * 3]
-                            g = pal[c * 3 + 1]
-                            b = pal[c * 3 + 2]
-                            out[y * w + x] = 0xFF000000 | (r << 16) | (g << 8) | b
+                            idx_u8[y * w + x] = pic[p + 3 + k]
                     p += length + 4
-            return out
+            return pal_u32, idx_u8
         except Exception:
             continue
     return None
@@ -983,7 +983,7 @@ def write_assets_header(design_dir: str, tokens: dict, out_path: str):
         ("spark", "symbols/spark.svg"),
         ("stream", "symbols/stream.svg"),
     ]
-    sizes = [13, 17, 18, 20, 24]
+    sizes = [16, 18, 20]
     doom_poster = extract_doom_titlepic()
 
     with open(out_path, "w", encoding="utf-8") as f:
@@ -1038,8 +1038,11 @@ def write_assets_header(design_dir: str, tokens: dict, out_path: str):
         w("};\n\n")
 
         if doom_poster is not None:
+            pal_u32, idx_u8 = doom_poster
             w("#define HAVE_DOOM_POSTER_ASSET 1\n")
-            write_u32_array(w, "doom_poster_320x200", doom_poster)
+            w("#define HAVE_DOOM_POSTER_PALETTE 1\n")
+            write_u32_array(w, "doom_poster_palette", pal_u32)
+            write_u8_array(w, "doom_poster_idx_320x200", idx_u8)
 
         w("#endif /* TVSHELL_ASSETS_H */\n")
 

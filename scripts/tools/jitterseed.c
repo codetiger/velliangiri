@@ -19,7 +19,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define SAMPLES	16384
+#define SAMPLES	2048
 #define CREDIT	256	/* bits */
 #define WALK	4096	/* bytes of scratch buffer walked per sample */
 
@@ -44,11 +44,11 @@ int main(void)
 	int fd, i, n = 0;
 
 	memset(&e, 0, sizeof(e));
+	t0 = start;
 	for (i = 0; i < SAMPLES; i++) {
 		int k, steps = 64 + (int)(acc & 63U);
 		unsigned char *p = (unsigned char *)e.buf;
 
-		t0 = now_ns();
 		for (k = 0; k < steps; k++) {
 			idx = (idx * 1103515245U + 12345U + acc) & (WALK - 1);
 			scratch[idx] += (unsigned char)(acc >> 7);
@@ -59,6 +59,7 @@ int main(void)
 		acc += (uint32_t)(t1 - t0);
 		p[i] = (unsigned char)(t1 - t0) ^ (unsigned char)((t1 - t0) >> 8);
 		distinct[p[i]]++;
+		t0 = t1;
 	}
 
 	for (i = 0; i < 256; i++) {

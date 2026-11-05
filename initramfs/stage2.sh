@@ -196,6 +196,7 @@ done
 # Data (/dev/nand0p2) holds the system keybag, a cache of the firmware above, the
 # persistent SSH host key and Wi-Fi credentials
 DATA=0
+DATA_DIRTY=0
 if [ -b /dev/nand0p2 ]; then
 	mkdir -p /mnt/data
 	if mount -t hfsplus -o rw /dev/nand0p2 /mnt/data 2>/dev/null; then
@@ -252,15 +253,18 @@ if [ "$missing" = 1 ] && [ -b /dev/nand0p1 ]; then
 		for f in $FW_FILES; do
 			if [ -s "$FW/$f" ] && [ ! -s "$FWCACHE/$f" ] && cp "$FW/$f" "$FWCACHE/$f.tmp" 2>/dev/null; then
 				mv "$FWCACHE/$f.tmp" "$FWCACHE/$f"
+				DATA_DIRTY=1
 				log_msg "nand0p2: cached $f"
 			fi
 		done
 		for f in $GPU_FILE $GLEVENT $VXD_FILE $IOP_FILE; do
 			if [ -s "$GPUFW/$f" ] && [ ! -s "$GPUCACHE/$f" ]; then
 				mkdir -p "$GPUCACHE"
-				cp "$GPUFW/$f" "$GPUCACHE/$f.tmp" 2>/dev/null &&
-					mv "$GPUCACHE/$f.tmp" "$GPUCACHE/$f" &&
+				if cp "$GPUFW/$f" "$GPUCACHE/$f.tmp" 2>/dev/null &&
+					mv "$GPUCACHE/$f.tmp" "$GPUCACHE/$f"; then
+					DATA_DIRTY=1
 					log_msg "nand0p2: cached $f"
+				fi
 			fi
 		done
 	fi
@@ -300,7 +304,7 @@ if [ "$DATA" = 1 ]; then
 		chmod 600 /etc/dropbear/dropbear_ed25519_host_key
 	elif [ -s /etc/dropbear/dropbear_ed25519_host_key ]; then
 		mkdir -p "$PDIR/dropbear"
-		cp /etc/dropbear/dropbear_ed25519_host_key "$PDIR/dropbear/dropbear_ed25519_host_key" 2>/dev/null
+		cp /etc/dropbear/dropbear_ed25519_host_key "$PDIR/dropbear/dropbear_ed25519_host_key" 2>/dev/null && DATA_DIRTY=1
 	fi
 	if [ -s "$PDIR/wpa_supplicant/wpa_supplicant.conf" ]; then
 		mkdir -p /etc/wpa_supplicant
@@ -311,21 +315,28 @@ if [ "$DATA" = 1 ]; then
 		mkdir -p "$PDIR/wpa_supplicant"
 		cp /etc/wpa_supplicant/wpa_supplicant.conf "$PDIR/wpa_supplicant/wpa_supplicant.conf" 2>/dev/null
 		chmod 600 "$PDIR/wpa_supplicant/wpa_supplicant.conf" 2>/dev/null
+		DATA_DIRTY=1
 		log_msg "nand0p2: seeded persistent wpa_supplicant.conf"
 	fi
 	# Bluetooth pairings are written by bluetoothd whenever a device pairs, so
 	# its state directory lives on Data, which stays mounted for the session
 	# (clean_shutdown unmounts it before reboot, halt and power-off)
 	BTSTATE=/mnt/data/linux/var/lib/bluetooth
-	mkdir -p "$BTSTATE" /var/lib/bluetooth \
+	mkdir -p /var/lib/bluetooth
+	for d in "$BTSTATE" \
 		/mnt/data/linux/etc /mnt/data/linux/models /mnt/data/linux/cache/thumbs \
 		/mnt/data/linux/notes /mnt/data/linux/media/photos /mnt/data/linux/media/videos \
-		/mnt/data/linux/media/music /mnt/data/linux/games/doom/saves
+		/mnt/data/linux/media/music /mnt/data/linux/games/doom/saves; do
+		if [ ! -d "$d" ]; then
+			mkdir -p "$d"
+			DATA_DIRTY=1
+		fi
+	done
 	chmod 700 "$BTSTATE" 2>/dev/null || true
 	if mount --bind "$BTSTATE" /var/lib/bluetooth 2>/dev/null; then
 		log_msg "nand0p2: Bluetooth pairings kept in /linux/var/lib/bluetooth"
 	fi
-	sync
+	[ "$DATA_DIRTY" = 1 ] && sync
 	log_msg "nand0p2: Data stays mounted at /mnt/data"
 fi
 
@@ -370,14 +381,17 @@ if [ "$BT_REBIND" = 1 ] || [ -n "$BMAC" ]; then
 	done
 fi
 
-# D-Bus system bus and bluetoothd (bluetoothctl for pairing and connections)
-if [ -x /usr/lib/bluetooth/bluetoothd ] && [ -x /usr/bin/dbus-daemon ]; then
-	mkdir -p /run/dbus /var/lib/bluetooth
-	dbus-uuidgen --ensure 2>/dev/null
-	if dbus-daemon --system 2>/dev/null; then
-		/usr/lib/bluetooth/bluetoothd >/dev/null 2>&1 &
-		log_msg "dbus and bluetoothd started"
-	fi
+# D-Bus system bus and bluetoothd (started asynchronously so tvshell is not delayed;
+# skip if /etc/velliangiri-no-bt exists)
+if [ ! -e /etc/velliangiri-no-bt ] && [ -x /usr/lib/bluetooth/bluetoothd ] && [ -x /usr/bin/dbus-daemon ]; then
+	(
+		mkdir -p /run/dbus /var/lib/bluetooth
+		dbus-uuidgen --ensure 2>/dev/null
+		if dbus-daemon --system 2>/dev/null; then
+			/usr/lib/bluetooth/bluetoothd >/dev/null 2>&1 &
+			log_msg "dbus and bluetoothd started"
+		fi
+	) &
 fi
 
 # Join Wi-Fi in background when a network is configured

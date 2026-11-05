@@ -120,6 +120,12 @@ static int rendered_frames;
 
 static uint32_t pal32[256];
 static uint32_t row_Staging[FB_TARGET_W];
+static uint16_t x2d_lut[FB_TARGET_W];
+static uint32_t x2d_lut_view_w;
+static uint32_t last_view_w;
+static uint32_t last_view_h;
+static uint32_t last_out_w;
+static uint32_t last_out_h;
 static uint32_t *headless_fb;
 
 static void update_palette32(void)
@@ -796,90 +802,124 @@ static void mus_step_tick(void)
 
 static void mix_audio_frames(int16_t *out, size_t frames)
 {
-	size_t f;
+	int32_t acc[PCM_PERIOD_FRAMES * 2];
+	size_t f, n;
 	int c, v;
 	uint32_t samples_per_mus_tick = pcm_rate / 140;
 
+	if (frames > PCM_PERIOD_FRAMES)
+		frames = PCM_PERIOD_FRAMES;
+
+	memset(acc, 0, frames * 2 * sizeof(int32_t));
+
 	pthread_mutex_lock(&audio_lock);
 
-	for (f = 0; f < frames; f++) {
-		int32_t acc_l = 0;
-		int32_t acc_r = 0;
-
-		/* Step 140 Hz MUS score clock */
-		if (active_song && mus_ptr && !mus_paused_flag && mus_master_vol > 0) {
+	/* Step 140 Hz MUS score clock in tick-bounded spans and mix active voices */
+	if (active_song && mus_ptr && !mus_paused_flag && mus_master_vol > 0) {
+		f = 0;
+		while (f < frames && active_song && mus_ptr && !mus_paused_flag) {
 			if (mus_samples_until_tick == 0) {
 				mus_step_tick();
 				mus_samples_until_tick = samples_per_mus_tick;
+				if (!active_song || !mus_ptr)
+					break;
 			}
-			mus_samples_until_tick--;
+			size_t span = frames - f;
+			if (span > mus_samples_until_tick)
+				span = mus_samples_until_tick;
+			mus_samples_until_tick -= (uint32_t)span;
 
 			for (v = 0; v < MUS_VOICES; v++) {
 				struct mus_voice *mv = &mus_voices[v];
 				if (!mv->active)
 					continue;
-				mv->phase += mv->phase_inc;
-				int32_t wave;
+				uint32_t phase = mv->phase;
+				uint32_t phase_inc = mv->phase_inc;
+				uint32_t env_decay = mv->env_decay;
+				int32_t vol_scaled = mv->volume * mus_master_vol;
+				int32_t *dst = &acc[f * 2];
+
 				if (mv->channel == 15) {
-					/* Percussion noise + punch */
-					uint32_t n = mv->phase ^ (mv->phase >> 13);
-					wave = (int16_t)(n & 0x1FFF) - 4096;
-					if (mv->env_decay > 12)
-						mv->env_decay -= 12;
-					else
-						mv->active = false;
+					for (n = 0; n < span; n++) {
+						phase += phase_inc;
+						uint32_t nz = phase ^ (phase >> 13);
+						int32_t wave = (int16_t)(nz & 0x1FFF) - 4096;
+						if (env_decay > 12) {
+							env_decay -= 12;
+						} else {
+							env_decay = 0;
+							mv->active = false;
+							break;
+						}
+						int32_t gain = (vol_scaled * (int32_t)(env_decay >> 8)) >> 14;
+						int32_t sample = (wave * gain) >> 8;
+						dst[n * 2 + 0] += sample;
+						dst[n * 2 + 1] += sample;
+					}
 				} else {
-					/* Warm asymmetric pulse + sub-octave harmonic */
-					int32_t p1 = (mv->phase & 0x80000000U) ? 2800 : -2800;
-					int32_t p2 = ((mv->phase << 1) & 0xC0000000U) ? 1400 : -1400;
-					wave = p1 + p2;
-					if (mv->env_decay > 1)
-						mv->env_decay -= 1;
+					for (n = 0; n < span; n++) {
+						phase += phase_inc;
+						int32_t p1 = (phase & 0x80000000U) ? 2800 : -2800;
+						int32_t p2 = ((phase << 1) & 0xC0000000U) ? 1400 : -1400;
+						int32_t wave = p1 + p2;
+						if (env_decay > 1)
+							env_decay -= 1;
+						int32_t gain = (vol_scaled * (int32_t)(env_decay >> 8)) >> 14;
+						int32_t sample = (wave * gain) >> 8;
+						dst[n * 2 + 0] += sample;
+						dst[n * 2 + 1] += sample;
+					}
 				}
-				int32_t gain = (mv->volume * mus_master_vol * (int32_t)(mv->env_decay >> 8)) >> 14;
-				int32_t sample = (wave * gain) >> 8;
-				acc_l += sample;
-				acc_r += sample;
+				mv->phase = phase;
+				mv->env_decay = env_decay;
 			}
+			f += span;
 		}
+	}
 
-		/* Mix 16 digital SFX channels */
-		for (c = 0; c < MIX_CHANNELS; c++) {
-			struct sfx_voice *sv = &sfx_voices[c];
-			if (!sv->active || !sv->samples)
-				continue;
+	/* Mix 16 digital SFX channels (channel-outer, frame-inner) */
+	for (c = 0; c < MIX_CHANNELS; c++) {
+		struct sfx_voice *sv = &sfx_voices[c];
+		if (!sv->active || !sv->samples)
+			continue;
 
-			uint32_t idx = (uint32_t)(sv->pos_fp >> 32);
-			if (idx >= sv->length) {
+		const uint8_t *samples = sv->samples;
+		uint32_t length = sv->length;
+		uint64_t pos_fp = sv->pos_fp;
+		uint64_t step_fp = sv->step_fp;
+		int lg = sv->left_gain;
+		int rg = sv->right_gain;
+
+		for (f = 0; f < frames; f++) {
+			uint32_t idx = (uint32_t)(pos_fp >> 32);
+			if (idx >= length) {
 				sv->active = false;
-				continue;
+				break;
 			}
-			int32_t s0 = ((int32_t)sv->samples[idx] - 128) << 8;
-			int32_t s1 = (idx + 1 < sv->length)
-				? (((int32_t)sv->samples[idx + 1] - 128) << 8)
+			int32_t s0 = ((int32_t)samples[idx] - 128) << 8;
+			int32_t s1 = (idx + 1 < length)
+				? (((int32_t)samples[idx + 1] - 128) << 8)
 				: s0;
-			int32_t frac = (int32_t)((sv->pos_fp >> 16) & 0xFFFF);
+			int32_t frac = (int32_t)((pos_fp >> 16) & 0xFFFF);
 			int32_t sample = s0 + (((s1 - s0) * frac) >> 16);
 
-			acc_l += (sample * sv->left_gain) >> 8;
-			acc_r += (sample * sv->right_gain) >> 8;
-			sv->pos_fp += sv->step_fp;
+			acc[f * 2 + 0] += (sample * lg) >> 8;
+			acc[f * 2 + 1] += (sample * rg) >> 8;
+			pos_fp += step_fp;
 		}
-
-		if (acc_l > 32767)
-			acc_l = 32767;
-		else if (acc_l < -32768)
-			acc_l = -32768;
-		if (acc_r > 32767)
-			acc_r = 32767;
-		else if (acc_r < -32768)
-			acc_r = -32768;
-
-		out[f * 2 + 0] = (int16_t)acc_l;
-		out[f * 2 + 1] = (int16_t)acc_r;
+		sv->pos_fp = pos_fp;
 	}
 
 	pthread_mutex_unlock(&audio_lock);
+
+	for (n = 0; n < frames * 2; n++) {
+		int32_t v32 = acc[n];
+		if (v32 > 32767)
+			v32 = 32767;
+		else if (v32 < -32768)
+			v32 = -32768;
+		out[n] = (int16_t)v32;
+	}
 }
 
 #ifdef __linux__
@@ -1405,19 +1445,36 @@ void DG_DrawFrame(void)
 	x_off = (out_w - view_w) / 2U;
 	y_off = (out_h - view_h) / 2U;
 
-	if (rendered_frames == 0) {
+	if (x2d_lut_view_w != view_w && view_w > 0) {
+		for (x = 0; x < view_w && x < FB_TARGET_W; x++)
+			x2d_lut[x] = (uint16_t)((x * SCREENWIDTH) / view_w);
+		x2d_lut_view_w = view_w;
+	}
+
+	if (rendered_frames == 0 ||
+	    view_w != last_view_w || view_h != last_view_h ||
+	    out_w != last_out_w || out_h != last_out_h) {
 		uint32_t y;
+		uint32_t r_off = x_off + view_w;
 
 		for (y = 0; y < y_off; y++)
 			memset(dst_base + y * fb_stride_px, 0, out_w * sizeof(uint32_t));
 		for (y = y_off + view_h; y < out_h; y++)
 			memset(dst_base + y * fb_stride_px, 0, out_w * sizeof(uint32_t));
-	}
+		if (x_off > 0 || r_off < out_w) {
+			for (y = y_off; y < y_off + view_h && y < out_h; y++) {
+				uint32_t *row_dst = dst_base + y * fb_stride_px;
 
-	memset(row_Staging, 0, x_off * sizeof(uint32_t));
-	if (x_off + view_w < out_w) {
-		memset(row_Staging + x_off + view_w, 0,
-		       (out_w - (x_off + view_w)) * sizeof(uint32_t));
+				if (x_off > 0)
+					memset(row_dst, 0, x_off * sizeof(uint32_t));
+				if (r_off < out_w)
+					memset(row_dst + r_off, 0, (out_w - r_off) * sizeof(uint32_t));
+			}
+		}
+		last_view_w = view_w;
+		last_view_h = view_h;
+		last_out_w = out_w;
+		last_out_h = out_h;
 	}
 
 	if (I_HiresViewActive && scale == HIRES_SCALE &&
@@ -1432,7 +1489,7 @@ void DG_DrawFrame(void)
 			uint32_t y_dst = y_off + y_hr;
 			uint32_t y2d = y_hr / HIRES_SCALE;
 			const uint8_t *srow = src + y2d * SCREENWIDTH;
-			uint32_t *d = row_Staging + x_off;
+			uint32_t *d = row_Staging;
 
 			if (y_dst >= out_h)
 				break;
@@ -1461,7 +1518,7 @@ void DG_DrawFrame(void)
 					}
 				} else {
 					for (x = 0; x < view_w; x++) {
-						uint32_t x2d = (x * SCREENWIDTH) / view_w;
+						uint32_t x2d = x2d_lut[x];
 
 						if (x >= vx0 && x < vx1 && !mrow[x2d])
 							d[x] = pal32[hrow[x]];
@@ -1481,17 +1538,17 @@ void DG_DrawFrame(void)
 					}
 				} else {
 					for (x = 0; x < view_w; x++)
-						d[x] = pal32[srow[(x * SCREENWIDTH) / view_w]];
+						d[x] = pal32[srow[x2d_lut[x]]];
 				}
 			}
 
-			memcpy(dst_base + y_dst * fb_stride_px, row_Staging,
-			       out_w * sizeof(uint32_t));
+			memcpy(dst_base + y_dst * fb_stride_px + x_off, row_Staging,
+			       view_w * sizeof(uint32_t));
 		}
 	} else {
 		for (y_src = 0; y_src < SCREENHEIGHT; y_src++) {
 			const uint8_t *srow = src + y_src * SCREENWIDTH;
-			uint32_t *d = row_Staging + x_off;
+			uint32_t *d = row_Staging;
 
 			if (!opt_widescreen && scale == 3) {
 				for (x = 0; x < SCREENWIDTH; x++) {
@@ -1504,15 +1561,15 @@ void DG_DrawFrame(void)
 				}
 			} else {
 				for (x = 0; x < view_w; x++)
-					d[x] = pal32[srow[(x * SCREENWIDTH) / view_w]];
+					d[x] = pal32[srow[x2d_lut[x]]];
 			}
 
 			for (s = 0; s < scale; s++) {
 				uint32_t y_dst = y_off + y_src * scale + s;
 
 				if (y_dst < out_h) {
-					memcpy(dst_base + y_dst * fb_stride_px, row_Staging,
-					       out_w * sizeof(uint32_t));
+					memcpy(dst_base + y_dst * fb_stride_px + x_off, row_Staging,
+					       view_w * sizeof(uint32_t));
 				}
 			}
 		}

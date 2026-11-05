@@ -71,14 +71,13 @@ static void s5l8947x_sha_blocks(u32 mode, u32 *state, unsigned int nwords,
 				const u8 *src, int blocks, unsigned int len)
 {
 	struct s5l8947x_sha *s = sha_dev;
-	unsigned long flags;
 	unsigned int i;
 	u32 v;
 
 	while (blocks > 0) {
 		int n = min(blocks, SHA_BLOCKS_PER_LOCK);
 
-		spin_lock_irqsave(&s->lock, flags);
+		spin_lock_bh(&s->lock);
 		writel_relaxed(mode, s->base + SHA_MODE);
 		for (i = 0; i < nwords; i++)
 			writel_relaxed(swab32(state[i]), s->base + SHA_STATE + 4 * i);
@@ -100,7 +99,7 @@ static void s5l8947x_sha_blocks(u32 mode, u32 *state, unsigned int nwords,
 			dev_err_ratelimited(s->dev, "engine stayed busy\n");
 		for (i = 0; i < nwords; i++)
 			state[i] = swab32(readl_relaxed(s->base + SHA_STATE + 4 * i));
-		spin_unlock_irqrestore(&s->lock, flags);
+		spin_unlock_bh(&s->lock);
 	}
 }
 

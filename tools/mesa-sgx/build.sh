@@ -85,8 +85,9 @@ else
 	PLATFORM="-Dplatforms= -Dglx=disabled -Dopengl=false"
 fi
 OPTS="--prefix=$PREFIX --libdir=lib $BT
-    -Dc_args=-mtls-dialect=gnu -Dcpp_args=-mtls-dialect=gnu
-    -Dgallium-drivers=sgx,softpipe -Dvulkan-drivers= $PLATFORM
+    -Dc_args=[-mtls-dialect=gnu,-mcpu=cortex-a9,-mfpu=neon]
+    -Dcpp_args=[-mtls-dialect=gnu,-mcpu=cortex-a9,-mfpu=neon]
+    -Dgallium-drivers=sgx -Dvulkan-drivers= $PLATFORM
     -Degl=enabled -Dgbm=enabled -Dgles1=enabled -Dgles2=enabled
     -Dglvnd=disabled -Dllvm=disabled -Dvalgrind=disabled
     -Dlibunwind=disabled -Dzstd=disabled -Dxmlconfig=enabled -Dexpat=enabled
@@ -112,7 +113,7 @@ DESTDIR="$ID" ninja -C "$BD" install >/dev/null
 
 I=$ID$PREFIX
 say "stripping the libraries' debug information ($(du -sh "$I/lib" | cut -f1) before)"
-find "$I/lib" -type f -name '*.so*' -exec strip --strip-debug {} + 2>/dev/null || true
+find "$I/lib" -type f -name '*.so*' -exec strip --strip-unneeded {} + 2>/dev/null || true
 # the device's root is minimal: libdrm and the C++ runtime are not in it, so
 # they go beside Mesa's own libraries, where LD_LIBRARY_PATH finds them
 for l in libdrm.so.2 libexpat.so.1 libgcc_s.so.1 libstdc++.so.6 libz.so.1; do

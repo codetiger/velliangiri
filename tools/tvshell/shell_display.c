@@ -787,6 +787,19 @@ void shell_display_present(void)
 			copy_span_u32(dst, src, copy_w);
 		}
 	}
+	if (disp.use_drm && disp.drm_fd >= 0 && disp.active_buf != 0 && disp.have_mode) {
+		struct drm_mode_crtc crtc = { 0 };
+
+		disp.active_buf = 0;
+		disp.fb_id = disp.bufs[0].fb_id;
+		crtc.crtc_id = disp.crtc_id;
+		crtc.fb_id = disp.fb_id;
+		crtc.set_connectors_ptr = (uintptr_t)&disp.conn_id;
+		crtc.count_connectors = 1;
+		crtc.mode = disp.mode_720p30;
+		crtc.mode_valid = 1;
+		(void)ioctl(disp.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc);
+	}
 	disp.dmg_count = 0;
 }
 
@@ -799,10 +812,12 @@ int shell_display_get_video_dmabuf(int buf_idx)
 
 int shell_display_prepare_video_backbuf(int *out_dmabuf_fd)
 {
-	const int back = 1;
+	int back = (disp.active_buf == 1) ? 2 : 1;
 
 	if (disp.headless || !disp.use_drm || disp.drm_fd < 0)
 		return -1;
+	if (disp.bufs[back].dmabuf_fd < 0 || !disp.bufs[back].map)
+		back = 1;
 	if (disp.bufs[back].dmabuf_fd < 0 || !disp.bufs[back].map)
 		return -1;
 
@@ -828,8 +843,8 @@ void shell_display_present_video_backbuf(int buf_idx,
 	/*
 	 * Composite the compact HUD pills from cached RAM onto the offscreen
 	 * DMA video frame while respecting each pill's anti-aliased rounded
-	 * corners, then blit the completed frame to the active scanout buffer
-	 * in a single top-to-bottom pass without unsynchronized SETCRTC flips.
+	 * corners, then flip the DRM CRTC directly to @buf_idx (zero 3.68 MB
+	 * CPU copy).
 	 */
 	for (i = 0; i < num_hud_rects; i++) {
 		int rx = hud_rects[i][0];
@@ -898,6 +913,23 @@ void shell_display_present_video_backbuf(int buf_idx,
 				else if (cov > 0)
 					dst_row[sx] = blend_pixel(dst_row[sx], src_row[sx], cov);
 			}
+		}
+	}
+
+	if (disp.have_mode && disp.bufs[buf_idx].fb_id != 0) {
+		struct drm_mode_crtc crtc = { 0 };
+
+		crtc.crtc_id = disp.crtc_id;
+		crtc.fb_id = disp.bufs[buf_idx].fb_id;
+		crtc.set_connectors_ptr = (uintptr_t)&disp.conn_id;
+		crtc.count_connectors = 1;
+		crtc.mode = disp.mode_720p30;
+		crtc.mode_valid = 1;
+		if (ioctl(disp.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc) == 0) {
+			disp.active_buf = buf_idx;
+			disp.fb_id = disp.bufs[buf_idx].fb_id;
+			disp.dmg_count = 0;
+			return;
 		}
 	}
 

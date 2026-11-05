@@ -21,15 +21,6 @@ static void mem_copy(void *dst, const void *src, uint32_t len)
 		d[i] = s[i];
 }
 
-static void mem_fill(void *dst, uint8_t val, uint32_t len)
-{
-	uint8_t *d = (uint8_t *)dst;
-	uint32_t i;
-
-	for (i = 0; i < len; i++)
-		d[i] = val;
-}
-
 static int manifest_valid(const struct boot_manifest *m)
 {
 	if (m->magic != BOOT_MANIFEST_MAGIC ||
@@ -86,7 +77,6 @@ int boot_load_from_nand(void *image_dst, void *dtb_dst, uint8_t *chosen_slot)
 	uint8_t *scratch = (uint8_t *)SCRATCH_PAGE_ADDR;
 	struct boot_manifest m0, m1, m;
 	int v0 = 0, v1 = 0;
-	uint32_t update_row = MANIFEST_REPLICA_ROW;
 	uint8_t slot;
 
 	if (fmi_boot_init())
@@ -103,27 +93,18 @@ int boot_load_from_nand(void *image_dst, void *dtb_dst, uint8_t *chosen_slot)
 	if (!v0 && !v1)
 		return -1;
 
-	if (v0 && (!v1 || m0.seq >= m1.seq)) {
+	if (v0 && (!v1 || m0.seq >= m1.seq))
 		mem_copy(&m, &m0, sizeof(m));
-		update_row = MANIFEST_REPLICA_ROW;
-	} else {
+	else
 		mem_copy(&m, &m1, sizeof(m));
-		update_row = MANIFEST_PRIMARY_ROW;
-	}
 
+	/*
+	 * Read-only slot selection: never erase or rewrite raw NAND without
+	 * hardware BCH-30 ECC from the stage-1 bootloader.
+	 */
 	slot = m.active_slot;
-	if (m.pending_slot <= 1U) {
-		if (m.boot_tries_left > 0U) {
-			slot = m.pending_slot;
-			m.boot_tries_left--;
-			m.seq++;
-			m.manifest_crc32 = boot_crc32(&m, sizeof(m) - sizeof(uint32_t));
-			mem_fill(scratch, 0xffU, FMI_PAGE_SIZE);
-			mem_copy(scratch, &m, sizeof(m));
-			if (!fmi_boot_erase_block(update_row))
-				fmi_boot_write_page(update_row, scratch, (void *)0);
-		}
-	}
+	if (m.pending_slot <= 1U && m.boot_tries_left > 0U)
+		slot = m.pending_slot;
 
 	if (!load_slot(&m.slots[slot], image_dst, dtb_dst)) {
 		if (chosen_slot)

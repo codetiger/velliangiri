@@ -31,6 +31,19 @@ static inline int s5l8947x_aes_hwkey_crypt(enum s5l8947x_aes_hwkey key, bool enc
 #endif
 
 struct block_device;
+struct mtd_info;
+
+#if IS_ENABLED(CONFIG_MTD_S5L8947X_FMI)
+void s5l8947x_fmi_get_syscfg(struct mtd_info *mtd, char serial[17],
+			     char model[17], u8 emac[6],
+			     u8 wmac[6], u8 bmac[6]);
+#else
+static inline void s5l8947x_fmi_get_syscfg(struct mtd_info *mtd, char serial[17],
+					   char model[17], u8 emac[6],
+					   u8 wmac[6], u8 bmac[6])
+{
+}
+#endif
 
 #if IS_ENABLED(CONFIG_MTD_S5L8947X_FTL)
 int s5l8947x_file_key_unwrap(const void *attr, size_t len, u8 fkey[32], u8 iv_key[16]);

@@ -425,6 +425,7 @@ struct s5l_display {
 	unsigned int audio_rate;
 	unsigned int audio_channels;
 	unsigned int gamma_brightness;
+	unsigned int last_gamma_brightness;
 	unsigned long tmds_hz;
 	struct hrtimer vblank_timer;
 	ktime_t vblank_period;
@@ -784,13 +785,18 @@ EXPORT_SYMBOL_GPL(s5l8947x_display_scanout);
  */
 static void s5l_gamma(struct s5l_display *d, unsigned int pct)
 {
-	u32 base = readl(d->out + OUT_GAMMA_IDX) & 0xfffe0f00U;
+	u32 base;
 	int c, i;
+
+	if (d->last_gamma_brightness == pct)
+		return;
+	d->last_gamma_brightness = pct;
 
 	if (pct >= 100) {
 		writel(0, d->out + OUT_GAMMA_EN);
 		return;
 	}
+	base = readl(d->out + OUT_GAMMA_IDX) & 0xfffe0f00U;
 	writel(base, d->out + OUT_GAMMA_IDX);
 	for (c = 0; c < 3; c++)
 		for (i = 0; i < 256; i++) {
@@ -834,7 +840,6 @@ static void s5l_pipe_setup(struct s5l_display *d, const struct drm_display_mode 
 {
 	u32 wh = m->vdisplay | (m->hdisplay << 16);
 	u32 v;
-	int i;
 
 	/* rgbout */
 	writel(readl(d->rgbout + RGB_CFG) | 0x10U, d->rgbout + RGB_CFG);
@@ -853,8 +858,8 @@ static void s5l_pipe_setup(struct s5l_display *d, const struct drm_display_mode 
 
 	/* output stage: V sync position is sync width + back porch - 2 */
 	writel(1, d->out + OUT_RESET);
-	for (i = 0; i < 200000 && (readl(d->out + OUT_RESET) & 1); i++)
-		;
+	readl_poll_timeout(d->out + OUT_RESET, v, !(v & 1), 1, 10000);
+	d->last_gamma_brightness = UINT_MAX;
 	writel(0, d->out + OUT_1C);
 	writel(0, d->out + OUT_24);
 	writel(m->hdisplay - 1, d->out + OUT_HSIZE);
@@ -1165,8 +1170,6 @@ static void s5l_pipe_enable(struct drm_simple_display_pipe *pipe,
 			d->vblank_period = ns_to_ktime(
 				DIV_ROUND_CLOSEST(NSEC_PER_SEC, refresh));
 			drm_crtc_vblank_on(&d->pipe.crtc);
-			hrtimer_start(&d->vblank_timer, d->vblank_period,
-				      HRTIMER_MODE_REL);
 		}
 	}
 
@@ -1241,11 +1244,31 @@ static void s5l_pipe_update(struct drm_simple_display_pipe *pipe,
 	s5l_complete_event(&pipe->crtc, pipe->crtc.state->active);
 }
 
+static int s5l_pipe_enable_vblank(struct drm_simple_display_pipe *pipe)
+{
+	struct s5l_display *d = to_s5l(pipe->crtc.dev);
+
+	if (!vblank_sim || !d->vblank_period)
+		return -EOPNOTSUPP;
+	hrtimer_start(&d->vblank_timer, d->vblank_period, HRTIMER_MODE_REL);
+	return 0;
+}
+
+static void s5l_pipe_disable_vblank(struct drm_simple_display_pipe *pipe)
+{
+	struct s5l_display *d = to_s5l(pipe->crtc.dev);
+
+	if (vblank_sim)
+		hrtimer_cancel(&d->vblank_timer);
+}
+
 static const struct drm_simple_display_pipe_funcs s5l_pipe_funcs = {
 	.mode_valid	= s5l_pipe_mode_valid,
 	.enable		= s5l_pipe_enable,
 	.disable	= s5l_pipe_disable,
 	.update		= s5l_pipe_update,
+	.enable_vblank	= s5l_pipe_enable_vblank,
+	.disable_vblank	= s5l_pipe_disable_vblank,
 };
 
 static const u32 s5l_formats[] = { DRM_FORMAT_XRGB8888, DRM_FORMAT_ARGB8888 };
@@ -1838,6 +1861,7 @@ static int s5l_probe(struct platform_device *pdev)
 	drm = &d->drm;
 	d->dev = dev;
 	d->gamma_brightness = 100;
+	d->last_gamma_brightness = UINT_MAX;
 	d->tmds_hz = 74250000;
 	d->audio_channels = 2;
 	mutex_init(&d->lock);

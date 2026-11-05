@@ -863,7 +863,7 @@ static int s5l8947x_audio_probe(struct platform_device *pdev)
 	struct snd_card *card;
 	struct clk_bulk_data *gates;
 	struct snd_pcm *pcm;
-	phys_addr_t phys;
+	phys_addr_t phys, spdif_phys;
 	unsigned int i;
 	int ret;
 
@@ -881,7 +881,7 @@ static int s5l8947x_audio_probe(struct platform_device *pdev)
 	platform_set_drvdata(pdev, aud);
 
 	aud->i2s_master = s5l8947x_map(pdev, "i2s-master", NULL);
-	aud->spdif = s5l8947x_map(pdev, "spdif", &phys);
+	aud->spdif = s5l8947x_map(pdev, "spdif", &spdif_phys);
 	if (IS_ERR(aud->i2s_master) || IS_ERR(aud->spdif)) {
 		ret = -ENODEV;
 		goto err_free_card;
@@ -932,7 +932,7 @@ static int s5l8947x_audio_probe(struct platform_device *pdev)
 		aud->streams[i].channels = 2;
 		aud->streams[i].nlines = 1;
 	}
-	opt->fifo_phys = phys + SPDIF_DATA;
+	opt->fifo_phys = spdif_phys + SPDIF_DATA;
 
 	for (i = 0; i < AUDIO_MAX_HDMI_LINES; i++) {
 		struct s5l8947x_line *ln = &hdmi->lines[i];

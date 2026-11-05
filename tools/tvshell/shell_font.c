@@ -10,6 +10,7 @@
  */
 
 #include <ctype.h>
+#include <fcntl.h>
 #ifdef __ARM_NEON
 #include <arm_neon.h>
 #endif
@@ -19,6 +20,9 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <unistd.h>
 
 #include "tvshell.h"
 #include "shell_assets.h"
@@ -36,6 +40,8 @@ struct ttf_font {
 	uint16_t num_hmetrics;
 	int16_t loca_format;
 	uint32_t cmap_off;
+	uint32_t fmt4_off;
+	uint32_t fmt12_off;
 	uint32_t hmtx_off;
 	uint32_t loca_off;
 	uint32_t glyf_off;
@@ -87,28 +93,26 @@ static inline uint32_t be32(const uint8_t *p)
 
 static int ttf_load_file(struct ttf_font *f, const char *path)
 {
-	FILE *fp;
-	long sz;
+	struct stat st;
+	int fd;
 	uint16_t num_tables, i;
 
 	memset(f, 0, sizeof(*f));
-	fp = fopen(path, "rb");
-	if (!fp)
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0)
 		return -1;
-	if (fseek(fp, 0, SEEK_END) != 0 || (sz = ftell(fp)) < 64 ||
-	    fseek(fp, 0, SEEK_SET) != 0) {
-		fclose(fp);
+	if (fstat(fd, &st) < 0 || st.st_size < 64) {
+		close(fd);
 		return -1;
 	}
-	f->data = malloc((size_t)sz);
-	if (!f->data || fread(f->data, 1, (size_t)sz, fp) != (size_t)sz) {
-		free(f->data);
+	f->size = (size_t)st.st_size;
+	f->data = mmap(NULL, f->size, PROT_READ, MAP_PRIVATE, fd, 0);
+	close(fd);
+	if (f->data == MAP_FAILED) {
 		f->data = NULL;
-		fclose(fp);
+		f->size = 0;
 		return -1;
 	}
-	fclose(fp);
-	f->size = (size_t)sz;
 
 	num_tables = be16(f->data + 4);
 	if (12 + (size_t)num_tables * 16 > f->size)
@@ -151,52 +155,64 @@ static int ttf_load_file(struct ttf_font *f, const char *path)
 	f->num_glyphs = be16(f->data + maxp_off + 4);
 	if (!f->units_per_em || !f->num_glyphs)
 		goto bad;
+
+	{
+		const uint8_t *cmap = f->data + f->cmap_off;
+		uint16_t ntables = (f->cmap_off + 4 <= f->size) ? be16(cmap + 2) : 0;
+
+		for (i = 0; i < ntables && f->cmap_off + 4 + (size_t)(i + 1) * 8 <= f->size; i++) {
+			const uint8_t *rec = cmap + 4 + i * 8;
+			uint16_t pid = be16(rec);
+			uint16_t eid = be16(rec + 2);
+			uint32_t sub_off = f->cmap_off + be32(rec + 4);
+
+			if (sub_off + 8 > f->size)
+				continue;
+			if ((pid == 3 && (eid == 1 || eid == 10)) || pid == 0) {
+				uint16_t fmt = be16(f->data + sub_off);
+
+				if (fmt == 12)
+					f->fmt12_off = sub_off;
+				else if (fmt == 4 && !f->fmt4_off)
+					f->fmt4_off = sub_off;
+			}
+		}
+	}
 	return 0;
 
 bad:
-	free(f->data);
+	if (f->data)
+		munmap(f->data, f->size);
 	memset(f, 0, sizeof(*f));
 	return -1;
 }
 
 static uint16_t ttf_find_glyph(const struct ttf_font *f, uint32_t cp)
 {
-	const uint8_t *cmap = f->data + f->cmap_off;
-	uint16_t ntables = be16(cmap + 2);
-	uint32_t fmt4_off = 0, fmt12_off = 0;
-	uint16_t i;
-
-	for (i = 0; i < ntables; i++) {
-		const uint8_t *rec = cmap + 4 + i * 8;
-		uint16_t pid = be16(rec);
-		uint16_t eid = be16(rec + 2);
-		uint32_t sub_off = f->cmap_off + be32(rec + 4);
-
-		if (sub_off + 8 > f->size)
-			continue;
-		if ((pid == 3 && (eid == 1 || eid == 10)) || pid == 0) {
-			uint16_t fmt = be16(f->data + sub_off);
-
-			if (fmt == 12)
-				fmt12_off = sub_off;
-			else if (fmt == 4 && !fmt4_off)
-				fmt4_off = sub_off;
-		}
-	}
+	uint32_t fmt4_off = f->fmt4_off;
+	uint32_t fmt12_off = f->fmt12_off;
 
 	if (fmt12_off && fmt12_off + 16 <= f->size) {
 		const uint8_t *sub = f->data + fmt12_off;
 		uint32_t ngroups = be32(sub + 12);
-		uint32_t g;
+		uint32_t lo = 0, hi = ngroups;
 
-		for (g = 0; g < ngroups && fmt12_off + 16 + (g + 1) * 12 <= f->size; g++) {
-			const uint8_t *grp = sub + 16 + g * 12;
-			uint32_t start = be32(grp);
-			uint32_t end = be32(grp + 4);
-			uint32_t glyph_id = be32(grp + 8);
+		if (fmt12_off + 16 + (size_t)ngroups * 12 <= f->size) {
+			while (lo < hi) {
+				uint32_t mid = lo + ((hi - lo) >> 1);
+				const uint8_t *grp = sub + 16 + mid * 12;
+				uint32_t end = be32(grp + 4);
 
-			if (cp >= start && cp <= end)
-				return (uint16_t)(glyph_id + (cp - start));
+				if (cp > end) {
+					lo = mid + 1;
+				} else {
+					uint32_t start = be32(grp);
+
+					if (cp >= start)
+						return (uint16_t)(be32(grp + 8) + (cp - start));
+					hi = mid;
+				}
+			}
 		}
 	}
 
@@ -207,31 +223,38 @@ static uint16_t ttf_find_glyph(const struct ttf_font *f, uint32_t cp)
 		const uint8_t *start_codes = end_codes + seg_count * 2 + 2;
 		const uint8_t *id_deltas = start_codes + seg_count * 2;
 		const uint8_t *id_range_offs = id_deltas + seg_count * 2;
-		uint16_t s;
+		uint16_t lo = 0, hi = seg_count;
 
-		for (s = 0; s < seg_count; s++) {
-			uint16_t end_c = be16(end_codes + s * 2);
-			uint16_t start_c;
+		if ((size_t)(id_range_offs + seg_count * 2 - f->data) <= f->size) {
+			while (lo < hi) {
+				uint16_t mid = (uint16_t)(lo + ((hi - lo) >> 1));
+				uint16_t end_c = be16(end_codes + mid * 2);
 
-			if (cp > end_c)
-				continue;
-			start_c = be16(start_codes + s * 2);
-			if (cp < start_c)
-				return 0;
-			int16_t delta = sbe16(id_deltas + s * 2);
-			uint16_t roff = be16(id_range_offs + s * 2);
+				if (cp > end_c)
+					lo = (uint16_t)(mid + 1);
+				else
+					hi = mid;
+			}
+			if (lo < seg_count) {
+				uint16_t start_c = be16(start_codes + lo * 2);
 
-			if (roff == 0)
-				return (uint16_t)((cp + delta) & 0xffffU);
-			const uint8_t *gptr = id_range_offs + s * 2 + roff +
-					      (cp - start_c) * 2;
-			if ((size_t)(gptr - f->data) + 2 > f->size)
-				return 0;
-			uint16_t glyph_id = be16(gptr);
+				if (cp < start_c)
+					return 0;
+				int16_t delta = sbe16(id_deltas + lo * 2);
+				uint16_t roff = be16(id_range_offs + lo * 2);
 
-			if (glyph_id == 0)
-				return 0;
-			return (uint16_t)((glyph_id + delta) & 0xffffU);
+				if (roff == 0)
+					return (uint16_t)((cp + delta) & 0xffffU);
+				const uint8_t *gptr = id_range_offs + lo * 2 + roff +
+						      (cp - start_c) * 2;
+				if ((size_t)(gptr - f->data) + 2 > f->size)
+					return 0;
+				uint16_t glyph_id = be16(gptr);
+
+				if (glyph_id == 0)
+					return 0;
+				return (uint16_t)((glyph_id + delta) & 0xffffU);
+			}
 		}
 	}
 	return 0;
@@ -1078,8 +1101,10 @@ void shell_font_free(void)
 		}
 		glyph_cache[i] = NULL;
 	}
-	for (r = 0; r < SHELL_FONT_ROLE_COUNT; r++)
-		free(fonts[r].data);
+	for (r = 0; r < SHELL_FONT_ROLE_COUNT; r++) {
+		if (fonts[r].data)
+			munmap(fonts[r].data, fonts[r].size);
+	}
 	memset(fonts, 0, sizeof(fonts));
 }
 
@@ -1186,9 +1211,10 @@ static void blit_glyph(const struct glyph_entry *ge, int pen_x, int baseline_y,
 	}
 }
 
-static int draw_role_at_baseline(enum shell_font_role role, int size_px,
-				 int x, int baseline_y, uint32_t fg,
-				 const char *utf8, int max_width)
+static int draw_role_at_baseline_ex(enum shell_font_role role, int size_px,
+				    int x, int baseline_y, uint32_t fg,
+				    const char *utf8, int max_width,
+				    bool emit_damage)
 {
 	const char *p = utf8;
 	int pen_x_q6 = x << 6;
@@ -1211,8 +1237,16 @@ static int draw_role_at_baseline(enum shell_font_role role, int size_px,
 	}
 
 	int drawn_w = (pen_x_q6 - start_x_q6 + 32) >> 6;
-	shell_display_damage(x - 4, baseline_y - size_px - 4, drawn_w + 16, size_px + 16);
+	if (emit_damage)
+		shell_display_damage(x - 4, baseline_y - size_px - 4, drawn_w + 16, size_px + 16);
 	return drawn_w;
+}
+
+static int draw_role_at_baseline(enum shell_font_role role, int size_px,
+				 int x, int baseline_y, uint32_t fg,
+				 const char *utf8, int max_width)
+{
+	return draw_role_at_baseline_ex(role, size_px, x, baseline_y, fg, utf8, max_width, true);
 }
 
 /*
@@ -1262,7 +1296,8 @@ int shell_font_draw_box_centered(enum shell_font_role role, int size_px,
 }
 
 /*
- * Draw multi-line wrapped text with zero ellipsis truncation.
+ * Draw multi-line wrapped text with zero ellipsis truncation (O(N) incremental
+ * Q6 width accumulation).
  */
 int shell_font_draw_wrapped_role(enum shell_font_role role, int size_px,
 				 int x, int y, int line_height, int max_width,
@@ -1271,9 +1306,15 @@ int shell_font_draw_wrapped_role(enum shell_font_role role, int size_px,
 	char line[384];
 	const char *p = utf8;
 	int lines_drawn = 0;
+	int max_w_q6 = max_width << 6;
+	struct glyph_entry *space_ge;
+	int space_q6;
 
 	if (!utf8 || !utf8[0])
 		return 0;
+
+	space_ge = get_glyph_phased(role, size_px, ' ', 0);
+	space_q6 = space_ge ? space_ge->advance_q6 : (size_px * 18);
 
 	while (*p && lines_drawn < max_lines) {
 		while (*p == ' ')
@@ -1283,33 +1324,43 @@ int shell_font_draw_wrapped_role(enum shell_font_role role, int size_px,
 
 		const char *scan = p;
 		const char *last_fit = p;
+		int line_w_q6 = 0;
 
-		line[0] = '\0';
 		while (*scan && *scan != '\n') {
 			const char *word_end = scan;
+			const char *wp = scan;
+			int word_w_q6 = 0;
 
 			while (*word_end && *word_end != ' ' && *word_end != '\n')
 				word_end++;
 
-			size_t candidate_len = (size_t)(word_end - p);
+			while (wp < word_end) {
+				uint32_t cp = utf8_next(&wp);
+				struct glyph_entry *ge = get_glyph_phased(role, size_px, cp, 0);
 
+				if (ge)
+					word_w_q6 += ge->advance_q6;
+			}
+
+			size_t candidate_len = (size_t)(word_end - p);
 			if (candidate_len >= sizeof(line))
 				break;
-			memcpy(line, p, candidate_len);
-			line[candidate_len] = '\0';
 
-			if (shell_font_measure_role(role, size_px, line) <= max_width ||
-			    last_fit == p) {
+			int next_w_q6 = line_w_q6 + word_w_q6;
+			if ((next_w_q6 + 32) <= max_w_q6 || last_fit == p) {
 				last_fit = word_end;
-				if (shell_font_measure_role(role, size_px, line) > max_width)
+				line_w_q6 = next_w_q6;
+				if ((next_w_q6 + 32) > max_w_q6)
 					break;
 			} else {
 				break;
 			}
 
 			scan = word_end;
-			while (*scan == ' ')
+			while (*scan == ' ') {
+				line_w_q6 += space_q6;
 				scan++;
+			}
 		}
 
 		size_t final_len = (size_t)(last_fit - p);
@@ -1449,10 +1500,23 @@ int shell_font_draw_summary_body(int x, int y, int line_height, int max_width,
 		}
 	}
 
-	/* Then draw all words cleanly on top */
-	for (i = 0; i < word_count; i++) {
-		shell_font_draw_role(role, size_px, words[i].wx, words[i].wy,
-				     fg, words[i].text, 0);
+	/* Then draw all words cleanly on top and emit a single coalesced damage rect */
+	{
+		int cap_h = shell_font_cap_height(role, size_px);
+
+		for (i = 0; i < word_count; i++) {
+			int baseline_y = words[i].wy + (size_px + cap_h) / 2;
+
+			draw_role_at_baseline_ex(role, size_px, words[i].wx,
+						 baseline_y, fg,
+						 words[i].text, 0, false);
+		}
+		if (word_count > 0) {
+			int lines_used = cur_line < max_lines ? (cur_line + 1) : max_lines;
+
+			shell_display_damage(x - 6, y - 4, max_width + 20,
+					     lines_used * line_height + 12);
+		}
 	}
 
 	if (total_sentences_out)

@@ -133,8 +133,20 @@ static struct notifier_block apple_s5l_wdt_restart_nb = {
 
 void __init apple_s5l_wdt_clocksource_init(void)
 {
+	struct device_node *np;
+
+	np = of_find_compatible_node(NULL, NULL, "apple,s5l8940x-wdt-timer");
+	if (!np)
+		np = of_find_compatible_node(NULL, NULL, "apple,s5l8947x-wdt");
+	if (!np) {
+		pr_err("no wdt node found\n");
+		return;
+	}
+
+	wdt_base = of_iomap(np, 0);
+	of_node_put(np);
 	if (!wdt_base) {
-		pr_err("counter not mapped, wall time stays on PMCCNTR\n");
+		pr_err("cannot map wdt counter\n");
 		return;
 	}
 
@@ -147,48 +159,4 @@ void __init apple_s5l_wdt_clocksource_init(void)
 		pr_err("could not register restart handler\n");
 	else
 		pr_info("restart handler registered (watchdog bite, 1 ms)\n");
-}
-
-unsigned long __init apple_s5l_calibrate_cpu_hz(void)
-{
-	struct device_node *np;
-	u32 w0, w1, c0, c1, wd, cd;
-	u64 hz;
-
-	np = of_find_compatible_node(NULL, NULL, "apple,s5l8940x-wdt-timer");
-	if (!np)
-		np = of_find_compatible_node(NULL, NULL, "apple,s5l8947x-wdt");
-	if (!np) {
-		pr_err("no wdt node found; CPU rate stays on fallback\n");
-		return 0;
-	}
-
-	wdt_base = of_iomap(np, 0);
-	of_node_put(np);
-	if (!wdt_base) {
-		pr_err("cannot map wdt counter\n");
-		return 0;
-	}
-
-	w0 = readl_relaxed(wdt_base + WDT_CUR_TIME);
-	c0 = apple_s5l_pmccntr_read();
-	while ((u32)(readl_relaxed(wdt_base + WDT_CUR_TIME) - w0) < APPLE_S5L_WDT_HZ / 20)
-		cpu_relax();
-	w1 = readl_relaxed(wdt_base + WDT_CUR_TIME);
-	c1 = apple_s5l_pmccntr_read();
-
-	wd = w1 - w0;
-	cd = c1 - c0;
-	if (!wd) {
-		pr_err("watchdog counter is not running\n");
-		return 0;
-	}
-
-	hz = mul_u32_u32(cd, APPLE_S5L_WDT_HZ);
-	do_div(hz, wd);
-
-	pr_info("calibrated %u CPU cycles per %u ticks of 24 MHz => CPU = %llu Hz\n",
-		cd, wd, hz);
-
-	return (unsigned long)hz;
 }

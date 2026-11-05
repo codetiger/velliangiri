@@ -8,7 +8,7 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="${ROOT}/out"
 BASE_DTB="${OUT}/s5l8947x-j33iap.dtb"
-IMAGE="${OUT}/Image"
+IMAGE="${OUT}/zImage"
 
 if [ ! -f "${BASE_DTB}" ] || [ ! -f "${IMAGE}" ]; then
 	echo "ERROR: ${BASE_DTB} or ${IMAGE} missing; run './scripts/velliangiri.sh kernel' first." >&2
@@ -24,9 +24,9 @@ make_slot_dtb() {
 	local bootargs
 
 	if [ "${profile}" = "prod" ]; then
-		bootargs="quiet loglevel=4 console=ttyGS0 ubi.mtd=ubi_sys ubi.block=0,${vol} ubi.block=0,firmware root=${ubiblk} rootfstype=squashfs ro rootwait lpj=96000"
+		bootargs="quiet loglevel=4 console=ttyGS0 ubi.mtd=ubi_sys ubi.block=0,${vol} ubi.block=0,firmware root=${ubiblk} rootfstype=squashfs ro rootwait lpj=3400000"
 	else
-		bootargs="earlycon=s3c6400,0x32500000 console=ttySAC3,115200n8 console=ttyGS0 ignore_loglevel initcall_debug ubi.mtd=ubi_sys ubi.block=0,${vol} ubi.block=0,firmware root=${ubiblk} rootfstype=squashfs ro rootwait lpj=96000"
+		bootargs="earlycon=s3c6400,0x32500000 console=ttySAC3,115200n8 console=ttyGS0 ignore_loglevel initcall_debug ubi.mtd=ubi_sys ubi.block=0,${vol} ubi.block=0,firmware root=${ubiblk} rootfstype=squashfs ro rootwait lpj=3400000"
 	fi
 
 	FMI_PATH="/soc@30000000/nand-controller@1200000"

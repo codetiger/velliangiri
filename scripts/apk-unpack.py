@@ -6,6 +6,7 @@ dependencies via APKINDEX.tar.gz and readelf without executing target binaries.
 """
 
 import argparse
+import glob
 import gzip
 import io
 import os
@@ -16,12 +17,27 @@ import sys
 import tarfile
 import urllib.request
 
+_ELF_NEEDS_CACHE: dict[tuple[int, int], list[str]] = {}
+
 
 def log(msg: str) -> None:
     print(f"    {msg}", flush=True)
 
 
-def fetch(url: str) -> bytes:
+def fetch(url: str, cache_dir: str | None = None, cache_name: str | None = None) -> bytes:
+    if cache_dir and cache_name:
+        os.makedirs(cache_dir, exist_ok=True)
+        cpath = os.path.join(cache_dir, cache_name)
+        if os.path.isfile(cpath) and os.path.getsize(cpath) > 0:
+            with open(cpath, "rb") as f:
+                return f.read()
+        with urllib.request.urlopen(url, timeout=60) as r:
+            data = r.read()
+        tmp = cpath + ".part"
+        with open(tmp, "wb") as f:
+            f.write(data)
+        os.replace(tmp, cpath)
+        return data
     with urllib.request.urlopen(url, timeout=60) as r:
         return r.read()
 
@@ -77,6 +93,10 @@ def parse_index(blob: bytes):
 
 def elf_needs(path: str) -> list[str]:
     try:
+        st = os.stat(path)
+        key = (st.st_ino, st.st_size)
+        if key in _ELF_NEEDS_CACHE:
+            return _ELF_NEEDS_CACHE[key]
         out = subprocess.run(
             ["readelf", "-dl", path], capture_output=True, text=True, timeout=30
         ).stdout
@@ -84,7 +104,28 @@ def elf_needs(path: str) -> list[str]:
         return []
     needs = re.findall(r"Shared library: \[(.+?)\]", out)
     interp = re.findall(r"program interpreter: (.+?)\]", out)
-    return needs + interp
+    res = needs + interp
+    _ELF_NEEDS_CACHE[key] = res
+    return res
+
+
+def apply_prune_list(dest: str, prune_file: str | None) -> None:
+    if not prune_file or not os.path.isfile(prune_file):
+        return
+    with open(prune_file, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line or line.startswith("#"):
+                continue
+            pat = os.path.join(dest, line.lstrip("/"))
+            for match in glob.glob(pat):
+                if os.path.isdir(match) and not os.path.islink(match):
+                    shutil.rmtree(match, ignore_errors=True)
+                else:
+                    try:
+                        os.unlink(match)
+                    except OSError:
+                        pass
 
 
 def is_elf(path: str) -> bool:
@@ -112,6 +153,8 @@ def main() -> int:
     ap.add_argument("--repo", required=True)
     ap.add_argument("--dest", required=True)
     ap.add_argument("--rootfs", required=True)
+    ap.add_argument("--cache", default=None)
+    ap.add_argument("--prune", default=None)
     ap.add_argument("--max-rounds", type=int, default=10)
     ap.add_argument("packages", nargs="+")
     args = ap.parse_args()
@@ -121,7 +164,10 @@ def main() -> int:
     os.makedirs(args.dest)
 
     print(f"==> index: {args.repo}/APKINDEX.tar.gz", flush=True)
-    by_name, by_soname = parse_index(fetch(f"{args.repo}/APKINDEX.tar.gz"))
+    idx_blob = fetch(
+        f"{args.repo}/APKINDEX.tar.gz", args.cache, "APKINDEX.tar.gz"
+    )
+    by_name, by_soname = parse_index(idx_blob)
     log(f"{len(by_name)} packages, {len(by_soname)} sonames")
 
     wanted, done = list(args.packages), set()
@@ -134,9 +180,12 @@ def main() -> int:
             if not fn:
                 sys.exit(f"error: no package named {pkg!r} in the index")
             print(f"==> {fn}", flush=True)
-            for n in untar_apk(fetch(f"{args.repo}/{fn}"), args.dest):
+            apk_blob = fetch(f"{args.repo}/{fn}", args.cache, fn)
+            for n in untar_apk(apk_blob, args.dest):
                 log(n)
             done.add(pkg)
+
+        apply_prune_list(args.dest, args.prune)
 
         roots = [args.dest, args.rootfs]
         missing = set()

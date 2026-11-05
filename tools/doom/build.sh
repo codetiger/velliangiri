@@ -41,7 +41,7 @@ echo "==> applying native high-resolution 3D renderer patch (960x600 / 1066x600)
 python3 -S "${ROOT}/tools/doom/patch-hires.py" "${DG_DIR}"
 
 CFLAGS=(
-	-O2
+	-O3
 	-mcpu=cortex-a9
 	-mfpu=neon
 	-std=gnu99

@@ -33,6 +33,7 @@
 #include <linux/bitfield.h>
 #include <linux/bits.h>
 #include <linux/clockchips.h>
+#include <linux/clocksource.h>
 #include <linux/cpumask.h>
 #include <linux/delay.h>
 #include <linux/init.h>
@@ -562,6 +563,19 @@ static int aic1_ce_shutdown(struct clock_event_device *ce)
 	return 0;
 }
 
+static u64 aic1_cs_read(struct clocksource *cs)
+{
+	return aic1_time(apple_aic1);
+}
+
+static struct clocksource aic1_clocksource = {
+	.name	= "apple-aic1-time",
+	.rating	= 400,
+	.read	= aic1_cs_read,
+	.mask	= CLOCKSOURCE_MASK(64),
+	.flags	= CLOCK_SOURCE_IS_CONTINUOUS,
+};
+
 static struct clock_event_device aic1_clkevt = {
 	.name			= "apple-aic1-timer",
 	.features		= CLOCK_EVT_FEAT_ONESHOT,
@@ -584,18 +598,18 @@ static bool __init aic1_tmr_try(struct apple_aic1 *aic, u32 win,
 	aic1_tmr_write(aic, AIC1_TMR_CFG, AIC1_TMR_CFG_INIT);
 
 	t0 = aic1_time(aic);
-	aic1_tmr_arm(aic, AIC1_TIMER_HZ / 100);
+	aic1_tmr_arm(aic, AIC1_TIMER_HZ / 1000);
 	cnt_a = aic1_tmr_read(aic, AIC1_TMR_CNT);
 	do {
 		if (READ_ONCE(aic1_tmr_events) != before)
 			break;
 		cpu_relax();
 		t = aic1_time(aic);
-	} while (t - t0 < AIC1_TIMER_HZ / 5);
+	} while (t - t0 < AIC1_TIMER_HZ / 50);
 	cnt_b = aic1_tmr_read(aic, AIC1_TMR_CNT);
 
 	if (READ_ONCE(aic1_tmr_events) != before) {
-		pr_info("AIC-TIMER: %s window %#x: 10 ms shot fired after %llu us (CFG was %#x)\n",
+		pr_info("AIC-TIMER: %s window %#x: 1 ms shot fired after %llu us (CFG was %#x)\n",
 			what, win,
 			div_u64((aic1_tmr_last - t0) * 1000000ULL, AIC1_TIMER_HZ),
 			cfg0);
@@ -604,7 +618,7 @@ static bool __init aic1_tmr_try(struct apple_aic1 *aic, u32 win,
 
 	aic1_tmr_disarm(aic);
 	aic1_tmr_write(aic, AIC1_TMR_CFG, cfg0);
-	pr_warn("AIC-TIMER: %s window %#x: nothing in 200 ms (CFG=%#x CNT %#x->%#x STAT=%#x)\n",
+	pr_warn("AIC-TIMER: %s window %#x: nothing in 20 ms (CFG=%#x CNT %#x->%#x STAT=%#x)\n",
 		what, win, cfg0, cnt_a, cnt_b, aic1_tmr_read(aic, AIC1_TMR_STAT));
 	return false;
 }
@@ -615,6 +629,8 @@ static int __init aic1_timer_init(void)
 
 	if (!aic)
 		return 0;
+
+	clocksource_register_hz(&aic1_clocksource, AIC1_TIMER_HZ);
 
 	if (!aic1_tmr_try(aic, AIC1_ALIAS_WINDOW, "alias") &&
 	    !aic1_tmr_try(aic, AIC1_CPU_WINDOW(0), "cpu0")) {

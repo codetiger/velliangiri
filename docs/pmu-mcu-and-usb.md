@@ -1,12 +1,12 @@
 # S5L8947X PMU, System MCU, USB HSIC, SHA & IOP Reference
 
-Clean-room hardware and protocol specification for the Dialog `D1815` PMU (`drivers/mfd/apple-d1815.c`, `drivers/rtc/rtc-apple-d1815.c`, `drivers/hwmon/apple-d1815-hwmon.c`), UART1 System/IR Microcontroller (`drivers/input/misc/s5l8947x-mcu.c`), USB 2.0 OTG/HSIC PHY (`drivers/usb/phy/phy-s5l8947x-usb.c`), SHA-1/SHA-2 accelerator (`drivers/crypto/s5l8947x-sha.c`), and IOP coprocessor (`drivers/soc/apple/s5l8947x-iop.c`).
+Clean-room hardware and protocol specification for the Dialog `D1815` PMU (`drivers/mfd/apple-pmu-i2c.c`, `drivers/rtc/rtc-apple-pmu.c`, `drivers/hwmon/apple-pmu-hwmon.c`), UART1 System/IR Microcontroller (`drivers/input/misc/s5l8947x-mcu.c`), USB 2.0 OTG/HSIC PHY (`drivers/phy/phy-apple-s5l-usb.c`), SHA-2 accelerator (`drivers/crypto/s5l8947x-sha.c`), and IOP coprocessor (`drivers/soc/apple/s5l8947x-iop.c`).
 
 ---
 
 ## 1. Dialog `D1815` PMU (`I2C0` @ `0x74`, IRQ 106)
 
-The `D1815` PMU on `I2C0` (`0x32000000`, slave address `0x74`) provides event interrupts, a 32-bit uptime counter with battery-less scratch calendar offset, a 12-bit multiplexing ADC, and power-rail control.
+The `D1815` PMU on `I2C0` (`0x33200000`, slave address `0x74`) provides event interrupts, a 32-bit uptime counter with battery-less scratch calendar offset, a 12-bit multiplexing ADC, and power-rail control.
 
 ### 1.1 RTC Counter, Scratch Calendar Offset & Alarm
 
@@ -120,7 +120,7 @@ An onboard microcontroller connected to `UART1` (`0x32600000`, IRQ `22`, PMGR ga
   - `+0x10` (`STATUS`): `bit 0` = done.
   - `+0x40..0x7f` (`STATE`): 20/28/32/48/64-byte digest/state in memory word order (supports state import/export).
   - `+0x80..0xff` (`BLOCK`): 64-byte (`16 words`) or 128-byte (`32 words` for SHA-384/512) input block in memory word order.
-- **Note:** On the single Cortex-A9 core at 850 MHz, uncached MMIO writes limit PIO throughput to `~14 MB/s`, which beats software `sha512sum` (`10.1 MB/s`) and thus only `sha384-s5l8947x` and `sha512-s5l8947x` are registered (`priority 300`), leaving SHA-1 (`43.2 MB/s` in software) and SHA-256 (`19.5 MB/s` in software) to the ARM CPU.
+- **Note:** On the single Cortex-A9 core at 850 MHz, uncached MMIO writes limit PIO throughput to `~14 MB/s`, which beats software `sha512sum` (`10.1 MB/s`); `sha384-s5l8947x` and `sha512-s5l8947x` are registered at `priority 300`, while `sha224-s5l8947x` and `sha256-s5l8947x` are registered at `priority 90` below the ARM/NEON software implementations (`19.5 MB/s`).
 
 ---
 

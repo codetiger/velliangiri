@@ -160,6 +160,7 @@ struct apple_sgx_bo {
 		struct drm_gem_dma_object dma;		/* one contiguous block */
 	};
 	struct drm_mm_node node;	/* its GPU address, and a guard page */
+	struct iosys_map vmap;		/* cached kernel mapping for details BOs */
 	u32 flags;			/* APPLE_SGX_BO_* */
 	u32 mapped;			/* bytes the PTEs cover */
 	u64 serial;			/* one per buffer object ever made */
@@ -180,7 +181,6 @@ struct apple_sgx_job {
 	bool kernel_pb;			/* it is the kernel's */
 
 	struct drm_gem_object *details_obj;
-	struct iosys_map details_map;
 	u32 *details;			/* the render details, in details_obj */
 
 	struct drm_gem_object **bos;	/* everything the render touches */
@@ -227,6 +227,8 @@ static void sgx_gem_free(struct drm_gem_object *obj)
 	struct apple_sgx_drm *sdrm = to_sgx_drm(obj->dev);
 	struct apple_sgx_bo *bo = to_sgx_bo(obj);
 
+	if (!iosys_map_is_null(&bo->vmap))
+		drm_gem_vunmap(obj, &bo->vmap);
 	if (drm_mm_node_allocated(&bo->node)) {
 		apple_sgx_mmu_unmap(sdrm->sgx, bo->node.start, bo->mapped);
 		mutex_lock(&sdrm->va_lock);
@@ -307,10 +309,8 @@ static int sgx_bo_map(struct apple_sgx_drm *sdrm, struct drm_gem_object *obj, u3
 {
 	struct apple_sgx_bo *bo = to_sgx_bo(obj);
 	size_t size = obj->size;
-	struct scatterlist *sg;
 	struct sg_table *sgt = NULL;
-	unsigned int i;
-	u32 pte, at;
+	u32 pte;
 	int ret;
 
 	/* an imported dma-buf has its table already; a shmem object is paged
@@ -357,17 +357,8 @@ static int sgx_bo_map(struct apple_sgx_drm *sdrm, struct drm_gem_object *obj, u3
 					size, pte);
 		bo->mapped = ret ? 0 : size;
 	} else {
-		at = bo->node.start;
-		for_each_sgtable_dma_sg(sgt, sg, i) {
-			ret = apple_sgx_mmu_map(sdrm->sgx, at, sg_dma_address(sg),
-						sg_dma_len(sg), pte);
-			if (ret)
-				break;
-			at += sg_dma_len(sg);
-		}
-		bo->mapped = at - bo->node.start;
-		if (!ret && bo->mapped != size)
-			ret = -EIO;
+		ret = apple_sgx_mmu_map_sgt(sdrm->sgx, bo->node.start, sgt, size,
+					    pte, &bo->mapped);
 	}
 	if (ret) {
 		apple_sgx_mmu_unmap(sdrm->sgx, bo->node.start, size);
@@ -581,6 +572,15 @@ static int sgx_ioctl_blit(struct drm_device *drm, void *data, struct drm_file *f
 		goto out;
 	}
 
+	{
+		long wret = dma_resv_wait_timeout(src->resv, DMA_RESV_USAGE_WRITE,
+						  true, msecs_to_jiffies(render_timeout_ms));
+		if (wret <= 0) {
+			ret = wret == 0 ? -ETIMEDOUT : (int)wret;
+			goto out;
+		}
+	}
+
 	/*
 	 * dst_handle 0 is the screen: the display pipe's live scanout, which
 	 * the kernel has mapped at SGX_FB_VA.  The caller takes its size and
@@ -733,7 +733,7 @@ static void sgx_pb_image(u8 *img)
 	u32 *d = (u32 *)img, total = 0, last, end;
 	unsigned int i;
 
-	memset(img, 0, SGX_PB_SIZE);
+	memset(img, 0, 0x51000);
 	for (i = 0; i < n; i++) {
 		u32 va = SGX_PB_VA + sgx_pb_blocks[i].off, size = sgx_pb_blocks[i].size;
 		u32 *h = (u32 *)(img + sgx_pb_blocks[i].off);
@@ -813,8 +813,6 @@ static void sgx_job_release(struct apple_sgx_job *job)
 {
 	unsigned int i;
 
-	if (job->details)
-		drm_gem_vunmap(job->details_obj, &job->details_map);
 	if (job->details_obj)
 		drm_gem_object_put(job->details_obj);
 	for (i = 0; i < job->bo_count; i++)
@@ -1181,10 +1179,13 @@ static int sgx_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 		ret = -EINVAL;
 		goto out_job;
 	}
-	ret = drm_gem_vmap(det, &job->details_map);
+	mutex_lock(&sdrm->va_lock);
+	if (iosys_map_is_null(&to_sgx_bo(det)->vmap))
+		ret = drm_gem_vmap(det, &to_sgx_bo(det)->vmap);
+	mutex_unlock(&sdrm->va_lock);
 	if (ret)
 		goto out_job;
-	job->details = job->details_map.vaddr + args->details_offset;
+	job->details = to_sgx_bo(det)->vmap.vaddr + args->details_offset;
 
 	ret = drm_sched_job_init(&job->base, &fpriv->entity, 1, NULL,
 				 file->client_id);

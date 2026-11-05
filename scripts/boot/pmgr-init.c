@@ -29,10 +29,14 @@
 
 static const uint32_t s5l8947x_pmgr_gates[] = {
 	0x3f10102cU, /* HPERF-NRT */
+	0x3f1010c4U, /* FMI0 */
+	0x3f1010c8U, /* FMI0B */
 	0x3f1010f8U, /* UART0 */
+	0x3f101104U, /* UART3 */
 	0x3f101118U, /* I2C0 */
 	0x3f101120U, /* I2C2 */
 	0x3f101144U, /* ETHERNET */
+	0x3f10115cU, /* CDMA */
 	0x3f101080U, /* UPERF */
 	0x3f101098U, /* USB-REG0 */
 	0x3f101084U, /* USB-OTG0 */

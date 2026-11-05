@@ -43,9 +43,9 @@ if [ -r /etc/build-date ]; then
 	fi
 fi
 
-# Seed kernel CRNG from clocksource jitter (~70 ms)
+# Seed kernel CRNG from clocksource jitter asynchronously (~9 ms)
 if [ -x /bin/jitterseed ]; then
-	r=$(/bin/jitterseed 2>&1) && msg "entropy: $r" || msg "entropy: jitterseed failed: $r"
+	( r=$(/bin/jitterseed 2>&1) && msg "entropy: $r" || msg "entropy: jitterseed failed: $r" ) &
 fi
 
 hostname velliangiri 2>/dev/null || true

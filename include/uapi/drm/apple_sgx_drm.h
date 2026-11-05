@@ -50,7 +50,11 @@
 #ifndef _APPLE_SGX_DRM_H_
 #define _APPLE_SGX_DRM_H_
 
+#if defined(__KERNEL__)
 #include "drm.h"
+#else
+#include <drm/drm.h>
+#endif
 
 #if defined(__cplusplus)
 extern "C" {

@@ -112,13 +112,11 @@ static struct {
 	uint64_t slideshow_last_ms;
 } g_mg;
 
-#ifdef MEDIA_GALLERY_STANDALONE
 static void handle_sig(int sig)
 {
 	(void)sig;
 	g_running = 0;
 }
-#endif
 
 static void mark_grid_full_redraw(void)
 {
@@ -169,6 +167,8 @@ static void apply_filter(enum mg_filter_kind filter)
 
 	g_mg.selected_idx = 0;
 	g_mg.current_page = 0;
+	g_mg.preload_cursor = 0;
+	g_mg.preload_done = false;
 	mark_grid_full_redraw();
 }
 
@@ -733,6 +733,8 @@ static void move_grid_selection(int next_idx)
 
 	if (new_page != old_page) {
 		g_mg.dirty_tiles = 0xffU;
+		g_mg.preload_cursor = new_page * MG_TILES_PER_PAGE;
+		g_mg.preload_done = false;
 	} else {
 		g_mg.dirty_tiles |= (uint8_t)((1U << old_slot) | (1U << new_slot));
 	}
@@ -962,11 +964,15 @@ static bool preload_next_gallery_thumbnail(void)
 		}
 	}
 
-	/* Then pre-warm all remaining items in the background */
-	while (g_mg.preload_cursor < g_mg.all_count) {
-		int idx = g_mg.preload_cursor++;
+	/* Then pre-warm at most 4 items ahead on the next page */
+	int preload_limit = (g_mg.current_page + 1) * MG_TILES_PER_PAGE + 4;
+	if (preload_limit > g_mg.filtered_count)
+		preload_limit = g_mg.filtered_count;
+	while (g_mg.preload_cursor < preload_limit) {
+		int f_idx = g_mg.preload_cursor++;
+		int raw_idx = g_mg.filtered_map[f_idx];
 		struct giri_media_card mc;
-		make_card_from_item(&g_mg.all_items[idx], idx, &mc);
+		make_card_from_item(&g_mg.all_items[raw_idx], raw_idx, &mc);
 		if (shell_media_preload_card_one(&mc))
 			return true;
 	}
@@ -1047,8 +1053,7 @@ int media_gallery_run(enum shell_theme_id theme_id)
 	return 0;
 }
 
-#ifdef MEDIA_GALLERY_STANDALONE
-int main(int argc, char **argv)
+int media_gallery_main(int argc, char **argv)
 {
 	bool headless = false;
 	const char *dump_ppm_path = NULL;
@@ -1135,5 +1140,11 @@ int main(int argc, char **argv)
 	shell_font_free();
 	shell_display_close();
 	return 0;
+}
+
+#ifdef MEDIA_GALLERY_STANDALONE
+int main(int argc, char **argv)
+{
+	return media_gallery_main(argc, argv);
 }
 #endif /* MEDIA_GALLERY_STANDALONE */

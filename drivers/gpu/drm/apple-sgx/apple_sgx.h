@@ -28,6 +28,7 @@ struct drm_file;
 struct drm_gem_object;
 struct page;
 struct resource;
+struct sg_table;
 
 /* The register window: six 16 KiB banks.  Bank 0 is the broadcast bank and
  * has no read path -- a read hangs the bus.  Bank 1 is the master, bank
@@ -194,6 +195,8 @@ struct apple_sgx {
 /* apple_sgx_hw.c */
 int apple_sgx_mmu_map(struct apple_sgx *sgx, u32 va, dma_addr_t pa, size_t size,
 		      u32 flags);
+int apple_sgx_mmu_map_sgt(struct apple_sgx *sgx, u32 va, struct sg_table *sgt,
+			  size_t size, u32 flags, u32 *mapped);
 void apple_sgx_mmu_unmap(struct apple_sgx *sgx, u32 va, size_t size);
 bool apple_sgx_up(struct apple_sgx *sgx);
 int apple_sgx_restart(struct apple_sgx *sgx);

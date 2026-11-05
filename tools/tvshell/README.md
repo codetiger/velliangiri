@@ -26,7 +26,37 @@ Native 10-foot television shell for the S5L8947X (`j33iap`) implementing the **G
 ## Building & Installing
 
 ```sh
-./tools/tvshell/fetch-fonts.sh    # Download Plus Jakarta Sans + JetBrains Mono TTFs
-./tools/tvshell/build.sh          # Generate token/SVG headers & cross-compile build/tvshell/tvshell
-./tools/tvshell/install.sh [HOST] # Install /bin/tvshell, fonts, and JSON catalogs over SSH
+./tools/tvshell/fetch-fonts.sh              # Download Plus Jakarta Sans + JetBrains Mono TTFs
+./tools/tvshell/build.sh                    # Generate token/SVG headers & cross-compile build/tvshell/tvshell
+./tools/tvshell/install.sh [root@HOST]      # Install /bin/tvshell, /bin/media-gallery symlink, fonts & JSON catalogs
 ```
+
+## One-Time Media & Placeholder Provisioning (Persistent Storage)
+
+Built OS images (`build/initramfs-s5l8947x.cpio`, `out/rootfs.sqsh`, `build/usr-local.sqsh`, and `out/boot-bundle-s5l8947x-j33iap.bin`) **do not** bundle sample photos, videos, extracted video frames, or placeholder JPEGs. Instead, media assets live on the persistent `Data` partition (`/dev/nand0p2`, mounted at `/mnt/data`) so they only need to be transferred **once** per device:
+
+- `/mnt/data/linux/placeholders/*.jpg` — Topic card placeholder artwork (`1280×720` baseline JPEGs)
+- `/mnt/data/linux/media/` (and `/mnt/data/linux/media/photos`, `/mnt/data/linux/media/videos`) — Local gallery photos (`*.jpeg`, `*.jpg`), videos (`*.mov`), and pre-extracted `720p` video frame sequences (`.frames/<video>/frame_*.jpg` + `audio.wav`)
+
+### 1. Transfer Sample Media & Placeholders Once
+
+```sh
+# Prepare (transcode to baseline JPEG + extract 24 fps 720p frames) and transfer to /mnt/data:
+./tools/tvshell/install.sh --media-only root@10.55.0.2
+
+# Or install /bin/tvshell AND transfer media in one command:
+./tools/tvshell/install.sh --media root@10.55.0.2
+```
+
+### 2. Transfer Your Own Photos & Videos
+
+1. Place source photos (`.jpg`, `.jpeg`, `.heic`, `.png`) and videos (`.mov`, `.mp4`) in `research/sample media/` on your host machine, then run:
+   ```sh
+   ./tools/tvshell/prepare-media.sh
+   ./tools/tvshell/install.sh --media-only root@10.55.0.2
+   ```
+2. Or copy baseline `.jpg`/`.jpeg` photos directly onto the device's persistent storage:
+   ```sh
+   tar -C /path/to/photos -cf - . | ssh root@10.55.0.2 "mkdir -p /mnt/data/linux/media/photos && tar -C /mnt/data/linux/media/photos -xf -"
+   ```
+   `tvshell` and `media-gallery` automatically scan `/mnt/data/linux/media`, `/mnt/data/linux/media/photos`, and `/mnt/data/linux/media/videos` using the S5L8947X hardware JPEG decoder (`/dev/video2`) and M2 hardware scaler (`/dev/video0`).

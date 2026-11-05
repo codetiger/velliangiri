@@ -380,7 +380,7 @@ int main(int argc, char **argv)
 	int16_t *period;
 	struct wav w = { 0 };
 	uint8_t *file;
-	size_t len;
+	size_t len = 0;
 	uint64_t pos = 0;
 	int opt, fd, ret = 1;
 

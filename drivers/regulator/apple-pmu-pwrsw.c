@@ -43,7 +43,7 @@ static int apple_pmu_pwrsw_enable(struct regulator_dev *rdev)
 	ret = regulator_enable_regmap(rdev);
 	if (!ret) {
 		pwrsw->was_enabled = 1;
-		mdelay(1);
+		usleep_range(1000, 1500);
 	}
 	return ret;
 }

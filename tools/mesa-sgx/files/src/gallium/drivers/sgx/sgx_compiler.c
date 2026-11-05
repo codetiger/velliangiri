@@ -280,6 +280,15 @@ scratch_give_back(struct comp *c, struct scratch *s)
    s->n = 0;
 }
 
+/* cached debug/probe environment flags */
+static bool
+env_flag(const char *name, int *cache)
+{
+   if (*cache < 0)
+      *cache = getenv(name) != NULL;
+   return *cache != 0;
+}
+
 static uint32_t
 f32_bits(float f)
 {
@@ -1225,13 +1234,14 @@ texture(struct comp *c, nir_tex_instr *tex, struct scratch *s)
    }
 sample:
    d = block(c, 4, 4);
+   static int tex_f32 = -1;
    if (c->fs->blend.tex_f16 >> tex->texture_index & 1) {
       /* (M43) a copy of half floats: four F32 back, as they are */
       emit(c, smp(USSE_SMP_F32, USSE_SMP_COORD_F32, treg(c, d), coords,
                   usse_reg(USSE_SA, c->sampler_sa + 4 * c->slot_of_unit[tex->texture_index]),
                   mode, lodreg));
       emit(c, USSE_WDF0);
-   } else if (getenv("SGX_TEX_F32")) {
+   } else if (env_flag("SGX_TEX_F32", &tex_f32)) {
       emit(c, smp(USSE_SMP_F32, USSE_SMP_COORD_F32, treg(c, d),
                          coords,
                          usse_reg(USSE_SA, c->sampler_sa + 4 * c->slot_of_unit[tex->texture_index]),
@@ -1459,7 +1469,8 @@ lower_fetch_coords(struct comp *c, nir_shader *s, nir_function_impl *impl)
    unsigned ncand = 0, nplain = 0;
    bool progress = false;
 
-   if (getenv("SGX_NOFETCH") || getenv("SGX_NO_PROJ_FETCH"))
+   static int no_fetch = -1, no_proj_fetch = -1;
+   if (env_flag("SGX_NOFETCH", &no_fetch) || env_flag("SGX_NO_PROJ_FETCH", &no_proj_fetch))
       return;
    nir_foreach_block(block, impl) {
       nir_foreach_instr(instr, block) {
@@ -1574,8 +1585,9 @@ static void
 plan_inputs(struct comp *c, nir_function_impl *impl)
 {
    bool read[VARYING_SLOT_MAX] = { false };
+   static int no_fetch = -1;
 
-   if (!getenv("SGX_NOFETCH")) {
+   if (!env_flag("SGX_NOFETCH", &no_fetch)) {
       nir_foreach_block(block, impl) {
          nir_foreach_instr(instr, block) {
             int slot;
@@ -2129,10 +2141,15 @@ intrinsic(struct comp *c, nir_intrinsic_instr *in)
       {
          /* SGX_DEBUG_FBFETCH=word: unpack a constant instead of o0 (a test
           * of the channel selects) */
-         const char *dbg = getenv("SGX_DEBUG_FBFETCH");
+         static const char *dbg;
+         static int dbg_init;
          struct usse_reg src = usse_reg(USSE_OUTPUT, 0);
          unsigned k = 0;
 
+         if (!dbg_init) {
+            dbg = getenv("SGX_DEBUG_FBFETCH");
+            dbg_init = 1;
+         }
          if (dbg) {
             k = take(c);
             src = treg(c, k);
@@ -2621,8 +2638,11 @@ optimize(nir_shader *s)
    /* ifs of up to 32 instructions a side flattened (selects); bigger ones
     * branch -- an unrolled loop with a break flattened whole needed 65
     * registers a pixel (M20).  SGX_FLATTEN_LIMIT=n to try others. */
+   static int flatten_limit = -1;
+   if (flatten_limit < 0)
+      flatten_limit = getenv("SGX_FLATTEN_LIMIT") ? atoi(getenv("SGX_FLATTEN_LIMIT")) : 32;
    const nir_opt_peephole_select_options flatten = {
-      .limit = getenv("SGX_FLATTEN_LIMIT") ? atoi(getenv("SGX_FLATTEN_LIMIT")) : 32,
+      .limit = flatten_limit,
       .indirect_load_ok = true, .expensive_alu_ok = true,
       .discard_ok = true,        /* if (c) discard: terminate_if(c) */
    };
@@ -3355,7 +3375,8 @@ f16_colour(struct comp *c, nir_function_impl *impl)
    unsigned reg[F16_NODES], ntemp = 0;
    struct usse_reg o0 = usse_reg(USSE_OUTPUT, 0), colour;
 
-   if (getenv("SGX_NO_F16") || c->vs || c->kills || c->ncolours || c->logicop >= 0 ||
+   static int no_f16 = -1;
+   if (env_flag("SGX_NO_F16", &no_f16) || c->vs || c->kills || c->ncolours || c->logicop >= 0 ||
        c->fs->blend.rt_kind != SGX_RT_UNORM8 || c->fs->blend.rt_srgb ||
        c->fs->blend.rt_intensity ||
        c->nuniforms || exec_list_length(&impl->body) != 1)
@@ -3624,7 +3645,8 @@ translate(struct comp *c, nir_shader *s)
       NIR_PASS(_, s, nir_convert_from_ssa, true, false);
 
    /* SGX_DEBUG_NIR=1: the shader as the compiler takes it */
-   if (getenv("SGX_DEBUG_NIR"))
+   static int dbg_nir = -1, no_ffma = -1;
+   if (env_flag("SGX_DEBUG_NIR", &dbg_nir))
       nir_print_shader(s, stderr);
    if (c->fs)
       plan_inputs(c, impl);
@@ -3634,7 +3656,7 @@ translate(struct comp *c, nir_shader *s)
    /* M38: a colour of four F16 at once -- the whole program */
    if (c->fs && f16_colour(c, impl))
       return true;
-   if (!getenv("SGX_NO_FFMA"))
+   if (!env_flag("SGX_NO_FFMA", &no_ffma))
       fuse_ffma(s, impl);
    nir_index_ssa_defs(impl);
    c->nvalues = n = impl->ssa_alloc * 4;
@@ -3751,9 +3773,10 @@ compile_fs(const nir_shader *fs, const struct sgx_blend_key *blend, char *why,
       c.fs->blend.colormask = 0xf;
    /* (discard keeps the tile's colour as the colour: blended again, not
     * kept, M19) */
+   static int no_sop2 = -1;
    if (blending && !fs->info.fs.uses_discard && !blend->logicop &&
        blend->rt_kind == SGX_RT_UNORM8 && !blend->rt_srgb && !blend->rt_intensity &&
-       !getenv("SGX_NO_SOP2") && sop2_blend(blend, &c.sop2_factors, &c.sop2_swap)) {
+       !env_flag("SGX_NO_SOP2", &no_sop2) && sop2_blend(blend, &c.sop2_factors, &c.sop2_swap)) {
       c.sop2 = true;
       blending = false;
    }
@@ -3896,7 +3919,8 @@ compile_fs(const nir_shader *fs, const struct sgx_blend_key *blend, char *why,
    c.fs->prog.ntemps = c.top;
    /* SGX_LDR_PROBE=word,...: the program those words, WDF0, then r0 into
     * o0 as it is (finding VLDST, M32) */
-   if (getenv("SGX_LDR_PROBE")) {
+   static int ldr_probe = -1;
+   if (env_flag("SGX_LDR_PROBE", &ldr_probe)) {
       const char *e = getenv("SGX_LDR_PROBE");
       unsigned n = 0;
 
@@ -4043,7 +4067,8 @@ compile_vs(const nir_shader *vs, const unsigned *varying_slot, unsigned nvarying
    s = nir_shader_clone(NULL, vs);
    NIR_PASS(_, s, nir_lower_io, nir_var_shader_in | nir_var_shader_out | nir_var_uniform,
             type_size_vec4, 0);
-   if (getenv("SGX_DEBUG_VS_NIR"))
+   static int dbg_vs_nir = -1;
+   if (env_flag("SGX_DEBUG_VS_NIR", &dbg_vs_nir))
       nir_print_shader(s, stderr);
    if (!translate(&c, s))
       goto out;

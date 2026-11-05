@@ -285,14 +285,27 @@ vpck_f32_to(unsigned fmt, struct usse_reg dest, struct usse_reg src, unsigned ma
 uint64_t
 usse_pack_f32x2(struct usse_reg dest, struct usse_reg src)
 {
-   return vpck_f32_to(6, dest, src, 0x3) ^ usse_xor("SGX_USSE_XOR_PACKF32");
+   static uint64_t xo;
+   static int init;
+
+   if (!init) {
+      xo = usse_xor("SGX_USSE_XOR_PACKF32");
+      init = 1;
+   }
+   return vpck_f32_to(6, dest, src, 0x3) ^ xo;
 }
 
 uint64_t
 usse_pack_f16(struct usse_reg dest, struct usse_reg src, unsigned mask)
 {
+   static uint64_t xo;
+   static int init;
    unsigned ext, bank, dext, dbank;
 
+   if (!init) {
+      xo = usse_xor("SGX_USSE_XOR_PACKF16");
+      init = 1;
+   }
    assert(!(src.num & 1));
    src_bank(src, &ext, &bank);
    dest_bank(dest, &dext, &dbank);
@@ -300,8 +313,7 @@ usse_pack_f16(struct usse_reg dest, struct usse_reg src, unsigned mask)
            bits(ext, 48, 48) | bits(6, 43, 41) | bits(5, 40, 38) | bits(mask, 37, 34) |
            bits(dbank, 33, 32) | bits(bank, 31, 30) | bits(bank, 29, 28) |
            bits(dest.num, 27, 21) | bits(3, 20, 19) | bits(1, 17, 16) | bits(2, 15, 14) |
-           bits(src.num >> 1, 13, 8) | bits(0, 7, 7) | bits((src.num >> 1) + 1, 6, 1)) ^
-          usse_xor("SGX_USSE_XOR_PACKF16");
+           bits(src.num >> 1, 13, 8) | bits(0, 7, 7) | bits((src.num >> 1) + 1, 6, 1)) ^ xo;
 }
 
 /* VPCK F16 to F32 (M43): usse_unpack_unorm8's word with source format 5
@@ -312,8 +324,14 @@ usse_pack_f16(struct usse_reg dest, struct usse_reg src, unsigned mask)
 uint64_t
 usse_unpack_f16(struct usse_reg dest, struct usse_reg src, unsigned chan)
 {
+   static uint64_t xo;
+   static int init;
    unsigned dext, dbank, ext, bank;
 
+   if (!init) {
+      xo = usse_xor("SGX_USSE_XOR_UNPACKF16");
+      init = 1;
+   }
    assert(!(dest.num & 1) && !(src.num & 1) && (chan == 0 || chan == 2));
    dest_bank(dest, &dext, &dbank);
    src_bank(src, &ext, &bank);
@@ -321,8 +339,7 @@ usse_unpack_f16(struct usse_reg dest, struct usse_reg src, unsigned chan)
            bits(1, 48, 48) | bits(5, 43, 41) | bits(6, 40, 38) | bits(3, 37, 34) |
            bits(dbank, 33, 32) | bits(bank, 31, 30) | bits(2, 29, 28) | bits(dest.num, 27, 21) |
            bits(3, 20, 19) | bits(chan + 1, 17, 16) | bits(2, 15, 14) |
-           bits(src.num >> 1, 13, 8) | bits(chan >> 1, 6, 1)) ^
-          usse_xor("SGX_USSE_XOR_UNPACKF16");
+           bits(src.num >> 1, 13, 8) | bits(chan >> 1, 6, 1)) ^ xo;
 }
 
 /* VPCK from four F16 in a register pair (M38: the stock driver's `pck.u8.f16 o0.xyzw,

@@ -107,7 +107,17 @@ Load `out/boot-bundle-s5l8947x-j33iap.bin` into RAM over USB and jump to its ent
 3. **USB Serial Console:** Available on `/dev/ttyACM0` or `/dev/cu.usbmodem*`.
 4. **Ethernet:** `eth0` acquires a DHCP lease automatically when plugged in.
 
-### 4. Useful Commands on the Device
+### 4. One-Time Media & Placeholder Transfer (Optional)
+
+Built OS images (`out/boot-bundle-s5l8947x-j33iap.bin`, `out/rootfs.sqsh`, `build/initramfs-s5l8947x.cpio`, and `build/usr-local.sqsh`) do **not** contain sample gallery photos, videos, or placeholder artwork so the images remain lean. To provision sample media and card placeholders onto the device's persistent `Data` volume (`/mnt/data/linux/media` and `/mnt/data/linux/placeholders`) **once** over SSH:
+
+```bash
+./tools/tvshell/install.sh --media-only root@10.55.0.2
+```
+
+You can also upload your own baseline `.jpg`/`.jpeg` photos to `/mnt/data/linux/media/photos` (or prepare custom photos/videos in `research/sample media/` via `./tools/tvshell/prepare-media.sh`); see [tools/tvshell/README.md](tools/tvshell/README.md) for details.
+
+### 5. Useful Commands on the Device
 
 ```bash
 hwtest                                # Run the automated on-device hardware test suite

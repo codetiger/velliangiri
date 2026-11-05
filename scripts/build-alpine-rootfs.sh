@@ -32,13 +32,15 @@ rm -rf "${STAGE_DIR}"
 mkdir -p "${STAGE_DIR}"
 tar --no-same-owner --no-same-permissions -xzf "${DL_DIR}/${TARBALL}" -C "${STAGE_DIR}"
 
-# Install APK packages (dropbear, nfs-utils, busybox-static, Wi-Fi and Bluetooth tools) via pure-Python resolver
+# Install APK packages (dropbear, nfs-utils, Wi-Fi and Bluetooth tools) via pure-Python resolver
 echo "[rootfs] Resolving and unpacking Alpine ${ALPINE_ARCH} packages ..."
 python3 "${ROOT}/scripts/apk-unpack.py" \
 	--repo "${REPO_MAIN}" \
 	--dest "${APK_WORK}" \
 	--rootfs "${STAGE_DIR}" \
-	dropbear dropbear-scp nfs-utils busybox-static iw wpa_supplicant wireless-regdb \
+	--cache "${DL_DIR}/apk" \
+	--prune "${ROOT}/config/initramfs-prune.txt" \
+	dropbear nfs-utils iw wpa_supplicant wireless-regdb \
 	bluez dbus mtd-utils-ubi
 
 (
@@ -51,10 +53,11 @@ python3 "${ROOT}/scripts/apk-unpack.py" \
 
 # Cross-compile the early entropy seeder, diagnostic tools, the WAV player, the BT patch/tools and the firmware carvers
 # ("<installed name>:<source in scripts/tools>")
-echo "[rootfs] Cross-compiling userspace tools (-O2 -mcpu=cortex-a9 -mfpu=neon) ..."
+echo "[rootfs] Cross-compiling userspace tools (-Os -s --gc-sections -mcpu=cortex-a9 -mfpu=neon) ..."
 for tool in jitterseed:jitterseed.c peek:mmio-peek.c i2cpoke:i2c-poke.c wavplay:wavplay.c l2bench:l2bench.c fbtest:fbtest.c btscan:btscan.c hcdcarve:hcdcarve.c sgxcarve:sgxcarve.c glcarve:glcarve.c vxdcarve:vxdcarve.c iopcarve:iopcarve.c m2mtest:m2mtest.c m2mshow:m2mshow.c jpegtest:jpegtest.c sgxinfo:sgxinfo.c sgxgem:sgxgem.c sgx2d:sgx2d.c sgxpresent:sgxpresent.c nand-restore:nand-restore.c; do
-	"${CROSS_CC}" -O2 -mcpu=cortex-a9 -mfpu=neon -Wall -Wextra -static \
-		-I "${ROOT}/tools" \
+	"${CROSS_CC}" -Os -s -ffunction-sections -fdata-sections -Wl,--gc-sections \
+		-mcpu=cortex-a9 -mfpu=neon -Wall -Wextra -static \
+		-I "${ROOT}/tools" -I "${ROOT}/scripts/tools" \
 		-o "${STAGE_DIR}/bin/${tool%%:*}" "${ROOT}/scripts/tools/${tool#*:}" -lm
 	chmod 755 "${STAGE_DIR}/bin/${tool%%:*}"
 done
@@ -63,7 +66,8 @@ done
 # from the template-frame library in the Mesa driver (no Mesa headers).
 SGXLIB="${ROOT}/tools/mesa-sgx/files/src/gallium/drivers/sgx"
 if [ -f "${ROOT}/tools/sgx/sgxframe.c" ]; then
-	"${CROSS_CC}" -O2 -mcpu=cortex-a9 -mfpu=neon -Wall -Wextra -static \
+	"${CROSS_CC}" -Os -s -ffunction-sections -fdata-sections -Wl,--gc-sections \
+		-mcpu=cortex-a9 -mfpu=neon -Wall -Wextra -static \
 		-I "${ROOT}/tools" -I "${SGXLIB}" -o "${STAGE_DIR}/bin/sgxframe" \
 		"${ROOT}/tools/sgx/sgxframe.c" \
 		"${SGXLIB}/sgx_template.c" \
@@ -76,16 +80,10 @@ echo "[rootfs] Building 1280x720@30 TV Shell (/bin/tvshell) ..."
 CROSS_CC="${CROSS_CC}" "${ROOT}/tools/tvshell/build.sh"
 cp "${ROOT}/build/tvshell/tvshell" "${STAGE_DIR}/bin/tvshell"
 chmod 755 "${STAGE_DIR}/bin/tvshell"
-if [ -x "${ROOT}/build/tvshell/media-gallery" ]; then
-	cp "${ROOT}/build/tvshell/media-gallery" "${STAGE_DIR}/bin/media-gallery"
-	chmod 755 "${STAGE_DIR}/bin/media-gallery"
-fi
+ln -sf tvshell "${STAGE_DIR}/bin/media-gallery"
 
 if [ ! -f "${DL_DIR}/fonts/PlusJakartaSans-Medium.ttf" ]; then
 	"${ROOT}/tools/tvshell/fetch-fonts.sh"
-fi
-if [ ! -f "${DL_DIR}/placeholders/dawn_ridge.jpg" ] || [ ! -f "${DL_DIR}/gallery/IMG_6452.jpeg" ]; then
-	"${ROOT}/tools/tvshell/prepare-media.sh"
 fi
 mkdir -p "${STAGE_DIR}/usr/share/fonts/tvshell"
 for fn in \
@@ -200,10 +198,6 @@ if [ -f "${PRUNE_LIST}" ]; then
 			# shellcheck disable=SC2086
 			rm -rf $pat 2>/dev/null || true
 		done
-		if [ -f bin/busybox.static ] && [ -f bin/busybox ]; then
-			cp bin/busybox.static bin/busybox
-			ln -sf busybox bin/busybox.static
-		fi
 	)
 fi
 
@@ -220,19 +214,10 @@ if command -v mksquashfs >/dev/null 2>&1; then
 		mkdir -p "${STAGE_DIR}/usr/share/games/doom"
 		cp "${DL_DIR}/doom/freedoom1.wad" "${STAGE_DIR}/usr/share/games/doom/freedoom1.wad"
 	fi
-	if [ -d "${DL_DIR}/placeholders" ]; then
-		mkdir -p "${STAGE_DIR}/usr/share/tvshell/placeholders"
-		cp "${DL_DIR}/placeholders/"*.jpg "${STAGE_DIR}/usr/share/tvshell/placeholders/" 2>/dev/null || true
-	fi
-	if [ -d "${DL_DIR}/gallery" ]; then
-		mkdir -p "${STAGE_DIR}/usr/share/tvshell/media/.frames"
-		cp "${DL_DIR}/gallery/"*.jpeg "${DL_DIR}/gallery/"*.mov "${STAGE_DIR}/usr/share/tvshell/media/" 2>/dev/null || true
-		cp "${DL_DIR}/gallery/.frames/"*.jpg "${STAGE_DIR}/usr/share/tvshell/media/.frames/" 2>/dev/null || true
-	fi
 	echo "[rootfs] Packing uncompressed SquashFS image -> ${ROOT}/out/rootfs.sqsh ..."
 	mksquashfs "${STAGE_DIR}" "${ROOT}/out/rootfs.sqsh" \
 		-noappend -all-root -noI -noD -noF -noX -b 131072 >/dev/null
-	if [ -s "${ROOT}/build/mesa-sgx-install.tar" ] || [ -s "${ROOT}/build/weston-armv7.tar" ] || [ -s "${DL_DIR}/doom/freedoom1.wad" ] || [ -d "${DL_DIR}/placeholders" ]; then
+	if [ -s "${ROOT}/build/mesa-sgx-install.tar" ] || [ -s "${ROOT}/build/weston-armv7.tar" ] || [ -s "${DL_DIR}/doom/freedoom1.wad" ]; then
 		echo "[rootfs] Packing usr-local SquashFS image -> ${ROOT}/build/usr-local.sqsh ..."
 		ULOCAL_STAGE="/tmp/velliangiri-usr-local-stage"
 		rm -rf "${ULOCAL_STAGE}"
@@ -248,15 +233,6 @@ if command -v mksquashfs >/dev/null 2>&1; then
 		if [ -s "${DL_DIR}/doom/freedoom1.wad" ]; then
 			mkdir -p "${ULOCAL_STAGE}/share/games/doom"
 			cp "${DL_DIR}/doom/freedoom1.wad" "${ULOCAL_STAGE}/share/games/doom/freedoom1.wad"
-		fi
-		if [ -d "${DL_DIR}/placeholders" ]; then
-			mkdir -p "${ULOCAL_STAGE}/share/tvshell/placeholders"
-			cp "${DL_DIR}/placeholders/"*.jpg "${ULOCAL_STAGE}/share/tvshell/placeholders/" 2>/dev/null || true
-		fi
-		if [ -d "${DL_DIR}/gallery" ]; then
-			mkdir -p "${ULOCAL_STAGE}/share/tvshell/media/.frames"
-			cp "${DL_DIR}/gallery/"*.jpeg "${DL_DIR}/gallery/"*.mov "${ULOCAL_STAGE}/share/tvshell/media/" 2>/dev/null || true
-			cp "${DL_DIR}/gallery/.frames/"*.jpg "${ULOCAL_STAGE}/share/tvshell/media/.frames/" 2>/dev/null || true
 		fi
 		mksquashfs "${ULOCAL_STAGE}" "${ROOT}/build/usr-local.sqsh" \
 			-noappend -all-root -noI -noD -noF -noX -b 131072 >/dev/null

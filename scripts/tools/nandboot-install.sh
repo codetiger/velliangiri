@@ -94,7 +94,8 @@ SLOT_OFFSET=$(( SLOT_EB_START * EB_BYTES ))
 DTB_PROD_OFFSET=$(( (SLOT_EB_START + 13) * EB_BYTES ))
 DTB_DEBUG_OFFSET=$(( DTB_PROD_OFFSET + 4 * PAGE_BYTES ))
 
-echo "[nandboot-install] Writing $IMAGE -> $BOOT_MTD @ 0x$(printf '%x' $SLOT_OFFSET) ..."
+echo "[nandboot-install] Erasing and writing $IMAGE -> $BOOT_MTD @ 0x$(printf '%x' $SLOT_OFFSET) ..."
+flash_erase "$BOOT_MTD" "$SLOT_OFFSET" 14
 nandwrite -p -s "$SLOT_OFFSET" "$BOOT_MTD" "$IMAGE"
 nandwrite -p -s "$DTB_PROD_OFFSET" "$BOOT_MTD" "$DTB_PROD"
 nandwrite -p -s "$DTB_DEBUG_OFFSET" "$BOOT_MTD" "$DTB_DEBUG"
@@ -111,7 +112,8 @@ fi
 echo "[nandboot-install] Verified kernel Image SHA-256: $READ_IMG_SHA"
 
 # 3. Write manifest copies to EB 0 (offset 0) and EB 1 (offset 2 MiB)
-echo "[nandboot-install] Committing manifest to EB 0 and EB 1 ..."
+echo "[nandboot-install] Erasing and committing manifest to EB 0 and EB 1 ..."
+flash_erase "$BOOT_MTD" 0 2
 nandwrite -p -s 0 "$BOOT_MTD" "$MANIFEST"
 nandwrite -p -s "$EB_BYTES" "$BOOT_MTD" "$MANIFEST"
 echo "[nandboot-install] Slot '$SLOT' installation complete and verified."

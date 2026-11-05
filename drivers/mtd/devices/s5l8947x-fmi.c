@@ -47,6 +47,7 @@
 #include <linux/mtd/mtd.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
+#include <linux/s5l8947x-aes.h>
 #include <linux/unaligned.h>
 
 /* host block */
@@ -1082,6 +1083,22 @@ static void s5l_fmi_read_syscfg(struct s5l_fmi *fmi)
 out:
 	kfree(best);
 }
+
+void s5l8947x_fmi_get_syscfg(struct mtd_info *mtd, char serial[17],
+			     char model[17], u8 emac[ETH_ALEN],
+			     u8 wmac[ETH_ALEN], u8 bmac[ETH_ALEN])
+{
+	struct s5l_fmi *fmi = mtd ? mtd->priv : NULL;
+
+	if (!fmi)
+		return;
+	memcpy(serial, fmi->serial, 17);
+	memcpy(model, fmi->model, 17);
+	ether_addr_copy(emac, fmi->emac);
+	ether_addr_copy(wmac, fmi->wmac);
+	ether_addr_copy(bmac, fmi->bmac);
+}
+EXPORT_SYMBOL_GPL(s5l8947x_fmi_get_syscfg);
 
 static ssize_t serial_show(struct device *dev, struct device_attribute *attr, char *buf)
 {

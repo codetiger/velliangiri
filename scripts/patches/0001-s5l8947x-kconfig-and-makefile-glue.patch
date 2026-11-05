@@ -612,7 +612,7 @@ diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
  
  menu "Apple SoC drivers"
  
-@@ -52,6 +52,16 @@ config APPLE_TUNABLE
+@@ -52,6 +52,27 @@ config APPLE_TUNABLE
  	tristate
  	depends on ARCH_APPLE || COMPILE_TEST
  
@@ -626,18 +626,52 @@ diff --git a/drivers/soc/apple/Kconfig b/drivers/soc/apple/Kconfig
 +	  its firmware and waits for the microkernel handshake. There is
 +	  no decode interface yet.
 +
++config APPLE_S5L8947X_IOP
++	tristate "S5L8947X IOP coprocessor power and firmware load"
++	depends on ARCH_APPLE_S5L || COMPILE_TEST
++	depends on COMMON_CLK
++	default ARCH_APPLE_S5L
++	help
++	  Brings up the S5L8947X IOP coprocessor: enables its clock gate,
++	  patches and loads the firmware carved from the device's own
++	  kernel image and starts the CPU. There is no message-channel
++	  client yet.
++
  endmenu
  
  endif
 diff --git a/drivers/soc/apple/Makefile b/drivers/soc/apple/Makefile
 --- a/drivers/soc/apple/Makefile
 +++ b/drivers/soc/apple/Makefile
-@@ -13,3 +13,5 @@ apple-sart-y = sart.o
+@@ -13,3 +13,6 @@ apple-sart-y = sart.o
  
  obj-$(CONFIG_APPLE_TUNABLE) += apple-tunable.o
  apple-tunable-y = tunable.o
 +
 +obj-$(CONFIG_APPLE_S5L8947X_VXD) += s5l8947x-vxd.o
++obj-$(CONFIG_APPLE_S5L8947X_IOP) += s5l8947x-iop.o
+diff --git a/drivers/media/platform/Kconfig b/drivers/media/platform/Kconfig
+--- a/drivers/media/platform/Kconfig
++++ b/drivers/media/platform/Kconfig
+@@ -66,6 +66,7 @@
+ source "drivers/media/platform/amd/Kconfig"
+ source "drivers/media/platform/amlogic/Kconfig"
+ source "drivers/media/platform/amphion/Kconfig"
++source "drivers/media/platform/apple/Kconfig"
+ source "drivers/media/platform/arm/Kconfig"
+ source "drivers/media/platform/aspeed/Kconfig"
+ source "drivers/media/platform/atmel/Kconfig"
+diff --git a/drivers/media/platform/Makefile b/drivers/media/platform/Makefile
+--- a/drivers/media/platform/Makefile
++++ b/drivers/media/platform/Makefile
+@@ -9,6 +9,7 @@
+ obj-y += amd/
+ obj-y += amlogic/
+ obj-y += amphion/
++obj-y += apple/
+ obj-y += arm/
+ obj-y += aspeed/
+ obj-y += atmel/
 diff --git a/sound/arm/Kconfig b/sound/arm/Kconfig
 --- a/sound/arm/Kconfig
 +++ b/sound/arm/Kconfig

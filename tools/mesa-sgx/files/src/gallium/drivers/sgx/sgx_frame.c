@@ -92,9 +92,12 @@
 #define EXT_FETCH_PDS   0x400
 #define FETCH_PDS_SIZE  0x100
 /* our pixel programs' PDS programs (M13c), one slot each, never reused */
-#define EXT_PROG_PDS    0x1000
-#define EXT_PROG_PDS_END 0x80000
-#define PROG_PDS_SLOT   0x80
+#define EXT_PROG_PDS       0x1000
+#define EXT_PROG_PDS_END   0x80000
+#define BUILT_PROG_PDS_END 0x30000
+#define BUILT_EXT_VB       0x30000
+#define BUILT_EXT_FRAME    0x3f000
+#define PROG_PDS_SLOT      0x80
 /* per render, in the frame's part of the EXT window: the secondary
  * attributes' loader and the words it loads (uniforms, texture states) */
 #define FRAME_UNI_PDS   0xf00
@@ -920,7 +923,7 @@ load_pack(struct sgx_frame *f, const char *dir)
 #define BUILT_IDX_COUNT 65535       /* 0..65534 for non-indexed triangle lists */
 #define BUILT_GL_SIZE   (BUILT_IDX + align(BUILT_IDX_COUNT * 2, 16))
 #define BUILT_VDM_SIZE  0x1000      /* the template's own draws' stream */
-#define BUILT_EXT_SIZE  0x400000    /* the pack's 4 MiB */
+#define BUILT_EXT_SIZE  0x41000     /* 260 KiB: PDS heap + fallback VB/frame */
 
 static struct sgx_bo *
 new_bo(struct sgx_frame *f, uint32_t size, uint32_t flags)
@@ -1261,7 +1264,7 @@ put_ours(struct sgx_frame *f)
    }
    f->fetch_pds = f->ext + EXT_FETCH_PDS;
    for (unsigned n = 0; n <= SGX_FRAME_MAX_VARYINGS; n++) {
-      unsigned len = fetch_program(f, pds, n, f->ext + EXT_VB);
+      unsigned len = fetch_program(f, pds, n, f->ext + (f->built ? BUILT_EXT_VB : EXT_VB));
 
       assert(len * 4 <= FETCH_PDS_SIZE);
       ok = ok && put(f, f->fetch_pds + n * FETCH_PDS_SIZE, pds, len * 4);
@@ -1273,7 +1276,7 @@ struct sgx_frame *
 sgx_frame_create(struct sgx_device *dev, const char *dir)
 {
    struct sgx_frame *f = CALLOC_STRUCT(sgx_frame);
-   uint32_t page;
+   uint32_t page, pds_end;
    uint8_t *at;
    bool pack;
 
@@ -1342,7 +1345,8 @@ sgx_frame_create(struct sgx_device *dev, const char *dir)
    f->empty_prog = f->code_heap->va;
    util_vma_heap_init(&f->code_vma, f->code_heap->va + 0x40, HEAP_SIZE - 0x40);
    f->code_vma.alloc_high = false;
-   util_vma_heap_init(&f->pds_vma, f->ext + EXT_PROG_PDS, EXT_PROG_PDS_END - EXT_PROG_PDS);
+   pds_end = f->built ? BUILT_PROG_PDS_END : EXT_PROG_PDS_END;
+   util_vma_heap_init(&f->pds_vma, f->ext + EXT_PROG_PDS, pds_end - EXT_PROG_PDS);
    f->pds_vma.alloc_high = false;
    f->vma_ready = true;
    f->handles[f->nhandles++] = f->code_heap->handle;
@@ -1569,16 +1573,18 @@ sgx_frame_zls_size(unsigned w, unsigned h, enum sgx_zls_format format)
 static uint32_t
 zls_ctl(const struct sgx_frame_zls *zls)
 {
-   const char *e = getenv("SGX_ZLS_CTL");
+   static int64_t forced = -2;
    uint32_t ctl = 0x00151000;
 
+   if (forced == -2)
+      forced = getenv("SGX_ZLS_CTL") ? (int64_t)strtoul(getenv("SGX_ZLS_CTL"), NULL, 0) : -1;
    ctl |= (uint32_t)zls->format << 24 | (uint32_t)zls->format << 21;
    if (zls->store)
       ctl |= 0xc | (zls->stencil ? 0x20000 : 0);
    if (zls->load)
       ctl |= 0x4002 | (zls->stencil ? 0x2000 : 0);
-   if (e)
-      ctl = strtoul(e, NULL, 0);
+   if (forced >= 0)
+      ctl = (uint32_t)forced;
    return (ctl & ~(0x7fu << 4)) | (DIV_ROUND_UP(zls->w, 64) - 1) << 4;
 }
 
@@ -1725,13 +1731,19 @@ kick(struct sgx_frame *f, const struct sgx_frame_target *t, float depth,
       for (unsigned i = 0; i < 0x160 / 4; i++)
          ((uint32_t *)(blk - 0x80))[i] ^= xo[i];
    }
-   if (getenv("SGX_DEBUG") && strstr(getenv("SGX_DEBUG"), "cmd")) {
-      for (unsigned i = 0; i < cmd[0] / 4; i++)
-         fprintf(stderr, "%s%03x:%08x", i % 8 ? " " : "\nsgx: cmd ", 4 * i, cmd[i]);
-      for (unsigned i = 0; i < 0x160 / 4; i++)
-         fprintf(stderr, "%s%03x:%08x", i % 8 ? " " : "\nsgx: blk ", 4 * i,
-                 ((uint32_t *)(blk - 0x80))[i]);
-      fprintf(stderr, "\n");
+   {
+      static int dbg_cmd = -1;
+
+      if (dbg_cmd < 0)
+         dbg_cmd = getenv("SGX_DEBUG") && strstr(getenv("SGX_DEBUG"), "cmd");
+      if (dbg_cmd) {
+         for (unsigned i = 0; i < cmd[0] / 4; i++)
+            fprintf(stderr, "%s%03x:%08x", i % 8 ? " " : "\nsgx: cmd ", 4 * i, cmd[i]);
+         for (unsigned i = 0; i < 0x160 / 4; i++)
+            fprintf(stderr, "%s%03x:%08x", i % 8 ? " " : "\nsgx: blk ", 4 * i,
+                    ((uint32_t *)(blk - 0x80))[i]);
+         fprintf(stderr, "\n");
+      }
    }
    memcpy(hs + n, handles, nhandles * sizeof(uint32_t));
    n += nhandles;
@@ -1810,7 +1822,8 @@ quad(float *v, const float rgba[4])
 static unsigned
 max_vertices(struct sgx_frame *f, unsigned stride)
 {
-   unsigned n = MIN2(f->idx_count, (EXT_FRAME - EXT_VB) / stride);
+   uint32_t vb_span = f->built ? (BUILT_EXT_FRAME - BUILT_EXT_VB) : (EXT_FRAME - EXT_VB);
+   unsigned n = MIN2(f->idx_count, vb_span / stride);
 
    return n - n % 3;
 }
@@ -2199,13 +2212,15 @@ render(struct sgx_frame *f, struct sgx_resource *rt, const struct sgx_frame_layo
 {
    const struct sgx_frame_target t = { rt, 0, 0 };
    uint32_t vdm[32] = { 0 }, full[32], prog[16], fetch[32], bg[4], *v = vdm;
-   uint32_t frame = f->ext + EXT_FRAME, vb = f->ext + EXT_VB, d0, p0, fb, eot, fetch_word;
+   uint32_t ext_frame = f->built ? BUILT_EXT_FRAME : EXT_FRAME;
+   uint32_t ext_vb = f->built ? BUILT_EXT_VB : EXT_VB;
+   uint32_t frame = f->ext + ext_frame, vb = f->ext + ext_vb, d0, p0, fb, eot, fetch_word;
    unsigned stride = l ? sgx_frame_vertex_floats(l) * sizeof(float) :
                      PACK_VTX_FLOATS * sizeof(float);
    unsigned colour = l ? l->colour : PACK_COLOUR_VARYING;
    bool f32 = l && (l->f32 >> l->colour & 1);
-   uint32_t uni_pds = f->ext + EXT_FRAME + FRAME_UNI_PDS;
-   uint32_t uni = f->ext + EXT_FRAME + FRAME_UNIFORMS;
+   uint32_t uni_pds = frame + FRAME_UNI_PDS;
+   uint32_t uni = frame + FRAME_UNIFORMS;
    struct sgx_eot to;
    unsigned i;
    int ret;

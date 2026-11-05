@@ -59,6 +59,7 @@
 #include <linux/of_platform.h>
 #include <linux/platform_device.h>
 #include <linux/s5l8947x-display.h>
+#include <linux/scatterlist.h>
 #include <linux/seq_file.h>
 #include <linux/sizes.h>
 #include <linux/slab.h>
@@ -403,29 +404,59 @@ static void sgx_init(struct apple_sgx *sgx)
  * only reaches the GPU once its MMU caches are invalidated: before the
  * microkernel boots that is the boot, afterwards the next kick asks the
  * microkernel for it (mmu_dirty, SGX_CC_INVAL_BIF_*). */
-int apple_sgx_mmu_map(struct apple_sgx *sgx, u32 va, dma_addr_t pa, size_t size,
-		      u32 flags)
+static int sgx_mmu_map_locked(struct apple_sgx *sgx, u32 va, dma_addr_t pa,
+			      size_t size, u32 flags)
 {
 	size_t done;
-	int ret = 0;
 
-	mutex_lock(&sgx->mmu_lock);
 	for (done = 0; done < size; done += SGX_PAGE_SIZE) {
 		u32 v = va + done, pde = v >> 22, pte = (v >> 12) & 0x3ff;
 
 		if (!sgx->pt[pde]) {
 			sgx->pt[pde] = dmam_alloc_coherent(sgx->dev, SGX_PAGE_SIZE,
 							   &sgx->pt_dma[pde], GFP_KERNEL);
-			if (!sgx->pt[pde]) {
-				ret = -ENOMEM;
-				break;
-			}
+			if (!sgx->pt[pde])
+				return -ENOMEM;
 			sgx->pd[pde] = lower_32_bits(sgx->pt_dma[pde]) | SGX_PDE_VALID;
 		}
 		sgx->pt[pde][pte] = lower_32_bits(pa + done) | flags | SGX_PTE_VALID;
 	}
+	return 0;
+}
+
+int apple_sgx_mmu_map(struct apple_sgx *sgx, u32 va, dma_addr_t pa, size_t size,
+		      u32 flags)
+{
+	int ret;
+
+	mutex_lock(&sgx->mmu_lock);
+	ret = sgx_mmu_map_locked(sgx, va, pa, size, flags);
 	atomic_set(&sgx->mmu_dirty, 1);
 	mutex_unlock(&sgx->mmu_lock);
+	return ret;
+}
+
+int apple_sgx_mmu_map_sgt(struct apple_sgx *sgx, u32 va, struct sg_table *sgt,
+			  size_t size, u32 flags, u32 *mapped)
+{
+	struct scatterlist *sg;
+	unsigned int i;
+	u32 at = va;
+	int ret = 0;
+
+	mutex_lock(&sgx->mmu_lock);
+	for_each_sgtable_dma_sg(sgt, sg, i) {
+		ret = sgx_mmu_map_locked(sgx, at, sg_dma_address(sg),
+					 sg_dma_len(sg), flags);
+		if (ret)
+			break;
+		at += sg_dma_len(sg);
+	}
+	atomic_set(&sgx->mmu_dirty, 1);
+	mutex_unlock(&sgx->mmu_lock);
+	*mapped = at - va;
+	if (!ret && *mapped != size)
+		ret = -EIO;
 	return ret;
 }
 
@@ -1018,11 +1049,11 @@ static int sgx_send_cmd(struct apple_sgx *sgx, enum sgx_cmd_type type,
 	wmb();
 	start = ktime_get();
 	sgx_write(sgx, SGX_CORE(0) + SGX_EVENT_KICK, 1);
+	spin_unlock_irqrestore(&sgx->ccb_lock, flags);
 
 	/* taken in tens of microseconds; never sleeps */
 	ret = read_poll_timeout_atomic(READ_ONCE, val, val == wo, 1, 500000, false,
 				       ctl[1]);
-	spin_unlock_irqrestore(&sgx->ccb_lock, flags);
 	if (!sgx->quiet || ret)
 	dev_info(sgx->dev,
 		 "command %s (cc 0x%x, data 0x%x 0x%x): %s after %lld us, CCB write %u read %u, "
@@ -1125,40 +1156,16 @@ static void sgx_blit_word(u32 *code, u32 va, unsigned int i, u64 w)
 
 /* The pixel program (sample the texel into o0), the two end-of-tile programs
  * and the pixel-back-end program, whose six state words come from the
- * destination: its address, stride and size. */
+ * destination: its address, stride and size.
+ * Static USSE programs and PDS tables are populated once in sgx_blit_init();
+ * per-blit updates write only the dynamic PBE, object, and vertex words. */
 static void sgx_blit_code(u32 *code, u32 dst_va, u32 dw, u32 dh, u32 dst_stride_px)
 {
-	u64 pbe[6];
-	unsigned int i;
-
-	memset(code, 0, SGX_BLIT_CODE_SIZE);
-	pbe[0] = 0x00110000;
-	pbe[1] = dst_va;
-	pbe[2] = dst_stride_px / 2 - 1;
-	pbe[3] = 0;
-	pbe[4] = 0;
-	pbe[5] = ((dh - 1) << 12) | (dw - 1);
-
-	sgx_blit_word(code, 0x1400, 0, SGX_PHAS);
-	sgx_blit_word(code, 0x1400, 1, 0x50850009a0000000ULL);
-	sgx_blit_word(code, 0x1c00, 0, SGX_PHAS);
-	sgx_blit_word(code, 0x1c00, 1, 0xf834800000000000ULL);
-	sgx_blit_word(code, 0x1c40, 0, SGX_PHAS);
-	sgx_blit_word(code, 0x1c40, 1, sgx_blit_limm(0, 0, false, false));
-	sgx_blit_word(code, 0x1c40, 2, sgx_blit_limm(1, 0, false, false));
-	sgx_blit_word(code, 0x1c40, 3, 0xfb26000081200000ULL);
-	sgx_blit_word(code, 0x1c80, 0, SGX_PHAS);
-	sgx_blit_word(code, 0x1c80, 1, sgx_blit_limm(1, 0, true, false));
-	sgx_blit_word(code, 0x1c80, 2, sgx_blit_limm(2, 1, true, false));
-	sgx_blit_word(code, 0x1c80, 3, sgx_blit_limm(4, 2, true, false));
-	sgx_blit_word(code, 0x1c80, 4, sgx_blit_limm(8, 3, true, true));
-	sgx_blit_word(code, 0x1d40, 0, SGX_PHAS);
-	sgx_blit_word(code, 0x1d40, 1, 0x488b0281a00c0000ULL);
-	sgx_blit_word(code, 0x1d40, 2, 0xe9a30084a0000000ULL);
-	sgx_blit_word(code, 0x1d40, 3, 0xf920000000000000ULL);
-	for (i = 0; i < 6; i++)
-		sgx_blit_word(code, 0x1d40, 4 + i, sgx_blit_limm(i, pbe[i], false, false));
-	sgx_blit_word(code, 0x1d40, 10, 0xfb24000003200082ULL);
+	sgx_blit_word(code, 0x1d40, 5, sgx_blit_limm(1, dst_va, false, false));
+	sgx_blit_word(code, 0x1d40, 6,
+		      sgx_blit_limm(2, dst_stride_px / 2 - 1, false, false));
+	sgx_blit_word(code, 0x1d40, 9,
+		      sgx_blit_limm(5, ((dh - 1) << 12) | (dw - 1), false, false));
 }
 
 /* The PDS block: the end-of-tile program and its constants, and one object
@@ -1181,8 +1188,7 @@ static const u32 sgx_blit_pds_tex[] = {
 	0x07000185, 0x07000c02, 0x07041004, 0xaf000000,
 };
 
-static void sgx_blit_object(u32 *w, u32 base, u32 va, u32 width, u32 height,
-			    u32 stride_px)
+static void sgx_blit_object_init(u32 *w, u32 base)
 {
 	u32 d = base + 0x20;
 
@@ -1191,24 +1197,25 @@ static void sgx_blit_object(u32 *w, u32 base, u32 va, u32 width, u32 height,
 	w[d / 4 + 1] = 0xa;
 	w[d / 4 + 2] = 0;
 	w[d / 4 + 3] = 0xf800;
+	w[d / 4 + 7] = 0x10000000;
+	memcpy(&w[(d + 0x20) / 4], sgx_blit_pds_tex, sizeof(sgx_blit_pds_tex));
+}
+
+static void sgx_blit_object(u32 *w, u32 base, u32 va, u32 width, u32 height,
+			    u32 stride_px)
+{
+	u32 d = base + 0x20;
+
 	/* a linear BGRA texture: the stride in the format word, the size in
 	 * the size word, and 0x10000000 marks it linear */
 	w[d / 4 + 4] = ((stride_px / 4 - 2) << 16) | 0x0e90;
 	w[d / 4 + 5] = 0xcc000000 | ((width - 1) << 12) | (height - 1);
 	w[d / 4 + 6] = va;
-	w[d / 4 + 7] = 0x10000000;
-	memcpy(&w[(d + 0x20) / 4], sgx_blit_pds_tex, sizeof(sgx_blit_pds_tex));
 }
 
 static void sgx_blit_block(u32 *w, u32 src_va, u32 sw, u32 sh, u32 src_stride_px,
 			   u32 dst_va, u32 dw, u32 dh, u32 dst_stride_px)
 {
-	memset(w, 0, SGX_BLIT_BLOCK_SIZE);
-	w[0x00 / 4] = sgx_blit_doutu(0x1c40);
-	w[0x08 / 4] = sgx_blit_doutu(0x1d40);
-	w[0x10 / 4] = sgx_blit_doutu(0x1c00);
-	memcpy(&w[0x1c / 4], sgx_blit_pds_const, sizeof(sgx_blit_pds_const));
-	memcpy(&w[0x50 / 4], sgx_blit_pds_main, sizeof(sgx_blit_pds_main));
 	sgx_blit_object(w, 0x100, dst_va, dw, dh, dst_stride_px);
 	sgx_blit_object(w, 0x160, src_va, sw, sh, src_stride_px);
 }
@@ -1216,47 +1223,87 @@ static void sgx_blit_block(u32 *w, u32 src_va, u32 sw, u32 sh, u32 src_stride_px
 /* The parameter page: the background object (the triangle that covers the
  * whole target), the quad object (the destination rectangle) and the region
  * header, whose offset is what the command names. */
-static void sgx_blit_param(u32 *w, u32 block_va, u32 dw, u32 dh)
+static void sgx_blit_param(u32 *w, u32 dw, u32 dh)
 {
+	w[13] = sgx_blit_xy_px(0, 2 * dh);
+	w[15] = sgx_blit_xy_px(2 * dw, 0);
+	w[0x40 + 17] = sgx_blit_xy_px(0, dh);
+	w[0x40 + 19] = sgx_blit_xy_px(dw, dh);
+	w[0x40 + 21] = sgx_blit_xy_px(dw, 0);
+}
+
+static void sgx_blit_init(struct apple_sgx *sgx)
+{
+	u32 *code = sgx->blit[0].cpu;
+	u32 *blk = sgx->blit[1].cpu;
+	u32 *prm = sgx->blit[2].cpu;
+	u32 block_va = SGX_BLIT_BLOCK_VA;
 	u32 bg_off = SGX_BLIT_PARAM_VA & 0x00ffffff;
 
-	memset(w, 0, SGX_BLIT_PARAM_SIZE);
-	w[0] = sgx_blit_pds_ptr(block_va + 0x100, 0);
-	w[1] = 0x0801e000;
-	w[2] = sgx_blit_pds_ptr(block_va + 0x120, 1);
-	w[5] = 0x3f800000;
-	w[8] = 0x3f800000;
-	w[9] = 2;
-	w[11] = sgx_blit_xy_px(0, 0);
-	w[12] = 0x3f800000;
-	w[13] = sgx_blit_xy_px(0, 2 * dh);
-	w[14] = 0x3f800000;
-	w[15] = sgx_blit_xy_px(2 * dw, 0);
-	w[16] = 0x3f800000;
+	/* static USSE code */
+	sgx_blit_word(code, 0x1400, 0, SGX_PHAS);
+	sgx_blit_word(code, 0x1400, 1, 0x50850009a0000000ULL);
+	sgx_blit_word(code, 0x1c00, 0, SGX_PHAS);
+	sgx_blit_word(code, 0x1c00, 1, 0xf834800000000000ULL);
+	sgx_blit_word(code, 0x1c40, 0, SGX_PHAS);
+	sgx_blit_word(code, 0x1c40, 1, sgx_blit_limm(0, 0, false, false));
+	sgx_blit_word(code, 0x1c40, 2, sgx_blit_limm(1, 0, false, false));
+	sgx_blit_word(code, 0x1c40, 3, 0xfb26000081200000ULL);
+	sgx_blit_word(code, 0x1c80, 0, SGX_PHAS);
+	sgx_blit_word(code, 0x1c80, 1, sgx_blit_limm(1, 0, true, false));
+	sgx_blit_word(code, 0x1c80, 2, sgx_blit_limm(2, 1, true, false));
+	sgx_blit_word(code, 0x1c80, 3, sgx_blit_limm(4, 2, true, false));
+	sgx_blit_word(code, 0x1c80, 4, sgx_blit_limm(8, 3, true, true));
+	sgx_blit_word(code, 0x1d40, 0, SGX_PHAS);
+	sgx_blit_word(code, 0x1d40, 1, 0x488b0281a00c0000ULL);
+	sgx_blit_word(code, 0x1d40, 2, 0xe9a30084a0000000ULL);
+	sgx_blit_word(code, 0x1d40, 3, 0xf920000000000000ULL);
+	sgx_blit_word(code, 0x1d40, 4, sgx_blit_limm(0, 0x00110000, false, false));
+	sgx_blit_word(code, 0x1d40, 7, sgx_blit_limm(3, 0, false, false));
+	sgx_blit_word(code, 0x1d40, 8, sgx_blit_limm(4, 0, false, false));
+	sgx_blit_word(code, 0x1d40, 10, 0xfb24000003200082ULL);
 
-	w[0x40 + 0] = sgx_blit_pds_ptr(block_va + 0x160, 0);
-	w[0x40 + 1] = 0x0801e000;
-	w[0x40 + 2] = sgx_blit_pds_ptr(block_va + 0x180, 1);
-	w[0x40 + 6] = 0x3f800000;
-	w[0x40 + 7] = 0x3f800000;
-	w[0x40 + 8] = 0x3f800000;
-	w[0x40 + 9] = 0x3f800000;
-	w[0x40 + 11] = 0x01d80000;
-	w[0x40 + 12] = 0x4e504a30;
-	w[0x40 + 13] = 2;
-	w[0x40 + 15] = sgx_blit_xy_px(0, 0);
-	w[0x40 + 16] = 0x3f800000;
-	w[0x40 + 17] = sgx_blit_xy_px(0, dh);
-	w[0x40 + 18] = 0x3f800000;
-	w[0x40 + 19] = sgx_blit_xy_px(dw, dh);
-	w[0x40 + 20] = 0x3f800000;
-	w[0x40 + 21] = sgx_blit_xy_px(dw, 0);
-	w[0x40 + 22] = 0x3f800000;
+	/* static PDS block */
+	blk[0x00 / 4] = sgx_blit_doutu(0x1c40);
+	blk[0x08 / 4] = sgx_blit_doutu(0x1d40);
+	blk[0x10 / 4] = sgx_blit_doutu(0x1c00);
+	memcpy(&blk[0x1c / 4], sgx_blit_pds_const, sizeof(sgx_blit_pds_const));
+	memcpy(&blk[0x50 / 4], sgx_blit_pds_main, sizeof(sgx_blit_pds_main));
+	sgx_blit_object_init(blk, 0x100);
+	sgx_blit_object_init(blk, 0x160);
 
-	w[0x80] = 0x80000000;
-	w[0x81] = 0x46400f03;
-	w[0x82] = 0x0c000000 | (((bg_off + 0x100) >> 2) & 0xffffff) | 0xb;
-	w[0x83] = 0xc0000000;
+	/* static parameter page */
+	prm[0] = sgx_blit_pds_ptr(block_va + 0x100, 0);
+	prm[1] = 0x0801e000;
+	prm[2] = sgx_blit_pds_ptr(block_va + 0x120, 1);
+	prm[5] = 0x3f800000;
+	prm[8] = 0x3f800000;
+	prm[9] = 2;
+	prm[11] = sgx_blit_xy_px(0, 0);
+	prm[12] = 0x3f800000;
+	prm[14] = 0x3f800000;
+	prm[16] = 0x3f800000;
+
+	prm[0x40 + 0] = sgx_blit_pds_ptr(block_va + 0x160, 0);
+	prm[0x40 + 1] = 0x0801e000;
+	prm[0x40 + 2] = sgx_blit_pds_ptr(block_va + 0x180, 1);
+	prm[0x40 + 6] = 0x3f800000;
+	prm[0x40 + 7] = 0x3f800000;
+	prm[0x40 + 8] = 0x3f800000;
+	prm[0x40 + 9] = 0x3f800000;
+	prm[0x40 + 11] = 0x01d80000;
+	prm[0x40 + 12] = 0x4e504a30;
+	prm[0x40 + 13] = 2;
+	prm[0x40 + 15] = sgx_blit_xy_px(0, 0);
+	prm[0x40 + 16] = 0x3f800000;
+	prm[0x40 + 18] = 0x3f800000;
+	prm[0x40 + 20] = 0x3f800000;
+	prm[0x40 + 22] = 0x3f800000;
+
+	prm[0x80] = 0x80000000;
+	prm[0x81] = 0x46400f03;
+	prm[0x82] = 0x0c000000 | (((bg_off + 0x100) >> 2) & 0xffffff) | 0xb;
+	prm[0x83] = 0xc0000000;
 }
 
 static void sgx_blit_cmd(u32 *c, u32 block_va, u32 dw, u32 dh, u32 completion_va,
@@ -1333,6 +1380,7 @@ static int sgx_blit_alloc(struct apple_sgx *sgx)
 			return ret;
 		}
 	}
+	sgx_blit_init(sgx);
 	sgx->blit_ready = true;
 	return 0;
 }
@@ -1371,7 +1419,7 @@ static int sgx_blit_locked(struct apple_sgx *sgx, u32 src_va, u32 src_w, u32 src
 	sgx_blit_code(sgx->blit[0].cpu, dst_va, dst_w, dst_h, dst_stride / 4);
 	sgx_blit_block(sgx->blit[1].cpu, src_va, src_w, src_h, src_stride / 4,
 		       dst_va, dst_w, dst_h, dst_stride / 4);
-	sgx_blit_param(sgx->blit[2].cpu, SGX_BLIT_BLOCK_VA, dst_w, dst_h);
+	sgx_blit_param(sgx->blit[2].cpu, dst_w, dst_h);
 
 	wo = READ_ONCE(ctl[0]);
 	if (wo + SGX_TQ_CMD_SIZE > SGX_TQ_CCB_SIZE) {

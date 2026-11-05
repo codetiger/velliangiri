@@ -12,7 +12,23 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 OUT_DIR="${ROOT}/build/tvshell"
 
 mkdir -p "${OUT_DIR}"
-python3 -S "${ROOT}/scripts/gen-shell-assets.py" "${ROOT}/tools/tvshell/design" "${OUT_DIR}"
+NEED_ASSETS=0
+if [ ! -f "${OUT_DIR}/shell_assets.h" ] || [ ! -f "${OUT_DIR}/shell_tokens.h" ] || \
+   [ "${ROOT}/scripts/gen-shell-assets.py" -nt "${OUT_DIR}/shell_assets.h" ]; then
+	NEED_ASSETS=1
+else
+	for df in "${ROOT}/tools/tvshell/design/"*.json \
+		  "${ROOT}/tools/tvshell/design/logo/"*.svg \
+		  "${ROOT}/tools/tvshell/design/symbols/"*.svg; do
+		if [ -f "${df}" ] && [ "${df}" -nt "${OUT_DIR}/shell_assets.h" ]; then
+			NEED_ASSETS=1
+			break
+		fi
+	done
+fi
+if [ "${NEED_ASSETS}" = "1" ]; then
+	python3 -S "${ROOT}/scripts/gen-shell-assets.py" "${ROOT}/tools/tvshell/design" "${OUT_DIR}"
+fi
 
 CC_BIN=""
 for cand in \
@@ -49,22 +65,5 @@ echo "==> compiling tvshell with ${CC_BIN}"
 	-lm
 
 "${CC_BIN%-gcc}-strip" "${OUT_DIR}/tvshell" 2>/dev/null || true
-ls -lh "${OUT_DIR}/tvshell"
-
-echo "==> compiling media-gallery with ${CC_BIN}"
-"${CC_BIN}" \
-	-O3 -mcpu=cortex-a9 -mfpu=neon \
-	-Wall -Wextra -Werror \
-	-static -D_GNU_SOURCE -DMEDIA_GALLERY_STANDALONE \
-	-I"${ROOT}/tools/tvshell" \
-	-I"${OUT_DIR}" \
-	"${ROOT}/tools/tvshell/media_gallery.c" \
-	"${ROOT}/tools/tvshell/shell_display.c" \
-	"${ROOT}/tools/tvshell/shell_font.c" \
-	"${ROOT}/tools/tvshell/shell_input.c" \
-	"${ROOT}/tools/tvshell/shell_media.c" \
-	-o "${OUT_DIR}/media-gallery" \
-	-lm
-
-"${CC_BIN%-gcc}-strip" "${OUT_DIR}/media-gallery" 2>/dev/null || true
-ls -lh "${OUT_DIR}/media-gallery"
+ln -sf tvshell "${OUT_DIR}/media-gallery"
+ls -lh "${OUT_DIR}/tvshell" "${OUT_DIR}/media-gallery"

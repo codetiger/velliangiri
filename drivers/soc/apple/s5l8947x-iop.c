@@ -30,6 +30,7 @@
 #include <linux/kstrtox.h>
 #include <linux/log2.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/string.h>
@@ -74,6 +75,7 @@ struct s5l8947x_iop {
 	dma_addr_t page_table_phys;
 	size_t page_table_size;
 
+	struct mutex lock;
 	bool started;
 };
 
@@ -91,26 +93,6 @@ static bool s5l8947x_iop_valid_image(const u8 *p)
 	       is_power_of_2(pt_size);
 }
 
-static int s5l8947x_iop_alloc(struct s5l8947x_iop *iop, size_t pt_size)
-{
-	struct device *dev = iop->dev;
-
-	if (iop->image && iop->page_table_size == pt_size)
-		return 0;
-
-	iop->image = dma_alloc_coherent(dev, IOPFW_SIZE, &iop->image_phys,
-					GFP_KERNEL);
-	iop->heap = dma_alloc_coherent(dev, IOPFW_HEAP_REQUIRED,
-				       &iop->heap_phys, GFP_KERNEL);
-	iop->page_table = dma_alloc_coherent(dev, pt_size,
-					     &iop->page_table_phys,
-					     GFP_KERNEL);
-	if (!iop->image || !iop->heap || !iop->page_table)
-		return -ENOMEM;
-	iop->page_table_size = pt_size;
-	return 0;
-}
-
 static void s5l8947x_iop_free(struct s5l8947x_iop *iop)
 {
 	if (iop->image)
@@ -126,6 +108,30 @@ static void s5l8947x_iop_free(struct s5l8947x_iop *iop)
 	iop->heap = NULL;
 	iop->page_table = NULL;
 	iop->page_table_size = 0;
+}
+
+static int s5l8947x_iop_alloc(struct s5l8947x_iop *iop, size_t pt_size)
+{
+	struct device *dev = iop->dev;
+
+	if (iop->image && iop->page_table_size == pt_size)
+		return 0;
+	if (iop->image || iop->heap || iop->page_table)
+		s5l8947x_iop_free(iop);
+
+	iop->image = dma_alloc_coherent(dev, IOPFW_SIZE, &iop->image_phys,
+					GFP_KERNEL);
+	iop->heap = dma_alloc_coherent(dev, IOPFW_HEAP_REQUIRED,
+				       &iop->heap_phys, GFP_KERNEL);
+	iop->page_table = dma_alloc_coherent(dev, pt_size,
+					     &iop->page_table_phys,
+					     GFP_KERNEL);
+	iop->page_table_size = pt_size;
+	if (!iop->image || !iop->heap || !iop->page_table) {
+		s5l8947x_iop_free(iop);
+		return -ENOMEM;
+	}
+	return 0;
 }
 
 static int s5l8947x_iop_start(struct s5l8947x_iop *iop)
@@ -215,11 +221,15 @@ static ssize_t state_show(struct device *dev, struct device_attribute *attr,
 			  char *buf)
 {
 	struct s5l8947x_iop *iop = dev_get_drvdata(dev);
+	ssize_t ret;
 
-	return sysfs_emit(buf, "%s ctrl=0x%08x image=0x%08x\n",
-			  iop->started ? "started" : "stopped",
-			  readl(iop->regs + IOP_CTRL),
-			  iop->image ? (u32)iop->image_phys : 0);
+	mutex_lock(&iop->lock);
+	ret = sysfs_emit(buf, "%s ctrl=0x%08x image=0x%08x\n",
+			 iop->started ? "started" : "stopped",
+			 readl(iop->regs + IOP_CTRL),
+			 iop->image ? (u32)iop->image_phys : 0);
+	mutex_unlock(&iop->lock);
+	return ret;
 }
 static DEVICE_ATTR_RO(state);
 
@@ -228,18 +238,17 @@ static ssize_t start_store(struct device *dev, struct device_attribute *attr,
 {
 	struct s5l8947x_iop *iop = dev_get_drvdata(dev);
 	bool on;
-	int ret;
+	int ret = 0;
 
 	if (kstrtobool(buf, &on))
 		return -EINVAL;
-	if (on) {
+	mutex_lock(&iop->lock);
+	if (on)
 		ret = s5l8947x_iop_start(iop);
-		if (ret)
-			return ret;
-	} else {
+	else
 		s5l8947x_iop_stop(iop);
-	}
-	return count;
+	mutex_unlock(&iop->lock);
+	return ret ? ret : count;
 }
 static DEVICE_ATTR_WO(start);
 
@@ -263,6 +272,7 @@ static int s5l8947x_iop_probe(struct platform_device *pdev)
 	if (!iop)
 		return -ENOMEM;
 	iop->dev = &pdev->dev;
+	mutex_init(&iop->lock);
 
 	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
 	iop->regs = devm_ioremap_resource(&pdev->dev, res);

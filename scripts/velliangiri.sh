@@ -87,6 +87,10 @@ case "${CMD}" in
 		echo "[velliangiri] Cleaning build outputs and staging directories ..."
 		rm -rf "${ROOT}/out" \
 			"${ROOT}/build/boot" \
+			"${ROOT}/build/nandboot" \
+			"${ROOT}/build/tvshell" \
+			"${ROOT}/build/doom" \
+			"${ROOT}/build/usr-local.sqsh" \
 			"${ROOT}/build/rootfs-stage" \
 			"${ROOT}/build/initramfs-s5l8947x.cpio"
 		;;
@@ -146,7 +150,7 @@ case "${CMD}" in
 		docker_run -it /bin/bash
 		;;
 	*)
-		echo "Usage: $0 {all|image|rootfs|kernel|bundle|tvshell|doom|mesa|weston|clean|check|shell}" >&2
+		echo "Usage: $0 {all|image|rootfs|kernel|bundle|nandboot|bootslot|tvshell|doom|mesa|weston|clean|check|shell}" >&2
 		exit 1
 		;;
 esac

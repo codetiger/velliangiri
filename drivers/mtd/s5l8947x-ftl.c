@@ -128,20 +128,6 @@
 #define CP_V4_HEADER_LEN	36
 #define CP_WRAP_LEN		40
 
-#define SCFG_HDR_LEN		0x80
-#define SCFG_HDR_VERSION	0x20
-#define SCFG_HDR_COPY_VER	0x28
-#define SCFG_MAGIC		0x53436667
-#define SCFG_COUNT		0x14
-#define SCFG_ENTRIES		0x18
-#define SCFG_ENTRY_SIZE		0x14
-#define SCFG_TAG_CNTB		0x434e5442
-#define SCFG_TAG_SRNM		0x53724e6d
-#define SCFG_TAG_MODN		0x4d6f6423
-#define SCFG_TAG_EMAC		0x454d6163
-#define SCFG_TAG_WMAC		0x574d6163
-#define SCFG_TAG_BMAC		0x424d6163
-
 static const u8 lv_magic[2][16] = {
 	{ 0x6a, 0x90, 0x88, 0xcf, 0x8a, 0xfd, 0x63, 0x0a,
 	  0xe3, 0x51, 0xe2, 0x48, 0x87, 0xe0, 0xb9, 0x8b },
@@ -209,6 +195,8 @@ struct ftl {
 	u8 *oob;
 	u8 *dec;		/* decrypted/encrypted 4 KiB logical block */
 	u32 cached;		/* page number in the cache, or FTL_UNMAPPED */
+	u32 cached_dec_lba;	/* LBA currently decrypted in dec, or FTL_UNMAPPED */
+	struct ftl_disk *cached_dec_disk;
 
 	bool in_gc;		/* garbage collection is copying: it may use the reserve */
 	u32 wsb_block;		/* active open superblock for writes, or 0 */
@@ -242,6 +230,10 @@ static DEFINE_MUTEX(ftl_file_lock);
 static struct crypto_skcipher *ftl_file_tfm;
 static struct skcipher_request *ftl_file_req;
 static u8 *ftl_file_buf;
+static u8 ftl_file_cached_fkey[AES_KEYSIZE_256];
+static u8 ftl_file_cached_ivkey[AES_KEYSIZE_128];
+static struct aes_enckey ftl_file_iv_aes;
+static bool ftl_file_keys_cached;
 static u8 ftl_file_master_key[AES_KEYSIZE_256];
 static bool ftl_file_master_valid;
 /* system keybag: payload key from the key store, class keys it unlocks */
@@ -705,6 +697,11 @@ static int ftl_copy(struct ftl *f, struct ftl_disk *d, u32 lba,
 	u8 *src;
 	int ret;
 
+	if (d && d->req && f->cached_dec_lba == lba && f->cached_dec_disk == d) {
+		memcpy(dst, f->dec + off, n);
+		return 0;
+	}
+
 	for (i = f->wbuf_count; i > 0; i--) {
 		if (f->wbuf_lbas[i - 1] == lba) {
 			src = f->wbuf_data + (i - 1) * FTL_LP_SIZE;
@@ -730,10 +727,13 @@ decrypt:
 	if (d && d->req) {
 		__le32 iv[4];
 
+		f->cached_dec_lba = FTL_UNMAPPED;
 		ftl_block_iv(lba, iv);
 		ret = ftl_decrypt(d->req, src, f->dec, FTL_LP_SIZE, iv);
 		if (ret)
 			return ret;
+		f->cached_dec_lba = lba;
+		f->cached_dec_disk = d;
 		src = f->dec;
 	}
 	memcpy(dst, src + off, n);
@@ -1078,6 +1078,7 @@ static int ftl_write(struct ftl *f, struct ftl_disk *d, u32 lba,
 		memcpy(f->dec + off, src, n);
 		raw = f->dec;
 	}
+	f->cached_dec_lba = FTL_UNMAPPED;
 	if (d && d->req) {
 		__le32 iv[4];
 
@@ -1766,147 +1767,10 @@ static void ftl_del_disk(struct ftl_disk *d)
 
 /* --- system configuration, key store and volume map --- */
 
-static void ftl_set_dt_mac(const char *compat, const char *propname,
-			   const u8 *mac, bool reverse)
-{
-	struct device_node *np = of_find_compatible_node(NULL, NULL, compat);
-	struct property *prop;
-	u8 *dst;
-	int i;
-
-	if (!np)
-		return;
-	/*
-	 * Unflattened properties point into the read-only flattened tree, so
-	 * replace the property instead of writing its value in place, adding
-	 * it when the tree has none. A replaced property moves to the node's
-	 * dead list, so neither is freed.
-	 */
-	prop = kzalloc(sizeof(*prop) + ETH_ALEN, GFP_KERNEL);
-	if (!prop)
-		goto out;
-	prop->name = kstrdup(propname, GFP_KERNEL);
-	if (!prop->name) {
-		kfree(prop);
-		goto out;
-	}
-	dst = (u8 *)(prop + 1);
-	if (reverse) {
-		for (i = 0; i < ETH_ALEN; i++)
-			dst[i] = mac[ETH_ALEN - 1 - i];
-	} else {
-		ether_addr_copy(dst, mac);
-	}
-	prop->value = dst;
-	prop->length = ETH_ALEN;
-	if (of_update_property(np, prop)) {
-		kfree(prop->name);
-		kfree(prop);
-	}
-out:
-	of_node_put(np);
-}
-
-static void ftl_copy_ascii(char *dst, size_t dst_size, const u8 *src, u32 len)
-{
-	size_t i, max = min_t(size_t, len, dst_size - 1);
-
-	for (i = 0; i < max && src[i] >= 0x20 && src[i] < 0x7f; i++)
-		dst[i] = src[i];
-	dst[i] = '\0';
-}
-
 static void ftl_read_syscfg(struct ftl *f)
 {
-	u32 start = f->blocks > KS_RESERVED_BLOCKS ? f->blocks - KS_RESERVED_BLOCKS : 0;
-	u32 scfg_max = f->mtd->writesize - SCFG_HDR_LEN;
-	u8 *buf, *best = NULL;
-	u32 cau, blk, best_ver = 0;
-	u32 count, i;
-
-	if (f->mtd->writesize <= SCFG_HDR_LEN + SCFG_ENTRIES)
-		return;
-	buf = kmalloc(f->mtd->writesize, GFP_KERNEL);
-	best = kmalloc(scfg_max, GFP_KERNEL);
-	if (!buf || !best)
-		goto out;
-
-	for (cau = 0; cau < f->caus; cau++) {
-		for (blk = start; blk < f->blocks; blk++) {
-			u32 ver;
-
-			if (ftl_read_slc(f, ftl_page(f, cau, blk, 0), buf,
-					 f->mtd->writesize) ||
-			    get_unaligned_le32(buf + SCFG_HDR_VERSION) != 1 ||
-			    get_unaligned_le32(buf + SCFG_HDR_LEN) != SCFG_MAGIC)
-				continue;
-			ver = get_unaligned_le32(buf + SCFG_HDR_COPY_VER);
-			if (!best_ver || ver >= best_ver) {
-				memcpy(best, buf + SCFG_HDR_LEN, scfg_max);
-				best_ver = ver ? ver : 1;
-			}
-		}
-	}
-	if (!best_ver)
-		goto out;
-
-	count = get_unaligned_le32(best + SCFG_COUNT);
-	count = min_t(u32, count, (scfg_max - SCFG_ENTRIES) / SCFG_ENTRY_SIZE);
-	for (i = 0; i < count; i++) {
-		const u8 *e = best + SCFG_ENTRIES + i * SCFG_ENTRY_SIZE;
-		u32 tag = get_unaligned_le32(e);
-		const u8 *val = e + 4;
-		u32 vlen = 16;
-
-		if (tag == SCFG_TAG_CNTB) {
-			u32 voff = get_unaligned_le32(e + 12);
-
-			tag = get_unaligned_le32(e + 4);
-			vlen = get_unaligned_le32(e + 8);
-			if (voff >= scfg_max || vlen > scfg_max - voff)
-				continue;
-			val = best + voff;
-		}
-		switch (tag) {
-		case SCFG_TAG_SRNM:
-			ftl_copy_ascii(f->serial, sizeof(f->serial), val, vlen);
-			break;
-		case SCFG_TAG_MODN:
-			ftl_copy_ascii(f->model, sizeof(f->model), val, vlen);
-			break;
-		case SCFG_TAG_EMAC:
-			if (vlen >= ETH_ALEN && is_valid_ether_addr(val))
-				ether_addr_copy(f->emac, val);
-			break;
-		case SCFG_TAG_WMAC:
-			if (vlen >= ETH_ALEN && is_valid_ether_addr(val))
-				ether_addr_copy(f->wmac, val);
-			break;
-		case SCFG_TAG_BMAC:
-			if (vlen >= ETH_ALEN && is_valid_ether_addr(val))
-				ether_addr_copy(f->bmac, val);
-			break;
-		}
-	}
-
-	if (is_valid_ether_addr(f->emac))
-		ftl_set_dt_mac("apple,s5l8947x-ethernet", "local-mac-address",
-			       f->emac, false);
-	if (is_valid_ether_addr(f->wmac))
-		ftl_set_dt_mac("usba5c,bd1a", "local-mac-address",
-			       f->wmac, false);
-	if (is_valid_ether_addr(f->bmac))
-		ftl_set_dt_mac("brcm,bcm4334-bt", "local-bd-address",
-			       f->bmac, true);
-
-	dev_info(&f->mtd->dev,
-		 "system config: serial %s, model %s, emac %pM, wmac %pM, bmac %pM\n",
-		 f->serial[0] ? f->serial : "-",
-		 f->model[0] ? f->model : "-",
-		 f->emac, f->wmac, f->bmac);
-out:
-	kfree(best);
-	kfree(buf);
+	s5l8947x_fmi_get_syscfg(f->mtd, f->serial, f->model,
+				f->emac, f->wmac, f->bmac);
 }
 
 static bool ftl_read_keystore(struct ftl *f, u8 *store)
@@ -2088,27 +1952,23 @@ int s5l8947x_file_key_unwrap(const void *attr, size_t len, u8 fkey[32], u8 iv_ke
 }
 EXPORT_SYMBOL_GPL(s5l8947x_file_key_unwrap);
 
-int s5l8947x_file_block_decrypt(struct block_device *bdev, u64 blocknr,
-				const u8 fkey[32], const u8 iv_key[16],
-				u64 file_off, void *dst)
+static int s5l8947x_file_block_crypt(struct block_device *bdev, u64 blocknr,
+				     const u8 fkey[32], const u8 iv_key[16],
+				     u64 file_off, void *buf, bool encrypt)
 {
 	struct ftl_disk *d = bdev ? bdev->bd_disk->private_data : NULL;
-	struct aes_enckey aes;
 	u8 iv[AES_BLOCK_SIZE];
 	__le32 lfsr[4];
 	struct ftl *f;
 	u64 pos, at;
 	int ret;
 
-	if (!d || !d->ftl || (file_off & (FTL_LP_SIZE - 1)))
+	if (!d || !d->ftl || (encrypt && d->ro) || (file_off & (FTL_LP_SIZE - 1)))
 		return -EINVAL;
 	f = d->ftl;
 	pos = blocknr << FTL_LP_SHIFT;
 	if (pos + FTL_LP_SIZE > d->size)
 		return -EIO;
-	ret = aes_prepareenckey(&aes, iv_key, AES_KEYSIZE_128);
-	if (ret)
-		return ret;
 
 	mutex_lock(&ftl_file_lock);
 	if (!ftl_file_tfm) {
@@ -2135,27 +1995,57 @@ int s5l8947x_file_block_decrypt(struct block_device *bdev, u64 blocknr,
 		}
 	}
 
-	at = ftl_disk_offset(d, pos);
-	mutex_lock(&f->lock);
-	ret = ftl_copy(f, NULL, at >> FTL_LP_SHIFT, 0, ftl_file_buf, FTL_LP_SIZE);
-	mutex_unlock(&f->lock);
-	if (ret)
-		goto out;
+	if (!ftl_file_keys_cached ||
+	    memcmp(ftl_file_cached_fkey, fkey, AES_KEYSIZE_256) ||
+	    memcmp(ftl_file_cached_ivkey, iv_key, AES_KEYSIZE_128)) {
+		ret = aes_prepareenckey(&ftl_file_iv_aes, iv_key, AES_KEYSIZE_128);
+		if (ret)
+			goto out;
+		ret = crypto_skcipher_setkey(ftl_file_tfm, fkey, AES_KEYSIZE_256);
+		if (ret)
+			goto out;
+		memcpy(ftl_file_cached_fkey, fkey, AES_KEYSIZE_256);
+		memcpy(ftl_file_cached_ivkey, iv_key, AES_KEYSIZE_128);
+		ftl_file_keys_cached = true;
+	}
 
-	ret = crypto_skcipher_setkey(ftl_file_tfm, fkey, AES_KEYSIZE_256);
-	if (!ret) {
-		ftl_block_iv((u32)file_off, lfsr);
-		aes_encrypt(&aes, iv, (const u8 *)lfsr);
-		ret = ftl_decrypt(ftl_file_req, ftl_file_buf, ftl_file_buf,
+	at = ftl_disk_offset(d, pos);
+	ftl_block_iv((u32)file_off, lfsr);
+	aes_encrypt(&ftl_file_iv_aes, iv, (const u8 *)lfsr);
+
+	if (encrypt) {
+		ret = ftl_encrypt(ftl_file_req, buf, ftl_file_buf,
 				  FTL_LP_SIZE, iv);
-		if (!ret)
-			memcpy(dst, ftl_file_buf, FTL_LP_SIZE);
+		if (!ret) {
+			mutex_lock(&f->lock);
+			ret = ftl_write(f, NULL, at >> FTL_LP_SHIFT, 0,
+					ftl_file_buf, FTL_LP_SIZE);
+			mutex_unlock(&f->lock);
+		}
+	} else {
+		mutex_lock(&f->lock);
+		ret = ftl_copy(f, NULL, at >> FTL_LP_SHIFT, 0,
+			       ftl_file_buf, FTL_LP_SIZE);
+		mutex_unlock(&f->lock);
+		if (!ret) {
+			ret = ftl_decrypt(ftl_file_req, ftl_file_buf,
+					  ftl_file_buf, FTL_LP_SIZE, iv);
+			if (!ret)
+				memcpy(buf, ftl_file_buf, FTL_LP_SIZE);
+		}
 	}
 out:
 	mutex_unlock(&ftl_file_lock);
-	memzero_explicit(&aes, sizeof(aes));
 	memzero_explicit(iv, sizeof(iv));
 	return ret;
+}
+
+int s5l8947x_file_block_decrypt(struct block_device *bdev, u64 blocknr,
+				const u8 fkey[32], const u8 iv_key[16],
+				u64 file_off, void *dst)
+{
+	return s5l8947x_file_block_crypt(bdev, blocknr, fkey, iv_key,
+					 file_off, dst, false);
 }
 EXPORT_SYMBOL_GPL(s5l8947x_file_block_decrypt);
 
@@ -2163,68 +2053,8 @@ int s5l8947x_file_block_encrypt(struct block_device *bdev, u64 blocknr,
 				const u8 fkey[32], const u8 iv_key[16],
 				u64 file_off, const void *src)
 {
-	struct ftl_disk *d = bdev ? bdev->bd_disk->private_data : NULL;
-	struct aes_enckey aes;
-	u8 iv[AES_BLOCK_SIZE];
-	__le32 lfsr[4];
-	struct ftl *f;
-	u64 pos, at;
-	int ret;
-
-	if (!d || !d->ftl || d->ro || (file_off & (FTL_LP_SIZE - 1)))
-		return -EINVAL;
-	f = d->ftl;
-	pos = blocknr << FTL_LP_SHIFT;
-	if (pos + FTL_LP_SIZE > d->size)
-		return -EIO;
-	ret = aes_prepareenckey(&aes, iv_key, AES_KEYSIZE_128);
-	if (ret)
-		return ret;
-
-	mutex_lock(&ftl_file_lock);
-	if (!ftl_file_tfm) {
-		struct crypto_skcipher *tfm = crypto_alloc_skcipher("cbc(aes)", 0, 0);
-
-		if (IS_ERR(tfm)) {
-			ret = PTR_ERR(tfm);
-			goto out;
-		}
-		ftl_file_tfm = tfm;
-	}
-	if (!ftl_file_req) {
-		ftl_file_req = skcipher_request_alloc(ftl_file_tfm, GFP_KERNEL);
-		if (!ftl_file_req) {
-			ret = -ENOMEM;
-			goto out;
-		}
-	}
-	if (!ftl_file_buf) {
-		ftl_file_buf = kmalloc(FTL_LP_SIZE, GFP_KERNEL);
-		if (!ftl_file_buf) {
-			ret = -ENOMEM;
-			goto out;
-		}
-	}
-
-	ret = crypto_skcipher_setkey(ftl_file_tfm, fkey, AES_KEYSIZE_256);
-	if (!ret) {
-		ftl_block_iv((u32)file_off, lfsr);
-		aes_encrypt(&aes, iv, (const u8 *)lfsr);
-		ret = ftl_encrypt(ftl_file_req, src, ftl_file_buf,
-				  FTL_LP_SIZE, iv);
-	}
-	if (!ret) {
-		at = ftl_disk_offset(d, pos);
-		mutex_lock(&f->lock);
-		ret = ftl_write(f, NULL, at >> FTL_LP_SHIFT, 0, ftl_file_buf,
-				FTL_LP_SIZE);
-		mutex_unlock(&f->lock);
-	}
-out:
-	mutex_unlock(&ftl_file_lock);
-	memzero_explicit(&aes, sizeof(aes));
-	memzero_explicit(iv, sizeof(iv));
-	return ret;
+	return s5l8947x_file_block_crypt(bdev, blocknr, fkey, iv_key,
+					 file_off, (void *)src, true);
 }
 EXPORT_SYMBOL_GPL(s5l8947x_file_block_encrypt);
 
@@ -2424,6 +2254,7 @@ static void ftl_notify_add(struct mtd_info *mtd)
 	f->nlba = f->caus * f->blocks * f->pages * f->lps;
 	sb_lps = f->caus * f->pages * f->lps;
 	f->cached = FTL_UNMAPPED;
+	f->cached_dec_lba = FTL_UNMAPPED;
 	mutex_init(&f->lock);
 	f->l2p = vmalloc(array_size(f->nlba, sizeof(*f->l2p)));
 	f->sbs = kcalloc(f->blocks, sizeof(*f->sbs), GFP_KERNEL);
@@ -2512,6 +2343,10 @@ static void __exit ftl_exit(void)
 	skcipher_request_free(ftl_file_req);
 	crypto_free_skcipher(ftl_file_tfm);
 	kfree_sensitive(ftl_file_buf);
+	memzero_explicit(ftl_file_cached_fkey, sizeof(ftl_file_cached_fkey));
+	memzero_explicit(ftl_file_cached_ivkey, sizeof(ftl_file_cached_ivkey));
+	memzero_explicit(&ftl_file_iv_aes, sizeof(ftl_file_iv_aes));
+	ftl_file_keys_cached = false;
 	memzero_explicit(ftl_file_master_key, sizeof(ftl_file_master_key));
 	ftl_file_master_valid = false;
 	memzero_explicit(ftl_bag_key, sizeof(ftl_bag_key));

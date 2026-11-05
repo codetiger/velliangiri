@@ -16,6 +16,8 @@
  * render node, checking that a foreign dma-buf gets mapped.
  */
 
+#include <drm/drm.h>
+#include <drm/drm_mode.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdint.h>
@@ -26,34 +28,6 @@
 #include <unistd.h>
 
 #include "sgx-uapi.h"
-
-/* generic DRM ioctls, without libdrm */
-struct drm_prime_handle {
-	uint32_t handle;
-	uint32_t flags;
-	int32_t fd;
-};
-
-struct drm_mode_create_dumb {
-	uint32_t height;
-	uint32_t width;
-	uint32_t bpp;
-	uint32_t flags;
-	uint32_t handle;
-	uint32_t pitch;
-	uint64_t size;
-};
-
-#define DRM_APPLE_PRIME_FD_TO_HANDLE	0x2e
-#define DRM_APPLE_PRIME_HANDLE_TO_FD	0x2d
-#define DRM_APPLE_MODE_CREATE_DUMB	0xb2
-
-#define DRM_IOCTL_APPLE_PRIME_HANDLE_TO_FD \
-	DRM_IOWR(DRM_APPLE_PRIME_HANDLE_TO_FD, struct drm_prime_handle)
-#define DRM_IOCTL_APPLE_PRIME_FD_TO_HANDLE \
-	DRM_IOWR(DRM_APPLE_PRIME_FD_TO_HANDLE, struct drm_prime_handle)
-#define DRM_IOCTL_APPLE_MODE_CREATE_DUMB \
-	DRM_IOWR(DRM_APPLE_MODE_CREATE_DUMB, struct drm_mode_create_dumb)
 
 #define SGX_GEM_SIZE	4096
 
@@ -70,7 +44,7 @@ static int import_from(const char *card, const char *render)
 	disp = open(card, O_RDWR);
 	if (disp < 0)
 		return fail(card);
-	if (ioctl(disp, DRM_IOCTL_APPLE_MODE_CREATE_DUMB, &cd) < 0) {
+	if (ioctl(disp, DRM_IOCTL_MODE_CREATE_DUMB, &cd) < 0) {
 		fail("MODE_CREATE_DUMB");
 		close(disp);
 		return 1;
@@ -80,7 +54,7 @@ static int import_from(const char *card, const char *render)
 
 	ph.handle = cd.handle;
 	ph.flags = O_CLOEXEC | O_RDWR;
-	if (ioctl(disp, DRM_IOCTL_APPLE_PRIME_HANDLE_TO_FD, &ph) < 0) {
+	if (ioctl(disp, DRM_IOCTL_PRIME_HANDLE_TO_FD, &ph) < 0) {
 		fail("PRIME_HANDLE_TO_FD(display)");
 		close(disp);
 		return 1;
@@ -96,7 +70,7 @@ static int import_from(const char *card, const char *render)
 	}
 	memset(&ph, 0, sizeof(ph));
 	ph.fd = dmabuf;
-	if (ioctl(sgx, DRM_IOCTL_APPLE_PRIME_FD_TO_HANDLE, &ph) < 0) {
+	if (ioctl(sgx, DRM_IOCTL_PRIME_FD_TO_HANDLE, &ph) < 0) {
 		fail("PRIME_FD_TO_HANDLE(render node)");
 		goto out;
 	}
@@ -189,7 +163,7 @@ int main(int argc, char **argv)
 		struct drm_prime_handle ph = { .handle = gc.handle,
 					       .flags = O_CLOEXEC | O_RDWR };
 
-		if (ioctl(fd, DRM_IOCTL_APPLE_PRIME_HANDLE_TO_FD, &ph) < 0)
+		if (ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &ph) < 0)
 			return fail("PRIME_HANDLE_TO_FD");
 		printf("PRIME_HANDLE_TO_FD: dma-buf fd %d (one contiguous block)\n",
 		       ph.fd);

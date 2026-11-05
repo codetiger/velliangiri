@@ -12,7 +12,7 @@ rate.
  2 files changed, 4 insertions(+), 2 deletions(-)
 
 diff --git a/drivers/tty/serial/Kconfig b/drivers/tty/serial/Kconfig
-index 1e92b16..3400785 100644
+index 1e92b16..5d2e279 100644
 --- a/drivers/tty/serial/Kconfig
 +++ b/drivers/tty/serial/Kconfig
 @@ -238,7 +238,7 @@ config SERIAL_CLPS711X_CONSOLE
@@ -24,6 +24,14 @@ index 1e92b16..3400785 100644
  	select SERIAL_CORE
  	help
  	  Support for the on-chip UARTs on the Samsung
+@@ -251,6 +251,7 @@ config SERIAL_SAMSUNG
+ config SERIAL_SAMSUNG_UARTS
+ 	int
+ 	depends on SERIAL_SAMSUNG
++	default 5 if ARCH_APPLE_S5L
+ 	default 4
+ 	help
+ 	  Select the number of available UART ports for the Samsung S3C
 diff --git a/drivers/tty/serial/samsung_tty.c b/drivers/tty/serial/samsung_tty.c
 index 0d184ee..bd419f7 100644
 --- a/drivers/tty/serial/samsung_tty.c

@@ -9,8 +9,11 @@ usr/lib/ossl-modules
 usr/bin/ssl_client
 etc/apk
 usr/sbin/rpc.*
-usr/sbin/nfsdcld
-usr/sbin/nfsdcltrack
+usr/sbin/rpcctl
+usr/sbin/rpcdebug
+usr/sbin/nfsdcl*
+sbin/nfsdcltrack
+usr/sbin/nfsidmap
 usr/sbin/blkmapd
 usr/sbin/fsidd
 usr/sbin/nfsrahead
@@ -48,6 +51,10 @@ usr/lib/libnl-xfrm*
 # over; drop the mesh daemon, Python/introspection helpers and D-Bus test tools
 usr/lib/bluetooth/bluetooth-meshd
 etc/bluetooth/mesh-main.conf
+usr/bin/mesh-*
+usr/bin/gi-*
+usr/bin/scp
+bin/busybox.static
 usr/bin/bluez-simple-agent
 usr/bin/bluemoon
 usr/bin/dbus-test-tool

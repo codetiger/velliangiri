@@ -22,20 +22,12 @@
 #include <linux/io.h>
 #include <linux/kernel.h>
 #include <linux/module.h>
+#include <linux/mutex.h>
 #include <linux/of.h>
 #include <linux/sizes.h>
-#include <linux/spinlock.h>
 
-#define PMGR_PHYS_BASE		0x3f100000UL
-#define PMGR_PLL1_CTL		0x0008
-#define PMGR_DOUBLER_CTL	0x0038
-#define PMGR_PERF_STATE_TBL(n)	(0x0200 + ((n) * 0x10))
-#define PMGR_PERF_STATE_CTL	0x0300
+#include "../../arch/arm/mach-apple/s5l8947x.h"
 
-#define PMGR_PLL_ENABLE_LOCKED	0xa0000000U
-#define PMGR_DOUBLER_BUSY	BIT(30)
-#define PMGR_PERF_STATE_BUSY	0x00ff0000U
-#define PMGR_TRANSITION_SPIN	200000
 #define S5L8947X_TRANSITION_NS	10000
 
 struct s5l8947x_opp {
@@ -83,7 +75,7 @@ static struct cpufreq_frequency_table s5l8947x_freq_table[] = {
 };
 
 static void __iomem *pmgr_base;
-static DEFINE_RAW_SPINLOCK(pmgr_perf_lock);
+static DEFINE_MUTEX(pmgr_perf_lock);
 
 static void s5l8947x_pmgr_ensure_opp_tables(void)
 {
@@ -125,7 +117,6 @@ static int s5l8947x_cpufreq_target_index(struct cpufreq_policy *policy,
 					 unsigned int index)
 {
 	const struct s5l8947x_opp *opp;
-	unsigned long flags;
 	u32 dbl, ctl;
 	int i;
 
@@ -134,7 +125,7 @@ static int s5l8947x_cpufreq_target_index(struct cpufreq_policy *policy,
 
 	opp = &s5l8947x_opps[index];
 
-	raw_spin_lock_irqsave(&pmgr_perf_lock, flags);
+	mutex_lock(&pmgr_perf_lock);
 
 	dbl = readl_relaxed(pmgr_base + PMGR_DOUBLER_CTL);
 	if ((dbl & 0x1fU) != opp->doubler_div) {
@@ -164,7 +155,7 @@ static int s5l8947x_cpufreq_target_index(struct cpufreq_policy *policy,
 	 */
 	loops_per_jiffy = (opp->freq_khz * 1000UL) / HZ;
 
-	raw_spin_unlock_irqrestore(&pmgr_perf_lock, flags);
+	mutex_unlock(&pmgr_perf_lock);
 	return 0;
 }
 

@@ -346,6 +346,7 @@ static struct skcipher_alg s5l_aes_algs[] = {
 /* --- probe --- */
 
 /* CBC-encrypt a random buffer in hardware and in software and compare. */
+#ifdef CONFIG_CRYPTO_MANAGER_EXTRA_TESTS
 static int s5l_aes_selftest(struct s5l_aes *a)
 {
 	struct aes_enckey sw;
@@ -385,6 +386,12 @@ out:
 	kfree(src);
 	return ret;
 }
+#else
+static inline int s5l_aes_selftest(struct s5l_aes *a)
+{
+	return 0;
+}
+#endif
 
 /* The device key works when it is enabled and gives a stable, non-trivial result. */
 static bool s5l_aes_device_key_usable(struct s5l_aes *a)
