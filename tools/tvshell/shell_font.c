@@ -26,6 +26,7 @@
 
 #include "tvshell.h"
 #include "shell_assets.h"
+#include "shell_gpu.h"
 
 #define SUB		32
 #define SAMPLES		4
@@ -58,6 +59,9 @@ struct glyph_entry {
 	int16_t yoff;
 	uint16_t w;
 	uint16_t h;
+	uint16_t atlas_u;
+	uint16_t atlas_v;
+	bool gpu_uploaded;
 	uint8_t *bitmap;
 	struct glyph_entry *next;
 };
@@ -1134,21 +1138,41 @@ int shell_font_measure_role(enum shell_font_role role, int size_px, const char *
 	return (w_q6 + 32) >> 6;
 }
 
-static void blit_glyph(const struct glyph_entry *ge, int pen_x, int baseline_y,
+static void blit_glyph(struct glyph_entry *ge, int pen_x, int baseline_y,
 		       uint32_t fg)
 {
-	uint32_t *fb = shell_display_backbuffer();
+	uint32_t *fb;
 	int py, px;
 	uint32_t fg_opaque, fg_rb, fg_g;
 	int x0, gw;
 
-	if (!ge || !ge->bitmap || !fb)
+	if (!ge || !ge->bitmap || ge->w == 0 || ge->h == 0)
+		return;
+
+	x0 = pen_x + ge->xoff;
+	if (shell_gpu_active()) {
+		if (!ge->gpu_uploaded) {
+			ge->gpu_uploaded = shell_gpu_upload_glyph(ge->w, ge->h,
+								  ge->bitmap,
+								  &ge->atlas_u,
+								  &ge->atlas_v);
+		}
+		if (ge->gpu_uploaded) {
+			shell_gpu_draw_glyph(x0, baseline_y + ge->yoff,
+					     (int)ge->w, (int)ge->h,
+					     ge->atlas_u, ge->atlas_v,
+					     fg, 255);
+			return;
+		}
+	}
+
+	fb = shell_display_backbuffer();
+	if (!fb)
 		return;
 
 	fg_opaque = fg | 0xff000000U;
 	fg_rb = fg & 0x00ff00ffU;
 	fg_g  = fg & 0x0000ff00U;
-	x0 = pen_x + ge->xoff;
 	gw = (int)ge->w;
 
 #ifdef __ARM_NEON

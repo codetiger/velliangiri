@@ -54,13 +54,18 @@ echo "==> compiling tvshell with ${CC_BIN}"
 	-Wall -Wextra -Werror \
 	-static -D_GNU_SOURCE \
 	-I"${ROOT}/tools/tvshell" \
+	-I"${ROOT}/include/uapi" \
+	-I"${ROOT}/tools/mesa-sgx/files/src/gallium/drivers/sgx" \
 	-I"${OUT_DIR}" \
 	"${ROOT}/tools/tvshell/tvshell.c" \
 	"${ROOT}/tools/tvshell/media_gallery.c" \
 	"${ROOT}/tools/tvshell/shell_display.c" \
 	"${ROOT}/tools/tvshell/shell_font.c" \
+	"${ROOT}/tools/tvshell/shell_gpu.c" \
 	"${ROOT}/tools/tvshell/shell_input.c" \
 	"${ROOT}/tools/tvshell/shell_media.c" \
+	"${ROOT}/tools/mesa-sgx/files/src/gallium/drivers/sgx/sgx_template.c" \
+	"${ROOT}/tools/mesa-sgx/files/src/gallium/drivers/sgx/sgx_rt.c" \
 	-o "${OUT_DIR}/tvshell" \
 	-lm
 

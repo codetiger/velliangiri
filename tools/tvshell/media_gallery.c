@@ -23,6 +23,7 @@
 
 #include "tvshell.h"
 #include "shell_assets.h"
+#include "shell_gpu.h"
 
 /* Fullscreen 4x2 Media Grid Geometry (inside 1280x720 safe area 64px L/R, 32px T/B) */
 #define MG_SAFE_X		64
@@ -282,7 +283,7 @@ static void render_single_tile(const struct shell_theme *th, int slot_idx, bool 
 	int y = MG_GRID_Y + row * (MG_TILE_H + MG_TILE_GAP_Y);
 	int w = MG_TILE_W;
 	int h = MG_TILE_H;
-	int pad = 10;
+	int pad = 12;
 	int item_idx = g_mg.current_page * MG_TILES_PER_PAGE + slot_idx;
 
 	if (clear_slot)
@@ -303,11 +304,11 @@ static void render_single_tile(const struct shell_theme *th, int slot_idx, bool 
 	struct giri_media_card mc;
 	make_card_from_item(it, raw_idx, &mc);
 
+	shell_draw_card_shadow(x, draw_y, w, h, MG_TILE_RADIUS);
 	if (focused) {
 		shell_draw_focus_glow(x, draw_y, w, h, MG_TILE_RADIUS,
 				      8, th->focus_ring, 68);
 	}
-	shell_draw_card_shadow(x, draw_y, w, h, MG_TILE_RADIUS);
 	shell_draw_rounded_rect(x, draw_y, w, h, MG_TILE_RADIUS,
 				focused ? th->surface_hi : th->surface);
 
@@ -320,9 +321,11 @@ static void render_single_tile(const struct shell_theme *th, int slot_idx, bool 
 	if (art) {
 		shell_draw_rounded_bitmap(x, draw_y, w, MG_TILE_ART_H,
 					  MG_TILE_RADIUS, art, false);
-		shell_draw_bitmap_xrgb(x, draw_y + MG_TILE_ART_H - MG_TILE_RADIUS,
-				       w, MG_TILE_RADIUS,
-				       art + (size_t)(MG_TILE_ART_H - MG_TILE_RADIUS) * w);
+		if (!shell_gpu_active()) {
+			shell_draw_bitmap_xrgb(x, draw_y + MG_TILE_ART_H - MG_TILE_RADIUS,
+					       w, MG_TILE_RADIUS,
+					       art + (size_t)(MG_TILE_ART_H - MG_TILE_RADIUS) * w);
+		}
 	}
 	shell_draw_rect(x + 1, draw_y + MG_TILE_ART_H, w - 2, 1, th->border);
 
@@ -429,7 +432,7 @@ static void render_grid_view(const struct shell_theme *th)
 {
 	int i;
 
-	if (!g_mg.bg_valid) {
+	if (!g_mg.bg_valid || shell_gpu_active()) {
 		shell_draw_rect(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, th->bg);
 		render_header_bar(th, false);
 		for (i = 0; i < MG_TILES_PER_PAGE; i++)
@@ -534,11 +537,13 @@ static void render_player_view(const struct shell_theme *th)
 	int dst_dmabuf_fd = -1;
 
 	if (g_mg.player_is_video) {
-		buf_idx = shell_display_prepare_video_backbuf(&dst_dmabuf_fd);
-		if (buf_idx >= 0 && dst_dmabuf_fd >= 0) {
-			direct_dmabuf_ok = shell_media_render_video_frame_dmabuf(
-				&g_mg.player_card, g_mg.player_frame_idx,
-				buf_idx, dst_dmabuf_fd);
+		if (!shell_gpu_active()) {
+			buf_idx = shell_display_prepare_video_backbuf(&dst_dmabuf_fd);
+			if (buf_idx >= 0 && dst_dmabuf_fd >= 0) {
+				direct_dmabuf_ok = shell_media_render_video_frame_dmabuf(
+					&g_mg.player_card, g_mg.player_frame_idx,
+					buf_idx, dst_dmabuf_fd);
+			}
 		}
 		if (!direct_dmabuf_ok) {
 			const uint32_t *art = shell_media_get_video_frame(
@@ -581,7 +586,7 @@ static void render_player_view(const struct shell_theme *th)
 	 * 1. Top-Left HUD Box (64, 32, 580, 40) — cleared to opaque dark
 	 *    cinema surface first so Grid View never bleeds through!
 	 */
-	if (direct_dmabuf_ok)
+	if (direct_dmabuf_ok && !shell_gpu_active())
 		shell_draw_rect(64, 32, 580, 40, 0xff120f0dU);
 	else
 		shell_draw_rounded_rect(64, 32, 580, 40, 10, 0xff120f0dU);
@@ -606,7 +611,7 @@ static void render_player_view(const struct shell_theme *th)
 	 * 2. Top-Right HUD Box (940, 32, 276, 40) — cleared to opaque dark
 	 *    cinema surface first so timer updates never ghost over old text!
 	 */
-	if (direct_dmabuf_ok)
+	if (direct_dmabuf_ok && !shell_gpu_active())
 		shell_draw_rect(940, 32, 276, 40, 0xff120f0dU);
 	else
 		shell_draw_rounded_rect(940, 32, 276, 40, 10, 0xff120f0dU);
@@ -633,7 +638,7 @@ static void render_player_view(const struct shell_theme *th)
 	 * 3. Bottom Dock Panel (64, 544, 1152, 140) — cleared to opaque dark
 	 *    cinema surface so video & photo overlays are 100% artifact-free.
 	 */
-	if (direct_dmabuf_ok)
+	if (direct_dmabuf_ok && !shell_gpu_active())
 		shell_draw_rect(64, 544, 1152, 140, 0xff120f0dU);
 	else
 		shell_draw_rounded_rect(64, 544, 1152, 140, 14, 0xff120f0dU);

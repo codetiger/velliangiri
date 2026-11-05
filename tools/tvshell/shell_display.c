@@ -29,6 +29,7 @@
 
 #include "tvshell.h"
 #include "shell_assets.h"
+#include "shell_gpu.h"
 
 /* Minimal DRM/KMS UAPI definitions so static builds need no libdrm */
 #define DRM_IOCTL_BASE			'd'
@@ -161,6 +162,8 @@ static struct {
 	uint32_t scanout_h;
 
 	uint32_t *backbuf;
+	bool backbuf_owned;
+	int last_gpu_buf;
 #define MAX_DMG_RECTS		8
 	struct {
 		int x0, y0, x1, y1;
@@ -170,6 +173,7 @@ static struct {
 	.drm_fd = -1,
 	.fb_fd = -1,
 	.tty_fd = -1,
+	.last_gpu_buf = -1,
 	.bufs = {
 		{ .dmabuf_fd = -1 },
 		{ .dmabuf_fd = -1 },
@@ -624,14 +628,22 @@ int shell_display_init(bool headless)
 {
 	init_corner_luts();
 	disp.headless = headless;
-	disp.backbuf = calloc((size_t)SHELL_SCREEN_W * SHELL_SCREEN_H, sizeof(uint32_t));
-	if (!disp.backbuf)
-		return -ENOMEM;
-
+	disp.last_gpu_buf = -1;
 	shell_display_damage_all();
 
-	if (headless)
+	if (headless) {
+		if (shell_gpu_init(-1, 0, NULL, SHELL_SCREEN_W, SHELL_SCREEN_H)) {
+			disp.backbuf = (uint32_t *)shell_gpu_get_headless_pixels(0);
+			disp.backbuf_owned = false;
+			return 0;
+		}
+		disp.backbuf = calloc((size_t)SHELL_SCREEN_W * SHELL_SCREEN_H,
+				      sizeof(uint32_t));
+		if (!disp.backbuf)
+			return -ENOMEM;
+		disp.backbuf_owned = true;
 		return 0;
+	}
 
 	ensure_720p30_and_gamma();
 
@@ -643,8 +655,33 @@ int shell_display_init(bool headless)
 #endif
 	}
 
-	if (setup_drm_scanout() == 0)
+	if (setup_drm_scanout() == 0) {
+		int dmabuf_fds[SHELL_DRM_BUF_COUNT] = {
+			disp.bufs[0].dmabuf_fd,
+			disp.bufs[1].dmabuf_fd,
+			disp.bufs[2].dmabuf_fd,
+		};
+
+		if (shell_gpu_init(disp.drm_fd, SHELL_DRM_BUF_COUNT, dmabuf_fds,
+				   SHELL_SCREEN_W, SHELL_SCREEN_H)) {
+			disp.backbuf = NULL;
+			disp.backbuf_owned = false;
+			return 0;
+		}
+		disp.backbuf = calloc((size_t)SHELL_SCREEN_W * SHELL_SCREEN_H,
+				      sizeof(uint32_t));
+		if (!disp.backbuf)
+			return -ENOMEM;
+		disp.backbuf_owned = true;
 		return 0;
+	}
+
+	disp.backbuf = calloc((size_t)SHELL_SCREEN_W * SHELL_SCREEN_H,
+			      sizeof(uint32_t));
+	if (!disp.backbuf)
+		return -ENOMEM;
+	disp.backbuf_owned = true;
+
 	if (setup_fbdev_scanout() == 0)
 		return 0;
 
@@ -655,6 +692,7 @@ int shell_display_init(bool headless)
 
 void shell_display_close(void)
 {
+	shell_gpu_close();
 	if (disp.tty_fd >= 0) {
 #ifdef __linux__
 		(void)ioctl(disp.tty_fd, KDSETMODE, KD_TEXT);
@@ -680,8 +718,11 @@ void shell_display_close(void)
 		close(disp.fb_fd);
 		disp.fb_fd = -1;
 	}
-	free(disp.backbuf);
+	if (disp.backbuf_owned)
+		free(disp.backbuf);
 	disp.backbuf = NULL;
+	disp.backbuf_owned = false;
+	disp.last_gpu_buf = -1;
 }
 
 uint32_t *shell_display_backbuffer(void)
@@ -758,6 +799,39 @@ void shell_display_present(void)
 {
 	int r, y;
 
+	if (shell_gpu_active()) {
+		if (shell_gpu_draw_count() == 0) {
+			disp.dmg_count = 0;
+			return;
+		}
+		if (disp.headless || !disp.use_drm || disp.drm_fd < 0) {
+			(void)shell_gpu_flush(0, disp.last_gpu_buf);
+			disp.last_gpu_buf = 0;
+			disp.dmg_count = 0;
+			return;
+		}
+		if (shell_gpu_flush(0, disp.last_gpu_buf) == 0) {
+			disp.last_gpu_buf = 0;
+			if (disp.active_buf != 0 && disp.have_mode &&
+			    disp.bufs[0].fb_id != 0) {
+				struct drm_mode_crtc crtc = { 0 };
+
+				crtc.crtc_id = disp.crtc_id;
+				crtc.fb_id = disp.bufs[0].fb_id;
+				crtc.set_connectors_ptr = (uintptr_t)&disp.conn_id;
+				crtc.count_connectors = 1;
+				crtc.mode = disp.mode_720p30;
+				crtc.mode_valid = 1;
+				(void)ioctl(disp.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc);
+				disp.active_buf = 0;
+				disp.fb_id = disp.bufs[0].fb_id;
+				disp.scanout = disp.bufs[0].map;
+			}
+		}
+		disp.dmg_count = 0;
+		return;
+	}
+
 	if (disp.dmg_count <= 0)
 		return;
 	if (disp.headless || !disp.scanout) {
@@ -805,17 +879,28 @@ void shell_display_present(void)
 
 int shell_display_get_video_dmabuf(int buf_idx)
 {
-	if (buf_idx < 0 || buf_idx >= SHELL_DRM_BUF_COUNT || !disp.use_drm)
+	if (buf_idx < 0 || buf_idx >= SHELL_DRM_BUF_COUNT)
 		return -1;
-	return disp.bufs[buf_idx].dmabuf_fd;
+	if (disp.use_drm && disp.bufs[buf_idx].dmabuf_fd >= 0)
+		return disp.bufs[buf_idx].dmabuf_fd;
+	if (shell_gpu_active())
+		return shell_gpu_target_dmabuf_fd(buf_idx);
+	return -1;
 }
 
 int shell_display_prepare_video_backbuf(int *out_dmabuf_fd)
 {
 	int back = (disp.active_buf == 1) ? 2 : 1;
 
-	if (disp.headless || !disp.use_drm || disp.drm_fd < 0)
-		return -1;
+	if (disp.headless || !disp.use_drm || disp.drm_fd < 0) {
+		int fd = shell_gpu_target_dmabuf_fd(1);
+
+		if (!shell_gpu_active() || fd < 0)
+			return -1;
+		if (out_dmabuf_fd)
+			*out_dmabuf_fd = fd;
+		return 1;
+	}
 	if (disp.bufs[back].dmabuf_fd < 0 || !disp.bufs[back].map)
 		back = 1;
 	if (disp.bufs[back].dmabuf_fd < 0 || !disp.bufs[back].map)
@@ -833,7 +918,37 @@ void shell_display_present_video_backbuf(int buf_idx,
 	uint32_t *dst_base;
 	int i, y;
 
-	if (buf_idx < 0 || buf_idx >= SHELL_DRM_BUF_COUNT || !disp.use_drm || disp.drm_fd < 0)
+	if (buf_idx < 0 || buf_idx >= SHELL_DRM_BUF_COUNT)
+		return;
+
+	if (shell_gpu_active()) {
+		if (shell_gpu_draw_count() > 0)
+			(void)shell_gpu_flush(buf_idx, buf_idx);
+
+		if (!disp.headless && disp.use_drm && disp.drm_fd >= 0 &&
+		    disp.have_mode && disp.bufs[buf_idx].fb_id != 0) {
+			struct drm_mode_crtc crtc = { 0 };
+
+			crtc.crtc_id = disp.crtc_id;
+			crtc.fb_id = disp.bufs[buf_idx].fb_id;
+			crtc.set_connectors_ptr = (uintptr_t)&disp.conn_id;
+			crtc.count_connectors = 1;
+			crtc.mode = disp.mode_720p30;
+			crtc.mode_valid = 1;
+			if (ioctl(disp.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc) == 0) {
+				disp.active_buf = buf_idx;
+				disp.fb_id = disp.bufs[buf_idx].fb_id;
+				disp.scanout = disp.bufs[buf_idx].map;
+				disp.last_gpu_buf = buf_idx;
+			}
+		} else if (disp.headless) {
+			disp.last_gpu_buf = buf_idx;
+		}
+		disp.dmg_count = 0;
+		return;
+	}
+
+	if (!disp.use_drm || disp.drm_fd < 0)
 		return;
 
 	dst_base = disp.bufs[buf_idx].map;
@@ -975,14 +1090,32 @@ int shell_display_acquire(void)
 
 int shell_display_dump_ppm(const char *path)
 {
-	FILE *f = fopen(path, "wb");
+	const uint32_t *px = disp.backbuf;
+	FILE *f;
 	int i, total = SHELL_SCREEN_W * SHELL_SCREEN_H;
 
+	if (shell_gpu_active()) {
+		int hbuf = (disp.last_gpu_buf >= 0) ? disp.last_gpu_buf : 0;
+
+		if (shell_gpu_draw_count() > 0) {
+			int dst = disp.use_drm ? disp.active_buf : 0;
+
+			(void)shell_gpu_flush(dst, disp.last_gpu_buf);
+			disp.last_gpu_buf = dst;
+			hbuf = dst;
+		}
+		px = disp.use_drm ? disp.bufs[disp.active_buf].map
+				  : shell_gpu_get_headless_pixels(hbuf);
+	}
+	if (!px)
+		return -EINVAL;
+
+	f = fopen(path, "wb");
 	if (!f)
 		return -errno;
 	fprintf(f, "P6\n%d %d\n255\n", SHELL_SCREEN_W, SHELL_SCREEN_H);
 	for (i = 0; i < total; i++) {
-		uint32_t c = disp.backbuf[i];
+		uint32_t c = px[i];
 		uint8_t rgb[3] = {
 			(uint8_t)((c >> 16) & 0xffU),
 			(uint8_t)((c >> 8) & 0xffU),
@@ -1006,6 +1139,11 @@ void shell_draw_rect(int x, int y, int w, int h, uint32_t color)
 
 	if (w <= 0 || h <= 0)
 		return;
+	if (shell_gpu_active()) {
+		shell_gpu_draw_rect(x, y, w, h, color, 255);
+		shell_display_damage(x, y, w, h);
+		return;
+	}
 	x0 = x < 0 ? 0 : x;
 	y0 = y < 0 ? 0 : y;
 	x1 = (x + w > SHELL_SCREEN_W) ? SHELL_SCREEN_W : (x + w);
@@ -1028,6 +1166,11 @@ void shell_draw_rect_alpha(int x, int y, int w, int h, uint32_t color, uint8_t a
 
 	if (w <= 0 || h <= 0 || alpha == 0)
 		return;
+	if (shell_gpu_active()) {
+		shell_gpu_draw_rect(x, y, w, h, color, alpha);
+		shell_display_damage(x, y, w, h);
+		return;
+	}
 	if (alpha == 255) {
 		shell_draw_rect(x, y, w, h, color);
 		return;
@@ -1118,6 +1261,11 @@ void shell_draw_rounded_rect_alpha(int x, int y, int w, int h, int radius,
 
 	if (w <= 0 || h <= 0 || alpha == 0)
 		return;
+	if (shell_gpu_active()) {
+		shell_gpu_draw_rounded_rect(x, y, w, h, radius, color, alpha);
+		shell_display_damage(x, y, w, h);
+		return;
+	}
 	if (radius <= 0) {
 		shell_draw_rect_alpha(x, y, w, h, color, alpha);
 		return;
@@ -1197,6 +1345,12 @@ void shell_draw_rounded_outline(int x, int y, int w, int h, int radius,
 
 	if (w <= 0 || h <= 0 || thickness <= 0)
 		return;
+	if (shell_gpu_active()) {
+		shell_gpu_draw_rounded_outline(x, y, w, h, radius,
+					       thickness, color, 255);
+		shell_display_damage(x, y, w, h);
+		return;
+	}
 	if (radius * 2 > w)
 		radius = w / 2;
 	if (radius * 2 > h)
@@ -1310,6 +1464,12 @@ void shell_draw_focus_glow(int x, int y, int w, int h, int radius,
 
 	if (spread <= 0 || max_alpha == 0)
 		return;
+	if (shell_gpu_active()) {
+		shell_gpu_draw_rounded_rect(gx, gy, gw, gh, gr,
+					    glow_color, max_alpha);
+		shell_display_damage(gx, gy, gw, gh);
+		return;
+	}
 
 	for (py = 0; py < gh; py++) {
 		int sy = gy + py;
@@ -1375,6 +1535,17 @@ void shell_draw_card_shadow(int x, int y, int w, int h, int radius)
 {
 	int s, py, px;
 
+	if (shell_gpu_active()) {
+		for (s = 8; s >= 2; s -= 2) {
+			shell_gpu_draw_rounded_rect(x - s / 2, y + 4 + s,
+						    w + s, h,
+						    radius + s / 2,
+						    0x06080cU, 14);
+		}
+		shell_display_damage(x - 4, y + 6, w + 8, h + 10);
+		return;
+	}
+
 	for (s = 8; s >= 2; s -= 2) {
 		int sx0 = x - s / 2;
 		int sy0 = y + 4 + s;
@@ -1433,55 +1604,68 @@ void shell_draw_card_bottom_scrim(int card_x, int card_y, int card_w, int card_h
 		scrim_h = card_h;
 	y_start = card_h - scrim_h;
 
-	for (py = y_start; py < card_h; py++) {
-		int sy = card_y + py;
+	if (shell_gpu_active()) {
+		shell_gpu_draw_card_bottom_scrim(card_x, card_y, card_w, card_h,
+						 radius, scrim_h);
+		shell_display_damage(card_x, card_y + y_start, card_w, scrim_h);
+		return;
+	}
 
-		if (sy < 0 || sy >= SHELL_SCREEN_H)
-			continue;
-		uint32_t *row = disp.backbuf + sy * SHELL_SCREEN_W;
+	{
+		static const int8_t bayer4x4[16] = {
+			-7,  1, -5,  3,
+			 5, -3,  7, -1,
+			-4,  4, -6,  2,
+			 8,  0,  6, -2
+		};
 
-		/* Distance from bottom: 0.0 at bottom -> 1.0 at top of scrim */
-		float dist_from_bottom = (float)(card_h - 1 - py) / (float)(scrim_h > 1 ? scrim_h - 1 : 1);
-		float alpha_f;
+		for (py = y_start; py < card_h; py++) {
+			int sy = card_y + py;
+			int ly = py - y_start;
 
-		if (dist_from_bottom <= 0.58f) {
-			float t = dist_from_bottom / 0.58f;
-			alpha_f = 0.96f + (0.84f - 0.96f) * t;
-		} else if (dist_from_bottom <= 0.84f) {
-			float t = (dist_from_bottom - 0.58f) / (0.84f - 0.58f);
-			alpha_f = 0.84f + (0.32f - 0.84f) * t;
-		} else {
-			float t = (dist_from_bottom - 0.84f) / (1.0f - 0.84f);
-			alpha_f = 0.32f * (1.0f - t);
-		}
-
-		int base_a = (int)(alpha_f * 255.0f + 0.5f);
-		if (base_a <= 0)
-			continue;
-		if (base_a > 255)
-			base_a = 255;
-		bool is_bottom_corner = (py >= card_h - radius);
-
-		if (!is_bottom_corner) {
-			int sx0 = card_x < 0 ? 0 : card_x;
-			int sx1 = (card_x + card_w > SHELL_SCREEN_W) ? SHELL_SCREEN_W : (card_x + card_w);
-
-			if (sx1 > sx0)
-				blend_span_const_alpha(row + sx0, sx1 - sx0, 0xff06080cU, (uint8_t)base_a);
-			continue;
-		}
-
-		for (px = 0; px < card_w; px++) {
-			int sx = card_x + px;
-
-			if (sx < 0 || sx >= SHELL_SCREEN_W)
+			if (sy < 0 || sy >= SHELL_SCREEN_H)
 				continue;
-			uint32_t cov = rounded_rect_cov255(px, py, card_w, card_h, radius);
-			if (cov == 0)
+			uint32_t *row = disp.backbuf + sy * SHELL_SCREEN_W;
+
+			/* Distance from bottom: 0.0 at bottom -> 1.0 at top of scrim */
+			float dist_from_bottom = (float)(card_h - 1 - py) / (float)(scrim_h > 1 ? scrim_h - 1 : 1);
+			float alpha_f;
+
+			if (dist_from_bottom <= 0.58f) {
+				float t = dist_from_bottom / 0.58f;
+				alpha_f = 0.96f + (0.84f - 0.96f) * t;
+			} else if (dist_from_bottom <= 0.84f) {
+				float t = (dist_from_bottom - 0.58f) / (0.84f - 0.58f);
+				alpha_f = 0.84f + (0.32f - 0.84f) * t;
+			} else {
+				float t = (dist_from_bottom - 0.84f) / (1.0f - 0.84f);
+				alpha_f = 0.32f * (1.0f - t);
+			}
+
+			if (alpha_f <= 0.0f)
 				continue;
-			uint32_t a255 = (cov * (uint32_t)base_a + 127U) >> 8;
-			if (a255 > 0)
-				row[sx] = blend_pixel(row[sx], 0xff06080cU, a255);
+
+			for (px = 0; px < card_w; px++) {
+				int sx = card_x + px;
+				float cov = 1.0f;
+				float dither = (float)bayer4x4[(ly & 3) * 4 + (px & 3)] * (1.5f / 16.0f);
+				int a;
+
+				if (sx < 0 || sx >= SHELL_SCREEN_W)
+					continue;
+				if (py >= card_h - radius &&
+				    (px < radius || px >= card_w - radius)) {
+					cov = (float)rounded_rect_cov255(px, py, card_w, card_h, radius) *
+					      (1.0f / 255.0f);
+					if (cov <= 0.0f)
+						continue;
+				}
+				a = (int)(alpha_f * cov * 255.0f + dither + 0.5f);
+				if (a > 255)
+					a = 255;
+				if (a > 0)
+					row[sx] = blend_pixel(row[sx], 0xff06080cU, (uint32_t)a);
+			}
 		}
 	}
 	shell_display_damage(card_x, card_y + y_start, card_w, scrim_h);
@@ -1493,23 +1677,39 @@ void shell_draw_card_bottom_scrim(int card_x, int card_y, int card_w, int card_h
  */
 void shell_draw_top_scrim(int w, int h)
 {
-	int py;
+	static const int8_t bayer4x4[16] = {
+		-7,  1, -5,  3,
+		 5, -3,  7, -1,
+		-4,  4, -6,  2,
+		 8,  0,  6, -2
+	};
+	int py, px;
 	int cw = (w > SHELL_SCREEN_W) ? SHELL_SCREEN_W : w;
 
-	if (cw <= 0)
+	if (cw <= 0 || h <= 0)
 		return;
+	if (shell_gpu_active()) {
+		shell_gpu_draw_top_scrim(cw, h);
+		shell_display_damage(0, 0, w, h);
+		return;
+	}
 	for (py = 0; py < h && py < SHELL_SCREEN_H; py++) {
 		uint32_t *row = disp.backbuf + py * SHELL_SCREEN_W;
 		float t = (float)py / (float)(h > 1 ? h - 1 : 1);
 		float alpha_f = (t <= 0.65f) ?
 			(0.88f + (0.45f - 0.88f) * (t / 0.65f)) :
 			(0.45f * (1.0f - (t - 0.65f) / 0.35f));
-		int base_a = (int)(alpha_f * 255.0f + 0.5f);
 
-		if (base_a > 0) {
-			if (base_a > 255)
-				base_a = 255;
-			blend_span_const_alpha(row, cw, 0xff06080cU, (uint8_t)base_a);
+		if (alpha_f <= 0.0f)
+			continue;
+		for (px = 0; px < cw; px++) {
+			float dither = (float)bayer4x4[(py & 3) * 4 + (px & 3)] * (1.5f / 16.0f);
+			int a = (int)(alpha_f * 255.0f + dither + 0.5f);
+
+			if (a > 255)
+				a = 255;
+			if (a > 0)
+				row[px] = blend_pixel(row[px], 0xff06080cU, (uint32_t)a);
 		}
 	}
 	shell_display_damage(0, 0, w, h);
@@ -1522,11 +1722,22 @@ void shell_draw_top_scrim(int w, int h)
  */
 void shell_draw_bottom_scrim(int y0, int w, int h)
 {
-	int py;
+	static const int8_t bayer4x4[16] = {
+		-7,  1, -5,  3,
+		 5, -3,  7, -1,
+		-4,  4, -6,  2,
+		 8,  0,  6, -2
+	};
+	int py, px;
 	int cw = (w > SHELL_SCREEN_W) ? SHELL_SCREEN_W : w;
 
-	if (cw <= 0)
+	if (cw <= 0 || h <= 0)
 		return;
+	if (shell_gpu_active()) {
+		shell_gpu_draw_bottom_scrim(y0, cw, h);
+		shell_display_damage(0, y0, w, h);
+		return;
+	}
 	for (py = 0; py < h; py++) {
 		int sy = y0 + py;
 
@@ -1543,12 +1754,16 @@ void shell_draw_bottom_scrim(int y0, int w, int h)
 		else
 			alpha_f = 0.35f * (1.0f - (dist - 0.82f) / 0.18f);
 
-		int base_a = (int)(alpha_f * 255.0f + 0.5f);
+		if (alpha_f <= 0.0f)
+			continue;
+		for (px = 0; px < cw; px++) {
+			float dither = (float)bayer4x4[(py & 3) * 4 + (px & 3)] * (1.5f / 16.0f);
+			int a = (int)(alpha_f * 255.0f + dither + 0.5f);
 
-		if (base_a > 0) {
-			if (base_a > 255)
-				base_a = 255;
-			blend_span_const_alpha(row, cw, 0xff06080cU, (uint8_t)base_a);
+			if (a > 255)
+				a = 255;
+			if (a > 0)
+				row[px] = blend_pixel(row[px], 0xff06080cU, (uint32_t)a);
 		}
 	}
 	shell_display_damage(0, y0, w, h);
@@ -1561,8 +1776,20 @@ void shell_draw_shimmer_bar(int x, int y, int w, int h, int radius,
 			    uint32_t base_color, uint32_t highlight_color, int phase_pct)
 {
 	int py, px;
-	int center_x = (w * phase_pct) / 100;
-	int band_w = w / 3 > 1 ? w / 3 : 1;
+	int center_x, band_w;
+
+	if (w <= 0 || h <= 0)
+		return;
+	if (shell_gpu_active()) {
+		shell_gpu_draw_shimmer_bar(x, y, w, h, radius,
+					   base_color, highlight_color,
+					   phase_pct);
+		shell_display_damage(x, y, w, h);
+		return;
+	}
+
+	center_x = (w * phase_pct) / 100;
+	band_w = w / 3 > 1 ? w / 3 : 1;
 
 	base_color |= 0xff000000U;
 	highlight_color |= 0xff000000U;
@@ -1605,6 +1832,13 @@ void shell_draw_bitmap_xrgb(int x, int y, int w, int h, const uint32_t *pixels)
 
 	if (!pixels || w <= 0 || h <= 0)
 		return;
+	if (shell_gpu_active() &&
+	    shell_gpu_draw_bitmap_rect(x, y, 0, 0, w, h, pixels, w, 255)) {
+		shell_display_damage(x, y, w, h);
+		return;
+	}
+	if (!disp.backbuf)
+		return;
 	for (py = 0; py < h; py++) {
 		int sy = y + py;
 
@@ -1635,6 +1869,13 @@ void shell_draw_rounded_bitmap_stride(int x, int y, int w, int h, int stride,
 
 	(void)zoom_slightly;
 	if (!pixels || w <= 0 || h <= 0 || stride < w)
+		return;
+	if (shell_gpu_active() &&
+	    shell_gpu_draw_rounded_bitmap(x, y, w, h, radius, pixels, stride)) {
+		shell_display_damage(x, y, w, h);
+		return;
+	}
+	if (!disp.backbuf)
 		return;
 	if (radius * 2 > w)
 		radius = w / 2;
@@ -1702,10 +1943,53 @@ void shell_draw_circle_alpha(int cx, int cy, int r, uint32_t color, uint8_t alph
 
 void shell_draw_symbol(enum shell_symbol_id sym, int x, int y, int size, uint32_t fg)
 {
+	static struct {
+		bool valid;
+		enum shell_symbol_id sym;
+		int size;
+		uint16_t u;
+		uint16_t v;
+	} sym_cache[64];
 	const uint8_t *mask = shell_get_symbol_mask(sym, size);
-	int py, px;
+	int py, px, i;
 
-	if (!mask)
+	if (!mask || size <= 0)
+		return;
+
+	if (shell_gpu_active()) {
+		int slot = -1;
+
+		for (i = 0; i < 64; i++) {
+			if (sym_cache[i].valid &&
+			    sym_cache[i].sym == sym &&
+			    sym_cache[i].size == size) {
+				slot = i;
+				break;
+			}
+			if (!sym_cache[i].valid && slot < 0)
+				slot = i;
+		}
+		if (slot >= 0 && !sym_cache[slot].valid) {
+			if (shell_gpu_upload_glyph((uint16_t)size, (uint16_t)size,
+						   mask, &sym_cache[slot].u,
+						   &sym_cache[slot].v)) {
+				sym_cache[slot].valid = true;
+				sym_cache[slot].sym = sym;
+				sym_cache[slot].size = size;
+			} else {
+				slot = -1;
+			}
+		}
+		if (slot >= 0 && sym_cache[slot].valid) {
+			shell_gpu_draw_glyph(x, y, size, size,
+					     sym_cache[slot].u, sym_cache[slot].v,
+					     fg, 255);
+			shell_display_damage(x, y, size, size);
+			return;
+		}
+	}
+
+	if (!disp.backbuf)
 		return;
 	for (py = 0; py < size; py++) {
 		int sy = y + py;

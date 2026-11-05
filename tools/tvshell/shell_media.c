@@ -41,6 +41,7 @@
 
 #include "tvshell.h"
 #include "shell_assets.h"
+#include "shell_gpu.h"
 
 #ifdef HAVE_DOOM_POSTER_ASSET
 static inline uint32_t sample_doom_poster_bilinear(float sx, float sy)
@@ -678,6 +679,7 @@ static struct {
 
 	struct hw_m2sc_ctx sc_card;	/* 550 x 624 (2x SS -> 275 x 312) on scaler0 */
 	struct hw_m2sc_ctx sc_tile;	/* 550 x 328 (2x SS -> 275 x 164) on scaler0 */
+	struct hw_m2sc_ctx sc_atlas;	/* 1680 x 960 zero-copy Atlas 1 DMABUF on scaler0 */
 	struct hw_m2sc_ctx sc_fs;	/* 1280 x 720 XRGB32 on scaler1 (MMAP) */
 	struct hw_m2sc_ctx sc_vid;	/* 1280 x 720 XRGB32 on scaler1 (DRM DMABUF) */
 } g_hw_pipe = {
@@ -685,6 +687,7 @@ static struct {
 	.nv12_dmabuf_fd = -1,
 	.sc_card = { .fd = -1 },
 	.sc_tile = { .fd = -1 },
+	.sc_atlas = { .fd = -1 },
 	.sc_fs = { .fd = -1 },
 	.sc_vid = { .fd = -1 },
 };
@@ -750,6 +753,7 @@ static void hw_pipe_close(void)
 {
 	hw_m2sc_ctx_close(&g_hw_pipe.sc_card);
 	hw_m2sc_ctx_close(&g_hw_pipe.sc_tile);
+	hw_m2sc_ctx_close(&g_hw_pipe.sc_atlas);
 	hw_m2sc_ctx_close(&g_hw_pipe.sc_fs);
 	hw_m2sc_ctx_close(&g_hw_pipe.sc_vid);
 
@@ -952,6 +956,10 @@ static bool hw_pipe_init(void)
 		goto err;
 	if (!hw_m2sc_ctx_init(&g_hw_pipe.sc_tile, g_hw_pipe.m2sc_dev[0], 550, 328, false))
 		goto err;
+	if (shell_gpu_active() && shell_gpu_atlas1_dmabuf_fd() >= 0) {
+		(void)hw_m2sc_ctx_init(&g_hw_pipe.sc_atlas, g_hw_pipe.m2sc_dev[0],
+				       2048, 1024, true);
+	}
 	if (!hw_m2sc_ctx_init(&g_hw_pipe.sc_fs, fs_dev, SHELL_SCREEN_W, SHELL_SCREEN_H, false))
 		goto err;
 	(void)hw_m2sc_ctx_init(&g_hw_pipe.sc_vid, fs_dev, SHELL_SCREEN_W, SHELL_SCREEN_H, true);
@@ -1075,7 +1083,8 @@ static bool hw_m2sc_wait_job(struct hw_m2sc_ctx *sc, uint32_t *dst_pixels)
 	return ok;
 }
 
-static void downsample_2x2_xrgb(const uint32_t *src, int dst_w, int dst_h, uint32_t *dst)
+static void downsample_2x2_xrgb_stride(const uint32_t *src, int dst_w, int dst_h,
+				       uint32_t *dst, int dst_stride)
 {
 	int src_stride = dst_w * 2;
 	int y, x;
@@ -1086,7 +1095,7 @@ static void downsample_2x2_xrgb(const uint32_t *src, int dst_w, int dst_h, uint3
 	for (y = 0; y < dst_h; y++) {
 		const uint32_t *r0 = src + (size_t)(y * 2) * src_stride;
 		const uint32_t *r1 = r0 + src_stride;
-		uint32_t *out = dst + (size_t)y * dst_w;
+		uint32_t *out = dst + (size_t)y * dst_stride;
 
 		x = 0;
 #ifdef __ARM_NEON
@@ -1184,6 +1193,96 @@ static bool hw_m2sc_dmabuf_run(struct hw_m2sc_ctx *sc,
 		ok = false;
 
 	return ok;
+}
+
+/*
+ * Zero-copy M2SC0 -> SGX Atlas 1 (1680x960 DMABUF) sub-rectangle scaling via
+ * V4L2_SEL_TGT_CROP (OUTPUT) + V4L2_SEL_TGT_COMPOSE (CAPTURE).
+ */
+struct atlas_slot_owner {
+	uint32_t **owner_ptr;
+	uint32_t *slot_ptr;
+	uint64_t last_used;
+};
+
+static struct atlas_slot_owner g_atlas_card_slots[10];
+static struct atlas_slot_owner g_atlas_tile_slots[10];
+static struct atlas_slot_owner g_atlas_fs_slots[2];
+static uint64_t g_atlas_clock = 1;
+
+static int alloc_atlas1_slot(bool is_tile, uint32_t **owner_ptr,
+			     uint32_t **out_slot_ptr)
+{
+	struct atlas_slot_owner *tbl = is_tile ? g_atlas_tile_slots : g_atlas_card_slots;
+	int i, victim = 0;
+	uint64_t oldest = UINT64_MAX;
+	uint32_t *sptr;
+
+	for (i = 0; i < 10; i++) {
+		if (tbl[i].owner_ptr == owner_ptr) {
+			victim = i;
+			break;
+		}
+		if (!tbl[i].owner_ptr) {
+			victim = i;
+			break;
+		}
+		if (tbl[i].last_used < oldest) {
+			oldest = tbl[i].last_used;
+			victim = i;
+		}
+	}
+
+	sptr = shell_gpu_atlas1_slot_ptr(is_tile, victim, NULL, NULL,
+					 NULL, NULL, NULL);
+	if (!sptr)
+		return -1;
+
+	if (tbl[victim].owner_ptr && tbl[victim].owner_ptr != owner_ptr)
+		*tbl[victim].owner_ptr = NULL;
+
+	tbl[victim].owner_ptr = owner_ptr;
+	tbl[victim].slot_ptr = sptr;
+	tbl[victim].last_used = ++g_atlas_clock;
+	*out_slot_ptr = sptr;
+	return victim;
+}
+
+static void touch_atlas1_slot(const uint32_t *ptr)
+{
+	int i;
+
+	if (!ptr)
+		return;
+	for (i = 0; i < 10; i++) {
+		if (g_atlas_card_slots[i].slot_ptr == ptr) {
+			g_atlas_card_slots[i].last_used = ++g_atlas_clock;
+			return;
+		}
+		if (g_atlas_tile_slots[i].slot_ptr == ptr) {
+			g_atlas_tile_slots[i].last_used = ++g_atlas_clock;
+			return;
+		}
+	}
+}
+
+static void promote_to_atlas1(bool is_tile, uint32_t **owner_ptr)
+{
+	uint32_t *heap_buf, *sptr = NULL;
+	int h = is_tile ? 164 : 312;
+	int row;
+
+	if (!owner_ptr || !*owner_ptr || !shell_gpu_active())
+		return;
+	heap_buf = *owner_ptr;
+	if (alloc_atlas1_slot(is_tile, owner_ptr, &sptr) < 0 || !sptr)
+		return;
+	for (row = 0; row < h; row++) {
+		memcpy(sptr + row * 2048, heap_buf + row * 275,
+		       275 * sizeof(uint32_t));
+	}
+	free(heap_buf);
+	*owner_ptr = sptr;
 }
 
 /* Run s5l8947x-jpeg on the bitstream already placed in g_hw_pipe.jpg_out_ptr */
@@ -1286,25 +1385,35 @@ static bool hw_decode_and_scale_jpeg_file(const char *path,
 	uint32_t *card_buf = NULL;
 	uint32_t *tile_buf = NULL;
 	uint32_t *fs_buf = fs_inplace_buf;
+	int card_stride = 275;
+	int tile_stride = 275;
+	bool card_in_atlas = false;
+	bool tile_in_atlas = false;
+	bool fs_in_atlas = false;
 
 	if (need_card) {
-		card_buf = malloc(275 * 312 * sizeof(uint32_t));
-		if (!card_buf)
-			return false;
-	}
-	if (need_tile) {
-		tile_buf = malloc(275 * 164 * sizeof(uint32_t));
-		if (!tile_buf) {
-			free(card_buf);
-			return false;
+		if (shell_gpu_active() &&
+		    alloc_atlas1_slot(false, out_card_275, &card_buf) >= 0) {
+			card_stride = 2048;
+			card_in_atlas = true;
+		} else {
+			card_buf = malloc(275 * 312 * sizeof(uint32_t));
+			if (!card_buf)
+				return false;
 		}
 	}
-	if (out_fs_720p) {
-		fs_buf = malloc((size_t)SHELL_SCREEN_W * SHELL_SCREEN_H * sizeof(uint32_t));
-		if (!fs_buf) {
-			free(card_buf);
-			free(tile_buf);
-			return false;
+	if (need_tile) {
+		if (shell_gpu_active() &&
+		    alloc_atlas1_slot(true, out_tile_275x164, &tile_buf) >= 0) {
+			tile_stride = 2048;
+			tile_in_atlas = true;
+		} else {
+			tile_buf = malloc(275 * 164 * sizeof(uint32_t));
+			if (!tile_buf) {
+				if (!card_in_atlas)
+					free(card_buf);
+				return false;
+			}
 		}
 	}
 
@@ -1320,15 +1429,40 @@ static bool hw_decode_and_scale_jpeg_file(const char *path,
 	}
 	if (ok && need_fs) {
 		compute_cover_crop_rect(src_w, src_h, SHELL_SCREEN_W, SHELL_SCREEN_H, &fs_crop);
-		fs_queued = hw_m2sc_queue_job(&g_hw_pipe.sc_fs, &fs_crop);
-		if (!fs_queued)
-			ok = false;
+		if (out_fs_720p && shell_gpu_active() && g_hw_pipe.sc_vid.streaming) {
+			uint32_t *fs_ptr = NULL;
+			int fs_fd = shell_gpu_fs_atlas_dmabuf_fd(0, &fs_ptr, NULL);
+
+			if (fs_fd >= 0 && fs_ptr &&
+			    hw_m2sc_dmabuf_run(&g_hw_pipe.sc_vid, &fs_crop, 0, fs_fd)) {
+				if (g_atlas_fs_slots[0].owner_ptr &&
+				    g_atlas_fs_slots[0].owner_ptr != out_fs_720p)
+					*g_atlas_fs_slots[0].owner_ptr = NULL;
+				g_atlas_fs_slots[0].owner_ptr = out_fs_720p;
+				g_atlas_fs_slots[0].slot_ptr = fs_ptr;
+				g_atlas_fs_slots[0].last_used = ++g_atlas_clock;
+				fs_buf = fs_ptr;
+				fs_in_atlas = true;
+			}
+		}
+		if (!fs_in_atlas) {
+			if (out_fs_720p) {
+				fs_buf = malloc((size_t)SHELL_SCREEN_W * SHELL_SCREEN_H * sizeof(uint32_t));
+				if (!fs_buf)
+					ok = false;
+			}
+			if (ok) {
+				fs_queued = hw_m2sc_queue_job(&g_hw_pipe.sc_fs, &fs_crop);
+				if (!fs_queued)
+					ok = false;
+			}
+		}
 	}
 
 	if (card_queued) {
 		if (hw_m2sc_wait_job(&g_hw_pipe.sc_card, NULL) && g_hw_pipe.sc_card.cap_ptr)
-			downsample_2x2_xrgb((const uint32_t *)g_hw_pipe.sc_card.cap_ptr,
-					    275, 312, card_buf);
+			downsample_2x2_xrgb_stride((const uint32_t *)g_hw_pipe.sc_card.cap_ptr,
+						   275, 312, card_buf, card_stride);
 		else
 			ok = false;
 	}
@@ -1338,8 +1472,8 @@ static bool hw_decode_and_scale_jpeg_file(const char *path,
 		if (hw_m2sc_queue_job(&g_hw_pipe.sc_tile, &tile_crop) &&
 		    hw_m2sc_wait_job(&g_hw_pipe.sc_tile, NULL) &&
 		    g_hw_pipe.sc_tile.cap_ptr)
-			downsample_2x2_xrgb((const uint32_t *)g_hw_pipe.sc_tile.cap_ptr,
-					    275, 164, tile_buf);
+			downsample_2x2_xrgb_stride((const uint32_t *)g_hw_pipe.sc_tile.cap_ptr,
+						   275, 164, tile_buf, tile_stride);
 		else
 			ok = false;
 	}
@@ -1348,9 +1482,11 @@ static bool hw_decode_and_scale_jpeg_file(const char *path,
 		ok = false;
 
 	if (!ok) {
-		free(card_buf);
-		free(tile_buf);
-		if (out_fs_720p)
+		if (!card_in_atlas)
+			free(card_buf);
+		if (!tile_in_atlas)
+			free(tile_buf);
+		if (out_fs_720p && !fs_in_atlas)
 			free(fs_buf);
 		return false;
 	}
@@ -2711,10 +2847,46 @@ static struct uri_cache_entry *find_uri_cache_entry(const char *resolved_path)
 		if (g_uri_cache[i].path[0] &&
 		    strcmp(g_uri_cache[i].path, resolved_path) == 0) {
 			g_uri_cache[i].last_used = ++g_cache_clock;
+#ifdef __linux__
+			touch_atlas1_slot(g_uri_cache[i].card_275);
+			touch_atlas1_slot(g_uri_cache[i].tile_275x164);
+#endif
 			return &g_uri_cache[i];
 		}
 	}
 	return NULL;
+}
+
+static void free_media_ptr(uint32_t **p)
+{
+	if (!p || !*p)
+		return;
+#ifdef __linux__
+	{
+		int i;
+		for (i = 0; i < 10; i++) {
+			if (g_atlas_card_slots[i].owner_ptr == p) {
+				g_atlas_card_slots[i].owner_ptr = NULL;
+				*p = NULL;
+				return;
+			}
+			if (g_atlas_tile_slots[i].owner_ptr == p) {
+				g_atlas_tile_slots[i].owner_ptr = NULL;
+				*p = NULL;
+				return;
+			}
+		}
+		for (i = 0; i < 2; i++) {
+			if (g_atlas_fs_slots[i].owner_ptr == p) {
+				g_atlas_fs_slots[i].owner_ptr = NULL;
+				*p = NULL;
+				return;
+			}
+		}
+	}
+#endif
+	free(*p);
+	*p = NULL;
 }
 
 static void evict_excess_fs_720p(const struct uri_cache_entry *keep)
@@ -2734,8 +2906,7 @@ static void evict_excess_fs_720p(const struct uri_cache_entry *keep)
 		}
 		if (active_fs < 2 || oldest_idx < 0)
 			break;
-		free(g_uri_cache[oldest_idx].fs_720p);
-		g_uri_cache[oldest_idx].fs_720p = NULL;
+		free_media_ptr(&g_uri_cache[oldest_idx].fs_720p);
 	}
 }
 
@@ -2768,10 +2939,14 @@ static struct uri_cache_entry *get_uri_cache_entry(const char *resolved_path,
 		int rw = 0, rh = 0;
 		uint32_t *raw = decode_image_file_raw(resolved_path, &rw, &rh);
 		if (raw) {
-			if (miss_card)
+			if (miss_card) {
 				hit->card_275 = scale_cover_bilinear(raw, rw, rh, 275, 312);
-			if (miss_tile)
+				promote_to_atlas1(false, &hit->card_275);
+			}
+			if (miss_tile) {
 				hit->tile_275x164 = scale_cover_bilinear(raw, rw, rh, 275, 164);
+				promote_to_atlas1(true, &hit->tile_275x164);
+			}
 			if (miss_fs) {
 				if (rw == SHELL_SCREEN_W && rh == SHELL_SCREEN_H) {
 					hit->fs_720p = raw;
@@ -2797,30 +2972,21 @@ static struct uri_cache_entry *get_uri_cache_entry(const char *resolved_path,
 	if (need_fs)
 		evict_excess_fs_720p(&g_uri_cache[victim]);
 
+	struct uri_cache_entry *e = &g_uri_cache[victim];
+	free_media_ptr(&e->card_275);
+	free_media_ptr(&e->tile_275x164);
+	free_media_ptr(&e->fs_720p);
+	memset(e, 0, sizeof(*e));
+
 #ifdef __linux__
-	{
-		uint32_t *hw_card = NULL;
-		uint32_t *hw_tile = NULL;
-		uint32_t *hw_fs = NULL;
-
-		if (hw_decode_and_scale_jpeg_file(resolved_path,
-						  need_card ? &hw_card : NULL,
-						  need_tile ? &hw_tile : NULL,
-						  need_fs   ? &hw_fs : NULL,
-						  NULL)) {
-			struct uri_cache_entry *e = &g_uri_cache[victim];
-
-			free(e->card_275);
-			free(e->tile_275x164);
-			free(e->fs_720p);
-			memset(e, 0, sizeof(*e));
-			snprintf(e->path, sizeof(e->path), "%s", resolved_path);
-			e->last_used = ++g_cache_clock;
-			e->card_275 = hw_card;
-			e->tile_275x164 = hw_tile;
-			e->fs_720p = hw_fs;
-			return e;
-		}
+	if (hw_decode_and_scale_jpeg_file(resolved_path,
+					  need_card ? &e->card_275 : NULL,
+					  need_tile ? &e->tile_275x164 : NULL,
+					  need_fs   ? &e->fs_720p : NULL,
+					  NULL)) {
+		snprintf(e->path, sizeof(e->path), "%s", resolved_path);
+		e->last_used = ++g_cache_clock;
+		return e;
 	}
 #endif
 
@@ -2829,18 +2995,16 @@ static struct uri_cache_entry *get_uri_cache_entry(const char *resolved_path,
 	if (!raw)
 		return NULL;
 
-	struct uri_cache_entry *e = &g_uri_cache[victim];
-	free(e->card_275);
-	free(e->tile_275x164);
-	free(e->fs_720p);
-	memset(e, 0, sizeof(*e));
-
 	snprintf(e->path, sizeof(e->path), "%s", resolved_path);
 	e->last_used = ++g_cache_clock;
-	if (need_card)
+	if (need_card) {
 		e->card_275 = scale_cover_bilinear(raw, rw, rh, 275, 312);
-	if (need_tile)
+		promote_to_atlas1(false, &e->card_275);
+	}
+	if (need_tile) {
 		e->tile_275x164 = scale_cover_bilinear(raw, rw, rh, 275, 164);
+		promote_to_atlas1(true, &e->tile_275x164);
+	}
 	if (need_fs) {
 		if (rw == SHELL_SCREEN_W && rh == SHELL_SCREEN_H) {
 			e->fs_720p = raw;
@@ -2862,8 +3026,13 @@ static const uint32_t *ensure_preset_art_loaded(enum giri_preset_art preset, boo
 
 	if (preset < 0 || preset >= GIRI_ART_COUNT)
 		preset = GIRI_ART_DAWN_RIDGE;
-	if (!need_card && !need_tile)
-		return want_tile ? g_art_cache[preset].tile_275x164 : g_art_cache[preset].card_275;
+	if (!need_card && !need_tile) {
+		const uint32_t *cached = want_tile ? g_art_cache[preset].tile_275x164 : g_art_cache[preset].card_275;
+#ifdef __linux__
+		touch_atlas1_slot(cached);
+#endif
+		return cached;
+	}
 
 	ph_name = preset_placeholder_names[preset];
 	if (ph_name && resolve_placeholder_path(ph_name, ph_path, sizeof(ph_path))) {
@@ -2877,19 +3046,27 @@ static const uint32_t *ensure_preset_art_loaded(enum giri_preset_art preset, boo
 		int rw = 0, rh = 0;
 		uint32_t *raw = decode_image_file_raw(ph_path, &rw, &rh);
 		if (raw) {
-			if (need_card)
+			if (need_card) {
 				g_art_cache[preset].card_275 = scale_cover_bilinear(raw, rw, rh, 275, 312);
-			if (need_tile)
+				promote_to_atlas1(false, &g_art_cache[preset].card_275);
+			}
+			if (need_tile) {
 				g_art_cache[preset].tile_275x164 = scale_cover_bilinear(raw, rw, rh, 275, 164);
+				promote_to_atlas1(true, &g_art_cache[preset].tile_275x164);
+			}
 			free(raw);
 			return want_tile ? g_art_cache[preset].tile_275x164 : g_art_cache[preset].card_275;
 		}
 	}
 
-	if (need_card)
+	if (need_card) {
 		g_art_cache[preset].card_275 = rasterize_preset_surface(preset, 275, 312);
-	if (need_tile)
+		promote_to_atlas1(false, &g_art_cache[preset].card_275);
+	}
+	if (need_tile) {
 		g_art_cache[preset].tile_275x164 = rasterize_preset_surface(preset, 275, 164);
+		promote_to_atlas1(true, &g_art_cache[preset].tile_275x164);
+	}
 	return want_tile ? g_art_cache[preset].tile_275x164 : g_art_cache[preset].card_275;
 }
 
@@ -3302,15 +3479,15 @@ void shell_media_free(void)
 	hw_pipe_close();
 #endif
 	for (i = 0; i < GIRI_ART_COUNT; i++) {
-		free(g_art_cache[i].card_275);
-		free(g_art_cache[i].tile_275x164);
-		free(g_art_cache[i].fs_720p);
+		free_media_ptr(&g_art_cache[i].card_275);
+		free_media_ptr(&g_art_cache[i].tile_275x164);
+		free_media_ptr(&g_art_cache[i].fs_720p);
 		memset(&g_art_cache[i], 0, sizeof(g_art_cache[i]));
 	}
 	for (i = 0; i < URI_CACHE_SLOTS; i++) {
-		free(g_uri_cache[i].card_275);
-		free(g_uri_cache[i].tile_275x164);
-		free(g_uri_cache[i].fs_720p);
+		free_media_ptr(&g_uri_cache[i].card_275);
+		free_media_ptr(&g_uri_cache[i].tile_275x164);
+		free_media_ptr(&g_uri_cache[i].fs_720p);
 		memset(&g_uri_cache[i], 0, sizeof(g_uri_cache[i]));
 	}
 	free(g_vid_frame_buf);
@@ -3671,7 +3848,7 @@ const uint32_t *shell_media_get_video_frame(const struct giri_media_card *card,
 		return NULL;
 
 #ifdef __linux__
-	/* Fast hardware V4L2 path (used by --bench and non-DRM fallback) */
+	/* Fast hardware V4L2 path (used by GPU mode, --bench, and non-DRM fallback) */
 	if (hw_pipe_init()) {
 		struct v4l2_rect crop;
 		int src_w = 0, src_h = 0;
@@ -3679,6 +3856,19 @@ const uint32_t *shell_media_get_video_frame(const struct giri_media_card *card,
 		if (qt_mov_open_for_card(card) &&
 		    hw_decode_mov_frame_to_nv12(frame_idx, &src_w, &src_h)) {
 			compute_cover_crop_rect(src_w, src_h, SHELL_SCREEN_W, SHELL_SCREEN_H, &crop);
+			if (shell_gpu_active() && g_hw_pipe.sc_vid.streaming) {
+				uint32_t *fs_ptr = NULL;
+				int fs_fd = shell_gpu_fs_atlas_dmabuf_fd(0, &fs_ptr, NULL);
+
+				if (fs_fd >= 0 && fs_ptr &&
+				    hw_m2sc_dmabuf_run(&g_hw_pipe.sc_vid, &crop, 0, fs_fd)) {
+					if (g_atlas_fs_slots[0].owner_ptr) {
+						*g_atlas_fs_slots[0].owner_ptr = NULL;
+						g_atlas_fs_slots[0].owner_ptr = NULL;
+					}
+					return fs_ptr;
+				}
+			}
 			if (hw_m2sc_queue_job(&g_hw_pipe.sc_fs, &crop) &&
 			    hw_m2sc_wait_job(&g_hw_pipe.sc_fs, NULL))
 				return (const uint32_t *)g_hw_pipe.sc_fs.cap_ptr;
@@ -3737,6 +3927,19 @@ const uint32_t *shell_media_get_video_frame(const struct giri_media_card *card,
 		}
 		if (resolved[0] && hw_decode_jpeg_file_to_nv12(resolved, &src_w, &src_h)) {
 			compute_pan_zoom_crop(src_w, src_h, frame_idx, &anim_r);
+			if (shell_gpu_active() && g_hw_pipe.sc_vid.streaming) {
+				uint32_t *fs_ptr = NULL;
+				int fs_fd = shell_gpu_fs_atlas_dmabuf_fd(0, &fs_ptr, NULL);
+
+				if (fs_fd >= 0 && fs_ptr &&
+				    hw_m2sc_dmabuf_run(&g_hw_pipe.sc_vid, &anim_r, 0, fs_fd)) {
+					if (g_atlas_fs_slots[0].owner_ptr) {
+						*g_atlas_fs_slots[0].owner_ptr = NULL;
+						g_atlas_fs_slots[0].owner_ptr = NULL;
+					}
+					return fs_ptr;
+				}
+			}
 			if (hw_m2sc_queue_job(&g_hw_pipe.sc_fs, &anim_r) &&
 			    hw_m2sc_wait_job(&g_hw_pipe.sc_fs, NULL))
 				return (const uint32_t *)g_hw_pipe.sc_fs.cap_ptr;

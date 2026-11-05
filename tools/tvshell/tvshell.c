@@ -31,6 +31,7 @@
 
 #include "tvshell.h"
 #include "shell_assets.h"
+#include "shell_gpu.h"
 
 #define HISTORY_MAX		12
 #define QUICK_PROMPTS_COUNT	7
@@ -1566,7 +1567,7 @@ static void render_window_main_incremental(const struct shell_theme *th)
 {
 	int i;
 
-	if (!g_ui.main_bg_valid || g_ui.backbuf_modal_win != -1) {
+	if (shell_gpu_active() || !g_ui.main_bg_valid || g_ui.backbuf_modal_win != -1) {
 		render_window_main(th);
 		return;
 	}
@@ -1625,12 +1626,12 @@ static void render_video_hud_dock(const struct shell_theme *th,
 	hud_rects[2][2] = dw;
 	hud_rects[2][3] = dh;
 
-	if (!g_ui.overlay_hud_dirty)
+	if (!g_ui.overlay_hud_dirty && !shell_gpu_active())
 		return;
 	g_ui.overlay_hud_dirty = false;
 
 	/* 1. Top-left badge + source pill */
-	shell_draw_rect(bx - 8, by - 4, top_w, 36, 0xff0c0f16U);
+	shell_draw_rounded_rect(bx - 8, by - 4, top_w, 36, 8, 0xff0c0f16U);
 	shell_draw_rounded_outline(bx - 8, by - 4, top_w, 36, 8, 1, 0xff263044U);
 	shell_draw_rounded_rect(bx, by, badge_w, 28, 6, th->accent);
 	shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 12,
@@ -1641,14 +1642,14 @@ static void render_video_hud_dock(const struct shell_theme *th,
 				  g_ui.overlay_source, top_w - badge_w - 26);
 
 	/* 2. Top-right Back pill */
-	shell_draw_rect(hx, by - 2, hw, 32, 0xff0f1218U);
+	shell_draw_rounded_rect(hx, by - 2, hw, 32, 8, 0xff0f1218U);
 	shell_draw_rounded_outline(hx, by - 2, hw, 32, 8, 2, th->focus_ring);
 	shell_font_draw_box_centered(SHELL_FONT_MONO_SEMIBOLD, 13,
 				     hx, by - 2, hw, 32,
 				     0xfff8fafcU, hint);
 
 	/* 3. Bottom cinema player dock */
-	shell_draw_rect(dx, dy, dw, dh, 0xff0b0e14U);
+	shell_draw_rounded_rect(dx, dy, dw, dh, 12, 0xff0b0e14U);
 	shell_draw_rounded_outline(dx, dy, dw, dh, 12, 1, 0xff263044U);
 
 	{
@@ -1702,7 +1703,7 @@ static void render_window_media_overlay(const struct shell_theme *th)
 	 * s5l8947x-jpeg (/dev/video2) -> NV12 DMABUF -> s5l8947x-m2sc (/dev/video1)
 	 * -> back DRM dumb buffer DMABUF, then composite only the 3 HUD pills.
 	 */
-	if (g_ui.overlay_is_video) {
+	if (g_ui.overlay_is_video && !shell_gpu_active()) {
 		int vdmabuf_fd = -1;
 		int vbuf_idx = shell_display_prepare_video_backbuf(&vdmabuf_fd);
 
@@ -1727,6 +1728,13 @@ static void render_window_media_overlay(const struct shell_theme *th)
 		shell_draw_bitmap_xrgb(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, fs_art);
 	else
 		shell_draw_rect(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H, 0xff060709U);
+
+	if (g_ui.overlay_is_video && shell_gpu_active()) {
+		int hud_rects[3][4];
+
+		render_video_hud_dock(th, hud_rects);
+		return;
+	}
 
 	if (g_ui.overlay_card.preset_art == GIRI_ART_DOOM_GAME)
 		draw_doom_art_labels(0, 0, SHELL_SCREEN_W, SHELL_SCREEN_H);
@@ -1878,10 +1886,11 @@ static void render_window_ask_modal(const struct shell_theme *th)
 	int dx = 180, dy = 152, dw = 920, dh = 416;
 
 	get_modal_palette(th, &mp);
-	if (g_ui.backbuf_modal_win != GIRI_WIN_ASK_MODAL ||
+	if (shell_gpu_active() ||
+	    g_ui.backbuf_modal_win != GIRI_WIN_ASK_MODAL ||
 	    g_ui.backbuf_modal_theme != (int)g_ui.theme_id ||
 	    g_ui.backbuf_modal_hist_idx != g_ui.history_idx) {
-		if (!g_ui.main_bg_valid)
+		if (shell_gpu_active() || !g_ui.main_bg_valid)
 			render_window_main(th);
 		draw_modal_backdrop_and_frame(&mp, dx, dy, dw, dh);
 		g_ui.main_bg_valid = false;
@@ -2062,10 +2071,11 @@ static void render_window_settings_modal(const struct shell_theme *th)
 	int dx = 160, dy = 42, dw = 960, dh = 636;
 
 	get_modal_palette(th, &mp);
-	if (g_ui.backbuf_modal_win != GIRI_WIN_SETTINGS_MODAL ||
+	if (shell_gpu_active() ||
+	    g_ui.backbuf_modal_win != GIRI_WIN_SETTINGS_MODAL ||
 	    g_ui.backbuf_modal_theme != (int)g_ui.theme_id ||
 	    g_ui.backbuf_modal_hist_idx != g_ui.history_idx) {
-		if (!g_ui.main_bg_valid)
+		if (shell_gpu_active() || !g_ui.main_bg_valid)
 			render_window_main(th);
 		draw_modal_backdrop_and_frame(&mp, dx, dy, dw, dh);
 		g_ui.main_bg_valid = false;
@@ -3100,7 +3110,8 @@ int main(int argc, char **argv)
 	g_ui.allow_async_art = true;
 	while (g_running) {
 		struct shell_input_event ev;
-		int timeout_ms = (g_ui.is_working || g_ui.cards_need_preload) ? 16 :
+		int timeout_ms = g_ui.cards_need_preload ? 16 :
+				 g_ui.is_working ? 50 :
 				 (g_ui.tts_speaking ||
 				  g_ui.active_win == GIRI_WIN_SETTINGS_MODAL) ? 30 : 250;
 		bool dirty = false;
