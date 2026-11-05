@@ -44,11 +44,12 @@ static inline void mark_visited(size_t o)
 
 static size_t walk(size_t start)
 {
-	size_t o = start, e = 0, p;
+	size_t o = start, e = 0;
 
 	for (;;) {
-		if (o + 3 > size || data[o + 1] != OP_HI_VENDOR)
+		if (o + 3 > size || data[o + 1] != OP_HI_VENDOR || is_visited(o))
 			break;
+		mark_visited(o);
 		if (data[o] == OP_LAUNCH_RAM) {
 			e = o + 3 + data[o + 2];
 			if (e > size)
@@ -59,23 +60,21 @@ static size_t walk(size_t start)
 		if (o >= size)
 			break;
 	}
-	if (e && e - start >= MIN_PATCH) {
-		for (p = start; p + 3 <= size && data[p + 1] == OP_HI_VENDOR;
-		     p += 3 + data[p + 2]) {
-			mark_visited(p);
-			if (data[p] == OP_LAUNCH_RAM)
-				break;
-		}
-	}
 	return e;
 }
 
 static int contains(const uint8_t *p, size_t len, const char *name)
 {
 	size_t n = strlen(name), i, j;
+	uint8_t c0;
 
-	for (i = 0; n && i + n <= len; i++) {
-		for (j = 0; j < n; j++)
+	if (!n || len < n)
+		return 0;
+	c0 = (uint8_t)tolower((unsigned char)name[0]);
+	for (i = 0; i + n <= len; i++) {
+		if ((uint8_t)tolower(p[i]) != c0)
+			continue;
+		for (j = 1; j < n; j++)
 			if (tolower(p[i + j]) != tolower((unsigned char)name[j]))
 				break;
 		if (j == n)

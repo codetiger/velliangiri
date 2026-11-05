@@ -204,4 +204,41 @@ In Linux `7.x`, the upstream kernel consolidated architecture-specific NEON/ARM 
 | **AES-128-CBC (ARM Scalar / Library)** | `19.0 MB/s` (`cbc(aes-arm)`) | **`22.7 MB/s` (`cbc-aes-lib`)** | **`+19.5%` faster** via `CONFIG_CRYPTO_LIB_AES_CBC` (`prio 200`) |
 | **AES-128-CTR (ARM NEON bit-sliced)** | `33.0 MB/s` (`ctr-aes-neonbs`) | `33.0 MB/s` (`ctr-aes-neonbs`) | Identical (`prio 250`) |
 | **ChaCha20 (ARM NEON)** | `73.9 MB/s` (`chacha20-neon`) | `71.3 MB/s` (`chacha20-lib`) | Consolidated into `lib/crypto/arm/chacha.h` (`prio 300`) |
-| **AES-128-CBC (`s5l8947x-aes` CDMA)** | `70.8 MB/s` (`s5l8947x-cbc-aes`) | In-kernel CDMA (`prio 300`) | Registered for in-kernel FTL/DM-Crypt consumers; masked from userspace `AF_ALG` by `CRYPTO_ALG_KERN_DRIVER_ONLY` in 7.x |
+| **AES-128-CBC (`s5l8947x-aes` CDMA)** | `70.8 MB/s` (`s5l8947x-aes`) | In-kernel CDMA (`prio 300`) | Registered for in-kernel FTL/DM-Crypt consumers; masked from userspace `AF_ALG` by `CRYPTO_ALG_KERN_DRIVER_ONLY` in 7.x |
+
+---
+
+## 8. Full-Stack Lean & Performance Optimization Impact (`Linux 7.3.1 #3`)
+
+Measured on live `S5L8947X` (`j33iap`) hardware at **`850 MHz`** (`performance` governor) comparing the pre-audit `Linux 7.3.1 #1` baseline against the post-audit `Linux 7.3.1 #3` build (Phases 1–5: zero-media rootfs, 64-bit `apple-aic1-time` clocksource, batched SGX543 MMU mapping, trimmed `sgx_pb_image()` zeroing, lazy `tvshell` surface allocation, and single-pass `hcdcarve`):
+
+### Image Footprint, Boot Time & System Memory
+
+| Metric | Pre-Audit (`7.3.1 #1`) | Post-Audit (`7.3.1 #3`) | Improvement |
+|---|---:|---:|---|
+| **Initramfs Archive (`initramfs-s5l8947x.cpio`)** | `140.0 MB` | **`25.0 MB`** | **`-82.1%`** (`-115.0 MB`, zero bundled media) |
+| **Rootfs SquashFS (`out/rootfs.sqsh`)** | `431.0 MB` | **`53.0 MB`** | **`-87.7%`** (`-378.0 MB`) |
+| **`/usr/local` SquashFS (`build/usr-local.sqsh`)** | `369.0 MB` | **`56.0 MB`** | **`-84.8%`** (`-313.0 MB`) |
+| **Uncompressed Kernel `out/Image`** | `158.0 MB` | **`41.0 MB`** | **`-74.1%`** (`-117.0 MB`) |
+| **Compressed `zImage` & DFU Boot Bundle** | `21.0 MB` | **`12.0 MB`** | **`-42.9%`** (`-9.0 MB`) |
+| **Stage 3 DFU Bundle Upload Time** | ~`17.8 s` | **`10.120 s`** | **`1.76x` faster** (`-7.7 s`) |
+| **Stage 5 Kernel + Initramfs -> USB Console** | `14.733 s` | **`13.367 s`** | **`-1.366 s` (`+9.3%` faster)** |
+| **System Free / Available RAM (`free -m`)** | ~`171 MB` free | **`286 MB` free / `349 MB` available** | **`+115 MB` usable RAM** (`53 MB` total used) |
+| **`tvshell` Resident Memory (`VmRSS` at 720p60)** | ~`48,000 kB` | **`9,668 kB` (`9.4 MB`)** | **`4.96x` lower RSS** (`-38.3 MB`, lazy card/tile decode) |
+
+### SGX543 GPU, Boot Carvers & Subsystem Benchmarks (`850 MHz`)
+
+| Workload | Pre-Audit (`7.3.1 #1`) | Post-Audit (`7.3.1 #3`) | Improvement |
+|---|---:|---:|---|
+| **`glcubes` `1920x1080` Context Init (`context`)** | `266.5 ms` | **`80.0 ms`** | **`3.33x` faster** (`-186.5 ms`; batched MMU + 324 KiB PB init) |
+| **`glcubes` `1920x1080` Total Startup (`load_ms`)** | `427.7 ms` | **`237.1 ms`** | **`1.80x` faster** (`-190.6 ms`; `5.84x` vs original `1384.2 ms`) |
+| **`glcubes` `1920x1080` Render (`avg_ms` / `min_ms`)** | `20.41 ms` / `17.39 ms` | **`19.76 ms` / `17.02 ms`** | **`50.60 fps`** (`+3.3%`, crosses 50 FPS at 1080p) |
+| **`glcubes` `1280x720` Offscreen (`avg_ms` / `fps`)** | — | **`10.20 ms` (`8.82 ms` min) / `98.01 fps`** | `203.6 ms` total load (`81.8 ms` context) |
+| **`glcubes` `1280x720` HDMI `--screen` (`720p60`)** | — | **`96.84 fps` render / `51.44 fps` presented** | `286.7 ms` load, `9.11 ms` avg DRM flip |
+| **`sgx2d` Hardware 2D Blit (64×64 -> 720p + 360p)** | — | **`17.00 ms` / process** | Pre-initialized static 2D blit templates in `sgx_blit_init()` |
+| **`hcdcarve` (`BCM4334B0.hcd`, 50 iters)** | `218.6 ms/iter` (`24.31 MB/s`) | **`159.4 ms/iter` (`33.34 MB/s`)** | **`+37.1%` faster** (`1.37x`) + **32x less RAM** (1-bit `visited` bitmap) |
+| **`sgxcarve` (`sgx.fw`, 10 iters)** | `298.0 ms/iter` (`24.66 MB/s`) | **`303.0 ms/iter` (`24.25 MB/s`)** | Shared `carve_common.h` (`crc=7db5bc6e` bit-exact) |
+| **`jitterseed` Early Entropy Seeder (`2048` samples)** | ~`38 ms/iter` | **`10.0 ms/iter`** | **`3.8x` faster** (halved `clock_gettime` calls + `apple-aic1-time`) |
+| **Encrypted HFS+ Read (`/mnt/data`, 32 MiB cold)** | — | **`12.17 MB/s` (`2.63 s`)** | `s5l8947x-fmi` + `s5l8947x-ftl` + `s5l8947x-aes` CDMA (`91%` of raw NAND) |
+| **L1 / L2 / DRAM Latency & Bandwidth (`l2bench`)** | `4.7 / 67.4 / 157.8 ns`, `3727 / 1625 MB/s` | **`4.7 / 67.9 / 159.2 ns`, `3719 / 1614 MB/s`** | Full parity |
+| **Hardware Test Suite (`/bin/hwtest`)** | `127 passed, 0 failed` | **`127 passed, 0 failed`** | Zero kernel warnings or regressions |

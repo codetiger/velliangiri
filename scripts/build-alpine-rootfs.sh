@@ -53,9 +53,9 @@ python3 "${ROOT}/scripts/apk-unpack.py" \
 
 # Cross-compile the early entropy seeder, diagnostic tools, the WAV player, the BT patch/tools and the firmware carvers
 # ("<installed name>:<source in scripts/tools>")
-echo "[rootfs] Cross-compiling userspace tools (-Os -s --gc-sections -mcpu=cortex-a9 -mfpu=neon) ..."
+echo "[rootfs] Cross-compiling userspace tools (-O2 -s --gc-sections -mcpu=cortex-a9 -mfpu=neon) ..."
 for tool in jitterseed:jitterseed.c peek:mmio-peek.c i2cpoke:i2c-poke.c wavplay:wavplay.c l2bench:l2bench.c fbtest:fbtest.c btscan:btscan.c hcdcarve:hcdcarve.c sgxcarve:sgxcarve.c glcarve:glcarve.c vxdcarve:vxdcarve.c iopcarve:iopcarve.c m2mtest:m2mtest.c m2mshow:m2mshow.c jpegtest:jpegtest.c sgxinfo:sgxinfo.c sgxgem:sgxgem.c sgx2d:sgx2d.c sgxpresent:sgxpresent.c nand-restore:nand-restore.c; do
-	"${CROSS_CC}" -Os -s -ffunction-sections -fdata-sections -Wl,--gc-sections \
+	"${CROSS_CC}" -O2 -s -ffunction-sections -fdata-sections -Wl,--gc-sections \
 		-mcpu=cortex-a9 -mfpu=neon -Wall -Wextra -static \
 		-I "${ROOT}/tools" -I "${ROOT}/scripts/tools" \
 		-o "${STAGE_DIR}/bin/${tool%%:*}" "${ROOT}/scripts/tools/${tool#*:}" -lm
@@ -66,7 +66,7 @@ done
 # from the template-frame library in the Mesa driver (no Mesa headers).
 SGXLIB="${ROOT}/tools/mesa-sgx/files/src/gallium/drivers/sgx"
 if [ -f "${ROOT}/tools/sgx/sgxframe.c" ]; then
-	"${CROSS_CC}" -Os -s -ffunction-sections -fdata-sections -Wl,--gc-sections \
+	"${CROSS_CC}" -O2 -s -ffunction-sections -fdata-sections -Wl,--gc-sections \
 		-mcpu=cortex-a9 -mfpu=neon -Wall -Wextra -static \
 		-I "${ROOT}/tools" -I "${SGXLIB}" -o "${STAGE_DIR}/bin/sgxframe" \
 		"${ROOT}/tools/sgx/sgxframe.c" \
