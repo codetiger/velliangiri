@@ -1051,27 +1051,24 @@ int shell_font_init(void)
 		(void)ttf_load_file(&fonts[r], path);
 	}
 
-	/* Pre-warm all UI sizes so interactive navigation and modals never miss cache */
+	/*
+	 * Pre-warm only the 10 primary Window 0 (home screen) font roles/sizes
+	 * at startup; secondary modal and overlay sizes rasterize lazily on first
+	 * open in <0.5 ms and are cached in the glyph hash table + SGX Atlas 0.
+	 */
 	static const struct {
 		enum shell_font_role role;
 		int size_px;
 	} warmup[] = {
-		{ SHELL_FONT_SANS_BOLD,     24 },
-		{ SHELL_FONT_SANS_BOLD,     22 },
-		{ SHELL_FONT_SANS_BOLD,     21 },
 		{ SHELL_FONT_SANS_BOLD,     18 },
 		{ SHELL_FONT_SANS_BOLD,     17 },
 		{ SHELL_FONT_SANS_BOLD,     15 },
 		{ SHELL_FONT_SANS_SEMIBOLD, 20 },
-		{ SHELL_FONT_SANS_SEMIBOLD, 19 },
 		{ SHELL_FONT_SANS_SEMIBOLD, 14 },
-		{ SHELL_FONT_SANS_MEDIUM,   18 },
 		{ SHELL_FONT_SANS_MEDIUM,   15 },
 		{ SHELL_FONT_SANS_MEDIUM,   13 },
-		{ SHELL_FONT_SANS_MEDIUM,   11 },
 		{ SHELL_FONT_MONO_SEMIBOLD, 12 },
 		{ SHELL_FONT_MONO_SEMIBOLD, 11 },
-		{ SHELL_FONT_MONO_MEDIUM,   13 },
 		{ SHELL_FONT_MONO_MEDIUM,   11 },
 	};
 	static const uint32_t special_cps[] = {

@@ -1701,9 +1701,10 @@ static void render_window_media_overlay(const struct shell_theme *th)
 	/*
 	 * Zero-copy hardware DMABUF video scanout fast path:
 	 * s5l8947x-jpeg (/dev/video2) -> NV12 DMABUF -> s5l8947x-m2sc (/dev/video1)
-	 * -> back DRM dumb buffer DMABUF, then composite only the 3 HUD pills.
+	 * -> back DRM dumb buffer DMABUF, then composite only the 3 HUD pills
+	 * (via SGX543 hardware background tile reload when GPU is active).
 	 */
-	if (g_ui.overlay_is_video && !shell_gpu_active()) {
+	if (g_ui.overlay_is_video) {
 		int vdmabuf_fd = -1;
 		int vbuf_idx = shell_display_prepare_video_backbuf(&vdmabuf_fd);
 

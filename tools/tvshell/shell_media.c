@@ -679,7 +679,6 @@ static struct {
 
 	struct hw_m2sc_ctx sc_card;	/* 550 x 624 (2x SS -> 275 x 312) on scaler0 */
 	struct hw_m2sc_ctx sc_tile;	/* 550 x 328 (2x SS -> 275 x 164) on scaler0 */
-	struct hw_m2sc_ctx sc_atlas;	/* 1680 x 960 zero-copy Atlas 1 DMABUF on scaler0 */
 	struct hw_m2sc_ctx sc_fs;	/* 1280 x 720 XRGB32 on scaler1 (MMAP) */
 	struct hw_m2sc_ctx sc_vid;	/* 1280 x 720 XRGB32 on scaler1 (DRM DMABUF) */
 } g_hw_pipe = {
@@ -687,7 +686,6 @@ static struct {
 	.nv12_dmabuf_fd = -1,
 	.sc_card = { .fd = -1 },
 	.sc_tile = { .fd = -1 },
-	.sc_atlas = { .fd = -1 },
 	.sc_fs = { .fd = -1 },
 	.sc_vid = { .fd = -1 },
 };
@@ -753,7 +751,6 @@ static void hw_pipe_close(void)
 {
 	hw_m2sc_ctx_close(&g_hw_pipe.sc_card);
 	hw_m2sc_ctx_close(&g_hw_pipe.sc_tile);
-	hw_m2sc_ctx_close(&g_hw_pipe.sc_atlas);
 	hw_m2sc_ctx_close(&g_hw_pipe.sc_fs);
 	hw_m2sc_ctx_close(&g_hw_pipe.sc_vid);
 
@@ -956,10 +953,6 @@ static bool hw_pipe_init(void)
 		goto err;
 	if (!hw_m2sc_ctx_init(&g_hw_pipe.sc_tile, g_hw_pipe.m2sc_dev[0], 550, 328, false))
 		goto err;
-	if (shell_gpu_active() && shell_gpu_atlas1_dmabuf_fd() >= 0) {
-		(void)hw_m2sc_ctx_init(&g_hw_pipe.sc_atlas, g_hw_pipe.m2sc_dev[0],
-				       2048, 1024, true);
-	}
 	if (!hw_m2sc_ctx_init(&g_hw_pipe.sc_fs, fs_dev, SHELL_SCREEN_W, SHELL_SCREEN_H, false))
 		goto err;
 	(void)hw_m2sc_ctx_init(&g_hw_pipe.sc_vid, fs_dev, SHELL_SCREEN_W, SHELL_SCREEN_H, true);
@@ -3210,23 +3203,47 @@ static void vid_audio_fill_period_locked(int16_t *dst_stereo, uint32_t frames)
 		return;
 	}
 
-	/* Gentle stereo ambient harmonic chord for non-.mov video stream cards */
+	/*
+	 * Gentle stereo ambient harmonic chord for non-.mov video stream cards.
+	 * Uses a precomputed 1024-entry Q12 sine LUT and 32-bit fixed-point
+	 * phase accumulators instead of 7 per-sample sinf() calls (eliminating
+	 * 336,000 floating-point transcendental evaluations/sec at 48 kHz).
+	 */
 	{
+		static int16_t sin_lut[1024];
+		static bool lut_ready;
 		uint32_t i;
-		float rate_f = (float)(g_vid_audio.rate > 0 ? g_vid_audio.rate : 48000);
+		uint32_t rate = g_vid_audio.rate > 0 ? g_vid_audio.rate : 48000;
+		uint64_t scale = 4294967296ULL;
+		uint32_t inc_env   = (uint32_t)((scale * 127) / ((uint64_t)rate * 1000));
+		uint32_t inc_l0    = (uint32_t)((scale * 22000) / ((uint64_t)rate * 100));
+		uint32_t inc_l1    = (uint32_t)((scale * 32963) / ((uint64_t)rate * 100));
+		uint32_t inc_l2    = (uint32_t)((scale * 44000) / ((uint64_t)rate * 100));
+		uint32_t inc_r0    = (uint32_t)((scale * 22050) / ((uint64_t)rate * 100));
+		uint32_t inc_r1    = (uint32_t)((scale * 33000) / ((uint64_t)rate * 100));
+		uint32_t inc_r2    = (uint32_t)((scale * 55437) / ((uint64_t)rate * 100));
+
+		if (!lut_ready) {
+			for (i = 0; i < 1024; i++) {
+				sin_lut[i] = (int16_t)(sinf((float)i * (2.0f * 3.14159265f / 1024.0f)) *
+						       4096.0f);
+			}
+			lut_ready = true;
+		}
 
 		for (i = 0; i < frames; i++) {
 			uint32_t p = g_vid_audio.synth_phase++;
-			float t = (float)p / rate_f;
-			float env = 0.55f + 0.35f * sinf(t * 0.8f);
-			float l = sinf(t * 2.0f * 3.14159265f * 220.0f) * 0.45f +
-				  sinf(t * 2.0f * 3.14159265f * 329.63f) * 0.30f +
-				  sinf(t * 2.0f * 3.14159265f * 440.0f) * 0.20f;
-			float r = sinf(t * 2.0f * 3.14159265f * 220.5f) * 0.45f +
-				  sinf(t * 2.0f * 3.14159265f * 330.0f) * 0.30f +
-				  sinf(t * 2.0f * 3.14159265f * 554.37f) * 0.20f;
-			dst_stereo[i * 2]     = (int16_t)(l * env * 2800.0f);
-			dst_stereo[i * 2 + 1] = (int16_t)(r * env * 2800.0f);
+			int32_t s_env = sin_lut[(uint32_t)(p * inc_env) >> 22];
+			int32_t env_q12 = 2253 + ((1434 * s_env) >> 12);
+			int32_t l_q12 = (45 * (int32_t)sin_lut[(uint32_t)(p * inc_l0) >> 22] +
+					 30 * (int32_t)sin_lut[(uint32_t)(p * inc_l1) >> 22] +
+					 20 * (int32_t)sin_lut[(uint32_t)(p * inc_l2) >> 22]) / 100;
+			int32_t r_q12 = (45 * (int32_t)sin_lut[(uint32_t)(p * inc_r0) >> 22] +
+					 30 * (int32_t)sin_lut[(uint32_t)(p * inc_r1) >> 22] +
+					 20 * (int32_t)sin_lut[(uint32_t)(p * inc_r2) >> 22]) / 100;
+
+			dst_stereo[i * 2]     = (int16_t)(((int64_t)l_q12 * env_q12 * 2800LL) >> 24);
+			dst_stereo[i * 2 + 1] = (int16_t)(((int64_t)r_q12 * env_q12 * 2800LL) >> 24);
 		}
 		if (g_vid_audio.total_frames > 0)
 			g_vid_audio.pcm_pos = (g_vid_audio.pcm_pos + frames) %

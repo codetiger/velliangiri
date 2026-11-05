@@ -81,19 +81,23 @@ bool shell_gpu_draw_bitmap_rect(int dst_x, int dst_y,
 				uint8_t alpha);
 
 /*
- * Zero-copy DMABUF Atlas accessors for M2SC0 hardware scaler (shell_media.c).
- * Atlas 1 (1400x960 contiguous BO):
+ * Zero-copy DMABUF & Atlas accessors for M2SC0/1 hardware scalers (shell_media.c).
+ * Atlas 1 (2048x1024 POT texture BO):
  *   - 10 Card slots (276x312) at y = 0, 312
  *   - 10 Tile slots (276x164) at y = 624, 788
- * Atlas 2 & 3 (1280x720 contiguous BOs):
+ *   - Persistent static bitmap cache & dynamic staging columns at x >= 1402
+ * Atlas 2 & 3 (1280x720 contiguous DMABUF BOs):
  *   - Fullscreen background & photo viewer slots
  */
-int shell_gpu_atlas1_dmabuf_fd(void);
 uint32_t *shell_gpu_atlas1_slot_ptr(bool is_tile, int slot_idx,
 				    int *out_x, int *out_y,
 				    int *out_stride_bytes,
 				    int *out_full_w, int *out_full_h);
 int shell_gpu_fs_atlas_dmabuf_fd(int fs_idx, uint32_t **out_ptr,
 				 int *out_stride_bytes);
+
+/* Shared 2x2-supersampled SDF corner coverage tables (shell_display.c) */
+uint8_t shell_sdf_corner_cov(int radius, int cy, int cx);
+uint8_t shell_sdf_corner_stroke(int radius, int thickness, int cy, int cx);
 
 #endif /* TVSHELL_GPU_H */

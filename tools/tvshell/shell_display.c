@@ -386,6 +386,25 @@ static void init_corner_luts(void)
 	g_corner_luts_ready = true;
 }
 
+uint8_t shell_sdf_corner_cov(int radius, int cy, int cx)
+{
+	init_corner_luts();
+	if (radius < 1 || radius > MAX_PRECOMP_RADIUS ||
+	    cy < 0 || cy >= radius || cx < 0 || cx >= radius)
+		return 255;
+	return g_corner_cov_lut[radius][cy][cx];
+}
+
+uint8_t shell_sdf_corner_stroke(int radius, int thickness, int cy, int cx)
+{
+	init_corner_luts();
+	if (radius < 1 || radius > MAX_PRECOMP_RADIUS ||
+	    thickness < 1 || thickness > MAX_PRECOMP_THICK ||
+	    cy < 0 || cy >= radius || cx < 0 || cx >= radius)
+		return 0;
+	return g_corner_stroke_lut[radius][thickness][cy][cx];
+}
+
 static bool drm_find_720p30(int fd)
 {
 	struct drm_mode_card_res res = { 0 };

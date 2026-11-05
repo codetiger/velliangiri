@@ -137,8 +137,8 @@ static struct {
 
 	/* Texture Atlases */
 	struct sgx_bo atlas0;		/* 1024x1024 UI primitives & FreeType glyphs */
-	struct sgx_bo atlas1;		/* 1680x960 M2SC0 photo cards & tiles */
-	struct sgx_bo atlas_fs[2];	/* 1280x720 M2SC0 fullscreen photos */
+	struct sgx_bo atlas1;		/* 2048x1024 M2SC0 photo cards, tiles & cached icons */
+	struct sgx_bo atlas_fs[2];	/* 1280x720 M2SC1 fullscreen photos */
 
 	/* Imported (or headless) scanout render targets */
 	int num_targets;
@@ -171,6 +171,17 @@ static struct {
 	uint16_t shelf_x;
 	uint16_t shelf_y;
 	uint16_t shelf_h;
+
+	/* Persistent Atlas 1 static bitmap cache (column x=1682) */
+	struct {
+		const uint32_t *pixels;
+		int w;
+		int h;
+		int stride;
+		int sy;
+	} static_bmps[16];
+	int static_bmp_count;
+	int static_bmp_y;
 
 	/* Per-frame geometry & command batching */
 	struct gpu_draw_pkt draws[MAX_DRAWS];
@@ -341,20 +352,6 @@ static bool atlas0_alloc(uint16_t w, uint16_t h, uint16_t *out_u, uint16_t *out_
 	return true;
 }
 
-static inline float gpu_sdf_corner_dist(float px, float py, float r)
-{
-	float qx = r - px;
-	float qy = r - py;
-	float ox = qx > 0.0f ? qx : 0.0f;
-	float oy = qy > 0.0f ? qy : 0.0f;
-	float outside = sqrtf(ox * ox + oy * oy);
-	float inside = (qx > qy ? qx : qy);
-
-	if (inside > 0.0f)
-		inside = 0.0f;
-	return outside + inside - r;
-}
-
 static const int8_t gpu_bayer4x4[16] = {
 	-7,  1, -5,  3,
 	 5, -3,  7, -1,
@@ -365,13 +362,13 @@ static const int8_t gpu_bayer4x4[16] = {
 /*
  * Pre-bake solid patch, 1:1 2x2-supersampled SDF filled corners (r=1..32),
  * 1:1 2x2-supersampled SDF outline corners (thickness=1..3, r=1..32), and
- * 1:1 4x4 Bayer-dithered scrim gradients matching shell_display.c's exact
- * subpixel coverage and ordered dithering tables.
+ * 1:1 4x4 Bayer-dithered scrim gradients reusing shell_display.c's shared
+ * subpixel coverage LUTs.
  */
 static void init_atlas0_primitives(void)
 {
 	uint32_t *px = (uint32_t *)g_gpu.atlas0.map;
-	int r, t, lx, ly, sx, sy;
+	int r, t, lx, ly;
 
 	memset(px, 0, g_gpu.atlas0.size);
 
@@ -387,7 +384,6 @@ static void init_atlas0_primitives(void)
 	/* 1:1 filled rounded-rect corners for r = 1..32 */
 	for (r = 1; r <= MAX_RADIUS; r++) {
 		uint16_t u0 = 0, v0 = 0;
-		float rf = (float)r;
 
 		if (!atlas0_alloc((uint16_t)(2 * r), (uint16_t)(2 * r), &u0, &v0))
 			break;
@@ -399,25 +395,7 @@ static void init_atlas0_primitives(void)
 
 			for (lx = 0; lx < 2 * r; lx++) {
 				int cx = (lx < r) ? lx : (2 * r - 1 - lx);
-				float acc = 0.0f;
-				uint8_t a;
-
-				for (sy = 0; sy < 2; sy++) {
-					float py = (float)cy + 0.25f + 0.5f * (float)sy;
-
-					for (sx = 0; sx < 2; sx++) {
-						float px_f = (float)cx + 0.25f + 0.5f * (float)sx;
-						float d = gpu_sdf_corner_dist(px_f, py, rf);
-						float c = 0.5f - d;
-
-						if (c > 1.0f)
-							c = 1.0f;
-						else if (c < 0.0f)
-							c = 0.0f;
-						acc += c;
-					}
-				}
-				a = (uint8_t)(acc * 63.75f + 0.5f);
+				uint8_t a = shell_sdf_corner_cov(r, cy, cx);
 
 				px[(v0 + ly) * ATLAS0_W + (u0 + lx)] =
 					((uint32_t)a << 24) | 0x00FFFFFFu;
@@ -427,11 +405,8 @@ static void init_atlas0_primitives(void)
 
 	/* 1:1 anti-aliased outline corners for thickness t = 1..3 and r = 1..32 */
 	for (t = 1; t <= MAX_STROKE_THICK; t++) {
-		float tf = (float)t;
-
 		for (r = 1; r <= MAX_RADIUS; r++) {
 			uint16_t u0 = 0, v0 = 0;
-			float rf = (float)r;
 
 			if (!atlas0_alloc((uint16_t)(2 * r), (uint16_t)(2 * r), &u0, &v0))
 				break;
@@ -443,30 +418,7 @@ static void init_atlas0_primitives(void)
 
 				for (lx = 0; lx < 2 * r; lx++) {
 					int cx = (lx < r) ? lx : (2 * r - 1 - lx);
-					float sacc = 0.0f;
-					uint8_t a;
-
-					for (sy = 0; sy < 2; sy++) {
-						float py = (float)cy + 0.25f + 0.5f * (float)sy;
-
-						for (sx = 0; sx < 2; sx++) {
-							float px_f = (float)cx + 0.25f + 0.5f * (float)sx;
-							float d = gpu_sdf_corner_dist(px_f, py, rf);
-							float outer_c = 0.5f - d;
-							float inner_c = 0.5f + d + tf;
-
-							if (outer_c > 1.0f)
-								outer_c = 1.0f;
-							else if (outer_c < 0.0f)
-								outer_c = 0.0f;
-							if (inner_c > 1.0f)
-								inner_c = 1.0f;
-							else if (inner_c < 0.0f)
-								inner_c = 0.0f;
-							sacc += outer_c * inner_c;
-						}
-					}
-					a = (uint8_t)(sacc * 63.75f + 0.5f);
+					uint8_t a = shell_sdf_corner_stroke(r, t, cy, cx);
 
 					px[(v0 + ly) * ATLAS0_W + (u0 + lx)] =
 						((uint32_t)a << 24) | 0x00FFFFFFu;
@@ -573,9 +525,6 @@ static void init_atlas0_primitives(void)
 			else
 				alpha_f = 0.35f * (1.0f - (dist - 0.82f) / 0.18f);
 
-			for (lx = 0; lx < BOT_SCRIM_H && lx < BOT_SCRIM_W; lx++) {
-				/* loop over full BOT_SCRIM_W below */
-			}
 			for (lx = 0; lx < BOT_SCRIM_W; lx++) {
 				float dither = (float)gpu_bayer4x4[(ly & 3) * 4 + (lx & 3)] *
 					       (1.5f / 16.0f);
@@ -899,6 +848,9 @@ bool shell_gpu_init(int drm_fd, int num_scanout_bufs,
 
 	init_atlas0_primitives();
 
+	g_gpu.static_bmp_count = 0;
+	g_gpu.static_bmp_y = 0;
+	g_gpu.staging_y = 0;
 	g_gpu.ndraws = 0;
 	g_gpu.nquads = 0;
 	g_gpu.frame_cleared = false;
@@ -1517,6 +1469,54 @@ static bool resolve_atlas_ptr(const uint32_t *pixels, int w, int h, int src_stri
 		return true;
 	}
 
+	/*
+	 * Persistent Atlas 1 static bitmap cache (column x=1682):
+	 * Uploads small static bitmaps (e.g. animated header logos) once into
+	 * Atlas 1 and reuses their coordinates with zero CPU memcpy on all
+	 * subsequent frames.
+	 */
+	if (w > 0 && w <= 276 && h > 0 && src_stride >= w) {
+		for (i = 0; i < g_gpu.static_bmp_count; i++) {
+			if (g_gpu.static_bmps[i].pixels == pixels &&
+			    g_gpu.static_bmps[i].w == w &&
+			    g_gpu.static_bmps[i].h == h &&
+			    g_gpu.static_bmps[i].stride == src_stride) {
+				*out_atlas_id = 1;
+				*out_sx = 1682;
+				*out_sy = g_gpu.static_bmps[i].sy;
+				return true;
+			}
+		}
+		if (g_gpu.static_bmp_count < 16 &&
+		    g_gpu.static_bmp_y + h <= ATLAS1_H) {
+			int idx = g_gpu.static_bmp_count++;
+			int sy = g_gpu.static_bmp_y;
+			uint32_t *dst = (uint32_t *)g_gpu.atlas1.map +
+					sy * ATLAS1_W + 1682;
+			int row;
+
+			for (row = 0; row < h; row++) {
+				uint32_t *drow = dst + row * ATLAS1_W;
+				const uint32_t *srow = pixels + row * src_stride;
+
+				drow[-1] = srow[0];
+				memcpy(drow, srow, (size_t)w * sizeof(uint32_t));
+				drow[w] = srow[w - 1];
+			}
+			g_gpu.static_bmps[idx].pixels = pixels;
+			g_gpu.static_bmps[idx].w = w;
+			g_gpu.static_bmps[idx].h = h;
+			g_gpu.static_bmps[idx].stride = src_stride;
+			g_gpu.static_bmps[idx].sy = sy;
+			g_gpu.static_bmp_y += h + 2;
+
+			*out_atlas_id = 1;
+			*out_sx = 1682;
+			*out_sy = sy;
+			return true;
+		}
+	}
+
 	/* Fallback: copy external small bitmap into Atlas 1 staging column (x=1402) */
 	if (w > 0 && w <= 276 && h > 0 && g_gpu.staging_y + h <= ATLAS1_H &&
 	    src_stride >= w) {
@@ -1757,13 +1757,6 @@ int shell_gpu_flush(int dst_buf_idx, int bg_buf_idx)
 	}
 
 	return 0;
-}
-
-int shell_gpu_atlas1_dmabuf_fd(void)
-{
-	if (!g_gpu.active)
-		return -1;
-	return g_gpu.atlas1.dmabuf_fd;
 }
 
 uint32_t *shell_gpu_atlas1_slot_ptr(bool is_tile, int slot_idx,
