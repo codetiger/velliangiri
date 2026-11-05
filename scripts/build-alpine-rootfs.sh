@@ -76,6 +76,10 @@ echo "[rootfs] Building 1280x720@30 TV Shell (/bin/tvshell) ..."
 CROSS_CC="${CROSS_CC}" "${ROOT}/tools/tvshell/build.sh"
 cp "${ROOT}/build/tvshell/tvshell" "${STAGE_DIR}/bin/tvshell"
 chmod 755 "${STAGE_DIR}/bin/tvshell"
+if [ -x "${ROOT}/build/tvshell/media-gallery" ]; then
+	cp "${ROOT}/build/tvshell/media-gallery" "${STAGE_DIR}/bin/media-gallery"
+	chmod 755 "${STAGE_DIR}/bin/media-gallery"
+fi
 
 if [ ! -f "${DL_DIR}/fonts/PlusJakartaSans-Medium.ttf" ]; then
 	"${ROOT}/tools/tvshell/fetch-fonts.sh"
