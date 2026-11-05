@@ -80,6 +80,9 @@ if [ "$INSTALL_APP" = "1" ]; then
 			$SSH "cat > /usr/share/tvshell/$j" < "$f"
 		done
 	fi
+
+	echo "==> restarting /bin/tvshell on $DEST"
+	$SSH "killall doom tvshell 2>/dev/null || true; sleep 0.2; nohup /bin/tvshell >/dev/null 2>&1 </dev/null &"
 fi
 
 if [ "$INSTALL_MEDIA" = "1" ]; then

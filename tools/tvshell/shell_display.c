@@ -150,6 +150,7 @@ static struct {
 	uint32_t conn_id;
 	uint32_t crtc_id;
 	uint32_t fb_id;
+	uint32_t orig_fb_id;
 	struct drm_scanout_buf bufs[SHELL_DRM_BUF_COUNT];
 	int active_buf;
 	struct drm_mode_modeinfo mode_720p30;
@@ -503,6 +504,14 @@ static int setup_drm_scanout(void)
 	if (disp.drm_fd < 0)
 		return -1;
 
+	{
+		struct drm_mode_crtc orig_crtc = { .crtc_id = disp.crtc_id };
+
+		if (ioctl(disp.drm_fd, DRM_IOCTL_MODE_GETCRTC, &orig_crtc) == 0 &&
+		    orig_crtc.fb_id != 0)
+			disp.orig_fb_id = orig_crtc.fb_id;
+	}
+
 	for (i = 0; i < SHELL_DRM_BUF_COUNT; i++) {
 		struct drm_mode_create_dumb creq = { 0 };
 		struct drm_mode_fb_cmd fbcmd = { 0 };
@@ -704,10 +713,10 @@ void shell_display_close(void)
 	if (disp.use_drm && disp.drm_fd >= 0) {
 		int i;
 
+		shell_display_release();
 		for (i = 0; i < SHELL_DRM_BUF_COUNT; i++)
 			destroy_drm_buf(i);
 		disp.scanout = NULL;
-		(void)ioctl(disp.drm_fd, DRM_IOCTL_DROP_MASTER, 0);
 		close(disp.drm_fd);
 		disp.drm_fd = -1;
 	} else if (disp.scanout) {
@@ -1061,8 +1070,39 @@ void shell_display_present_video_backbuf(int buf_idx,
 
 void shell_display_release(void)
 {
-	if (disp.use_drm && disp.drm_fd >= 0)
+	if (disp.use_drm && disp.drm_fd >= 0) {
+		if (disp.orig_fb_id != 0 && disp.have_mode) {
+			struct drm_mode_crtc crtc = { 0 };
+
+			crtc.crtc_id = disp.crtc_id;
+			crtc.fb_id = disp.orig_fb_id;
+			crtc.set_connectors_ptr = (uintptr_t)&disp.conn_id;
+			crtc.count_connectors = 1;
+			crtc.mode = disp.mode_720p30;
+			crtc.mode_valid = 1;
+			(void)ioctl(disp.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc);
+		}
 		(void)ioctl(disp.drm_fd, DRM_IOCTL_DROP_MASTER, 0);
+		disp.active_buf = -1;
+#ifdef __linux__
+		{
+			int fbfd = open("/dev/fb0", O_RDWR | O_CLOEXEC);
+
+			if (fbfd >= 0) {
+				struct fb_var_screeninfo vinfo;
+
+				if (ioctl(fbfd, FBIOGET_VSCREENINFO, &vinfo) == 0) {
+					vinfo.activate |= FB_ACTIVATE_NOW | FB_ACTIVATE_FORCE;
+					vinfo.xoffset = 0;
+					vinfo.yoffset = 0;
+					(void)ioctl(fbfd, FBIOPUT_VSCREENINFO, &vinfo);
+					(void)ioctl(fbfd, FBIOPAN_DISPLAY, &vinfo);
+				}
+				close(fbfd);
+			}
+		}
+#endif
+	}
 }
 
 int shell_display_acquire(void)
@@ -1073,6 +1113,10 @@ int shell_display_acquire(void)
 		struct drm_mode_crtc crtc = { 0 };
 
 		(void)ioctl(disp.drm_fd, DRM_IOCTL_SET_MASTER, 0);
+		disp.active_buf = 0;
+		disp.last_gpu_buf = -1;
+		disp.fb_id = disp.bufs[0].fb_id;
+		disp.scanout = disp.bufs[0].map;
 		if (disp.have_mode) {
 			crtc.crtc_id = disp.crtc_id;
 			crtc.fb_id = disp.fb_id;

@@ -1380,6 +1380,11 @@ void DG_Init(void)
 
 		if (ioctl(fb_fd, FBIOGET_VSCREENINFO, &vinfo) == 0 &&
 		    ioctl(fb_fd, FBIOGET_FSCREENINFO, &finfo) == 0) {
+			vinfo.activate |= FB_ACTIVATE_NOW | FB_ACTIVATE_FORCE;
+			vinfo.xoffset = 0;
+			vinfo.yoffset = 0;
+			(void)ioctl(fb_fd, FBIOPUT_VSCREENINFO, &vinfo);
+			(void)ioctl(fb_fd, FBIOPAN_DISPLAY, &vinfo);
 			fb_width = vinfo.xres ? vinfo.xres : FB_TARGET_W;
 			fb_height = vinfo.yres ? vinfo.yres : FB_TARGET_H;
 			fb_stride_px = (finfo.line_length >= fb_width * 4)
