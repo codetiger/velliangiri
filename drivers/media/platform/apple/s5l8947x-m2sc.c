@@ -738,7 +738,7 @@ static void m2sc_work(struct work_struct *work)
 
 	src = v4l2_m2m_src_buf_remove(ctx->fh.m2m_ctx);
 	dst = v4l2_m2m_dst_buf_remove(ctx->fh.m2m_ctx);
-	v4l2_m2m_buf_copy_metadata(src, dst, true);
+	v4l2_m2m_buf_copy_metadata(src, dst);
 	src->sequence = ctx->q[0].sequence++;
 	dst->sequence = ctx->q[1].sequence++;
 	vb2_set_plane_payload(&dst->vb2_buf, 0, ctx->q[1].pix.sizeimage);
@@ -822,8 +822,6 @@ static const struct vb2_ops m2sc_qops = {
 	.buf_queue	 = m2sc_buf_queue,
 	.start_streaming = m2sc_start_streaming,
 	.stop_streaming	 = m2sc_stop_streaming,
-	.wait_prepare	 = vb2_ops_wait_prepare,
-	.wait_finish	 = vb2_ops_wait_finish,
 };
 
 static int m2sc_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *dst)
@@ -1010,7 +1008,7 @@ static int m2sc_open(struct file *file)
 		kfree(ctx);
 		return ret;
 	}
-	v4l2_fh_add(&ctx->fh);
+	v4l2_fh_add(&ctx->fh, file);
 	mutex_unlock(&m->vdev_lock);
 	return 0;
 }
@@ -1022,7 +1020,7 @@ static int m2sc_release(struct file *file)
 
 	mutex_lock(&m->vdev_lock);
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
-	v4l2_fh_del(&ctx->fh);
+	v4l2_fh_del(&ctx->fh, file);
 	v4l2_fh_exit(&ctx->fh);
 	mutex_unlock(&m->vdev_lock);
 	kfree(ctx);

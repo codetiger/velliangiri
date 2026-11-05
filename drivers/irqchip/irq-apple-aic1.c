@@ -466,8 +466,9 @@ static int __init aic1_of_init(struct device_node *node,
 
 	aic1_clear_sticky_nirq(aic);
 
-	aic->domain = irq_domain_add_linear(node, aic->nr_irq,
-					    &aic1_irq_domain_ops, aic);
+	aic->domain = irq_domain_create_linear(of_fwnode_handle(node),
+					       aic->nr_irq,
+					       &aic1_irq_domain_ops, aic);
 	if (!aic->domain) {
 		pr_err("failed to create IRQ domain\n");
 		kfree(aic);

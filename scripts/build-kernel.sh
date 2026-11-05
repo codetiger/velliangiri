@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
-# Cross-compile mainline Linux 6.12 zImage + s5l8947x-j33iap.dtb
+# Cross-compile mainline Linux 7.x zImage + s5l8947x-j33iap.dtb
 
 set -euo pipefail
 

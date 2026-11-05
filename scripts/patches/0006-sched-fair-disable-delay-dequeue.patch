@@ -8,7 +8,6 @@ SCHED_DEBUG it can still be switched at runtime through
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/kernel/sched/features.h b/kernel/sched/features.h
-index da8ec0c..9e7c1ce 100644
 --- a/kernel/sched/features.h
 +++ b/kernel/sched/features.h
 @@ -55,7 +55,7 @@ SCHED_FEAT(CACHE_HOT_BUDDY, true)
@@ -19,4 +18,4 @@ index da8ec0c..9e7c1ce 100644
 +SCHED_FEAT(DELAY_DEQUEUE, false)
  SCHED_FEAT(DELAY_ZERO, true)
  
- /*
+ SCHED_FEAT(PARANOID_AVG, false)

@@ -5,13 +5,13 @@
 <h1 align="center">Velliangiri</h1>
 
 <p align="center">
-  <strong>Mainline Linux 6.12 for the S5L8947X (<code>j33iap</code>) and related ARMv7 devices.</strong><br>
+  <strong>Mainline Linux 7.3 for the S5L8947X (<code>j33iap</code>) and related ARMv7 devices.</strong><br>
   Clean-room drivers · Upstream-style kernel overlay · <code>GPL-2.0-only</code>
 </p>
 
 ---
 
-Velliangiri brings a mainline **Linux 6.12** kernel and an **Alpine Linux (`armv7`)** userspace to retired ARMv7 hardware built around the **S5L8940X / S5L8947X** SoC family.
+Velliangiri brings a mainline **Linux 7.3** kernel and an **Alpine Linux (`armv7`)** userspace to retired ARMv7 hardware built around the **S5L8940X / S5L8947X** SoC family.
 
 The system boots over USB into RAM in ~20 seconds while using the internal NAND flash for persistent state: on first boot, required firmware is automatically extracted from the device's `System` volume and cached on the encrypted `Data` volume alongside SSH host keys, Wi-Fi configuration, Bluetooth pairings, and cached graphics packages.
 
@@ -82,7 +82,7 @@ See [docs/progress.md](docs/progress.md) for the detailed support matrix, [docs/
 ./scripts/velliangiri.sh all
 ```
 
-This builds the Alpine `armv7` initramfs, compiles mainline Linux 6.12 and the Device Tree, and packs the self-relocating boot image:
+This builds the Alpine `armv7` initramfs, compiles mainline Linux 7.3 and the Device Tree, and packs the self-relocating boot image:
 
 ```text
 out/boot-bundle-s5l8947x-j33iap.bin

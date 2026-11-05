@@ -1325,7 +1325,7 @@ static int s5l_fmi_probe(struct platform_device *pdev)
 	if (IS_ERR(fmi->ecc))
 		return PTR_ERR(fmi->ecc);
 
-	ret = devm_clk_bulk_get_all_enable(dev, &clks);
+	ret = devm_clk_bulk_get_all_enabled(dev, &clks);
 	if (ret < 0)
 		return dev_err_probe(dev, ret, "failed to enable clocks\n");
 

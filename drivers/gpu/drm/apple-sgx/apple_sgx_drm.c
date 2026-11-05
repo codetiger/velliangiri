@@ -777,7 +777,7 @@ static struct apple_sgx_bo *sgx_kpb_get(struct apple_sgx_drm *sdrm)
 	bo->serial = atomic64_inc_return(&sdrm->bo_serial);
 	ret = sgx_bo_map(sdrm, &shmem->base, SGX_PB_VA);
 	if (!ret)
-		ret = drm_gem_vmap_unlocked(&shmem->base, &sdrm->kpb_map);
+		ret = drm_gem_vmap(&shmem->base, &sdrm->kpb_map);
 	if (ret) {
 		drm_err(&sdrm->drm, "no parameter buffer at 0x%08x: %d\n", SGX_PB_VA, ret);
 		drm_gem_object_put(&shmem->base);
@@ -814,7 +814,7 @@ static void sgx_job_release(struct apple_sgx_job *job)
 	unsigned int i;
 
 	if (job->details)
-		drm_gem_vunmap_unlocked(job->details_obj, &job->details_map);
+		drm_gem_vunmap(job->details_obj, &job->details_map);
 	if (job->details_obj)
 		drm_gem_object_put(job->details_obj);
 	for (i = 0; i < job->bo_count; i++)
@@ -978,7 +978,7 @@ static enum drm_gpu_sched_stat sgx_job_timedout(struct drm_sched_job *sched_job)
 	int ret;
 
 	if (!parent || dma_fence_is_signaled(parent))
-		return DRM_GPU_SCHED_STAT_NOMINAL;
+		return DRM_GPU_SCHED_STAT_NO_HANG;
 
 	drm_sched_stop(&sdrm->sched, sched_job);
 	hrtimer_cancel(&sdrm->poll);
@@ -1004,8 +1004,8 @@ static enum drm_gpu_sched_stat sgx_job_timedout(struct drm_sched_job *sched_job)
 		dma_fence_signal(hw);
 		dma_fence_put(hw);
 	}
-	drm_sched_start(&sdrm->sched);
-	return DRM_GPU_SCHED_STAT_NOMINAL;
+	drm_sched_start(&sdrm->sched, 0);
+	return DRM_GPU_SCHED_STAT_RESET;
 }
 
 static void sgx_job_free(struct drm_sched_job *sched_job)
@@ -1181,12 +1181,13 @@ static int sgx_ioctl_submit(struct drm_device *drm, void *data, struct drm_file 
 		ret = -EINVAL;
 		goto out_job;
 	}
-	ret = drm_gem_vmap_unlocked(det, &job->details_map);
+	ret = drm_gem_vmap(det, &job->details_map);
 	if (ret)
 		goto out_job;
 	job->details = job->details_map.vaddr + args->details_offset;
 
-	ret = drm_sched_job_init(&job->base, &fpriv->entity, 1, NULL);
+	ret = drm_sched_job_init(&job->base, &fpriv->entity, 1, NULL,
+				 file->client_id);
 	if (ret)
 		goto out_job;
 	ret = sgx_job_in_syncs(job, file, args);
@@ -1278,7 +1279,6 @@ static const struct drm_driver sgx_drm_driver = {
 	.gem_prime_import_sg_table = sgx_gem_prime_import_sg_table,
 	.name = "apple_sgx",
 	.desc = "S5L8947X PowerVR SGX543",
-	.date = "20261003",
 	.major = 0,
 	.minor = 1,
 };
@@ -1300,6 +1300,14 @@ static void sgx_drm_release(struct drm_device *drm, void *data)
 
 int apple_sgx_drm_init(struct apple_sgx *sgx)
 {
+	const struct drm_sched_init_args sched_args = {
+		.ops = &sgx_sched_ops,
+		.num_rqs = DRM_SCHED_PRIORITY_COUNT,
+		.credit_limit = 1,
+		.timeout = msecs_to_jiffies(render_timeout_ms),
+		.name = "apple-sgx-render",
+		.dev = sgx->dev,
+	};
 	struct apple_sgx_drm *sdrm;
 	int ret;
 
@@ -1313,8 +1321,8 @@ int apple_sgx_drm_init(struct apple_sgx *sgx)
 	spin_lock_init(&sdrm->fence_lock);
 	spin_lock_init(&sdrm->job_lock);
 	sdrm->fence_context = dma_fence_context_alloc(1);
-	hrtimer_init(&sdrm->poll, CLOCK_MONOTONIC, HRTIMER_MODE_REL_SOFT);
-	sdrm->poll.function = sgx_poll;
+	hrtimer_setup(&sdrm->poll, sgx_poll, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL_SOFT);
 	INIT_WORK(&sdrm->rekick, sgx_rekick_work);
 
 	drm_mm_init(&sdrm->va, SGX_USER_VA_START, SGX_USER_VA_END - SGX_USER_VA_START);
@@ -1341,9 +1349,7 @@ int apple_sgx_drm_init(struct apple_sgx *sgx)
 	if (ret)
 		return ret;
 
-	ret = drm_sched_init(&sdrm->sched, &sgx_sched_ops, NULL, DRM_SCHED_PRIORITY_COUNT,
-			     1, 0, msecs_to_jiffies(render_timeout_ms), NULL, NULL,
-			     "apple-sgx-render", sgx->dev);
+	ret = drm_sched_init(&sdrm->sched, &sched_args);
 	if (ret)
 		return ret;
 

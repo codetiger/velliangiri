@@ -183,7 +183,6 @@ static struct cpufreq_driver s5l8947x_cpufreq_driver = {
 	.target_index	= s5l8947x_cpufreq_target_index,
 	.get		= s5l8947x_cpufreq_get,
 	.init		= s5l8947x_cpufreq_init,
-	.attr		= cpufreq_generic_attr,
 };
 
 static int __init s5l8947x_cpufreq_driver_init(void)

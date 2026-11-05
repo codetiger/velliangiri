@@ -29,8 +29,6 @@
 
 #include <crypto/internal/hash.h>
 #include <crypto/sha2.h>
-#include <crypto/sha256_base.h>
-#include <crypto/sha512_base.h>
 #include <linux/clk.h>
 #include <linux/io.h>
 #include <linux/iopoll.h>
@@ -39,6 +37,7 @@
 #include <linux/of.h>
 #include <linux/platform_device.h>
 #include <linux/spinlock.h>
+#include <linux/string.h>
 #include <linux/unaligned.h>
 
 #define SHA_MODE		0x08
@@ -127,19 +126,87 @@ static void s5l8947x_sha512_blocks(struct sha512_state *sst, const u8 *src,
 		sst->state[i] = (u64)w[2 * i] << 32 | w[2 * i + 1];
 }
 
+static int s5l8947x_sha224_init(struct shash_desc *desc)
+{
+	struct sha256_state *sctx = shash_desc_ctx(desc);
+
+	sha224_block_init(&sctx->ctx);
+	return 0;
+}
+
+static int s5l8947x_sha256_init(struct shash_desc *desc)
+{
+	struct sha256_state *sctx = shash_desc_ctx(desc);
+
+	sha256_block_init(&sctx->ctx);
+	return 0;
+}
+
+static void s5l8947x_sha256_do_update(struct sha256_state *sctx,
+				      const u8 *data, unsigned int len)
+{
+	unsigned int partial = sctx->count % SHA256_BLOCK_SIZE;
+
+	sctx->count += len;
+	if (unlikely((partial + len) >= SHA256_BLOCK_SIZE)) {
+		int blocks;
+
+		if (partial) {
+			int p = SHA256_BLOCK_SIZE - partial;
+
+			memcpy(sctx->buf + partial, data, p);
+			data += p;
+			len -= p;
+			s5l8947x_sha256_blocks(sctx, sctx->buf, 1);
+		}
+		blocks = len / SHA256_BLOCK_SIZE;
+		len %= SHA256_BLOCK_SIZE;
+		if (blocks) {
+			s5l8947x_sha256_blocks(sctx, data, blocks);
+			data += blocks * SHA256_BLOCK_SIZE;
+		}
+		partial = 0;
+	}
+	if (len)
+		memcpy(sctx->buf + partial, data, len);
+}
+
 static int s5l8947x_sha256_update(struct shash_desc *desc, const u8 *data,
 				  unsigned int len)
 {
-	return sha256_base_do_update(desc, data, len, s5l8947x_sha256_blocks);
+	s5l8947x_sha256_do_update(shash_desc_ctx(desc), data, len);
+	return 0;
 }
 
 static int s5l8947x_sha256_finup(struct shash_desc *desc, const u8 *data,
 				 unsigned int len, u8 *out)
 {
+	struct sha256_state *sctx = shash_desc_ctx(desc);
+	unsigned int digest_size = crypto_shash_digestsize(desc->tfm);
+	unsigned int bit_offset = SHA256_BLOCK_SIZE - sizeof(__be64);
+	unsigned int partial;
+	__be32 *digest = (__be32 *)out;
+	int i;
+
 	if (len)
-		sha256_base_do_update(desc, data, len, s5l8947x_sha256_blocks);
-	sha256_base_do_finalize(desc, s5l8947x_sha256_blocks);
-	return sha256_base_finish(desc, out);
+		s5l8947x_sha256_do_update(sctx, data, len);
+
+	partial = sctx->count % SHA256_BLOCK_SIZE;
+	sctx->buf[partial++] = 0x80;
+	if (partial > bit_offset) {
+		memset(sctx->buf + partial, 0, SHA256_BLOCK_SIZE - partial);
+		partial = 0;
+		s5l8947x_sha256_blocks(sctx, sctx->buf, 1);
+	}
+	memset(sctx->buf + partial, 0, bit_offset - partial);
+	put_unaligned_be64(sctx->count << 3, sctx->buf + bit_offset);
+	s5l8947x_sha256_blocks(sctx, sctx->buf, 1);
+
+	for (i = 0; i < digest_size / 4; i++)
+		put_unaligned_be32(sctx->state[i], digest++);
+
+	*sctx = (struct sha256_state){};
+	return 0;
 }
 
 static int s5l8947x_sha256_final(struct shash_desc *desc, u8 *out)
@@ -147,19 +214,109 @@ static int s5l8947x_sha256_final(struct shash_desc *desc, u8 *out)
 	return s5l8947x_sha256_finup(desc, NULL, 0, out);
 }
 
+static int s5l8947x_sha384_init(struct shash_desc *desc)
+{
+	struct sha512_state *sctx = shash_desc_ctx(desc);
+
+	sctx->state[0] = SHA384_H0;
+	sctx->state[1] = SHA384_H1;
+	sctx->state[2] = SHA384_H2;
+	sctx->state[3] = SHA384_H3;
+	sctx->state[4] = SHA384_H4;
+	sctx->state[5] = SHA384_H5;
+	sctx->state[6] = SHA384_H6;
+	sctx->state[7] = SHA384_H7;
+	sctx->count[0] = sctx->count[1] = 0;
+	return 0;
+}
+
+static int s5l8947x_sha512_init(struct shash_desc *desc)
+{
+	struct sha512_state *sctx = shash_desc_ctx(desc);
+
+	sctx->state[0] = SHA512_H0;
+	sctx->state[1] = SHA512_H1;
+	sctx->state[2] = SHA512_H2;
+	sctx->state[3] = SHA512_H3;
+	sctx->state[4] = SHA512_H4;
+	sctx->state[5] = SHA512_H5;
+	sctx->state[6] = SHA512_H6;
+	sctx->state[7] = SHA512_H7;
+	sctx->count[0] = sctx->count[1] = 0;
+	return 0;
+}
+
+static void s5l8947x_sha512_do_update(struct sha512_state *sctx,
+				      const u8 *data, unsigned int len)
+{
+	unsigned int partial = sctx->count[0] % SHA512_BLOCK_SIZE;
+
+	sctx->count[0] += len;
+	if (sctx->count[0] < len)
+		sctx->count[1]++;
+
+	if (unlikely((partial + len) >= SHA512_BLOCK_SIZE)) {
+		int blocks;
+
+		if (partial) {
+			int p = SHA512_BLOCK_SIZE - partial;
+
+			memcpy(sctx->buf + partial, data, p);
+			data += p;
+			len -= p;
+			s5l8947x_sha512_blocks(sctx, sctx->buf, 1);
+		}
+		blocks = len / SHA512_BLOCK_SIZE;
+		len %= SHA512_BLOCK_SIZE;
+		if (blocks) {
+			s5l8947x_sha512_blocks(sctx, data, blocks);
+			data += blocks * SHA512_BLOCK_SIZE;
+		}
+		partial = 0;
+	}
+	if (len)
+		memcpy(sctx->buf + partial, data, len);
+}
+
 static int s5l8947x_sha512_update(struct shash_desc *desc, const u8 *data,
 				  unsigned int len)
 {
-	return sha512_base_do_update(desc, data, len, s5l8947x_sha512_blocks);
+	s5l8947x_sha512_do_update(shash_desc_ctx(desc), data, len);
+	return 0;
 }
 
 static int s5l8947x_sha512_finup(struct shash_desc *desc, const u8 *data,
 				 unsigned int len, u8 *out)
 {
+	struct sha512_state *sctx = shash_desc_ctx(desc);
+	unsigned int digest_size = crypto_shash_digestsize(desc->tfm);
+	unsigned int bit_offset = SHA512_BLOCK_SIZE - 2 * sizeof(__be64);
+	unsigned int partial;
+	__be64 *digest = (__be64 *)out;
+	int i;
+
 	if (len)
-		sha512_base_do_update(desc, data, len, s5l8947x_sha512_blocks);
-	sha512_base_do_finalize(desc, s5l8947x_sha512_blocks);
-	return sha512_base_finish(desc, out);
+		s5l8947x_sha512_do_update(sctx, data, len);
+
+	partial = sctx->count[0] % SHA512_BLOCK_SIZE;
+	sctx->buf[partial++] = 0x80;
+	if (partial > bit_offset) {
+		memset(sctx->buf + partial, 0, SHA512_BLOCK_SIZE - partial);
+		partial = 0;
+		s5l8947x_sha512_blocks(sctx, sctx->buf, 1);
+	}
+	memset(sctx->buf + partial, 0, bit_offset - partial);
+	put_unaligned_be64(sctx->count[1] << 3 | sctx->count[0] >> 61,
+			   sctx->buf + bit_offset);
+	put_unaligned_be64(sctx->count[0] << 3,
+			   sctx->buf + bit_offset + sizeof(__be64));
+	s5l8947x_sha512_blocks(sctx, sctx->buf, 1);
+
+	for (i = 0; i < digest_size / 8; i++)
+		put_unaligned_be64(sctx->state[i], digest++);
+
+	*sctx = (struct sha512_state){};
+	return 0;
 }
 
 static int s5l8947x_sha512_final(struct shash_desc *desc, u8 *out)
@@ -186,10 +343,10 @@ static int s5l8947x_sha512_final(struct shash_desc *desc, u8 *out)
 
 /* SHA-224 and SHA-384 run SHA-256 and SHA-512 from their own initial values. */
 static struct shash_alg s5l8947x_sha_algs[] = {
-	S5L_SHA_ALG("sha224", SHA224, sha256, sha224_base_init, 90),
-	S5L_SHA_ALG("sha256", SHA256, sha256, sha256_base_init, 90),
-	S5L_SHA_ALG("sha384", SHA384, sha512, sha384_base_init, 300),
-	S5L_SHA_ALG("sha512", SHA512, sha512, sha512_base_init, 300),
+	S5L_SHA_ALG("sha224", SHA224, sha256, s5l8947x_sha224_init, 90),
+	S5L_SHA_ALG("sha256", SHA256, sha256, s5l8947x_sha256_init, 90),
+	S5L_SHA_ALG("sha384", SHA384, sha512, s5l8947x_sha384_init, 350),
+	S5L_SHA_ALG("sha512", SHA512, sha512, s5l8947x_sha512_init, 350),
 };
 
 static int s5l8947x_sha_probe(struct platform_device *pdev)

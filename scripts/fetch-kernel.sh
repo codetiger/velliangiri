@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
-# Fetch and extract mainline Linux 6.12 LTS source tree into build/linux
+# Fetch and extract mainline Linux 7.x source tree into build/linux
 
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-KERNEL_VERSION="${KERNEL_VERSION:-6.12.79}"
+KERNEL_VERSION="${KERNEL_VERSION:-7.3.1}"
 KERNEL_MAJOR="${KERNEL_VERSION%%.*}"
 TARBALL="linux-${KERNEL_VERSION}.tar.xz"
 URL="https://cdn.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/${TARBALL}"
@@ -16,8 +16,18 @@ TREE_DIR="${KERNEL_TREE:-${ROOT}/build/linux}"
 mkdir -p "${DL_DIR}" "$(dirname "${TREE_DIR}")"
 
 if [ -f "${TREE_DIR}/Makefile" ]; then
-	echo "[fetch-kernel] Kernel tree already present at ${TREE_DIR}"
-	exit 0
+	EXISTING_VER="$(awk '
+		/^VERSION =/ { v=$3 }
+		/^PATCHLEVEL =/ { p=$3 }
+		/^SUBLEVEL =/ { s=$3 }
+		END { if (s == "" || s == "0") printf "%s.%s\n", v, p; else printf "%s.%s.%s\n", v, p, s }
+	' "${TREE_DIR}/Makefile")"
+	if [ "${EXISTING_VER}" = "${KERNEL_VERSION}" ] || [ "${EXISTING_VER}.0" = "${KERNEL_VERSION}" ]; then
+		echo "[fetch-kernel] Kernel tree ${EXISTING_VER} already present at ${TREE_DIR}"
+		exit 0
+	fi
+	echo "[fetch-kernel] Replacing existing kernel tree (${EXISTING_VER} -> ${KERNEL_VERSION}) at ${TREE_DIR} ..."
+	rm -rf "${TREE_DIR}"
 fi
 
 if [ ! -f "${DL_DIR}/${TARBALL}" ]; then

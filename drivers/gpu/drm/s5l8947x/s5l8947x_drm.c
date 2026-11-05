@@ -46,6 +46,7 @@
 #include <linux/string.h>
 #include <linux/workqueue.h>
 
+#include <drm/clients/drm_client_setup.h>
 #include <drm/drm_atomic_helper.h>
 #include <drm/drm_connector.h>
 #include <drm/drm_drv.h>
@@ -58,6 +59,7 @@
 #include <drm/drm_gem_framebuffer_helper.h>
 #include <drm/drm_managed.h>
 #include <drm/drm_modeset_helper_vtables.h>
+#include <drm/drm_print.h>
 #include <drm/drm_probe_helper.h>
 #include <drm/drm_simple_kms_helper.h>
 #include <drm/drm_vblank.h>
@@ -1422,7 +1424,7 @@ static int s5l_conn_get_modes(struct drm_connector *conn)
 }
 
 static enum drm_mode_status s5l_conn_mode_valid(struct drm_connector *conn,
-						struct drm_display_mode *mode)
+						const struct drm_display_mode *mode)
 {
 	return s5l_mode_ok(mode);
 }
@@ -1462,9 +1464,9 @@ static const struct drm_driver s5l_drm_driver = {
 	.driver_features	= DRIVER_GEM | DRIVER_MODESET | DRIVER_ATOMIC,
 	.fops			= &s5l_fops,
 	DRM_GEM_DMA_DRIVER_OPS,
+	DRM_FBDEV_DMA_DRIVER_OPS,
 	.name			= "s5l8947x",
 	.desc			= "S5L8947X display pipe and HDMI",
-	.date			= "20261031",
 	.major			= 1,
 	.minor			= 0,
 };
@@ -1914,8 +1916,8 @@ static int s5l_probe(struct platform_device *pdev)
 		return ret;
 	drm_mode_config_reset(drm);
 
-	hrtimer_init(&d->vblank_timer, CLOCK_MONOTONIC, HRTIMER_MODE_REL);
-	d->vblank_timer.function = s5l_vblank_timer;
+	hrtimer_setup(&d->vblank_timer, s5l_vblank_timer, CLOCK_MONOTONIC,
+		      HRTIMER_MODE_REL);
 	if (vblank_sim) {
 		ret = drm_vblank_init(drm, 1);
 		if (ret)
@@ -1937,7 +1939,7 @@ static int s5l_probe(struct platform_device *pdev)
 		return ret;
 	}
 	schedule_delayed_work(&d->hpd_work, msecs_to_jiffies(500));
-	drm_fbdev_dma_setup(drm, 32);
+	drm_client_setup_with_color_mode(drm, 32);
 	return 0;
 }
 

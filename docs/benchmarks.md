@@ -1,6 +1,6 @@
 # Benchmarks & ARM NEON Impact (`S5L8947X` / `j33iap`)
 
-Measured on live `S5L8947X` (`j33iap`) hardware running mainline **Linux 6.12.79** with the CPU frequency governor pinned to `performance` at **`850 MHz`** (`850000 kHz`).
+Measured on live `S5L8947X` (`j33iap`) hardware running mainline **Linux 6.12.79** and **Linux 7.3.1** with the CPU frequency governor pinned to `performance` at **`850 MHz`** (`850000 kHz`).
 
 ## 1. Test Environment
 
@@ -135,3 +135,73 @@ Measured with `sgx-gl glcubes` (10×10×10 grid = **1,000 textured, shaded 3D cu
    - Expanded the pre-built identity index buffer (`BUILT_IDX_COUNT`) from `8,190` to `65,535` vertices and added a static repacked multi-VBO GPU BO cache in `gpu_vs_draw()`, eliminating per-frame CPU index generation and 1.15 MiB/frame of strided CPU vertex copies.
 4. **Startup, Mipmaps & DRM EDID Caching:**
    - Removed redundant write-combined `memset` on freshly allocated kernel shmem GEM BOs, added a write-only `PIPE_MAP_WRITE` fast path in `cpu_blit()` for `glGenerateMipmap()`, and cached parsed HDMI EDID across `get_modes()` calls in `s5l8947x_drm.c`.
+
+---
+
+## 7. Linux 6.12.79 vs. Linux 7.3.1 Kernel Migration Comparison
+
+Measured back-to-back on the same `S5L8947X` (`j33iap`) device with the CPU governor pinned to `performance` at **`850 MHz`** (`850,000,643 Hz` calibrated against the 24 MHz watchdog counter, `1700.00 BogoMIPS`), comparing **Linux `6.12.79` (`#277`)** and **Linux `7.3.1` (`#1`)**:
+
+### Boot, Bundle Size & Hardware Verification (`hwtest`)
+
+| Metric | Linux `6.12.79` (`#277`) | Linux `7.3.1` (`#1`) | Notes |
+|---|---|---|---|
+| **CPU Clock / BogoMIPS** | `850,000 kHz` / `1700.00` | `850,000 kHz` / `1700.00` | Cortex-A9 r2p8 + PL310 L2 (`512 KB`, 16-way) |
+| **Boot Bundle Size (`boot-bundle-s5l8947x-j33iap.bin`)** | `12,869,056 B` (`12.27 MiB`) | `12,919,872 B` (`12.32 MiB`) | `+50.8 KiB` (`+0.39%`) with full Mesa/GBM/GLESv2 rootfs |
+| **Stage 5 Kernel Boot (`0x80000000` -> USB Console)** | ~`14.7 s` | **`14.733 s`** | XZ decompress + kernel init + initramfs + USB CDC-ACM ready |
+| **Hardware Test Suite (`/bin/hwtest`)** | **127 passed, 0 failed, 2 skipped** | **127 passed, 0 failed, 2 skipped** | Full parity across CPU, AIC, CDMA, FMI/FTL, AES/SHA, DRM/HDMI, SGX543, M2SC, JPEG, H264, USB, Wi-Fi/BT, and Audio |
+
+### Cache & Memory Hierarchy (`l2bench` & `neonbench`)
+
+| Benchmark | Linux `6.12.79` (`#277`) | Linux `7.3.1` (`#1`) | Delta |
+|---|---:|---:|---:|
+| **L1 Latency (16 KB pointer chase)** | `4.7 ns` | `4.7 ns` | `0.0%` |
+| **L1 Boundary Latency (32 KB pointer chase)** | `4.8 ns` | `4.8 ns` | `0.0%` |
+| **PL310 L2 Latency (64 KB / 128 KB / 256 KB)** | `43.2 / 58.6 / 65.2 ns` | `42.5 / 59.1 / 67.4 ns` | Within thermal/cache-placement variance |
+| **PL310 L2 Boundary Latency (512 KB)** | `68.5 ns` | `72.7 ns` | Within L2 replacement variance |
+| **LPDDR2 DRAM Latency (4 MB / 16 MB pointer chase)** | `159.4 / 158.9 ns` | **`157.8 / 157.5 ns`** | **`-0.9%` (lower latency)** |
+| **`l2bench` 256 KB Sequential Read (PL310 L2)** | `3,676 MB/s` | **`3,727 MB/s`** | **`+1.4%`** |
+| **`l2bench` 16 MB Sequential Read (LPDDR2 DRAM)** | `1,615 MB/s` | **`1,625 MB/s`** | **`+0.6%`** |
+| **`neonbench` L2 256 KB Read (Scalar / GPR32 / NEON)** | `454.9 / 851.5 / 1,033.8 MB/s` | **`455.2 / 856.3 / 1,041.6 MB/s`** | **`+0.8%` NEON** |
+| **`neonbench` DRAM 16 MB Read (Scalar / GPR32 / NEON)** | `305.5 / 393.2 / 507.2 MB/s` | **`306.8 / 394.5 / 506.7 MB/s`** | Parity (`-0.1%` NEON, `+0.3%` GPR32) |
+
+### Storage, HFS+ Decompression & Firmware Carvers
+
+| Workload | Linux `6.12.79` (`#277`) | Linux `7.3.1` (`#1`) | Delta |
+|---|---:|---:|---:|
+| **`/dev/nand0p1` Raw Block Read (32 MiB, cold cache)** | `13.11 MB/s` (`2.44 s`) | **`13.39 MB/s` (`2.39 s`)** | **`+2.1%`** |
+| **HFS+ `decmpfs` Read (`/usr/sbin` + `/usr/bin`)** | `15.72 MB/s` (`4.06 s`) | `15.56 MB/s` (`4.10 s`) | `-1.0%` |
+| **`sgxcarve` (LZSS + NEON Adler-32, 10 iters)** | `25.17 MB/s` (`292.0 ms/iter`) | `24.66 MB/s` (`298.0 ms/iter`) | `-2.0%` (`crc=7db5bc6e` bit-exact) |
+| **`sgxcarve` Scalar (`-O2`, 10 iters)** | `23.48 MB/s` (`313.0 ms/iter`) | `23.26 MB/s` (`316.0 ms/iter`) | `-0.9%` |
+| **`hcdcarve` (`BCM4334B0.hcd`, 50 iters)** | `25.14 MB/s` (`211.4 ms/iter`) | `24.31 MB/s` (`218.6 ms/iter`) | `-3.3%` |
+
+### Userspace CLI & NEON SIMD Microbenchmarks
+
+| Workload | Linux `6.12.79` (`#277`) | Linux `7.3.1` (`#1`) | Delta |
+|---|---:|---:|---:|
+| **`sha256sum` (32 MiB)** | `19.47 MB/s` (`4.93 s`) | `19.24 MB/s` (`4.99 s`) | `-1.2%` |
+| **`sha512sum` (32 MiB)** | `10.55 MB/s` (`9.10 s`) | `10.53 MB/s` (`9.12 s`) | `-0.2%` |
+| **`sha1sum` (32 MiB)** | `44.04 MB/s` (`2.18 s`) | **`44.44 MB/s` (`2.16 s`)** | **`+0.9%`** |
+| **`md5sum` (32 MiB)** | `78.69 MB/s` (`1.22 s`) | **`80.00 MB/s` (`1.20 s`)** | **`+1.7%`** |
+| **`gzip -1 -c` (32 MiB)** | `3.10 MB/s` (`10.31 s`) | `3.02 MB/s` (`10.61 s`) | `-2.6%` |
+| **Adler-32 (`128 MiB`, Scalar -> NEON)** | `229.8 -> 378.8 MB/s` (`1.65x`) | **`233.6 -> 383.3 MB/s` (`1.64x`)** | **`+1.2%` NEON** |
+| **Audio Resampler (`44.1 -> 48 kHz`, Scalar -> NEON)** | `137.8 -> 177.8 MB/s` (`1.29x`) | **`137.2 -> 179.1 MB/s` (`1.31x`)** | **`+0.7%` NEON** |
+| **720p `RGB565 -> XRGB8888` (Scalar -> NEON)** | `248.7 MB/s (70.7 fps) -> 494.9 MB/s (140.8 fps)` | **`251.3 MB/s (71.5 fps) -> 505.4 MB/s (143.8 fps)`** | **`+2.1%` NEON (`+3.0 fps`)** |
+
+### Kernel Cryptographic Subsystem (`AF_ALG`, 16 MiB Transfers)
+
+In Linux `7.x`, the upstream kernel consolidated architecture-specific NEON/ARM crypto modules (`sha1-neon`, `sha256-neon`, `sha512-neon`, `blake2b-neon`, `chacha20-neon`, `aes-arm`) into the unified `lib/crypto/` library (`*-lib` drivers) and introduced `/proc/sys/crypto/af_alg_restrict = 1` by default (which restricts userspace `AF_ALG` sockets from binding directly to low-level driver cra_driver_names unless set to `0`):
+
+| Algorithm (`16 MiB` via `AF_ALG`) | Linux `6.12.79` (`#277`) | Linux `7.3.1` (`#1`) | Notes / Driver Change |
+|---|---:|---:|---|
+| **SHA-1 (ARM NEON)** | `94.1 MB/s` (`sha1-neon`) | `92.4 MB/s` (`sha1-lib`) | Consolidated into `lib/crypto/arm/sha1.h` (`prio 300`) |
+| **SHA-256 (ARM NEON)** | `49.8 MB/s` (`sha256-neon`) | `49.0 MB/s` (`sha256-lib`) | Consolidated into `lib/crypto/arm/sha256.h` (`prio 300`) |
+| **SHA-256 (`s5l8947x-sha` PIO)** | `15.4 MB/s` (`sha256-s5l8947x`) | `15.4 MB/s` (`sha256-s5l8947x`) | Identical hardware PIO throughput (`prio 150`) |
+| **SHA-512 (ARM NEON)** | `31.6 MB/s` (`sha512-neon`) | `31.2 MB/s` (`sha512-lib`) | Consolidated into `lib/crypto/arm/sha512.h` (`prio 300`) |
+| **SHA-512 (`s5l8947x-sha` PIO)** | `16.4 MB/s` (`sha512-s5l8947x`) | `16.4 MB/s` (`sha512-s5l8947x`) | Raised to `prio 350` so `s5l8947x-sha` stays default for SHA-512 |
+| **BLAKE2b-512 (ARM NEON)** | `57.3 MB/s` (`blake2b-512-neon`) | `57.1 MB/s` (`blake2b-512-lib`) | Consolidated into `lib/crypto/arm/blake2b.h` (`prio 300`) |
+| **AES-128-CBC (ARM NEON bit-sliced)** | `22.9 MB/s` (`cbc-aes-neonbs`) | `22.8 MB/s` (`cbc-aes-neonbs`) | Identical (`prio 250`) |
+| **AES-128-CBC (ARM Scalar / Library)** | `19.0 MB/s` (`cbc(aes-arm)`) | **`22.7 MB/s` (`cbc-aes-lib`)** | **`+19.5%` faster** via `CONFIG_CRYPTO_LIB_AES_CBC` (`prio 200`) |
+| **AES-128-CTR (ARM NEON bit-sliced)** | `33.0 MB/s` (`ctr-aes-neonbs`) | `33.0 MB/s` (`ctr-aes-neonbs`) | Identical (`prio 250`) |
+| **ChaCha20 (ARM NEON)** | `73.9 MB/s` (`chacha20-neon`) | `71.3 MB/s` (`chacha20-lib`) | Consolidated into `lib/crypto/arm/chacha.h` (`prio 300`) |
+| **AES-128-CBC (`s5l8947x-aes` CDMA)** | `70.8 MB/s` (`s5l8947x-cbc-aes`) | In-kernel CDMA (`prio 300`) | Registered for in-kernel FTL/DM-Crypt consumers; masked from userspace `AF_ALG` by `CRYPTO_ALG_KERN_DRIVER_ONLY` in 7.x |

@@ -42,7 +42,7 @@ diff --git a/fs/hfsplus/extents.c b/fs/hfsplus/extents.c
 diff --git a/fs/hfsplus/hfsplus_fs.h b/fs/hfsplus/hfsplus_fs.h
 --- a/fs/hfsplus/hfsplus_fs.h
 +++ b/fs/hfsplus/hfsplus_fs.h
-@@ -191,6 +191,13 @@
+@@ -158,6 +158,13 @@ struct hfsplus_sb_info {
  	int work_queued;               /* non-zero delayed work is queued */
  	struct delayed_work sync_work; /* FS sync delayed work */
  	spinlock_t work_lock;          /* protects sync_work and work_queued */
@@ -56,9 +56,9 @@ diff --git a/fs/hfsplus/hfsplus_fs.h b/fs/hfsplus/hfsplus_fs.h
  	struct rcu_head rcu;
  };
  
-@@ -250,6 +257,10 @@
- 	struct list_head open_dir_list;
- 	spinlock_t open_dir_lock;
+@@ -215,6 +222,10 @@ struct hfsplus_inode_info {
+ 	u8 userflags;		/* BSD user file flags */
+ 	u32 subfolders;		/* Subfolder count (HFSX only) */
  	loff_t phys_size;
 +	s8 file_crypt;
 +	u8 decmpfs_type;
@@ -67,7 +67,7 @@ diff --git a/fs/hfsplus/hfsplus_fs.h b/fs/hfsplus/hfsplus_fs.h
  
  	struct inode vfs_inode;
  };
-@@ -262,6 +273,7 @@
+@@ -227,6 +238,7 @@ struct hfsplus_inode_info {
  #define HFSPLUS_I_EXT_DIRTY	2	/* has changes in the extent tree */
  #define HFSPLUS_I_ALLOC_DIRTY	3	/* has changes in the allocation file */
  #define HFSPLUS_I_ATTR_DIRTY	4	/* has changes in the attributes tree */
@@ -78,12 +78,12 @@ diff --git a/fs/hfsplus/hfsplus_fs.h b/fs/hfsplus/hfsplus_fs.h
 diff --git a/fs/hfsplus/hfsplus_raw.h b/fs/hfsplus/hfsplus_raw.h
 --- a/fs/hfsplus/hfsplus_raw.h
 +++ b/fs/hfsplus/hfsplus_raw.h
-@@ -84,7 +84,20 @@
- #define HFSPLUS_FLG_NODUMP	0x01
- #define HFSPLUS_FLG_IMMUTABLE	0x02
- #define HFSPLUS_FLG_APPEND	0x04
-+#define HFSPLUS_FLG_DECMPFS	0x20
+@@ -17,4 +17,60 @@
+ #include <linux/types.h>
+ #include <linux/hfs_common.h>
  
++#define HFSPLUS_FLG_DECMPFS	0x20
++
 +#define HFSPLUS_DECMPFS_MAGIC		0x636d7066
 +#define HFSPLUS_DECMPFS_TYPE_ZLIB_ATTR	3
 +#define HFSPLUS_DECMPFS_TYPE_ZLIB_RSRC	4
@@ -96,13 +96,6 @@ diff --git a/fs/hfsplus/hfsplus_raw.h b/fs/hfsplus/hfsplus_raw.h
 +	__le64 uncompressed_size;
 +} __packed;
 +
- /* A single contiguous area of a file */
- struct hfsplus_extent {
- 	__be32 start_block;
-@@ -147,6 +160,48 @@
- #define HFSPLUS_VOL_SOFTLOCK		(1 << 15)
- #define HFSPLUS_VOL_UNUSED_NODE_FIX	(1 << 31)
- 
 +/* HFS+ Journal structures */
 +#define HFSPLUS_JIB_IN_FS		(1 << 0)
 +#define HFSPLUS_JIB_NEED_INIT		(1 << 1)
@@ -145,9 +138,7 @@ diff --git a/fs/hfsplus/hfsplus_raw.h b/fs/hfsplus/hfsplus_raw.h
 +	struct hfsplus_block_info binfo[];
 +} __packed;
 +
- /* HFS+ BTree node descriptor */
- struct hfs_bnode_desc {
- 	__be32 next;
+ #endif
 diff --git a/fs/hfsplus/inode.c b/fs/hfsplus/inode.c
 --- a/fs/hfsplus/inode.c
 +++ b/fs/hfsplus/inode.c
@@ -521,14 +512,22 @@ diff --git a/fs/hfsplus/inode.c b/fs/hfsplus/inode.c
  }
  
  static void hfsplus_write_failed(struct address_space *mapping, loff_t to)
-@@ -41,11 +395,38 @@
- int hfsplus_write_begin(struct file *file, struct address_space *mapping,
- 		loff_t pos, unsigned len, struct folio **foliop, void **fsdata)
+@@ -41,21 +395,47 @@
+ int hfsplus_write_begin(const struct kiocb *iocb,
+ 			struct address_space *mapping, loff_t pos,
+ 			unsigned len, struct folio **foliop,
+ 			void **fsdata)
  {
-+	struct inode *inode = mapping->host;
+ 	struct inode *inode = mapping->host;
 +	struct hfsplus_inode_info *hip = HFSPLUS_I(inode);
+ 	struct hfsplus_sb_info *sbi = HFSPLUS_SB(inode->i_sb);
+ 	loff_t total_capacity;
  	int ret;
-+
+ 
+ 	total_capacity = (loff_t)sbi->total_blocks << sbi->alloc_blksz_shift;
+ 
+ 	if (pos >= total_capacity)
+ 		return -EFBIG;
 +	if (test_bit(HFSPLUS_I_DECMPFS, &hip->flags))
 +		return -EOPNOTSUPP;
 +	hfsplus_init_file_crypt(inode);
@@ -536,8 +535,9 @@ diff --git a/fs/hfsplus/inode.c b/fs/hfsplus/inode.c
 +		return -EACCES;
 +
 +	if (hip->file_crypt == 1 && inode->i_sb->s_blocksize == PAGE_SIZE) {
++		struct file *file = iocb ? iocb->ki_filp : NULL;
 +		loff_t isize = i_size_read(inode);
- 
++
 +		if ((hip->phys_size & (PAGE_SIZE - 1)) && pos > hip->phys_size) {
 +			struct folio *f = read_mapping_folio(mapping,
 +					hip->phys_size >> PAGE_SHIFT, file);
@@ -553,17 +553,17 @@ diff --git a/fs/hfsplus/inode.c b/fs/hfsplus/inode.c
 +			folio_put(f);
 +		}
 +	}
-+
- 	ret = cont_write_begin(file, mapping, pos, len, foliop, fsdata,
+ 
+ 	ret = cont_write_begin(iocb, mapping, pos, len, foliop, fsdata,
  				hfsplus_get_block,
--				&HFSPLUS_I(mapping->host)->phys_size);
+-				&HFSPLUS_I(inode)->phys_size);
 +				&hip->phys_size);
  	if (unlikely(ret))
  		hfsplus_write_failed(mapping, pos + len);
  
-@@ -126,6 +507,10 @@
- 	size_t count = iov_iter_count(iter);
- 	ssize_t ret;
+@@ -171,6 +553,10 @@
+ 		invalidate_inode_pages2_range(mapping, start_page, end_page);
+ 	}
  
 +	if (HFSPLUS_I(inode)->file_crypt > 0 ||
 +	    test_bit(HFSPLUS_I_DECMPFS, &HFSPLUS_I(inode)->flags))
@@ -572,14 +572,14 @@ diff --git a/fs/hfsplus/inode.c b/fs/hfsplus/inode.c
  	ret = blockdev_direct_IO(iocb, inode, iter, hfsplus_get_block);
  
  	/*
-@@ -141,11 +526,76 @@
+@@ -186,11 +572,81 @@
  	}
  
  	return ret;
 +}
 +
 +static int hfsplus_crypt_writepage(struct folio *folio,
-+				   struct writeback_control *wbc, void *data)
++				   struct writeback_control *wbc)
 +{
 +	struct inode *inode = folio->mapping->host;
 +	struct hfsplus_inode_info *hip = HFSPLUS_I(inode);
@@ -643,9 +643,14 @@ diff --git a/fs/hfsplus/inode.c b/fs/hfsplus/inode.c
 +	struct inode *inode = mapping->host;
 +	struct hfsplus_inode_info *hip = HFSPLUS_I(inode);
 +
-+	if (hip->file_crypt == 1 && inode->i_sb->s_blocksize == PAGE_SIZE)
-+		return write_cache_pages(mapping, wbc, hfsplus_crypt_writepage,
-+					 NULL);
++	if (hip->file_crypt == 1 && inode->i_sb->s_blocksize == PAGE_SIZE) {
++		struct folio *folio = NULL;
++		int err;
++
++		while ((folio = writeback_iter(mapping, wbc, folio, &err)))
++			err = hfsplus_crypt_writepage(folio, wbc);
++		return err;
++	}
  	return mpage_writepages(mapping, wbc, hfsplus_get_block);
  }
  
@@ -714,7 +719,7 @@ diff --git a/fs/hfsplus/inode.c b/fs/hfsplus/inode.c
 +			    !file->data_fork.total_size)
 +				hfsplus_init_decmpfs(inode);
  		} else if (S_ISLNK(inode->i_mode)) {
- 			inode->i_op = &page_symlink_inode_operations;
+ 			inode->i_op = &hfsplus_symlink_inode_operations;
  			inode_nohighmem(inode);
 @@ -609,7 +1083,8 @@
  	if (HFSPLUS_IS_RSRC(inode))
@@ -729,18 +734,18 @@ diff --git a/fs/hfsplus/inode.c b/fs/hfsplus/inode.c
 diff --git a/fs/hfsplus/super.c b/fs/hfsplus/super.c
 --- a/fs/hfsplus/super.c
 +++ b/fs/hfsplus/super.c
-@@ -93,6 +93,8 @@
- 	INIT_LIST_HEAD(&HFSPLUS_I(inode)->open_dir_list);
- 	spin_lock_init(&HFSPLUS_I(inode)->open_dir_lock);
+@@ -92,6 +92,8 @@ static struct inode *hfsplus_iget(struct super_block *sb, unsigned long ino)
+ 	HFSPLUS_I(inode)->userflags = 0;
+ 	HFSPLUS_I(inode)->subfolders = 0;
  	HFSPLUS_I(inode)->phys_size = 0;
 +	HFSPLUS_I(inode)->file_crypt = 0;
 +	HFSPLUS_I(inode)->decmpfs_type = 0;
  
  	if (inode->i_ino >= HFSPLUS_FIRSTUSER_CNID ||
  	    inode->i_ino == HFSPLUS_ROOT_CNID) {
-@@ -185,6 +187,10 @@
+@@ -187,6 +189,10 @@ static void hfsplus_evict_inode(struct inode *inode)
  {
- 	hfs_dbg(INODE, "hfsplus_evict_inode: %lu\n", inode->i_ino);
+ 	hfs_dbg("ino %llu\n", inode->i_ino);
  	truncate_inode_pages_final(&inode->i_data);
 +	memzero_explicit(HFSPLUS_I(inode)->file_key,
 +			 sizeof(HFSPLUS_I(inode)->file_key));
@@ -749,7 +754,7 @@ diff --git a/fs/hfsplus/super.c b/fs/hfsplus/super.c
  	clear_inode(inode);
  	if (HFSPLUS_IS_RSRC(inode)) {
  		HFSPLUS_I(HFSPLUS_I(inode)->rsrc_inode)->rsrc_inode = NULL;
-@@ -327,6 +333,9 @@
+@@ -349,6 +355,9 @@ static void hfsplus_put_super(struct super_block *sb)
  	hfs_btree_close(sbi->attr_tree);
  	hfs_btree_close(sbi->cat_tree);
  	hfs_btree_close(sbi->ext_tree);
@@ -758,8 +763,8 @@ diff --git a/fs/hfsplus/super.c b/fs/hfsplus/super.c
 +	kvfree(sbi->decmpfs_ws);
  	kfree(sbi->s_vhdr_buf);
  	kfree(sbi->s_backup_vhdr_buf);
- 	call_rcu(&sbi->rcu, delayed_free);
-@@ -349,6 +358,266 @@
+ 	hfs_dbg("finished\n");
+@@ -371,6 +380,266 @@ static int hfsplus_statfs(struct dentry *dentry, struct kstatfs *buf)
  	buf->f_namelen = HFSPLUS_MAX_STRLEN;
  
  	return 0;
@@ -1025,51 +1030,44 @@ diff --git a/fs/hfsplus/super.c b/fs/hfsplus/super.c
 +	return err;
  }
  
- static int hfsplus_remount(struct super_block *sb, int *flags, char *data)
-@@ -359,27 +628,52 @@
- 	if (!(*flags & SB_RDONLY)) {
- 		struct hfsplus_vh *vhdr = HFSPLUS_SB(sb)->s_vhdr;
- 		int force = 0;
+ static int hfsplus_reconfigure(struct fs_context *fc)
+@@ -383,24 +652,45 @@ static int hfsplus_reconfigure(struct fs_context *fc)
+ 	if (!(fc->sb_flags & SB_RDONLY)) {
+ 		struct hfsplus_sb_info *sbi = HFSPLUS_SB(sb);
+ 		struct hfsplus_vh *vhdr = sbi->s_vhdr;
 +		bool jnl_clean = false;
- 
- 		if (!hfsplus_parse_options_remount(data, &force))
- 			return -EINVAL;
++
++		if (vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_JOURNALED))
++			jnl_clean = !hfsplus_handle_journal(sb, true, false);
  
 -		if (!(vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_UNMNT))) {
 -			pr_warn("filesystem was not cleanly unmounted, running fsck.hfsplus is recommended.  leaving read-only.\n");
 -			sb->s_flags |= SB_RDONLY;
--			*flags |= SB_RDONLY;
--		} else if (force) {
-+		if (vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_JOURNALED))
-+			jnl_clean = !hfsplus_handle_journal(sb, true, false);
-+
-+		if (force) {
+-			fc->sb_flags |= SB_RDONLY;
+-		} else if (test_bit(HFSPLUS_SB_FORCE, &sbi->flags)) {
++		if (test_bit(HFSPLUS_SB_FORCE, &sbi->flags)) {
  			/* nothing */
  		} else if (vhdr->attributes &
  				cpu_to_be32(HFSPLUS_VOL_SOFTLOCK)) {
  			pr_warn("filesystem is marked locked, leaving read-only.\n");
  			sb->s_flags |= SB_RDONLY;
- 			*flags |= SB_RDONLY;
+ 			fc->sb_flags |= SB_RDONLY;
 -		} else if (vhdr->attributes &
 -				cpu_to_be32(HFSPLUS_VOL_JOURNALED)) {
 +		} else if (!(vhdr->attributes & cpu_to_be32(HFSPLUS_VOL_UNMNT))) {
 +			pr_warn("filesystem was not cleanly unmounted, running fsck.hfsplus is recommended.  leaving read-only.\n");
 +			sb->s_flags |= SB_RDONLY;
-+			*flags |= SB_RDONLY;
++			fc->sb_flags |= SB_RDONLY;
 +		} else if ((vhdr->attributes &
 +				cpu_to_be32(HFSPLUS_VOL_JOURNALED)) &&
 +			   !jnl_clean) {
  			pr_warn("filesystem is marked journaled, leaving read-only.\n");
  			sb->s_flags |= SB_RDONLY;
- 			*flags |= SB_RDONLY;
+ 			fc->sb_flags |= SB_RDONLY;
  		}
 +
-+		if (!(*flags & SB_RDONLY)) {
-+			vhdr->last_mount_vers = cpu_to_be32(HFSP_MOUNT_VERSION);
-+			vhdr->modify_date = hfsp_now2mt();
-+			be32_add_cpu(&vhdr->write_count, 1);
-+			vhdr->attributes &= cpu_to_be32(~HFSPLUS_VOL_UNMNT);
-+			vhdr->attributes |= cpu_to_be32(HFSPLUS_VOL_INCNSTNT);
++		if (!(fc->sb_flags & SB_RDONLY)) {
++			hfsplus_prepare_volume_header_for_commit(vhdr);
 +			hfsplus_sync_fs(sb, 1);
 +		}
 +	} else {
@@ -1086,23 +1084,20 @@ diff --git a/fs/hfsplus/super.c b/fs/hfsplus/super.c
  	}
  	return 0;
  }
-@@ -406,6 +700,7 @@
- 	struct qstr str;
- 	struct nls_table *nls = NULL;
+@@ -459,10 +750,12 @@ static int hfsplus_fill_super(struct super_block *sb, struct fs_context *fc)
+ 	struct nls_table *nls;
  	u64 last_fs_block, last_fs_page;
+ 	int silent = fc->sb_flags & SB_SILENT;
 +	bool jnl_clean = false;
  	int err;
  
- 	err = -ENOMEM;
-@@ -416,6 +711,7 @@
- 	sb->s_fs_info = sbi;
  	mutex_init(&sbi->alloc_mutex);
  	mutex_init(&sbi->vh_mutex);
 +	mutex_init(&sbi->decmpfs_lock);
  	spin_lock_init(&sbi->work_lock);
  	INIT_DELAYED_WORK(&sbi->sync_work, delayed_sync_fs);
- 	hfsplus_fill_defaults(sbi);
-@@ -450,6 +746,8 @@
+ 
+@@ -498,6 +791,8 @@ static int hfsplus_fill_super(struct super_block *sb, struct fs_context *fc)
  		goto out_free_vhdr;
  	}
  	sbi->total_blocks = be32_to_cpu(vhdr->total_blocks);
@@ -1111,7 +1106,7 @@ diff --git a/fs/hfsplus/super.c b/fs/hfsplus/super.c
  	sbi->free_blocks = be32_to_cpu(vhdr->free_blocks);
  	sbi->next_cnid = be32_to_cpu(vhdr->next_cnid);
  	sbi->file_count = be32_to_cpu(vhdr->file_count);
-@@ -478,16 +776,16 @@
+@@ -526,16 +821,16 @@ static int hfsplus_fill_super(struct super_block *sb, struct fs_context *fc)
  	sb->s_op = &hfsplus_sops;
  	sb->s_maxbytes = MAX_LFS_FILESIZE;
  

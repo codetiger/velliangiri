@@ -1950,12 +1950,12 @@ static bool ftl_read_keystore(struct ftl *f, u8 *store)
 static int ftl_rfc3394_unwrap(const u8 *kek, unsigned int kek_len,
 			      const u8 in[CP_WRAP_LEN], u8 out[AES_KEYSIZE_256])
 {
-	struct crypto_aes_ctx ctx;
+	struct aes_key ctx;
 	u8 blk[AES_BLOCK_SIZE];
 	u64 a, r[4];
 	int i, j, ret;
 
-	ret = aes_expandkey(&ctx, kek, kek_len);
+	ret = aes_preparekey(&ctx, kek, kek_len);
 	if (ret)
 		return ret;
 	a = get_unaligned_be64(in);
@@ -2053,11 +2053,10 @@ out:
 
 int s5l8947x_file_key_unwrap(const void *attr, size_t len, u8 fkey[32], u8 iv_key[16])
 {
-	u32 digest[SHA1_DIGEST_WORDS], ws[SHA1_WORKSPACE_WORDS];
-	u8 blk[SHA1_BLOCK_SIZE] = {};
+	u8 digest[SHA1_DIGEST_SIZE];
 	const u8 *p = attr, *kek;
 	u32 class;
-	int i, ret;
+	int ret;
 
 	if (len < CP_V4_HEADER_LEN + CP_WRAP_LEN)
 		return -EINVAL;
@@ -2082,16 +2081,9 @@ int s5l8947x_file_key_unwrap(const void *attr, size_t len, u8 fkey[32], u8 iv_ke
 		return ret;
 	atomic_inc(&ftl_class_files[class]);
 
-	memcpy(blk, fkey, AES_KEYSIZE_256);
-	blk[AES_KEYSIZE_256] = 0x80;
-	put_unaligned_be64(AES_KEYSIZE_256 * 8, blk + SHA1_BLOCK_SIZE - 8);
-	sha1_init(digest);
-	sha1_transform(digest, blk, ws);
-	for (i = 0; i < 4; i++)
-		put_unaligned_be32(digest[i], iv_key + 4 * i);
-	memzero_explicit(blk, sizeof(blk));
+	sha1(fkey, AES_KEYSIZE_256, digest);
+	memcpy(iv_key, digest, 16);
 	memzero_explicit(digest, sizeof(digest));
-	memzero_explicit(ws, sizeof(ws));
 	return 0;
 }
 EXPORT_SYMBOL_GPL(s5l8947x_file_key_unwrap);
@@ -2101,7 +2093,7 @@ int s5l8947x_file_block_decrypt(struct block_device *bdev, u64 blocknr,
 				u64 file_off, void *dst)
 {
 	struct ftl_disk *d = bdev ? bdev->bd_disk->private_data : NULL;
-	struct crypto_aes_ctx aes;
+	struct aes_enckey aes;
 	u8 iv[AES_BLOCK_SIZE];
 	__le32 lfsr[4];
 	struct ftl *f;
@@ -2114,7 +2106,7 @@ int s5l8947x_file_block_decrypt(struct block_device *bdev, u64 blocknr,
 	pos = blocknr << FTL_LP_SHIFT;
 	if (pos + FTL_LP_SIZE > d->size)
 		return -EIO;
-	ret = aes_expandkey(&aes, iv_key, AES_KEYSIZE_128);
+	ret = aes_prepareenckey(&aes, iv_key, AES_KEYSIZE_128);
 	if (ret)
 		return ret;
 
@@ -2172,7 +2164,7 @@ int s5l8947x_file_block_encrypt(struct block_device *bdev, u64 blocknr,
 				u64 file_off, const void *src)
 {
 	struct ftl_disk *d = bdev ? bdev->bd_disk->private_data : NULL;
-	struct crypto_aes_ctx aes;
+	struct aes_enckey aes;
 	u8 iv[AES_BLOCK_SIZE];
 	__le32 lfsr[4];
 	struct ftl *f;
@@ -2185,7 +2177,7 @@ int s5l8947x_file_block_encrypt(struct block_device *bdev, u64 blocknr,
 	pos = blocknr << FTL_LP_SHIFT;
 	if (pos + FTL_LP_SIZE > d->size)
 		return -EIO;
-	ret = aes_expandkey(&aes, iv_key, AES_KEYSIZE_128);
+	ret = aes_prepareenckey(&aes, iv_key, AES_KEYSIZE_128);
 	if (ret)
 		return ret;
 

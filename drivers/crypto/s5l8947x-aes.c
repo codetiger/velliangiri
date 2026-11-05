@@ -348,7 +348,7 @@ static struct skcipher_alg s5l_aes_algs[] = {
 /* CBC-encrypt a random buffer in hardware and in software and compare. */
 static int s5l_aes_selftest(struct s5l_aes *a)
 {
-	struct crypto_aes_ctx sw;
+	struct aes_enckey sw;
 	u8 key[AES_KEYSIZE_256], iv[AES_BLOCK_SIZE], chain[AES_BLOCK_SIZE];
 	size_t len = a->chunk, i;
 	u8 *src, *hw, *ref;
@@ -363,7 +363,7 @@ static int s5l_aes_selftest(struct s5l_aes *a)
 	get_random_bytes(iv, sizeof(iv));
 	get_random_bytes(src, len);
 
-	ret = aes_expandkey(&sw, key, sizeof(key));
+	ret = aes_prepareenckey(&sw, key, sizeof(key));
 	if (ret)
 		goto out;
 	memcpy(chain, iv, sizeof(chain));

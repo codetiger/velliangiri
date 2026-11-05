@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: GPL-2.0-only
-# Top-level build orchestrator for Project Velliangiri (S5L8947X Linux 6.12)
+# Top-level build orchestrator for Project Velliangiri (S5L8947X Linux 7.x)
 #
 # Usage:
 #   ./scripts/velliangiri.sh image          # Build Docker cross-compile container
 #   ./scripts/velliangiri.sh rootfs         # Build Alpine 3.21 armhf initramfs
-#   ./scripts/velliangiri.sh kernel         # Build Linux 6.12 zImage + DTB
+#   ./scripts/velliangiri.sh kernel         # Build Linux 7.x zImage + DTB
 #   ./scripts/velliangiri.sh bundle         # Pack self-relocating boot bundle
 #   ./scripts/velliangiri.sh all            # Run rootfs + kernel + bundle
 #   ./scripts/velliangiri.sh tvshell        # Build 1280x720@30 TV shell (/bin/tvshell)

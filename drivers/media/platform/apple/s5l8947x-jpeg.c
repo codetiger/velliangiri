@@ -365,7 +365,7 @@ static void jpg_work(struct work_struct *work)
 	else if (ret)
 		dev_warn_ratelimited(j->dev, "decode failed: %d (status %08x)\n", ret, job.status);
 
-	v4l2_m2m_buf_copy_metadata(src, dst, true);
+	v4l2_m2m_buf_copy_metadata(src, dst);
 	src->sequence = ctx->sequence[0]++;
 	dst->sequence = ctx->sequence[1]++;
 	vb2_set_plane_payload(&dst->vb2_buf, 0, ret ? 0 : cp->sizeimage);
@@ -454,8 +454,6 @@ static const struct vb2_ops jpg_qops = {
 	.buf_queue	 = jpg_buf_queue,
 	.start_streaming = jpg_start_streaming,
 	.stop_streaming	 = jpg_stop_streaming,
-	.wait_prepare	 = vb2_ops_wait_prepare,
-	.wait_finish	 = vb2_ops_wait_finish,
 };
 
 static int jpg_queue_init(void *priv, struct vb2_queue *src, struct vb2_queue *dst)
@@ -589,7 +587,7 @@ static int jpg_open(struct file *file)
 		kfree(ctx);
 		return ret;
 	}
-	v4l2_fh_add(&ctx->fh);
+	v4l2_fh_add(&ctx->fh, file);
 	mutex_unlock(&j->vdev_lock);
 	return 0;
 }
@@ -601,7 +599,7 @@ static int jpg_release(struct file *file)
 
 	mutex_lock(&j->vdev_lock);
 	v4l2_m2m_ctx_release(ctx->fh.m2m_ctx);
-	v4l2_fh_del(&ctx->fh);
+	v4l2_fh_del(&ctx->fh, file);
 	v4l2_fh_exit(&ctx->fh);
 	mutex_unlock(&j->vdev_lock);
 	kfree(ctx);

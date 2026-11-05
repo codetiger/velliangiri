@@ -143,12 +143,13 @@ static int s5l8940x_gpio_get(struct gpio_chip *chip, unsigned int offset)
 	return !!(s5l8940x_get_bits(agp, offset) & REG_PIN_DATA_MASK);
 }
 
-static void s5l8940x_gpio_set(struct gpio_chip *chip, unsigned int offset,
-			      int value)
+static int s5l8940x_gpio_set(struct gpio_chip *chip, unsigned int offset,
+			     int value)
 {
 	struct s5l8940x_gpio_pinctrl *agp = gpiochip_get_data(chip);
 
 	s5l8940x_set_bits(agp, offset, REG_PIN_DATA_MASK, value ? 1 : 0);
+	return 0;
 }
 
 static const struct pinctrl_ops s5l8940x_pinctrl_ops = {
@@ -248,7 +249,7 @@ static int s5l8940x_pinconf_get(struct pinctrl_dev *pctldev, unsigned int pin,
 			return -EINVAL;
 		arg = 1;
 		break;
-	case PIN_CONFIG_OUTPUT:
+	case PIN_CONFIG_LEVEL:
 		if ((cfg & REG_PIN_MODE_MASK) != REG_PIN_MODE_OUTPUT_1)
 			return -EINVAL;
 		arg = cfg & REG_PIN_DATA_MASK;
@@ -327,7 +328,7 @@ static int s5l8940x_pinconf_set(struct pinctrl_dev *pctldev, unsigned int pin,
 			else
 				val = (val & ~REG_PIN_MODE_MASK) | REG_PIN_MODE_INPUT;
 			break;
-		case PIN_CONFIG_OUTPUT:
+		case PIN_CONFIG_LEVEL:
 			mask |= REG_PIN_MODE_MASK | REG_PIN_DATA_MASK;
 			val = (val & ~(REG_PIN_MODE_MASK | REG_PIN_DATA_MASK)) |
 			      REG_PIN_MODE_OUTPUT_1 | (arg ? 1 : 0);

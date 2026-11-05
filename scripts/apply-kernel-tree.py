@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: GPL-2.0-only
 """
 Overlay clean-room S5L8947X files (arch/arm/, drivers/, include/, sound/) onto a
-mainline Linux 6.12 tree and apply scripts/patches/*.patch idempotently.
+mainline Linux 7.x tree and apply scripts/patches/*.patch idempotently.
 """
 
 from __future__ import annotations
@@ -138,7 +138,7 @@ def apply_patches(tree: str, revert: bool) -> int:
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description="Overlay S5L8947X files and patches onto Linux 6.12")
+    ap = argparse.ArgumentParser(description="Overlay S5L8947X files and patches onto Linux 7.x")
     ap.add_argument("--tree", default=os.path.join(ROOT, "build", "linux"))
     ap.add_argument("--revert", action="store_true")
     args = ap.parse_args()
