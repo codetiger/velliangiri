@@ -45,6 +45,7 @@
 #define DRM_IOCTL_MODE_GETCONNECTOR	DRM_IOWR(0xa7, struct drm_mode_get_connector)
 #define DRM_IOCTL_MODE_ADDFB		DRM_IOWR(0xae, struct drm_mode_fb_cmd)
 #define DRM_IOCTL_MODE_RMFB		DRM_IOWR(0xaf, unsigned int)
+#define DRM_IOCTL_MODE_PAGE_FLIP	DRM_IOWR(0xb0, struct drm_mode_crtc_page_flip)
 #define DRM_IOCTL_MODE_CREATE_DUMB	DRM_IOWR(0xb2, struct drm_mode_create_dumb)
 #define DRM_IOCTL_MODE_MAP_DUMB		DRM_IOWR(0xb3, struct drm_mode_map_dumb)
 #define DRM_IOCTL_MODE_DESTROY_DUMB	DRM_IOWR(0xb4, struct drm_mode_destroy_dumb)
@@ -110,6 +111,14 @@ struct drm_mode_fb_cmd {
 	uint32_t handle;
 };
 
+struct drm_mode_crtc_page_flip {
+	uint32_t crtc_id;
+	uint32_t fb_id;
+	uint32_t flags;
+	uint32_t reserved;
+	uint64_t user_data;
+};
+
 struct drm_mode_create_dumb {
 	uint32_t height, width, bpp, flags;
 	uint32_t handle, pitch;
@@ -153,7 +162,7 @@ static struct {
 	uint32_t orig_fb_id;
 	struct drm_scanout_buf bufs[SHELL_DRM_BUF_COUNT];
 	int active_buf;
-	struct drm_mode_modeinfo mode_720p30;
+	struct drm_mode_modeinfo mode_720p60;
 	bool have_mode;
 
 	uint32_t *scanout;
@@ -405,12 +414,13 @@ uint8_t shell_sdf_corner_stroke(int radius, int thickness, int cy, int cx)
 	return g_corner_stroke_lut[radius][thickness][cy][cx];
 }
 
-static bool drm_find_720p30(int fd)
+static bool drm_find_720p60(int fd)
 {
 	struct drm_mode_card_res res = { 0 };
 	uint32_t conns[8] = { 0 }, crtcs[8] = { 0 };
 	struct drm_mode_get_connector conn = { 0 };
 	struct drm_mode_modeinfo modes[64];
+	int fallback_idx = -1;
 	uint32_t i;
 
 	if (ioctl(fd, DRM_IOCTL_MODE_GETRESOURCES, &res) < 0)
@@ -449,33 +459,105 @@ static bool drm_find_720p30(int fd)
 
 	for (i = 0; i < conn.count_modes; i++) {
 		if (modes[i].hdisplay == 1280 && modes[i].vdisplay == 720 &&
-		    modes[i].vrefresh == 30) {
-			disp.mode_720p30 = modes[i];
-			disp.have_mode = true;
-			return true;
+		    modes[i].vrefresh == 60) {
+			if (modes[i].type & 0x08) {
+				disp.mode_720p60 = modes[i];
+				disp.have_mode = true;
+				return true;
+			}
+			if (fallback_idx < 0)
+				fallback_idx = (int)i;
 		}
 	}
+	if (fallback_idx >= 0) {
+		disp.mode_720p60 = modes[fallback_idx];
+		disp.have_mode = true;
+		return true;
+	}
 	{
-		/* CEA-861 VIC 62: 1280x720@30 (74.25 MHz, positive syncs) */
-		static const struct drm_mode_modeinfo cea_720p30 = {
+		/* CEA-861 VIC 4: 1280x720@60 (74.25 MHz, positive syncs) */
+		static const struct drm_mode_modeinfo cea_720p60 = {
 			.clock = 74250,
 			.hdisplay = 1280,
-			.hsync_start = 3040,
-			.hsync_end = 3080,
-			.htotal = 3300,
+			.hsync_start = 1390,
+			.hsync_end = 1430,
+			.htotal = 1650,
 			.vdisplay = 720,
 			.vsync_start = 725,
 			.vsync_end = 730,
 			.vtotal = 750,
-			.vrefresh = 30,
+			.vrefresh = 60,
 			.flags = 0x05,
-			.type = 0x40,
+			.type = 0x48,
 			.name = "1280x720",
 		};
-		disp.mode_720p30 = cea_720p30;
+		disp.mode_720p60 = cea_720p60;
 		disp.have_mode = true;
 		return true;
 	}
+}
+
+static void ensure_hdmi_phy_latch(void)
+{
+#ifdef __linux__
+	int fd = open("/dev/mem", O_RDWR | O_SYNC | O_CLOEXEC);
+	volatile uint32_t *phy;
+
+	if (fd < 0)
+		return;
+	phy = mmap(NULL, 4096, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0x39780000);
+	if (phy != MAP_FAILED) {
+		uint32_t w1 = phy[0x8c / 4];
+
+		if ((w1 & 0x00ffffffU) == 0x00f82040U &&
+		    (w1 >> 24) != (((w1 >> 3) & 0xffU))) {
+			uint32_t fix_w1 = (w1 & 0x00ffffffU) |
+					  (((w1 >> 3) & 0xffU) << 24);
+			int i;
+
+			for (i = 0; i < 100 && (phy[0x84 / 4] & 1U); i++)
+				;
+			phy[0xa4 / 4] = (phy[0xa4 / 4] & 0x00ffffffU);
+			for (i = 0; i < 100 && (phy[0x84 / 4] & 1U); i++)
+				;
+			phy[0x8c / 4] = fix_w1;
+			for (i = 0; i < 100 && (phy[0x84 / 4] & 1U); i++)
+				;
+			phy[0xa4 / 4] = (phy[0xa4 / 4] & 0x00ffffffU) | 0x80000000U;
+			for (i = 0; i < 100 && (phy[0x84 / 4] & 1U); i++)
+				;
+		}
+		munmap((void *)phy, 4096);
+	}
+	close(fd);
+#endif
+}
+
+static int drm_flip_fb(uint32_t fb_id)
+{
+	struct drm_mode_crtc_page_flip flip = {
+		.crtc_id = disp.crtc_id,
+		.fb_id = fb_id,
+	};
+	struct drm_mode_crtc crtc = { 0 };
+	int ret;
+
+	if (disp.drm_fd < 0 || fb_id == 0)
+		return -1;
+	if (ioctl(disp.drm_fd, DRM_IOCTL_MODE_PAGE_FLIP, &flip) == 0)
+		return 0;
+	if (!disp.have_mode)
+		return -1;
+	crtc.crtc_id = disp.crtc_id;
+	crtc.fb_id = fb_id;
+	crtc.set_connectors_ptr = (uintptr_t)&disp.conn_id;
+	crtc.count_connectors = 1;
+	crtc.mode = disp.mode_720p60;
+	crtc.mode_valid = 1;
+	ret = ioctl(disp.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc);
+	if (ret == 0)
+		ensure_hdmi_phy_latch();
+	return ret;
 }
 
 static void destroy_drm_buf(int idx)
@@ -504,7 +586,6 @@ static void destroy_drm_buf(int idx)
 
 static int setup_drm_scanout(void)
 {
-	struct drm_mode_crtc crtc = { 0 };
 	const char *cards[] = { "/dev/dri/card0", "/dev/dri/card1" };
 	int i;
 
@@ -514,7 +595,7 @@ static int setup_drm_scanout(void)
 		if (fd < 0)
 			continue;
 		(void)ioctl(fd, DRM_IOCTL_SET_MASTER, 0);
-		if (drm_find_720p30(fd)) {
+		if (drm_find_720p60(fd)) {
 			disp.drm_fd = fd;
 			break;
 		}
@@ -526,9 +607,17 @@ static int setup_drm_scanout(void)
 	{
 		struct drm_mode_crtc orig_crtc = { .crtc_id = disp.crtc_id };
 
-		if (ioctl(disp.drm_fd, DRM_IOCTL_MODE_GETCRTC, &orig_crtc) == 0 &&
-		    orig_crtc.fb_id != 0)
-			disp.orig_fb_id = orig_crtc.fb_id;
+		if (ioctl(disp.drm_fd, DRM_IOCTL_MODE_GETCRTC, &orig_crtc) == 0) {
+			if (orig_crtc.fb_id != 0)
+				disp.orig_fb_id = orig_crtc.fb_id;
+			if (orig_crtc.mode_valid &&
+			    orig_crtc.mode.hdisplay == 1280 &&
+			    orig_crtc.mode.vdisplay == 720 &&
+			    orig_crtc.mode.vrefresh == 60) {
+				disp.mode_720p60 = orig_crtc.mode;
+				disp.have_mode = true;
+			}
+		}
 	}
 
 	for (i = 0; i < SHELL_DRM_BUF_COUNT; i++) {
@@ -578,17 +667,10 @@ static int setup_drm_scanout(void)
 			disp.bufs[i].dmabuf_fd = preq.fd;
 	}
 
-	disp.active_buf = 0;
+	disp.active_buf = -1;
 	disp.fb_id = disp.bufs[0].fb_id;
 	disp.scanout = disp.bufs[0].map;
-
-	crtc.crtc_id = disp.crtc_id;
-	crtc.fb_id = disp.fb_id;
-	crtc.set_connectors_ptr = (uintptr_t)&disp.conn_id;
-	crtc.count_connectors = 1;
-	crtc.mode = disp.mode_720p30;
-	crtc.mode_valid = 1;
-	(void)ioctl(disp.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc);
+	ensure_hdmi_phy_latch();
 
 	disp.use_drm = true;
 	return 0;
@@ -633,7 +715,7 @@ static int setup_fbdev_scanout(void)
 #endif
 }
 
-static void ensure_720p30_and_gamma(void)
+static void ensure_720p60_and_gamma(void)
 {
 	char cur[64] = { 0 };
 	int fd;
@@ -646,10 +728,10 @@ static void ensure_720p30_and_gamma(void)
 		ssize_t n = read(fd, cur, sizeof(cur) - 1);
 
 		close(fd);
-		if (n > 0 && strncmp(cur, "1280x720@30", 11) == 0)
+		if (n > 0 && strncmp(cur, "1280x720@60", 11) == 0)
 			return;
 	}
-	write_sysfs_str("/sys/module/s5l8947x_drm/parameters/preferred_mode", "1280x720@30\n");
+	write_sysfs_str("/sys/module/s5l8947x_drm/parameters/preferred_mode", "1280x720@60\n");
 }
 
 int shell_display_init(bool headless)
@@ -673,7 +755,7 @@ int shell_display_init(bool headless)
 		return 0;
 	}
 
-	ensure_720p30_and_gamma();
+	ensure_720p60_and_gamma();
 
 	disp.tty_fd = open("/dev/tty0", O_RDWR | O_CLOEXEC);
 	if (disp.tty_fd >= 0) {
@@ -732,7 +814,8 @@ void shell_display_close(void)
 	if (disp.use_drm && disp.drm_fd >= 0) {
 		int i;
 
-		shell_display_release();
+		if (disp.orig_fb_id != 0)
+			(void)drm_flip_fb(disp.orig_fb_id);
 		for (i = 0; i < SHELL_DRM_BUF_COUNT; i++)
 			destroy_drm_buf(i);
 		disp.scanout = NULL;
@@ -828,6 +911,8 @@ void shell_display_present(void)
 	int r, y;
 
 	if (shell_gpu_active()) {
+		int next_buf;
+
 		if (shell_gpu_draw_count() == 0) {
 			disp.dmg_count = 0;
 			return;
@@ -838,22 +923,13 @@ void shell_display_present(void)
 			disp.dmg_count = 0;
 			return;
 		}
-		if (shell_gpu_flush(0, disp.last_gpu_buf) == 0) {
-			disp.last_gpu_buf = 0;
-			if (disp.active_buf != 0 && disp.have_mode &&
-			    disp.bufs[0].fb_id != 0) {
-				struct drm_mode_crtc crtc = { 0 };
-
-				crtc.crtc_id = disp.crtc_id;
-				crtc.fb_id = disp.bufs[0].fb_id;
-				crtc.set_connectors_ptr = (uintptr_t)&disp.conn_id;
-				crtc.count_connectors = 1;
-				crtc.mode = disp.mode_720p30;
-				crtc.mode_valid = 1;
-				(void)ioctl(disp.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc);
-				disp.active_buf = 0;
-				disp.fb_id = disp.bufs[0].fb_id;
-				disp.scanout = disp.bufs[0].map;
+		next_buf = (disp.active_buf == 0) ? 1 : 0;
+		if (shell_gpu_flush(next_buf, disp.last_gpu_buf) == 0) {
+			disp.last_gpu_buf = next_buf;
+			if (drm_flip_fb(disp.bufs[next_buf].fb_id) == 0) {
+				disp.active_buf = next_buf;
+				disp.fb_id = disp.bufs[next_buf].fb_id;
+				disp.scanout = disp.bufs[next_buf].map;
 			}
 		}
 		disp.dmg_count = 0;
@@ -889,18 +965,11 @@ void shell_display_present(void)
 			copy_span_u32(dst, src, copy_w);
 		}
 	}
-	if (disp.use_drm && disp.drm_fd >= 0 && disp.active_buf != 0 && disp.have_mode) {
-		struct drm_mode_crtc crtc = { 0 };
-
-		disp.active_buf = 0;
-		disp.fb_id = disp.bufs[0].fb_id;
-		crtc.crtc_id = disp.crtc_id;
-		crtc.fb_id = disp.fb_id;
-		crtc.set_connectors_ptr = (uintptr_t)&disp.conn_id;
-		crtc.count_connectors = 1;
-		crtc.mode = disp.mode_720p30;
-		crtc.mode_valid = 1;
-		(void)ioctl(disp.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc);
+	if (disp.use_drm && disp.drm_fd >= 0 && disp.active_buf != 0) {
+		if (drm_flip_fb(disp.bufs[0].fb_id) == 0) {
+			disp.active_buf = 0;
+			disp.fb_id = disp.bufs[0].fb_id;
+		}
 	}
 	disp.dmg_count = 0;
 }
@@ -954,16 +1023,8 @@ void shell_display_present_video_backbuf(int buf_idx,
 			(void)shell_gpu_flush(buf_idx, buf_idx);
 
 		if (!disp.headless && disp.use_drm && disp.drm_fd >= 0 &&
-		    disp.have_mode && disp.bufs[buf_idx].fb_id != 0) {
-			struct drm_mode_crtc crtc = { 0 };
-
-			crtc.crtc_id = disp.crtc_id;
-			crtc.fb_id = disp.bufs[buf_idx].fb_id;
-			crtc.set_connectors_ptr = (uintptr_t)&disp.conn_id;
-			crtc.count_connectors = 1;
-			crtc.mode = disp.mode_720p30;
-			crtc.mode_valid = 1;
-			if (ioctl(disp.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc) == 0) {
+		    disp.bufs[buf_idx].fb_id != 0) {
+			if (drm_flip_fb(disp.bufs[buf_idx].fb_id) == 0) {
 				disp.active_buf = buf_idx;
 				disp.fb_id = disp.bufs[buf_idx].fb_id;
 				disp.scanout = disp.bufs[buf_idx].map;
@@ -1059,16 +1120,8 @@ void shell_display_present_video_backbuf(int buf_idx,
 		}
 	}
 
-	if (disp.have_mode && disp.bufs[buf_idx].fb_id != 0) {
-		struct drm_mode_crtc crtc = { 0 };
-
-		crtc.crtc_id = disp.crtc_id;
-		crtc.fb_id = disp.bufs[buf_idx].fb_id;
-		crtc.set_connectors_ptr = (uintptr_t)&disp.conn_id;
-		crtc.count_connectors = 1;
-		crtc.mode = disp.mode_720p30;
-		crtc.mode_valid = 1;
-		if (ioctl(disp.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc) == 0) {
+	if (disp.bufs[buf_idx].fb_id != 0) {
+		if (drm_flip_fb(disp.bufs[buf_idx].fb_id) == 0) {
 			disp.active_buf = buf_idx;
 			disp.fb_id = disp.bufs[buf_idx].fb_id;
 			disp.dmg_count = 0;
@@ -1090,17 +1143,8 @@ void shell_display_present_video_backbuf(int buf_idx,
 void shell_display_release(void)
 {
 	if (disp.use_drm && disp.drm_fd >= 0) {
-		if (disp.orig_fb_id != 0 && disp.have_mode) {
-			struct drm_mode_crtc crtc = { 0 };
-
-			crtc.crtc_id = disp.crtc_id;
-			crtc.fb_id = disp.orig_fb_id;
-			crtc.set_connectors_ptr = (uintptr_t)&disp.conn_id;
-			crtc.count_connectors = 1;
-			crtc.mode = disp.mode_720p30;
-			crtc.mode_valid = 1;
-			(void)ioctl(disp.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc);
-		}
+		if (disp.orig_fb_id != 0)
+			(void)drm_flip_fb(disp.orig_fb_id);
 		(void)ioctl(disp.drm_fd, DRM_IOCTL_DROP_MASTER, 0);
 		disp.active_buf = -1;
 #ifdef __linux__
@@ -1111,10 +1155,8 @@ void shell_display_release(void)
 				struct fb_var_screeninfo vinfo;
 
 				if (ioctl(fbfd, FBIOGET_VSCREENINFO, &vinfo) == 0) {
-					vinfo.activate |= FB_ACTIVATE_NOW | FB_ACTIVATE_FORCE;
 					vinfo.xoffset = 0;
 					vinfo.yoffset = 0;
-					(void)ioctl(fbfd, FBIOPUT_VSCREENINFO, &vinfo);
 					(void)ioctl(fbfd, FBIOPAN_DISPLAY, &vinfo);
 				}
 				close(fbfd);
@@ -1126,25 +1168,14 @@ void shell_display_release(void)
 
 int shell_display_acquire(void)
 {
-	ensure_720p30_and_gamma();
+	ensure_720p60_and_gamma();
 
 	if (disp.use_drm && disp.drm_fd >= 0) {
-		struct drm_mode_crtc crtc = { 0 };
-
 		(void)ioctl(disp.drm_fd, DRM_IOCTL_SET_MASTER, 0);
-		disp.active_buf = 0;
+		disp.active_buf = -1;
 		disp.last_gpu_buf = -1;
 		disp.fb_id = disp.bufs[0].fb_id;
 		disp.scanout = disp.bufs[0].map;
-		if (disp.have_mode) {
-			crtc.crtc_id = disp.crtc_id;
-			crtc.fb_id = disp.fb_id;
-			crtc.set_connectors_ptr = (uintptr_t)&disp.conn_id;
-			crtc.count_connectors = 1;
-			crtc.mode = disp.mode_720p30;
-			crtc.mode_valid = 1;
-			(void)ioctl(disp.drm_fd, DRM_IOCTL_MODE_SETCRTC, &crtc);
-		}
 	}
 	shell_display_damage_all();
 	shell_display_present();

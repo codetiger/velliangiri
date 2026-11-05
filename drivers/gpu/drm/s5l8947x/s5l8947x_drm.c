@@ -599,6 +599,7 @@ static int s5l_phy_program(struct s5l_display *d, const struct s5l_phy_cfg *p)
 
 	img[0] = s5l_phy_byte(d, 0);
 	memcpy(&img[1], p->cfg, sizeof(p->cfg));
+	img[7] = ((img[4] | (img[5] << 8) | (img[6] << 16) | (img[7] << 24)) >> 3) & 0xffU;
 	img[31] = 0;
 
 	ret = s5l_phy_write(d, 31, 0x00);
@@ -928,8 +929,8 @@ static void s5l_hdmi_timing(struct s5l_display *d, const struct drm_display_mode
 	hdmi_wb(d, HDMI_CORE(0x130), vfp + vsw, 2);
 	hdmi_wb(d, HDMI_CORE(0x148), vfp + vt, 2);
 	hdmi_wb(d, HDMI_CORE(0x140), vfp + vsw + vt, 2);
-	hdmi_wb(d, HDMI_CORE(0x158), hfp + ht / 2, 2);
-	hdmi_wb(d, HDMI_CORE(0x150), hfp + ht / 2, 2);
+	hdmi_wb(d, HDMI_CORE(0x158), (hfp + ht / 2) % ht, 2);
+	hdmi_wb(d, HDMI_CORE(0x150), (hfp + ht / 2) % ht, 2);
 
 	hdmi_wb(d, HDMI_TG(0x00), 0, 1);
 	hdmi_wb(d, HDMI_TG(0x18), ht, 2);
