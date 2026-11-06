@@ -1,0 +1,99 @@
+--- a/ggml/src/ggml-cpu/vec.h
++++ b/ggml/src/ggml-cpu/vec.h
+@@ -1145,6 +1145,55 @@
+     return svdiv_f32_x(pg, x, svadd_f32_x(pg, one, exp_cx));
+ }
+ 
++#elif defined(__ARM_NEON) && !defined(__aarch64__) && !defined(GGML_ARMV7_DISABLE)
++
++// ARMv7-A NEON (Cortex-A9 class: no FMA, no vdivq). Same algorithm as the
++// AArch64 version below, with separate multiply-accumulate (the Cody-Waite
++// step stays exact: n*ln2_hi needs fewer than 24 bits), the overflow/underflow
++// cases selected without a branch (a NEON->ARM transfer stalls this core),
++// and divisions done as a reciprocal estimate refined by two Newton steps.
++inline static float32x4_t ggml_v_expf(float32x4_t x) {
++    const float32x4_t r = vdupq_n_f32(0x1.8p23f);
++    const float32x4_t z = vmlaq_f32(r, x, vdupq_n_f32(0x1.715476p+0f));
++    const float32x4_t n = vsubq_f32(z, r);
++    const float32x4_t b = vmlsq_f32(vmlsq_f32(x, n, vdupq_n_f32(0x1.62e4p-1f)), n,
++                                    vdupq_n_f32(0x1.7f7d1cp-20f));
++    const uint32x4_t e = vshlq_n_u32(vreinterpretq_u32_f32(z), 23);
++    const float32x4_t k = vreinterpretq_f32_u32(vaddq_u32(e, vreinterpretq_u32_f32(vdupq_n_f32(1))));
++    const uint32x4_t c = vcagtq_f32(n, vdupq_n_f32(126));
++    const float32x4_t u = vmulq_f32(b, b);
++    const float32x4_t pa = vmlaq_f32(vdupq_n_f32(0x1.fffdb6p-2f), vdupq_n_f32(0x1.555e66p-3f), b);
++    const float32x4_t pb = vmlaq_f32(vdupq_n_f32(0x1.573e2ep-5f), vdupq_n_f32(0x1.0e4020p-7f), b);
++    const float32x4_t j = vmlaq_f32(vmulq_f32(vdupq_n_f32(0x1.ffffecp-1f), b),
++                                    vmlaq_f32(pa, pb, u), u);
++    const uint32x4_t d = vandq_u32(vcleq_f32(n, vdupq_n_f32(0)), vdupq_n_u32(0x82000000));
++    const float32x4_t s1 = vreinterpretq_f32_u32(vaddq_u32(d, vdupq_n_u32(0x7f000000)));
++    const float32x4_t s2 = vreinterpretq_f32_u32(vsubq_u32(e, d));
++    return vbslq_f32(vcagtq_f32(n, vdupq_n_f32(192)), vmulq_f32(s1, s1),
++                     vbslq_f32(c, vmulq_f32(vmlaq_f32(s2, s2, j), s1), vmlaq_f32(k, k, j)));
++}
++
++// 1/d, ~1 ulp; vrecps defines inf*0 as 2, so 1/inf -> 0 stays finite
++inline static float32x4_t ggml_v_armv7_recip(float32x4_t d) {
++    float32x4_t r = vrecpeq_f32(d);
++    r = vmulq_f32(vrecpsq_f32(d, r), r);
++    return vmulq_f32(vrecpsq_f32(d, r), r);
++}
++
++// computes silu x/(1+exp(-x)) in single precision vector
++inline static float32x4_t ggml_v_silu(float32x4_t x) {
++    const float32x4_t one = vdupq_n_f32(1.0f);
++    const float32x4_t exp_neg_x = ggml_v_expf(vnegq_f32(x));
++    return vmulq_f32(x, ggml_v_armv7_recip(vaddq_f32(one, exp_neg_x)));
++}
++
++// gelu_quick(x) = x / (1 + exp(-1.702 x))
++inline static float32x4_t ggml_v_gelu_quick(float32x4_t x) {
++    const float32x4_t one = vdupq_n_f32(1.0f);
++    const float32x4_t exp_cx = ggml_v_expf(vmulq_n_f32(x, GELU_QUICK_COEF));
++    return vmulq_f32(x, ggml_v_armv7_recip(vaddq_f32(one, exp_cx)));
++}
++
+ #elif defined(__ARM_NEON) && defined(__aarch64__)
+ 
+ // adapted from arm limited optimized routine
+--- a/ggml/src/ggml-cpu/vec.cpp
++++ b/ggml/src/ggml-cpu/vec.cpp
+@@ -397,7 +397,7 @@
+         const svbool_t pg = svwhilelt_b32_s32(i, n);
+         svst1_f32(pg, y + i, ggml_v_silu(pg, svld1_f32(pg, x + i)));
+     }
+-#elif defined(__ARM_NEON) && defined(__aarch64__)
++#elif defined(__ARM_NEON) && (defined(__aarch64__) || !defined(GGML_ARMV7_DISABLE))
+     for (; i + 3 < n; i += 4) {
+         vst1q_f32(y + i, ggml_v_silu(vld1q_f32(x + i)));
+     }
+@@ -438,7 +438,7 @@
+         const svbool_t pg = svwhilelt_b32_s32(i, n);
+         svst1_f32(pg, y + i, svmul_f32_x(pg, ggml_v_silu(pg, svld1_f32(pg, x + i)), svld1_f32(pg, g + i)));
+     }
+-#elif defined(__ARM_NEON) && defined(__aarch64__)
++#elif defined(__ARM_NEON) && (defined(__aarch64__) || !defined(GGML_ARMV7_DISABLE))
+     for (; i + 3 < n; i += 4) {
+         vst1q_f32(y + i, vmulq_f32(ggml_v_silu(vld1q_f32(x + i)), vld1q_f32(g + i)));
+     }
+@@ -674,6 +674,20 @@
+                                                 vdupq_n_f32(max)));
+         vst1q_f32(y + i, val);
+         sum += (ggml_float)vaddvq_f32(val);
++    }
++#elif defined(__ARM_NEON) && !defined(GGML_ARMV7_DISABLE)
++    {
++        // ARMv7: accumulate in NEON, reduce once (per-iteration vaddvq is
++        // four NEON->ARM transfers on this core)
++        float32x4_t vsum = vdupq_n_f32(0.0f);
++        for (; i + 3 < n; i += 4) {
++            float32x4_t val = ggml_v_expf(vsubq_f32(vld1q_f32(x + i),
++                                                    vdupq_n_f32(max)));
++            vst1q_f32(y + i, val);
++            vsum = vaddq_f32(vsum, val);
++        }
++        sum += (ggml_float)(vgetq_lane_f32(vsum, 0) + vgetq_lane_f32(vsum, 1) +
++                            vgetq_lane_f32(vsum, 2) + vgetq_lane_f32(vsum, 3));
+     }
+ #elif defined(__VXE__) || defined(__VXE2__)
+     for (; i + 3 < n; i += 4) {

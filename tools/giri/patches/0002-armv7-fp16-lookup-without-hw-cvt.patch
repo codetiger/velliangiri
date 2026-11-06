@@ -1,0 +1,16 @@
+--- a/ggml/src/ggml-cpu/simd-mappings.h
++++ b/ggml/src/ggml-cpu/simd-mappings.h
+@@ -39,7 +39,12 @@
+ // for old CUDA compilers (<= 11), we use uint16_t: ref https://github.com/ggml-org/llama.cpp/pull/10616
+ // for     MUSA compilers        , we use uint16_t: ref https://github.com/ggml-org/llama.cpp/pull/11843
+ //
+-#if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE) && !(defined(__CUDACC__) && __CUDACC_VER_MAJOR__ <= 11) && !defined(__MUSACC__)
++// 32-bit Arm without the half-precision conversion extension (e.g. Cortex-A9
++// with -mfpu=neon, __ARM_FP lacks bit 1) turns every __fp16 cast into a libgcc
++// soft-float call; fall through to the lookup table there instead.
++#if defined(__ARM_NEON) && defined(__ARM_FP16_FORMAT_IEEE) && \
++    (defined(__aarch64__) || (defined(__ARM_FP) && (__ARM_FP & 2))) && \
++    !(defined(__CUDACC__) && __CUDACC_VER_MAJOR__ <= 11) && !defined(__MUSACC__)
+     #define GGML_CPU_COMPUTE_FP16_TO_FP32(x) neon_compute_fp16_to_fp32(x)
+     #define GGML_CPU_COMPUTE_FP32_TO_FP16(x) neon_compute_fp32_to_fp16(x)
+ 

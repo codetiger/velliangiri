@@ -1,0 +1,42 @@
+--- a/ggml/src/ggml-cpu/vec.cpp
++++ b/ggml/src/ggml-cpu/vec.cpp
+@@ -1,5 +1,10 @@
+ #include "vec.h"
+ 
++// ARMv7-A NEON f32 dot products (Cortex-A9 class)
++#if defined(__ARM_NEON) && !defined(__aarch64__)
++#include "armv7-f32.h"
++#endif
++
+ #include <cassert>
+ 
+ // precomputed gelu table for f16 (128 KB)
+@@ -9,6 +14,14 @@
+ ggml_fp16_t ggml_table_gelu_quick_f16[1 << 16];
+ 
+ void ggml_vec_dot_f32(int n, float * GGML_RESTRICT s, size_t bs, const float * GGML_RESTRICT x, size_t bx, const float * GGML_RESTRICT y, size_t by, int nrc) {
++#if defined(GGML_ARMV7_F32_KERNELS)
++   if (nrc == 2) {
++       ggml_armv7_vec_dot_f32_2x2(n, s, bs, x, bx, y, by);
++       return;
++   }
++   ggml_armv7_vec_dot_f32(n, s, x, y);
++   return;
++#endif
+    assert(nrc == 1);
+    GGML_UNUSED(nrc);
+    GGML_UNUSED(bx);
+--- a/ggml/src/ggml-cpu/ggml-cpu.c
++++ b/ggml/src/ggml-cpu/ggml-cpu.c
+@@ -220,7 +220,11 @@
+         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp32,
+         .vec_dot                  = (ggml_vec_dot_t) ggml_vec_dot_f32,
+         .vec_dot_type             = GGML_TYPE_F32,
++#if defined(__ARM_NEON) && !defined(__aarch64__) && !defined(GGML_ARMV7_DISABLE)
++        .nrows                    = 2,
++#else
+         .nrows                    = 1,
++#endif
+     },
+     [GGML_TYPE_F16] = {
+         .from_float               = (ggml_from_float_t) ggml_cpu_fp32_to_fp16,
