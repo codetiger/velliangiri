@@ -1,0 +1,42 @@
+Bluetooth: hci_event: mask vendor bits in the legacy advertising type
+
+The BCM4334 on the S5L8947X board, once its patch RAM is loaded, reports
+LE Advertising Report event types with bits 4-7 set (0x10, 0x13, 0x14,
+0x20, 0x21, 0x23, 0x24, 0x90, 0xa0 seen in one scan). The low nibble is a
+valid legacy type, but process_adv_report() rejects anything above
+LE_ADV_SCAN_RSP, so most reports are dropped. That includes the directed
+advertising (0x21) a bonded LE keyboard sends to reconnect, which leaves
+the keyboard unable to reconnect after it goes idle.
+
+Clear the upper nibble when the low nibble is a defined legacy type.
+Compliant controllers never set these reserved bits, so nothing changes
+for them.
+---
+ net/bluetooth/hci_event.c | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/net/bluetooth/hci_event.c b/net/bluetooth/hci_event.c
+--- a/net/bluetooth/hci_event.c
++++ b/net/bluetooth/hci_event.c
+@@ -6468,8 +6468,20 @@
+ 		hci_store_wake_reason(hdev, &info->bdaddr, info->bdaddr_type);
+ 
+ 		if (info->length <= max_adv_len(hdev)) {
++			u8 type = info->type;
++
++			/* Legacy event types are 0x00-0x04. The BCM4334 with
++			 * its patch RAM loaded sets vendor bits 4-7 (seen:
++			 * 0x10, 0x21, 0x24, 0x90), which would drop the
++			 * report, including the directed advertising a
++			 * bonded HID device uses to reconnect.
++			 */
++			if (type > LE_ADV_SCAN_RSP &&
++			    (type & 0x0f) <= LE_ADV_SCAN_RSP)
++				type &= 0x0f;
++
+ 			rssi = info->data[info->length];
+-			process_adv_report(hdev, info->type, &info->bdaddr,
++			process_adv_report(hdev, type, &info->bdaddr,
+ 					   info->bdaddr_type, NULL, 0,
+ 					   HCI_ADV_PHY_1M, 0, rssi,
+ 					   info->data, info->length, false,
