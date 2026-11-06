@@ -31,6 +31,38 @@ Native 10-foot television shell for the S5L8947X (`j33iap`) implementing the **G
 ./tools/tvshell/install.sh [root@HOST]      # Install /bin/tvshell, /bin/media-gallery symlink, fonts & JSON catalogs
 ```
 
+## Choosing the LLM (On-Device or a LAN Server)
+
+Ask Giri's backend is set by `LLM_*` keys in the persistent `/mnt/data/linux/etc/shell.conf` (the same file as `THEME`), read when tvshell starts. Selection is explicit: there is no automatic fallback between backends.
+
+| Key | Meaning |
+|---|---|
+| `LLM_MODE` | `device` (default) or `remote` |
+| `LLM_URL` | Remote server base URL, plain HTTP on the LAN, e.g. `http://192.168.68.101:8080` (`[fe80::1%usb0]` literals work too) |
+| `LLM_MODEL` | Model name sent to the server (Ollama/LM Studio need it; llama-server uses its `--alias`) |
+| `LLM_API_KEY` | Optional, sent as `Authorization: Bearer` |
+| `LLM_TIMEOUT_S` | Whole-request timeout, default 90 |
+| `LLM_JSON_SCHEMA` | `1` (default) sends `response_format` `json_schema`; set `0` for servers without it |
+| `LLM_DEVICE_MODEL` | GGUF path for the on-device backend |
+
+The remote backend speaks the OpenAI-compatible `POST /v1/chat/completions` API. The model fills the summary title (≤64 chars), the text (≤250) and the two follow-up buttons (≤42). The request runs on a worker thread while the shimmer plays. Menu cancels it. If the request fails, the summary slot shows the error. `device` mode still shows the built-in responses until the on-device LLM daemon is in place.
+
+```sh
+# Serve a model from the Mac (llama.cpp llama-server, Metal), listening on the LAN:
+bash tools/giri/fetch.sh
+bash tools/giri/serve-host.sh build/dl/giri/models/SmolLM2-360M-Instruct-Q8_0.gguf 8080 smollm2-360m
+#   or: OLLAMA_HOST=0.0.0.0 ollama serve   (URL http://<mac-ip>:11434, LLM_MODEL=<ollama model>)
+
+# Point the device at it (keeps other shell.conf keys, restarts tvshell):
+./tools/tvshell/llm-config.sh remote http://192.168.68.101:8080 smollm2-360m
+./tools/tvshell/llm-config.sh show            # current keys + GET /v1/models from the device
+./tools/tvshell/llm-config.sh device          # back to on-device
+./tools/tvshell/llm-config.sh set LLM_TIMEOUT_S=120
+
+# Check a reply without the remote control (renders the LLM screen to a file):
+/bin/tvshell --headless --topic "Tell me about the Western Ghats" --dump-ppm /tmp/llm.ppm
+```
+
 ## One-Time Media & Placeholder Provisioning (Persistent Storage)
 
 Built OS images (`build/initramfs-s5l8947x.cpio`, `out/rootfs.sqsh`, `build/usr-local.sqsh`, and `out/boot-bundle-s5l8947x-j33iap.bin`) **do not** bundle sample photos, videos, extracted video frames, or placeholder JPEGs. Instead, media assets live on the persistent `Data` partition (`/dev/nand0p2`, mounted at `/mnt/data`) so they only need to be transferred **once** per device:

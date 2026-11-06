@@ -135,6 +135,11 @@ static struct {
 	char sys_memory[24];
 	char sys_network[24];
 	char sys_display[24];
+
+	/* Giri LLM backend (shell.conf LLM_* keys) */
+	struct shell_llm_config llm;
+	char llm_desc[128];
+	bool llm_waiting;	/* topic transition waits for the LLM reply */
 } g_ui;
 
 static volatile sig_atomic_t g_running = 1;
@@ -2141,7 +2146,19 @@ static void render_window_settings_modal(const struct shell_theme *th)
 	/* Section 2: SUPPORTED AI MODELS (2x3 grid, indices 3..8) */
 	shell_font_draw_role(SHELL_FONT_MONO_SEMIBOLD, 11,
 			     ix + 2, iy, th->muted,
-			     "SUPPORTED AI MODELS (SUPPORTED_MODELS.JSON)", iw);
+			     "SUPPORTED AI MODELS (SUPPORTED_MODELS.JSON)", iw / 2);
+	{
+		/* active backend from shell.conf, right-aligned */
+		char be[160];
+		int bw;
+
+		snprintf(be, sizeof(be), "BACKEND: %s", g_ui.llm_desc);
+		bw = shell_font_measure_role(SHELL_FONT_MONO_SEMIBOLD, 11, be) + 2;
+		if (bw > iw - 340)	/* keep clear of the section label */
+			bw = iw - 340;
+		shell_font_draw_role(SHELL_FONT_MONO_SEMIBOLD, 11,
+				     ix + iw - bw, iy, th->accent, be, bw);
+	}
 	iy += 18;
 
 	int mod_w = (iw - 10) / 2;	/* 447px each */
@@ -2276,10 +2293,62 @@ static void start_topic_transition(const char *query)
 	build_topic_screen(g_ui.pending_query, &g_ui.pending_screen);
 	g_ui.has_pending_screen = true;
 
+	/* LAN LLM: the summary and follow-ups come from the server; the
+	 * shimmer runs until the reply (or error/timeout) arrives. */
+	g_ui.llm_waiting = false;
+	if (g_ui.llm.mode == SHELL_LLM_REMOTE)
+		g_ui.llm_waiting = shell_llm_start(&g_ui.llm, query ? query : "") == 0;
+
 	if (!was_main || !g_ui.main_bg_valid)
 		mark_full_redraw();
 	else
 		g_ui.dirty_slots |= 0x03;
+}
+
+/* Fill Slot 2 and the two contextual Slot 4 buttons from an LLM reply. */
+static void apply_llm_result(const struct shell_llm_result *r, struct giri_screen *scr)
+{
+	char caption[160];
+	int k;
+
+	if (!r->ok) {
+		fprintf(stderr, "tvshell: LLM request failed after %d ms: %s\n",
+			r->elapsed_ms, r->error);
+		snprintf(scr->summary.title, sizeof(scr->summary.title),
+			 "Giri could not get an answer from the LLM server");
+		shell_font_fit_clean_phrase(r->error, scr->summary.text,
+					    sizeof(scr->summary.text), SHELL_LIMIT_SUMMARY_TEXT);
+		snprintf(caption, sizeof(caption), "%s", g_ui.llm_desc);
+		shell_font_fit_clean_phrase(caption, scr->summary.source_caption,
+					    sizeof(scr->summary.source_caption),
+					    SHELL_LIMIT_SUMMARY_SOURCE);
+		return;
+	}
+	fprintf(stderr, "tvshell: LLM reply in %d ms\n", r->elapsed_ms);
+	shell_font_fit_clean_phrase(r->title, scr->summary.title,
+				    sizeof(scr->summary.title), SHELL_LIMIT_SUMMARY_TITLE);
+	shell_font_fit_clean_phrase(r->summary, scr->summary.text,
+				    sizeof(scr->summary.text), SHELL_LIMIT_SUMMARY_TEXT);
+	snprintf(caption, sizeof(caption), "Giri · %s%s",
+		 g_ui.llm.model[0] ? g_ui.llm.model : "LAN LLM",
+		 g_ui.llm.model[0] ? " on LAN" : "");
+	shell_font_fit_clean_phrase(caption, scr->summary.source_caption,
+				    sizeof(scr->summary.source_caption), SHELL_LIMIT_SUMMARY_SOURCE);
+
+	for (k = 0; k < 2; k++) {
+		struct giri_footer_link *fl = &scr->footer_links[1 + k];
+
+		if (!r->next[k][0])
+			continue;
+		shell_font_fit_clean_phrase(r->next[k], fl->label, sizeof(fl->label),
+					    SHELL_LIMIT_FOOTER_LABEL);
+		fl->symbol = k ? SHELL_SYM_GLOBE : SHELL_SYM_SPARK;
+		memset(&fl->action, 0, sizeof(fl->action));
+		snprintf(fl->action.type, sizeof(fl->action.type), "ask_giri");
+		snprintf(fl->action.capability, sizeof(fl->action.capability),
+			 "internet.search_and_extract");
+		snprintf(fl->action.query, sizeof(fl->action.query), "%s", r->next[k]);
+	}
 }
 
 static void complete_topic_transition(void)
@@ -2428,11 +2497,22 @@ static void handle_key_event(const struct shell_input_event *ev)
 	 */
 	if (g_ui.is_working) {
 		if (ev->key == SHELL_KEY_MENU) {
+			if (g_ui.llm_waiting) {
+				shell_llm_cancel();
+				g_ui.llm_waiting = false;
+			}
 			g_ui.is_working = false;
 			g_ui.has_pending_screen = false;
 			g_ui.logo_frame_idx = 0;
 			g_ui.dirty_slots |= 0x03;
 			return;
+		}
+		/* waiting for the LLM: nothing to show yet, keep the shimmer */
+		if (g_ui.llm_waiting && ev->key != SHELL_KEY_MENU_HOLD)
+			return;
+		if (g_ui.llm_waiting) {
+			shell_llm_cancel();
+			g_ui.llm_waiting = false;
 		}
 		complete_topic_transition();
 	}
@@ -2709,7 +2789,16 @@ static bool tick_animations(uint64_t now)
 			g_ui.logo_frame_idx = logo_pingpong_steps[g_ui.logo_step_cursor];
 			g_ui.dirty_slots |= 0x01;
 		}
-		if (now - g_ui.working_start_ms >= 260) {
+		if (g_ui.llm_waiting) {
+			struct shell_llm_result r;
+
+			if (shell_llm_poll(&r)) {
+				g_ui.llm_waiting = false;
+				if (g_ui.has_pending_screen)
+					apply_llm_result(&r, &g_ui.pending_screen);
+			}
+		}
+		if (!g_ui.llm_waiting && now - g_ui.working_start_ms >= 260) {
 			complete_topic_transition();
 			dirty = true;
 		}
@@ -3074,10 +3163,32 @@ int main(int argc, char **argv)
 	load_supported_models();
 	load_apps_catalog();
 	refresh_system_metrics();
+	shell_llm_config_load(&g_ui.llm);
+	shell_llm_describe(&g_ui.llm, g_ui.llm_desc, sizeof(g_ui.llm_desc));
+	fprintf(stderr, "tvshell: LLM backend: %s (%s)\n", g_ui.llm_desc,
+		shell_llm_config_path());
 
-	if (initial_topic)
+	if (initial_topic) {
 		build_topic_screen(initial_topic, &g_ui.history[0]);
-	else
+		/* --topic with a LAN LLM: wait for the reply before the first
+		 * frame (used with --dump-ppm to check LLM screens) */
+		if (g_ui.llm.mode == SHELL_LLM_REMOTE &&
+		    shell_llm_start(&g_ui.llm, initial_topic) == 0) {
+			struct shell_llm_result r;
+			uint64_t until = shell_now_ms() + (uint64_t)(g_ui.llm.timeout_s + 2) * 1000;
+
+			while (!shell_llm_poll(&r)) {
+				if (shell_now_ms() > until || !g_running) {
+					shell_llm_cancel();
+					memset(&r, 0, sizeof(r));
+					snprintf(r.error, sizeof(r.error), "no reply");
+					break;
+				}
+				usleep(50 * 1000);
+			}
+			apply_llm_result(&r, &g_ui.history[0]);
+		}
+	} else
 		build_home_screen(&g_ui.history[0]);
 	g_ui.history_len = 1;
 	g_ui.history_idx = 0;

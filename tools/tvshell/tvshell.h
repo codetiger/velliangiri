@@ -277,4 +277,40 @@ uint64_t shell_now_ms(void);
 int media_gallery_run(enum shell_theme_id theme_id);
 int media_gallery_main(int argc, char **argv);
 
+/* ------------------------------------------------------------------
+ * shell_llm.c: Giri LLM backend (shell.conf LLM_* keys)
+ * ------------------------------------------------------------------ */
+enum shell_llm_mode {
+	SHELL_LLM_DEVICE = 0,	/* on-device model (built-in responses for now) */
+	SHELL_LLM_REMOTE,	/* OpenAI-compatible server on the LAN */
+};
+
+struct shell_llm_config {
+	enum shell_llm_mode mode;
+	char url[160];		/* http://host[:port][/prefix] */
+	char model[64];
+	char api_key[128];
+	int timeout_s;
+	bool json_schema;	/* send response_format json_schema */
+	char device_model[160];
+};
+
+struct shell_llm_result {
+	bool ok;
+	char title[160];
+	char summary[400];
+	char next[2][96];
+	char error[160];
+	int elapsed_ms;
+};
+
+const char *shell_llm_config_path(void);
+void shell_llm_config_load(struct shell_llm_config *cfg);
+void shell_llm_describe(const struct shell_llm_config *cfg, char *buf, size_t sz);
+/* Start a request on a worker thread; a new request supersedes the old one. */
+int shell_llm_start(const struct shell_llm_config *cfg, const char *query);
+/* Non-blocking: true once the current request has finished (ok or error). */
+bool shell_llm_poll(struct shell_llm_result *out);
+void shell_llm_cancel(void);
+
 #endif /* TVSHELL_H */
