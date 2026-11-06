@@ -2622,7 +2622,7 @@ struct art_cache_slot {
 };
 
 #define URI_CACHE_SLOTS		40
-#define MAX_ASYNC_FETCHES	4
+#define MAX_ASYNC_FETCHES	8
 
 struct uri_cache_entry {
 	char path[256];
@@ -2724,6 +2724,172 @@ static uint32_t fnv1a_hash(const char *str)
 	return h;
 }
 
+/*
+ * "commons:<phrase>" card images: search Wikimedia Commons over HTTPS and
+ * download a 960 px JPEG thumbnail (Commons serves these as baseline JPEG,
+ * which both JPEG decoders handle). Runs in a forked child of a process
+ * that has other threads, so it sticks to static buffers, fork/exec and
+ * plain syscalls.
+ */
+#define COMMONS_UA	"Velliangiri-tvshell/1.0 (https://github.com/codetiger/velliangiri)"
+#define COMMONS_API	"https://commons.wikimedia.org/w/api.php?action=query&format=json" \
+			"&generator=search&gsrnamespace=6&gsrlimit=10&prop=imageinfo" \
+			"&iiprop=url%7Cmime%7Csize%7Cextmetadata" \
+			"&iiextmetadatafilter=LicenseShortName&iiurlwidth=960&gsrsearch="
+
+static int run_wget(const char *url, const char *out, int timeout_s)
+{
+	char tmo[8];
+	int status = 0;
+	pid_t pid;
+
+	snprintf(tmo, sizeof(tmo), "%d", timeout_s);
+	pid = fork();
+	if (pid == 0) {
+		char *argv[] = { "wget", "-q", "-T", tmo, "-U", COMMONS_UA,
+				 "-O", (char *)out, (char *)url, NULL };
+		execvp("wget", argv);
+		_exit(127);
+	}
+	if (pid < 0 || waitpid(pid, &status, 0) < 0)
+		return -1;
+	return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
+}
+
+/* Percent-encode q (+ " filetype:bitmap") onto dst. */
+static void commons_encode_query(const char *q, char *dst, size_t sz)
+{
+	static const char hex[] = "0123456789ABCDEF";
+	const char *suffix = " filetype:bitmap";
+	size_t o = 0;
+	int pass;
+
+	for (pass = 0; pass < 2; pass++) {
+		const unsigned char *p = (const unsigned char *)(pass ? suffix : q);
+
+		for (; *p && o + 4 < sz; p++) {
+			if ((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+			    (*p >= '0' && *p <= '9') || *p == '-' || *p == '_' || *p == '.') {
+				dst[o++] = (char)*p;
+			} else {
+				dst[o++] = '%';
+				dst[o++] = hex[*p >> 4];
+				dst[o++] = hex[*p & 15];
+			}
+		}
+	}
+	dst[o] = '\0';
+}
+
+/* Copy the JSON string value following key inside [seg, end) ("\/" -> "/"). */
+static bool seg_get_str(const char *seg, const char *end, const char *key,
+			char *dst, size_t sz)
+{
+	const char *p = seg;
+	size_t klen = strlen(key), o = 0;
+
+	while ((p = strstr(p, key)) && p < end) {
+		p += klen;
+		if (*p != ':' || p[1] != '"')
+			continue;
+		for (p += 2; *p && *p != '"' && p < end && o + 1 < sz; p++) {
+			if (*p == '\\' && p[1]) {
+				p++;
+				if (*p == 'u')	/* keep it simple: drop \uXXXX */
+					{ p += 4; continue; }
+			}
+			dst[o++] = *p;
+		}
+		dst[o] = '\0';
+		return o > 0;
+	}
+	return false;
+}
+
+static long seg_get_int(const char *seg, const char *end, const char *key)
+{
+	const char *p = strstr(seg, key);
+
+	if (!p || p >= end)
+		return -1;
+	p += strlen(key);
+	return *p == ':' ? strtol(p + 1, NULL, 10) : -1;
+}
+
+static int commons_fetch_child(const char *query, const char *out_jpg)
+{
+	static char json[256 * 1024], url[1024], enc[256], best[768];
+	static char lic[64], credit[128], json_path[300], credit_path[300];
+	const char *p;
+	long best_idx = 1L << 30;
+	bool best_wide = false;
+	ssize_t n;
+	int fd;
+
+	commons_encode_query(query, enc, sizeof(enc));
+	snprintf(url, sizeof(url), "%s%s", COMMONS_API, enc);
+	snprintf(json_path, sizeof(json_path), "%s.json", out_jpg);
+	if (run_wget(url, json_path, 12) < 0)
+		return -1;
+	fd = open(json_path, O_RDONLY);
+	if (fd < 0)
+		return -1;
+	n = read(fd, json, sizeof(json) - 1);
+	close(fd);
+	unlink(json_path);
+	if (n <= 0)
+		return -1;
+	json[n] = '\0';
+
+	/* page objects: ..."index":N,"imageinfo":[{ ... }] */
+	best[0] = lic[0] = '\0';
+	for (p = json; (p = strstr(p, "\"index\":")); ) {
+		long idx = strtol(p + 8, NULL, 10);
+		const char *seg = strstr(p, "\"imageinfo\":[{");
+		const char *end = seg ? strstr(seg, "}]") : NULL;
+		char mime[32], thumb[768], l[64];
+		long w, h;
+		bool wide;
+
+		if (!seg || !end) {
+			p += 8;
+			continue;
+		}
+		p = end;
+		if (!seg_get_str(seg, end, "\"mime\"", mime, sizeof(mime)) ||
+		    strcmp(mime, "image/jpeg") ||
+		    !seg_get_str(seg, end, "\"thumburl\"", thumb, sizeof(thumb)))
+			continue;
+		w = seg_get_int(seg, end, "\"width\"");
+		h = seg_get_int(seg, end, "\"height\"");
+		wide = w > 0 && h > 0 && w * 10 >= h * 12;
+		/* prefer landscape, then search rank */
+		if ((wide && !best_wide) || (wide == best_wide && idx < best_idx)) {
+			best_idx = idx;
+			best_wide = wide;
+			snprintf(best, sizeof(best), "%s", thumb);
+			l[0] = '\0';
+			if (seg_get_str(seg, end, "\"LicenseShortName\":{\"value\"", l, sizeof(l)))
+				snprintf(lic, sizeof(lic), "%s", l);
+			else
+				lic[0] = '\0';
+		}
+	}
+	if (!best[0] || run_wget(best, out_jpg, 12) < 0)
+		return -1;
+
+	snprintf(credit_path, sizeof(credit_path), "%.250s.credit", out_jpg);
+	snprintf(credit, sizeof(credit), "%s%sWikimedia Commons", lic, lic[0] ? " · " : "");
+	fd = open(credit_path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+	if (fd >= 0) {
+		ssize_t wr = write(fd, credit, strlen(credit));
+
+		(void)wr;
+		close(fd);
+	}
+	return 0;
+}
+
 /* Non-blocking background fetcher for live http/https article image URLs */
 static bool check_or_start_url_fetch(const char *url, char *local_out, size_t out_sz)
 {
@@ -2746,8 +2912,19 @@ static bool check_or_start_url_fetch(const char *url, char *local_out, size_t ou
 		}
 	}
 
-	/* Find an empty slot to launch background wget/curl */
-	for (i = 0; i < MAX_ASYNC_FETCHES; i++) {
+	/* Find an empty slot, else recycle a finished one (slots used to be
+	 * single-use, so after the first few downloads nothing loaded) */
+	for (i = 0; i < MAX_ASYNC_FETCHES; i++)
+		if (g_fetches[i].pid == 0 && g_fetches[i].url[0] == '\0')
+			break;
+	if (i == MAX_ASYNC_FETCHES) {
+		for (i = 0; i < MAX_ASYNC_FETCHES; i++)
+			if (g_fetches[i].pid == 0 && g_fetches[i].done)
+				break;
+		if (i < MAX_ASYNC_FETCHES)
+			memset(&g_fetches[i], 0, sizeof(g_fetches[i]));
+	}
+	for (; i < MAX_ASYNC_FETCHES; i++) {
 		if (g_fetches[i].pid == 0 && g_fetches[i].url[0] == '\0') {
 			pid_t pid = fork();
 			if (pid == 0) {
@@ -2759,6 +2936,19 @@ static bool check_or_start_url_fetch(const char *url, char *local_out, size_t ou
 					dup2(devnull, STDERR_FILENO);
 					if (devnull > 2)
 						close(devnull);
+				}
+				if (strncmp(url, "commons:", 8) == 0) {
+					if (commons_fetch_child(url + 8, tmp_path) == 0 &&
+					    rename(tmp_path, local_out) == 0) {
+						char c_tmp[300], c_out[300];
+
+						snprintf(c_tmp, sizeof(c_tmp), "%.250s.credit", tmp_path);
+						snprintf(c_out, sizeof(c_out), "%.250s.credit", local_out);
+						(void)rename(c_tmp, c_out);
+						_exit(0);
+					}
+					unlink(tmp_path);
+					_exit(1);
 				}
 				/* Try wget first (BusyBox / Alpine), then curl without invoking /bin/sh */
 				int status = 0;
@@ -2801,6 +2991,28 @@ static bool check_or_start_url_fetch(const char *url, char *local_out, size_t ou
 		}
 	}
 	return false;
+}
+
+/* Licence/credit line for a downloaded Commons card image, if known. */
+bool shell_media_get_card_credit(const struct giri_media_card *card, char *buf, size_t sz)
+{
+	char path[300];
+	ssize_t n;
+	int fd;
+
+	if (!card || strncmp(card->uri, "commons:", 8) || sz < 2)
+		return false;
+	snprintf(path, sizeof(path), "/tmp/tvshell-cache/art_%08x.jpg.credit",
+		 fnv1a_hash(card->uri));
+	fd = open(path, O_RDONLY);
+	if (fd < 0)
+		return false;
+	n = read(fd, buf, sz - 1);
+	close(fd);
+	if (n <= 0)
+		return false;
+	buf[n] = '\0';
+	return true;
 }
 
 bool shell_media_poll_async(void)
@@ -3520,7 +3732,8 @@ static bool resolve_card_image_path(const struct giri_media_card *card,
 
 	if (card->uri[0]) {
 		if (strncmp(card->uri, "http://", 7) == 0 ||
-		    strncmp(card->uri, "https://", 8) == 0) {
+		    strncmp(card->uri, "https://", 8) == 0 ||
+		    strncmp(card->uri, "commons:", 8) == 0) {
 			if (check_or_start_url_fetch(card->uri, out_path, out_sz))
 				return true;
 		} else if (resolve_media_path(card->uri, out_path, out_sz)) {

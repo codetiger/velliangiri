@@ -2296,8 +2296,14 @@ static void start_topic_transition(const char *query)
 	/* LAN LLM: the summary and follow-ups come from the server; the
 	 * shimmer runs until the reply (or error/timeout) arrives. */
 	g_ui.llm_waiting = false;
-	if (g_ui.llm.mode == SHELL_LLM_REMOTE)
+	if (g_ui.llm.mode == SHELL_LLM_REMOTE) {
 		g_ui.llm_waiting = shell_llm_start(&g_ui.llm, query ? query : "") == 0;
+		/* the header shows what was asked, not the canned topic title */
+		if (g_ui.llm_waiting && query && query[0])
+			shell_font_fit_clean_phrase(query, g_ui.pending_screen.prompt_title,
+						    sizeof(g_ui.pending_screen.prompt_title),
+						    SHELL_LIMIT_PROMPT_TITLE);
+	}
 
 	if (!was_main || !g_ui.main_bg_valid)
 		mark_full_redraw();
@@ -2349,6 +2355,38 @@ static void apply_llm_result(const struct shell_llm_result *r, struct giri_scree
 			 "internet.search_and_extract");
 		snprintf(fl->action.query, sizeof(fl->action.query), "%s", r->next[k]);
 	}
+
+	/* Slot 3: one picture card per aspect, image searched on Wikimedia
+	 * Commons; the built-in art stays as the fallback until it loads. */
+	for (k = 0; k < SHELL_LLM_CARDS && k < SHELL_CARD_COUNT; k++) {
+		const struct shell_llm_card *c = &r->cards[k];
+		struct giri_media_card *mc = &scr->media_cards[k];
+		enum giri_preset_art preset = mc->preset_art;
+		char id[16], badge[24], uri[160], detail[384];
+		const char *q = c->image[0] ? c->image : c->title;
+		size_t i;
+
+		if (!c->title[0] || !q[0])
+			continue;
+		snprintf(id, sizeof(id), "llm_%d", k);
+		snprintf(badge, sizeof(badge), "%s", c->badge[0] ? c->badge : "PHOTO");
+		for (i = 0; badge[i]; i++)
+			if (badge[i] >= 'a' && badge[i] <= 'z')
+				badge[i] = (char)(badge[i] - 32);
+		if (strlen(badge) > SHELL_LIMIT_CARD_BADGE)
+			badge[SHELL_LIMIT_CARD_BADGE] = '\0';
+		snprintf(uri, sizeof(uri), "commons:%s", q);
+		{
+			/* "<subtitle>. <summary>", clipped to the overlay text */
+			int room = (int)sizeof(detail) - 1 - (int)strlen(c->subtitle) - 2;
+
+			snprintf(detail, sizeof(detail), "%s%s%.*s", c->subtitle,
+				 c->subtitle[0] ? ". " : "", room > 0 ? room : 0, r->summary);
+		}
+		fill_card_uri(mc, id, c->title, c->subtitle[0] ? c->subtitle : q, badge,
+			      "PHOTO", GIRI_CARD_PAGE_IMAGE, preset, uri,
+			      "open_image", "media.open_image", c->title, detail);
+	}
 }
 
 static void complete_topic_transition(void)
@@ -2385,6 +2423,12 @@ static void open_media_overlay(const char *badge, const struct giri_media_card *
 		 "%s", current_screen()->summary.source_caption[0]
 		       ? current_screen()->summary.source_caption
 		       : "Velliangiri OS · Standardized Detail View");
+	{
+		char credit[64];
+
+		if (shell_media_get_card_credit(mc, credit, sizeof(credit)))
+			snprintf(g_ui.overlay_source, sizeof(g_ui.overlay_source), "%s", credit);
+	}
 	snprintf(g_ui.overlay_title, sizeof(g_ui.overlay_title), "%s", mc->title);
 	snprintf(g_ui.overlay_text, sizeof(g_ui.overlay_text),
 		 "%s", mc->detail_text[0] ? mc->detail_text : mc->subtitle);
@@ -3175,6 +3219,10 @@ int main(int argc, char **argv)
 		if (g_ui.llm.mode == SHELL_LLM_REMOTE &&
 		    shell_llm_start(&g_ui.llm, initial_topic) == 0) {
 			struct shell_llm_result r;
+
+			shell_font_fit_clean_phrase(initial_topic, g_ui.history[0].prompt_title,
+						    sizeof(g_ui.history[0].prompt_title),
+						    SHELL_LIMIT_PROMPT_TITLE);
 			uint64_t until = shell_now_ms() + (uint64_t)(g_ui.llm.timeout_s + 2) * 1000;
 
 			while (!shell_llm_poll(&r)) {
@@ -3187,6 +3235,36 @@ int main(int argc, char **argv)
 				usleep(50 * 1000);
 			}
 			apply_llm_result(&r, &g_ui.history[0]);
+
+			/* --dump-ppm: let the card images download first */
+			if (dump_ppm_path) {
+				uint64_t img_until = shell_now_ms() + 25000;
+
+				while (shell_now_ms() < img_until && g_running) {
+					char credit[64];
+					int k, ready = 0, want = 0;
+
+					(void)shell_media_poll_async();
+					while (shell_media_preload_next_card(&g_ui.history[0]))
+						;
+					for (k = 0; k < SHELL_CARD_COUNT; k++) {
+						const struct giri_media_card *mc =
+							&g_ui.history[0].media_cards[k];
+
+						if (strncmp(mc->uri, "commons:", 8))
+							continue;
+						want++;
+						ready += shell_media_get_card_credit(mc, credit,
+										     sizeof(credit));
+					}
+					if (ready == want)
+						break;
+					usleep(200 * 1000);
+				}
+				(void)shell_media_poll_async();
+				while (shell_media_preload_next_card(&g_ui.history[0]))
+					;
+			}
 		}
 	} else
 		build_home_screen(&g_ui.history[0]);

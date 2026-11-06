@@ -41,7 +41,7 @@ python3 "${ROOT}/scripts/apk-unpack.py" \
 	--cache "${DL_DIR}/apk" \
 	--prune "${ROOT}/config/initramfs-prune.txt" \
 	dropbear nfs-utils iw wpa_supplicant wireless-regdb \
-	bluez dbus mtd-utils-ubi
+	bluez dbus mtd-utils-ubi ssl_client
 
 (
 	cd "${APK_WORK}"

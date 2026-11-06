@@ -264,6 +264,8 @@ void shell_media_audio_set_paused(bool paused);
 void shell_media_audio_seek_sec(int elapsed_sec);
 int shell_media_audio_get_frame_idx(int fps, int total_frames);
 bool shell_media_poll_async(void);
+/* "Licence · Wikimedia Commons" for a downloaded commons: card image. */
+bool shell_media_get_card_credit(const struct giri_media_card *card, char *buf, size_t sz);
 int shell_media_scan_device(struct shell_media_item *items, int max_items, bool video_only);
 
 /* shell_input.c */
@@ -295,11 +297,21 @@ struct shell_llm_config {
 	char device_model[160];
 };
 
+#define SHELL_LLM_CARDS	4
+
+struct shell_llm_card {
+	char title[64];
+	char subtitle[96];
+	char badge[24];
+	char image[96];		/* image search phrase */
+};
+
 struct shell_llm_result {
 	bool ok;
 	char title[160];
 	char summary[400];
 	char next[2][96];
+	struct shell_llm_card cards[SHELL_LLM_CARDS];
 	char error[160];
 	int elapsed_ms;
 };

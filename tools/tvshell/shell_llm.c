@@ -481,7 +481,13 @@ static char *build_request_body(const struct llm_job *job)
 		"characters), \"summary\" (one or two plain sentences, at most 250 "
 		"characters, no markdown), \"next1\" and \"next2\" (two short "
 		"follow-up questions the viewer might ask next, each at most 42 "
-		"characters). No other text.";
+		"characters), and \"cards\": exactly 4 objects for picture cards "
+		"about different aspects of the answer, each with \"title\" (at "
+		"most 26 characters), \"subtitle\" (at most 38 characters), "
+		"\"badge\" (one or two uppercase words, at most 10 characters, "
+		"e.g. HISTORY, WILDLIFE) and \"image\" (a short photo search "
+		"phrase of 2 to 4 concrete English words naming something "
+		"photographable). No other text.";
 	static const char *schema =
 		",\"response_format\":{\"type\":\"json_schema\",\"json_schema\":{"
 		"\"name\":\"giri_screen\",\"strict\":true,\"schema\":{\"type\":\"object\","
@@ -489,10 +495,18 @@ static char *build_request_body(const struct llm_job *job)
 		"\"title\":{\"type\":\"string\",\"maxLength\":64},"
 		"\"summary\":{\"type\":\"string\",\"maxLength\":250},"
 		"\"next1\":{\"type\":\"string\",\"maxLength\":42},"
-		"\"next2\":{\"type\":\"string\",\"maxLength\":42}},"
-		"\"required\":[\"title\",\"summary\",\"next1\",\"next2\"],"
+		"\"next2\":{\"type\":\"string\",\"maxLength\":42},"
+		"\"cards\":{\"type\":\"array\",\"minItems\":4,\"maxItems\":4,"
+		"\"items\":{\"type\":\"object\",\"properties\":{"
+		"\"title\":{\"type\":\"string\",\"maxLength\":26},"
+		"\"subtitle\":{\"type\":\"string\",\"maxLength\":38},"
+		"\"badge\":{\"type\":\"string\",\"maxLength\":10},"
+		"\"image\":{\"type\":\"string\",\"maxLength\":40}},"
+		"\"required\":[\"title\",\"subtitle\",\"badge\",\"image\"],"
+		"\"additionalProperties\":false}}},"
+		"\"required\":[\"title\",\"summary\",\"next1\",\"next2\",\"cards\"],"
 		"\"additionalProperties\":false}}}";
-	const size_t cap = 4096;
+	const size_t cap = 6144;
 	char *b = malloc(cap);
 	size_t pos;
 
@@ -505,7 +519,7 @@ static char *build_request_body(const struct llm_job *job)
 		pos += (size_t)snprintf(b + pos, cap - pos, "\",");
 	}
 	pos += (size_t)snprintf(b + pos, cap - pos,
-		"\"stream\":false,\"temperature\":0.3,\"max_tokens\":320,"
+		"\"stream\":false,\"temperature\":0.3,\"max_tokens\":700,"
 		"\"messages\":[{\"role\":\"system\",\"content\":\"");
 	pos = json_escape(b, cap, pos, sys);
 	pos += (size_t)snprintf(b + pos, cap - pos,
@@ -516,7 +530,95 @@ static char *build_request_body(const struct llm_job *job)
 	return b;
 }
 
-/* Pull title/summary/next1/next2 out of the assistant message content. */
+/*
+ * Copy the JSON object starting at p ('{') into dst, honouring strings, so
+ * key lookups stay inside one card. Returns a pointer past the object.
+ */
+static const char *json_copy_object(const char *p, char *dst, size_t dst_sz)
+{
+	const char *s = p;
+	int depth = 0;
+	bool in_str = false;
+
+	for (; *p; p++) {
+		if (in_str) {
+			if (*p == '\\' && p[1])
+				p++;
+			else if (*p == '"')
+				in_str = false;
+			continue;
+		}
+		if (*p == '"')
+			in_str = true;
+		else if (*p == '{')
+			depth++;
+		else if (*p == '}' && --depth == 0) {
+			p++;
+			break;
+		}
+	}
+	scopy(dst, dst_sz, "");
+	if ((size_t)(p - s) < dst_sz) {
+		memcpy(dst, s, (size_t)(p - s));
+		dst[p - s] = '\0';
+	}
+	return p;
+}
+
+/* Overwrite the array value of "key" (brackets included) with spaces. */
+static void blank_array(char *obj, const char *key)
+{
+	char pat[40];
+	char *p, *q;
+	int depth = 0;
+	bool in_str = false;
+
+	snprintf(pat, sizeof(pat), "\"%s\"", key);
+	p = strstr(obj, pat);
+	if (!p || !(p = strchr(p, '[')))
+		return;
+	for (q = p; *q; q++) {
+		if (in_str) {
+			if (*q == '\\' && q[1])
+				q++;
+			else if (*q == '"')
+				in_str = false;
+			continue;
+		}
+		if (*q == '"')
+			in_str = true;
+		else if (*q == '[')
+			depth++;
+		else if (*q == ']' && --depth == 0)
+			break;
+	}
+	if (*q)
+		memset(p, ' ', (size_t)(q - p + 1));
+}
+
+static void parse_cards(const char *obj, struct shell_llm_result *res)
+{
+	const char *p = strstr(obj, "\"cards\"");
+	char one[512];
+	int k;
+
+	if (!p || !(p = strchr(p, '[')))
+		return;
+	for (k = 0; k < SHELL_LLM_CARDS; k++) {
+		struct shell_llm_card *c = &res->cards[k];
+
+		p = strchr(p, '{');
+		if (!p)
+			break;
+		p = json_copy_object(p, one, sizeof(one));
+		json_get_string(one, "title", c->title, sizeof(c->title));
+		json_get_string(one, "subtitle", c->subtitle, sizeof(c->subtitle));
+		json_get_string(one, "badge", c->badge, sizeof(c->badge));
+		json_get_string(one, "image", c->image, sizeof(c->image));
+	}
+}
+
+/* Pull title/summary/next1/next2/cards out of the assistant message content. */
 static void parse_content(const char *content, const char *query,
 			  struct shell_llm_result *res)
 {
@@ -526,10 +628,16 @@ static void parse_content(const char *content, const char *query,
 	if (think)	/* reasoning models: skip the thinking block */
 		obj = think + 8;
 	obj = strchr(obj, '{');
-	if (obj && json_get_string(obj, "summary", res->summary, sizeof(res->summary))) {
-		json_get_string(obj, "title", res->title, sizeof(res->title));
-		json_get_string(obj, "next1", res->next[0], sizeof(res->next[0]));
-		json_get_string(obj, "next2", res->next[1], sizeof(res->next[1]));
+	/* top-level keys are looked up with the cards array blanked out so a
+	 * card's "title" can never be taken for the screen title */
+	char *top = obj ? strdup(obj) : NULL;
+	if (top)
+		blank_array(top, "cards");
+	if (top && json_get_string(top, "summary", res->summary, sizeof(res->summary))) {
+		json_get_string(top, "title", res->title, sizeof(res->title));
+		json_get_string(top, "next1", res->next[0], sizeof(res->next[0]));
+		json_get_string(top, "next2", res->next[1], sizeof(res->next[1]));
+		parse_cards(obj, res);
 	} else {
 		/* model ignored the format: show its text as the summary */
 		const char *t = think ? think + 8 : content;
@@ -539,6 +647,7 @@ static void parse_content(const char *content, const char *query,
 			res->summary[j++] = (t[i] == '\n' || t[i] == '\r') ? ' ' : t[i];
 		res->summary[j] = '\0';
 	}
+	free(top);
 	if (!res->title[0])
 		scopy(res->title, sizeof(res->title), query);
 	res->ok = res->summary[0] != '\0';
